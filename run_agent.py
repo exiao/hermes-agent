@@ -3523,6 +3523,8 @@ class AIAgent:
         base_url = (self.base_url or "").lower()
         if "nousresearch" in base_url:
             return True
+        if "ai-gateway.vercel.sh" in base_url:
+            return True
         if "openrouter" not in base_url:
             return False
         if "api.mistral.ai" in base_url:
@@ -5256,6 +5258,15 @@ class AIAgent:
                     if hasattr(response, 'usage') and response.usage:
                         if self.api_mode in ("codex_responses", "anthropic_messages"):
                             prompt_tokens = getattr(response.usage, 'input_tokens', 0) or 0
+                            if self.api_mode == "anthropic_messages":
+                                # Anthropic splits input into cache_read + cache_creation
+                                # + non-cached input_tokens. Without adding the cached
+                                # portions, the context bar shows only the tiny non-cached
+                                # portion (e.g. 3 tokens) instead of the real total (~18K).
+                                # Other providers (OpenAI/Codex) already include cached
+                                # tokens in their input_tokens/prompt_tokens field.
+                                prompt_tokens += getattr(response.usage, 'cache_read_input_tokens', 0) or 0
+                                prompt_tokens += getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
                             completion_tokens = getattr(response.usage, 'output_tokens', 0) or 0
                             total_tokens = (
                                 getattr(response.usage, 'total_tokens', None)
@@ -5574,7 +5585,13 @@ class AIAgent:
                     # are programming bugs, not transient failures.
                     _RETRYABLE_STATUS_CODES = {413, 429, 529}
                     is_local_validation_error = isinstance(api_error, (ValueError, TypeError))
-                    is_client_status_error = isinstance(status_code, int) and 400 <= status_code < 500 and status_code not in _RETRYABLE_STATUS_CODES
+                    # Detect generic 400s from Anthropic OAuth (transient server-side failures).
+                    # Real invalid_request_error responses include a descriptive message;
+                    # transient ones contain only "Error" or are empty. (ref: issue #1608)
+                    _err_body = getattr(api_error, "body", None) or {}
+                    _err_message = (_err_body.get("error", {}).get("message", "") if isinstance(_err_body, dict) else "")
+                    _is_generic_400 = (status_code == 400 and _err_message.strip().lower() in ("error", ""))
+                    is_client_status_error = isinstance(status_code, int) and 400 <= status_code < 500 and status_code not in _RETRYABLE_STATUS_CODES and not _is_generic_400
                     is_client_error = (is_local_validation_error or is_client_status_error or any(phrase in error_msg for phrase in [
                         'error code: 401', 'error code: 403',
                         'error code: 404', 'error code: 422',

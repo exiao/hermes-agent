@@ -768,6 +768,7 @@ def cmd_model(args):
         "kimi-coding": "Kimi / Moonshot",
         "minimax": "MiniMax",
         "minimax-cn": "MiniMax (China)",
+        "ai-gateway": "AI Gateway",
         "custom": "Custom endpoint",
     }
     active_label = provider_labels.get(active, active)
@@ -787,6 +788,7 @@ def cmd_model(args):
         ("kimi-coding", "Kimi / Moonshot (Moonshot AI direct API)"),
         ("minimax", "MiniMax (global direct API)"),
         ("minimax-cn", "MiniMax China (domestic direct API)"),
+        ("ai-gateway", "AI Gateway (Vercel — 200+ models, pay-per-use)"),
     ]
 
     # Add user-defined custom providers from config.yaml
@@ -855,7 +857,7 @@ def cmd_model(args):
         _model_flow_anthropic(config, current_model)
     elif selected_provider == "kimi-coding":
         _model_flow_kimi(config, current_model)
-    elif selected_provider in ("zai", "minimax", "minimax-cn"):
+    elif selected_provider in ("zai", "minimax", "minimax-cn", "ai-gateway"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
 
@@ -2122,7 +2124,17 @@ def _restore_stashed_changes(
     print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
     return True
 
-
+def _invalidate_update_cache():
+    """Delete the update-check cache so ``hermes --version`` doesn't
+    report a stale "commits behind" count after a successful update."""
+    try:
+        cache_file = Path(os.getenv(
+            "HERMES_HOME", Path.home() / ".hermes"
+        )) / ".update_check"
+        if cache_file.exists():
+            cache_file.unlink()
+    except Exception:
+        pass
 
 def cmd_update(args):
     """Update Hermes Agent to the latest version."""
@@ -2195,6 +2207,7 @@ def cmd_update(args):
         commit_count = int(result.stdout.strip())
         
         if commit_count == 0:
+            _invalidate_update_cache()
             print("✓ Already up to date!")
             return
         
@@ -2214,6 +2227,8 @@ def cmd_update(args):
                     auto_stash_ref,
                     prompt_user=prompt_for_restore,
                 )
+        
+        _invalidate_update_cache()
         
         # Reinstall Python dependencies (prefer uv for speed, fall back to pip)
         print("→ Updating Python dependencies...")
