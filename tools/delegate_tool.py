@@ -583,7 +583,49 @@ def _run_single_child(
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
+        _cache_read = getattr(child, "session_cache_read_tokens", 0)
+        _cache_write = getattr(child, "session_cache_write_tokens", 0)
         _model = getattr(child, "model", None)
+
+        # Coerce potentially-mock values to real numbers.  This matters for
+        # the cache-hit ratio math below, and mirrors what _run_single_child
+        # already does for input/output tokens a few lines up.
+        def _coerce_num(v):
+            return v if isinstance(v, (int, float)) else 0
+
+        _input_tokens = _coerce_num(_input_tokens)
+        _output_tokens = _coerce_num(_output_tokens)
+        _cache_read = _coerce_num(_cache_read)
+        _cache_write = _coerce_num(_cache_write)
+
+        # W12: shape-mirror telemetry.
+        # The whole point of the shape-mirror regime (W6-W11) is to make
+        # the child's first API call hit the parent's prompt cache.  Log
+        # the hit ratio so we can SEE in the gateway logs whether the
+        # cache actually hit, without having to scrape Anthropic dashboards.
+        #
+        # Denominator is (input + cache_read):  cache_read tokens are NOT
+        # counted in input_tokens by Anthropic, so total prompt size is the
+        # sum.  Cache hit ratio = cache_read / total_prompt.
+        total_prompt = _input_tokens + _cache_read
+        cache_hit_ratio = (
+            _cache_read / total_prompt if total_prompt > 0 else 0.0
+        )
+        try:
+            logger.info(
+                "[subagent-%d] 💾 cache: %d/%d tokens (%.0f%% hit, %d written) "
+                "model=%s api_calls=%d",
+                task_index,
+                int(_cache_read),
+                int(total_prompt),
+                cache_hit_ratio * 100,
+                int(_cache_write),
+                _model if isinstance(_model, str) else "?",
+                api_calls,
+            )
+        except Exception:
+            # Never let telemetry formatting crash a real delegation.
+            pass
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -594,8 +636,12 @@ def _run_single_child(
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
             "tokens": {
-                "input": _input_tokens if isinstance(_input_tokens, (int, float)) else 0,
-                "output": _output_tokens if isinstance(_output_tokens, (int, float)) else 0,
+                "input": _input_tokens,
+                "output": _output_tokens,
+                # W12: cache accounting for shape-mirror health checks.
+                "cache_read": _cache_read,
+                "cache_write": _cache_write,
+                "cache_hit_ratio": round(cache_hit_ratio, 4),
             },
             "tool_trace": tool_trace,
         }
@@ -886,9 +932,45 @@ def delegate_task(
 
     total_duration = round(time.monotonic() - overall_start, 2)
 
+    # W12: aggregate cache-hit telemetry across all child tasks.
+    # Gives the gateway operator a one-line rollup: "did the shape-mirror
+    # actually hit cache across all three children, or just one?"
+    agg_cache_read = 0
+    agg_cache_write = 0
+    agg_input = 0
+    agg_output = 0
+    for entry in results:
+        toks = entry.get("tokens") or {}
+        agg_cache_read += int(toks.get("cache_read", 0) or 0)
+        agg_cache_write += int(toks.get("cache_write", 0) or 0)
+        agg_input += int(toks.get("input", 0) or 0)
+        agg_output += int(toks.get("output", 0) or 0)
+    agg_total_prompt = agg_input + agg_cache_read
+    agg_hit_ratio = (
+        agg_cache_read / agg_total_prompt if agg_total_prompt > 0 else 0.0
+    )
+    try:
+        logger.info(
+            "[delegate] 💾 rollup: %d/%d prompt tokens cached (%.0f%% hit, "
+            "%d written) across %d task(s) in %.1fs",
+            agg_cache_read, agg_total_prompt,
+            agg_hit_ratio * 100, agg_cache_write,
+            len(results), total_duration,
+        )
+    except Exception:
+        pass
+
     return json.dumps({
         "results": results,
         "total_duration_seconds": total_duration,
+        # W12: top-level cache rollup, easy for callers (and tests) to read.
+        "cache_summary": {
+            "input_tokens": agg_input,
+            "output_tokens": agg_output,
+            "cache_read_tokens": agg_cache_read,
+            "cache_write_tokens": agg_cache_write,
+            "cache_hit_ratio": round(agg_hit_ratio, 4),
+        },
     }, ensure_ascii=False)
 
 
