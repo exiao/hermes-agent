@@ -291,7 +291,13 @@ def _build_child_agent(
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
-    child_prompt = _build_child_system_prompt(goal, context, workspace_path=workspace_hint)
+    # Shape-mirror (W8): do NOT synthesize a "Claude Code default" system prompt
+    # for the child.  With parent-shape snapshot attached (see below), the
+    # child's system is parent's verbatim value — any ephemeral overlay would
+    # break the byte-equal prefix that Anthropic caches on.  We keep the
+    # workspace_hint reference live (other call-sites still use it).
+    _ = workspace_hint  # noqa: F841 — retained for future use / fallback path
+    child_prompt = None
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -394,6 +400,19 @@ def _build_child_agent(
         else:
             parent_agent._active_children.append(child)
 
+    # ── Shape-mirror: attach parent's request snapshot to the child ──────
+    # The child's top-level API call will be built from this snapshot so the
+    # prefix (system + tools + message-prefix) byte-matches parent's, enabling
+    # Anthropic prompt-cache hits and ~10× quota reduction on Max subscriptions.
+    # See ~/.hermes/plans/hermes-patches/delegation-shape-mirror.md
+    snapshot = getattr(parent_agent, "_delegation_shape_snapshot", None)
+    if snapshot is not None:
+        child._parent_shape_snapshot = snapshot
+        # Freeze the child's system prompt to parent's verbatim value.
+        # Without this, _build_system_prompt() would synthesize the child's
+        # own baseline (SOUL.md + child-specific additions) on the first turn.
+        child._frozen_system_prompt = snapshot.get("system")
+
     return child
 
 def _run_single_child(
@@ -469,7 +488,20 @@ def _run_single_child(
     _heartbeat_thread.start()
 
     try:
-        result = child.run_conversation(user_message=goal)
+        # Shape-mirror: if the parent snapshotted its request shape, replay
+        # the parent's message prefix so the child's first API call hits the
+        # Anthropic prompt cache.  The `goal` becomes the next user message
+        # *after* the prefix (identical to what the parent's next turn would
+        # have looked like without delegation), which is exactly what the
+        # cache is keyed on.
+        shape_snapshot = getattr(child, "_parent_shape_snapshot", None)
+        if shape_snapshot is not None:
+            result = child.run_conversation(
+                user_message=goal,
+                conversation_history=shape_snapshot.get("messages_prefix") or [],
+            )
+        else:
+            result = child.run_conversation(user_message=goal)
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, '_flush'):

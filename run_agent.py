@@ -6494,6 +6494,43 @@ class AIAgent:
                     content[-1]["cache_control"] = make_cache_marker(self._cache_ttl)
                 break
 
+    def capture_delegation_snapshot(self, messages: list) -> dict:
+        """Capture parent request shape for shape-mirror delegation.
+
+        Returns a deep-copied snapshot of the fields that must be byte-identical
+        between parent and child for Anthropic prompt-cache hits to fire.  Called
+        from the tool dispatcher just before invoking delegate_task, when the
+        parent's `messages` list is in scope (it's a local in run_conversation,
+        not a durable attribute).
+
+        Fields captured:
+          model, system (effective prompt string), tools (definitions list),
+          messages_prefix (deep-copied conversation so far), max_tokens,
+          reasoning_config, api_mode, provider.
+
+        See ~/.hermes/plans/hermes-patches/delegation-shape-mirror.md
+        """
+        import copy
+        # The parent's cached system prompt is built at turn start (line ~8420).
+        # Using _cached_system_prompt (not rebuilding) guarantees byte equality
+        # with what the parent is about to send in this very turn.
+        system_text = getattr(self, "_cached_system_prompt", None) or ""
+        if self.ephemeral_system_prompt:
+            # Parent's actual effective system == cached + ephemeral overlay.
+            # Mirror that exactly so the child's prefix matches byte-for-byte.
+            system_text = (system_text + "\n\n" + self.ephemeral_system_prompt).strip()
+        return {
+            "model": self.model,
+            "system": system_text,
+            "tools": copy.deepcopy(self.tools) if self.tools else [],
+            "messages_prefix": copy.deepcopy(messages) if messages else [],
+            "max_tokens": getattr(self, "max_tokens", None),
+            "reasoning_config": getattr(self, "reasoning_config", None),
+            "api_mode": getattr(self, "api_mode", None),
+            "provider": getattr(self, "provider", None),
+            "base_url": getattr(self, "base_url", None),
+        }
+
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
         if self.api_mode == "anthropic_messages":
@@ -7473,6 +7510,13 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
+            # Shape-mirror: capture parent's request shape so delegate_task's
+            # child can replay the identical prefix for cache hits.  Set here
+            # (concurrent dispatch) so _invoke_tool can read self._delegation_shape_snapshot
+            # — it doesn't receive `messages` as a parameter.
+            if function_name == "delegate_task":
+                self._delegation_shape_snapshot = self.capture_delegation_snapshot(messages)
+
             # Checkpoint for file-mutating tools
             if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
@@ -7879,6 +7923,10 @@ class AIAgent:
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
                 from tools.delegate_tool import delegate_task as _delegate_task
+                # Shape-mirror: capture parent's exact request shape so the child
+                # can replay the identical prefix (system + tools + messages) and
+                # hit the Anthropic prompt cache.  See delegation-shape-mirror.md
+                self._delegation_shape_snapshot = self.capture_delegation_snapshot(messages)
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
                     spinner_label = f"🔀 delegating {len(tasks_arg)} tasks"
@@ -8411,7 +8459,12 @@ class AIAgent:
                 except Exception:
                     pass  # Fall through to build fresh
 
-            if stored_prompt:
+            if getattr(self, "_frozen_system_prompt", None) is not None:
+                # Shape-mirror delegation: child uses parent's verbatim system
+                # prompt so the Anthropic prompt cache hits on the shared prefix.
+                # See ~/.hermes/plans/hermes-patches/delegation-shape-mirror.md
+                self._cached_system_prompt = self._frozen_system_prompt
+            elif stored_prompt:
                 # Continuing session — reuse the exact system prompt from
                 # the previous turn so the Anthropic cache prefix matches.
                 self._cached_system_prompt = stored_prompt
