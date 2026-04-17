@@ -916,15 +916,31 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
                 "Set delegation.api_key or OPENAI_API_KEY."
             )
 
-        base_lower = configured_base_url.lower()
-        provider = "custom"
-        api_mode = "chat_completions"
-        if "chatgpt.com/backend-api/codex" in base_lower:
-            provider = "openai-codex"
-            api_mode = "codex_responses"
-        elif "api.anthropic.com" in base_lower:
-            provider = "anthropic"
-            api_mode = "anthropic_messages"
+        # W4: provider-based routing takes precedence over host inspection.
+        # Host-string matching only works for Anthropic's canonical endpoint
+        # (api.anthropic.com); it silently mis-routes local proxies / gateways
+        # that speak the Anthropic Messages protocol on a different host
+        # (e.g. claude-code-proxy on 127.0.0.1:18801 fronting a Max
+        # subscription). If the operator declares `delegation.provider`, trust
+        # it — fall back to host inspection only when unset.
+        if configured_provider:
+            provider = configured_provider
+            if provider == "anthropic":
+                api_mode = "anthropic_messages"
+            elif provider == "openai-codex":
+                api_mode = "codex_responses"
+            else:
+                api_mode = "chat_completions"
+        else:
+            base_lower = configured_base_url.lower()
+            provider = "custom"
+            api_mode = "chat_completions"
+            if "chatgpt.com/backend-api/codex" in base_lower:
+                provider = "openai-codex"
+                api_mode = "codex_responses"
+            elif "api.anthropic.com" in base_lower:
+                provider = "anthropic"
+                api_mode = "anthropic_messages"
 
         return {
             "model": configured_model,
