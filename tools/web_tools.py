@@ -656,7 +656,6 @@ Create a markdown summary that captures all key information in a well-organized,
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "temperature": 0.1,
                 "max_tokens": max_tokens,
                 # No explicit timeout — async_call_llm reads auxiliary.web_extract.timeout
                 # from config (default 360s / 6min).  Users with slow local models can
@@ -796,7 +795,6 @@ Create a single, unified markdown summary."""
                 {"role": "system", "content": "You synthesize multiple summaries into one cohesive, comprehensive summary. Be thorough but concise."},
                 {"role": "user", "content": synthesis_prompt},
             ],
-            "temperature": 0.1,
             "max_tokens": 20000,
         }
         if extra_body:

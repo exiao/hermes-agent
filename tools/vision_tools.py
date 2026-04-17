@@ -564,7 +564,6 @@ async def vision_analyze_tool(
         call_kwargs = {
             "task": "vision",
             "messages": messages,
-            "temperature": 0.1,
             "max_tokens": 2000,
             "timeout": vision_timeout,
         }

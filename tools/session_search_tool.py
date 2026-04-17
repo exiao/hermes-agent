@@ -208,7 +208,6 @@ async def _summarize_session(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.1,
                 max_tokens=MAX_SUMMARY_TOKENS,
             )
             content = extract_content_or_reasoning(response)
