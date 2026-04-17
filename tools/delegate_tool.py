@@ -406,7 +406,11 @@ def _build_child_agent(
     # Anthropic prompt-cache hits and ~10× quota reduction on Max subscriptions.
     # See ~/.hermes/plans/hermes-patches/delegation-shape-mirror.md
     snapshot = getattr(parent_agent, "_delegation_shape_snapshot", None)
-    if snapshot is not None:
+    # isinstance(dict) — not just truthy — because MagicMock-based tests
+    # auto-create a MagicMock attribute here that is truthy but isn't a real
+    # snapshot.  A real snapshot is always the dict returned by
+    # AIAgent.capture_delegation_snapshot().
+    if isinstance(snapshot, dict):
         child._parent_shape_snapshot = snapshot
         # Freeze the child's system prompt to parent's verbatim value.
         # Without this, _build_system_prompt() would synthesize the child's
@@ -495,7 +499,10 @@ def _run_single_child(
         # have looked like without delegation), which is exactly what the
         # cache is keyed on.
         shape_snapshot = getattr(child, "_parent_shape_snapshot", None)
-        if shape_snapshot is not None:
+        # See _build_child_agent for why we require dict — MagicMock children
+        # in unit tests auto-create a truthy attr here that isn't a real
+        # snapshot.
+        if isinstance(shape_snapshot, dict):
             result = child.run_conversation(
                 user_message=goal,
                 conversation_history=shape_snapshot.get("messages_prefix") or [],
