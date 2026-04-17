@@ -78,6 +78,42 @@ def _get_model_config() -> Dict[str, Any]:
         # Accept "model" as alias for "default" (users intuitively write model.model)
         if not cfg.get("default") and cfg.get("model"):
             cfg["default"] = cfg["model"]
+
+        configured_provider = str(cfg.get("provider") or "").strip().lower()
+        providers_cfg = config.get("providers")
+        provider_cfg = {}
+        if configured_provider and isinstance(providers_cfg, dict):
+            entry = providers_cfg.get(configured_provider)
+            if isinstance(entry, dict):
+                provider_cfg = entry
+
+        # If model.* omits endpoint/auth fields, inherit them from providers.<provider>.*.
+        # This keeps runtime resolution aligned with config.yaml layouts like:
+        #   model.provider: anthropic
+        #   providers.anthropic.base_url: http://127.0.0.1:18801
+        if provider_cfg:
+            if not str(cfg.get("base_url") or "").strip():
+                provider_base_url = (
+                    provider_cfg.get("base_url")
+                    or provider_cfg.get("api")
+                    or provider_cfg.get("url")
+                    or ""
+                )
+                if provider_base_url:
+                    cfg["base_url"] = str(provider_base_url).strip()
+            if not str(cfg.get("api_key") or "").strip():
+                provider_api_key = provider_cfg.get("api_key") or ""
+                if provider_api_key:
+                    cfg["api_key"] = str(provider_api_key).strip()
+            if not str(cfg.get("key_env") or "").strip():
+                provider_key_env = provider_cfg.get("key_env") or ""
+                if provider_key_env:
+                    cfg["key_env"] = str(provider_key_env).strip()
+            if not str(cfg.get("api_mode") or "").strip():
+                provider_transport = provider_cfg.get("transport") or provider_cfg.get("api_mode") or ""
+                if provider_transport:
+                    cfg["api_mode"] = str(provider_transport).strip()
+
         default = (cfg.get("default") or "").strip()
         base_url = (cfg.get("base_url") or "").strip()
         is_local = "localhost" in base_url or "127.0.0.1" in base_url

@@ -25,6 +25,30 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_get_model_config_merges_provider_specific_anthropic_base_url(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "anthropic",
+                "default": "claude-opus-4-6",
+            },
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://proxy.example.com/anthropic",
+                }
+            },
+        },
+    )
+
+    resolved = rp._get_model_config()
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["default"] == "claude-opus-4-6"
+    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
+
+
 def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):
     class _Entry:
         access_token = "pool-token"
@@ -41,10 +65,17 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
     monkeypatch.setattr(
         rp,
-        "_get_model_config",
+        "load_config",
         lambda: {
-            "provider": "anthropic",
-            "base_url": "https://proxy.example.com/anthropic",
+            "model": {
+                "provider": "anthropic",
+                "default": "claude-opus-4-6",
+            },
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://proxy.example.com/anthropic",
+                }
+            },
         },
     )
     monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
