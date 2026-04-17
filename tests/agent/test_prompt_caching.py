@@ -4,12 +4,31 @@ import copy
 import pytest
 
 from agent.prompt_caching import (
+    CACHE_TTL,
     _apply_cache_marker,
     apply_anthropic_cache_control,
+    make_cache_marker,
 )
 
 
+# Bare marker used by _apply_cache_marker unit tests (TTL-agnostic — the
+# marker-placement logic doesn't care about the TTL field; it just attaches
+# whatever dict is passed in).
 MARKER = {"type": "ephemeral"}
+
+
+class TestMakeCacheMarker:
+    def test_default_is_1h(self):
+        """Default TTL is 1h (see CACHE_TTL constant)."""
+        assert CACHE_TTL == "1h"
+        assert make_cache_marker() == {"type": "ephemeral", "ttl": "1h"}
+
+    def test_explicit_5m_omits_ttl_field(self):
+        """5m is Anthropic's default; the ttl field is omitted to match their implicit form."""
+        assert make_cache_marker("5m") == {"type": "ephemeral"}
+
+    def test_explicit_1h_adds_ttl_field(self):
+        assert make_cache_marker("1h") == {"type": "ephemeral", "ttl": "1h"}
 
 
 class TestApplyCacheMarker:
