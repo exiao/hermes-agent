@@ -417,6 +417,49 @@ def _build_child_agent(
         # own baseline (SOUL.md + child-specific additions) on the first turn.
         child._frozen_system_prompt = snapshot.get("system")
 
+        # W13: shape-mirror compactor safety.
+        #
+        # When the child runs long and hits its compression threshold, the
+        # default compactor will (a) call _invalidate_system_prompt() +
+        # _build_system_prompt() and overwrite _cached_system_prompt, and
+        # (b) summarize the message prefix starting at protect_first_n=3.
+        # Either move breaks the byte-equal cache anchor the shape mirror
+        # spent W6-W11 setting up: turn N+1 sends a different system string
+        # or a different messages prefix, and the cache entry is evicted.
+        #
+        # We need two guards:
+        #   1. Tell the compactor the mirrored prefix is immutable head
+        #      content so summarization never touches it.  Bump
+        #      protect_first_n to cover the full prefix length + a small
+        #      margin (the +1 accounts for the user `goal` message that
+        #      gets appended on first turn).
+        #   2. Mark the child so its compactor call-site knows to reuse
+        #      _frozen_system_prompt instead of rebuilding from scratch.
+        #      The _compress_context patch in run_agent.py checks
+        #      _frozen_system_prompt and short-circuits the rebuild.
+        prefix = snapshot.get("messages_prefix") or []
+        try:
+            _prefix_len = len(prefix) if isinstance(prefix, list) else 0
+        except Exception:
+            _prefix_len = 0
+        # Keep the entire mirrored prefix + goal message out of the
+        # compactor's summarization window.  The default was 3 — bump it
+        # to whatever parent actually sent.
+        if _prefix_len > 0:
+            _compactor = getattr(child, "context_compressor", None)
+            if _compactor is not None:
+                try:
+                    _current = int(getattr(_compactor, "protect_first_n", 3))
+                except (TypeError, ValueError):
+                    _current = 3
+                # +1 for the user goal message; never shrink from default.
+                _compactor.protect_first_n = max(_current, _prefix_len + 1)
+                logger.debug(
+                    "[subagent-%d] compactor protect_first_n bumped to %d "
+                    "(mirrored prefix len=%d + 1 goal msg)",
+                    task_index, _compactor.protect_first_n, _prefix_len,
+                )
+
     return child
 
 def _run_single_child(

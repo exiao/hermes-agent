@@ -7270,7 +7270,19 @@ class AIAgent:
             compressed.append({"role": "user", "content": todo_snapshot})
 
         self._invalidate_system_prompt()
-        new_system_prompt = self._build_system_prompt(system_message)
+        # W13: shape-mirror compactor safety.
+        # When this agent is a delegated child with a parent-frozen system
+        # prompt, a fresh rebuild would emit this child's *own* baseline
+        # (SOUL.md etc.) and invalidate the byte-equal cache anchor that
+        # the shape mirror (W6-W11) set up.  Reuse the frozen value
+        # instead — the whole point of frozen_system_prompt is that it
+        # matches parent byte-for-byte on every turn, pre- and post-
+        # compaction.
+        _frozen = getattr(self, "_frozen_system_prompt", None)
+        if _frozen is not None:
+            new_system_prompt = _frozen
+        else:
+            new_system_prompt = self._build_system_prompt(system_message)
         self._cached_system_prompt = new_system_prompt
 
         if self._session_db:
