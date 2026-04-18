@@ -15,8 +15,13 @@ from unittest.mock import patch
 
 import pytest
 
-from tools.send_file_tool import send_file_tool, MAX_FILE_SIZE
+from tools.send_file_tool import send_file_tool, MAX_FILE_SIZE, SEND_FILE_SCHEMA
+from tools.registry import registry
+from agent.anthropic_adapter import convert_tools_to_anthropic
 from gateway.platforms.base import BasePlatformAdapter
+
+# Trigger registration (idempotent)
+import tools.send_file_tool  # noqa: F401
 
 
 # ===========================================================================
@@ -206,3 +211,151 @@ class TestExtractLocalFilesExpanded:
         content = "Download from https://example.com/data.json"
         files, cleaned = self._extract_with_mock(content)
         assert len(files) == 0
+
+
+# ===========================================================================
+# Schema shape — regression tests for the double-wrap bug
+# ===========================================================================
+#
+# HISTORY: SEND_FILE_SCHEMA was originally authored wrapped in an outer
+# {"type": "function", "function": {...}} envelope — the only tool in the
+# codebase to do so. The registry's get_definitions() adds that envelope
+# itself, producing a double-wrapped schema where parameters sat two levels
+# deep. The Anthropic adapter's convert_tools_to_anthropic() did
+# fn.get("parameters", ...) on the outer dict and fell back to empty
+# properties — so the model never saw file_path. See:
+#   ~/.hermes/plans/hermes-patches/send-file-schema-unwrap.md
+#
+# These tests lock in the flat shape convention so future edits can't
+# silently reintroduce the bug.
+# ===========================================================================
+
+class TestSendFileSchemaShape:
+    """Regression tests for the schema double-wrap bug."""
+
+    def test_schema_is_flat_not_wrapped(self):
+        """SEND_FILE_SCHEMA must be flat — no outer {type:function,function:{}} envelope."""
+        # The flat form has 'name', 'description', 'parameters' at top level.
+        assert "name" in SEND_FILE_SCHEMA, (
+            "SEND_FILE_SCHEMA missing top-level 'name' — likely double-wrapped. "
+            "See hermes-patches/send-file-schema-unwrap.md"
+        )
+        assert "parameters" in SEND_FILE_SCHEMA, (
+            "SEND_FILE_SCHEMA missing top-level 'parameters' — likely double-wrapped."
+        )
+        # Negative: must NOT have the outer function envelope.
+        assert "function" not in SEND_FILE_SCHEMA, (
+            "SEND_FILE_SCHEMA has outer 'function' key — this is the double-wrap bug. "
+            "Unwrap to match every other tool in tools/*.py"
+        )
+        assert SEND_FILE_SCHEMA.get("type") != "function", (
+            "SEND_FILE_SCHEMA has top-level type='function' — this is the outer envelope "
+            "that causes the double-wrap bug."
+        )
+
+    def test_required_file_path_declared(self):
+        """file_path must be declared required — otherwise model can call with empty args."""
+        params = SEND_FILE_SCHEMA["parameters"]
+        assert params["type"] == "object"
+        assert "file_path" in params["properties"]
+        assert params["properties"]["file_path"]["type"] == "string"
+        assert "file_path" in params["required"]
+
+    def test_registry_exposes_file_path_in_openai_format(self):
+        """registry.get_definitions() must surface file_path in the OpenAI-format schema."""
+        defs = registry.get_definitions({"send_file"})
+        assert len(defs) == 1, "send_file not registered"
+        entry = defs[0]
+        # OpenAI format: {"type": "function", "function": {name, description, parameters}}
+        assert entry["type"] == "function"
+        fn = entry["function"]
+        assert fn["name"] == "send_file"
+        props = fn["parameters"]["properties"]
+        assert "file_path" in props, (
+            "file_path missing from OpenAI-format schema — registry not emitting params "
+            "correctly. Check that SEND_FILE_SCHEMA is flat (see send-file-schema-unwrap.md)."
+        )
+        assert "caption" in props
+        assert "file_path" in fn["parameters"]["required"]
+
+    def test_anthropic_adapter_surfaces_file_path(self):
+        """After convert_tools_to_anthropic(), file_path must be in input_schema.properties.
+
+        This is the exact path that broke: registry -> get_definitions ->
+        convert_tools_to_anthropic -> model. If any step drops the parameters,
+        the model sees {"properties": {}} and calls the tool with empty args.
+        """
+        oai_defs = registry.get_definitions({"send_file"})
+        ant_defs = convert_tools_to_anthropic(oai_defs)
+        assert len(ant_defs) == 1
+        tool = ant_defs[0]
+        assert tool["name"] == "send_file"
+        schema = tool["input_schema"]
+        assert schema["type"] == "object"
+        assert "file_path" in schema["properties"], (
+            "file_path missing from Anthropic input_schema — this is the exact bug "
+            "that caused send_file to be called with empty args. "
+            "See hermes-patches/send-file-schema-unwrap.md"
+        )
+        assert schema["properties"]["file_path"]["type"] == "string"
+        assert "file_path" in schema["required"]
+
+    def test_anthropic_schema_has_no_empty_properties_fallback(self):
+        """Guard against the empty-properties fallback in convert_tools_to_anthropic().
+
+        The converter defaults to {"type":"object","properties":{}} when it
+        can't find 'parameters'. A passing test that hits that fallback is
+        silent failure. Assert we don't.
+        """
+        oai_defs = registry.get_definitions({"send_file"})
+        ant_defs = convert_tools_to_anthropic(oai_defs)
+        schema = ant_defs[0]["input_schema"]
+        assert schema["properties"] != {}, (
+            "Anthropic input_schema has empty properties — converter hit its "
+            "fallback. Schema body is not reaching the model."
+        )
+
+    def test_all_tool_schemas_are_flat(self):
+        """Every registered tool's raw schema must be flat (no outer function envelope).
+
+        This catches the double-wrap bug for ANY tool, not just send_file.
+        If a new tool lands with the wrong shape, this test fails loudly.
+        """
+        for name in registry.get_all_tool_names():
+            schema = registry.get_schema(name)
+            assert schema is not None, f"Tool {name} has no schema"
+            # Flat form: name, description, parameters at top level.
+            # Wrapped form (bug): {"type": "function", "function": {...}}
+            assert schema.get("type") != "function" or "function" not in schema, (
+                f"Tool {name!r} has wrapped schema ({{type:function, function:{{...}}}}). "
+                f"Unwrap to flat form — see tools/send_message_tool.py for reference. "
+                f"Refs: hermes-patches/send-file-schema-unwrap.md"
+            )
+            # Parameters must be at top level (or absent for zero-arg tools).
+            if "parameters" not in schema:
+                # Some tools legitimately have no params — but then properties
+                # should be absent or empty at the top level too.
+                continue
+            assert isinstance(schema["parameters"], dict), (
+                f"Tool {name!r} 'parameters' is not a dict"
+            )
+
+
+class TestSendFileHandlerValidatesEmptyPath:
+    """Regression: empty string should not be treated as CWD."""
+
+    def test_empty_path_gives_clear_error(self):
+        """Path('').resolve() returns CWD, which is a directory — handler must reject.
+
+        This is the symptom users saw: 'Not a file (maybe a directory?): '
+        when the schema wasn't exposing file_path. The handler still hits
+        this path if anyone calls with empty string. Make sure the error
+        is informative.
+        """
+        result = send_file_tool("")
+        parsed = json.loads(result)
+        assert "error" in parsed
+        # Error should mention the problem — either "not found" or "directory"
+        # (depending on whether CWD exists, which it does in tests)
+        err = parsed["error"].lower()
+        assert "not found" in err or "directory" in err or "not a file" in err

@@ -26,25 +26,24 @@ MAX_FILE_SIZE = 100 * 1024 * 1024
 SEND_FILE_SCHEMA = {
     "name": "send_file",
     "description": (
-        "Send a local file as a native attachment to the current chat. "
-        "Works for any file type: documents (.pdf, .md, .txt, .docx), "
-        "config files (.yaml, .json, .toml), code (.py, .js, .ts), "
-        "archives (.zip, .tar.gz), images, audio, video, and more. "
-        "The file is delivered as a platform-native attachment "
-        "(e.g., Signal file, Telegram document, Slack file upload). "
-        "Use this instead of pasting file contents as text when the "
-        "user asks to 'send', 'share', or 'attach' a file."
+        "Attach a local file to the current chat (Signal, Telegram, Discord, "
+        "Slack, etc.). Any file type: docs, config, code, archives, images, "
+        "audio, video. Returns a MEDIA:<path> string.\n\n"
+        "You MUST echo the returned MEDIA:<path> verbatim in your final reply "
+        "text (own line, blank line above). The gateway scans reply text, not "
+        "tool results. Skipping this step silently sends zero attachments. "
+        "For multiple files, one MEDIA line per file."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Absolute or ~/relative path to the file to send",
+                "description": "Absolute or ~/relative path to the file",
             },
             "caption": {
                 "type": "string",
-                "description": "Optional message to accompany the file",
+                "description": "Optional caption prepended to the returned MEDIA line",
             },
         },
         "required": ["file_path"],
