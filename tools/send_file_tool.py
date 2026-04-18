@@ -24,33 +24,30 @@ MAX_FILE_SIZE = 100 * 1024 * 1024
 
 
 SEND_FILE_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "send_file",
-        "description": (
-            "Send a local file as a native attachment to the current chat. "
-            "Works for any file type: documents (.pdf, .md, .txt, .docx), "
-            "config files (.yaml, .json, .toml), code (.py, .js, .ts), "
-            "archives (.zip, .tar.gz), images, audio, video, and more. "
-            "The file is delivered as a platform-native attachment "
-            "(e.g., Signal file, Telegram document, Slack file upload). "
-            "Use this instead of pasting file contents as text when the "
-            "user asks to 'send', 'share', or 'attach' a file."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Absolute or ~/relative path to the file to send",
-                },
-                "caption": {
-                    "type": "string",
-                    "description": "Optional message to accompany the file",
-                },
+    "name": "send_file",
+    "description": (
+        "Send a local file as a native attachment to the current chat. "
+        "Works for any file type: documents (.pdf, .md, .txt, .docx), "
+        "config files (.yaml, .json, .toml), code (.py, .js, .ts), "
+        "archives (.zip, .tar.gz), images, audio, video, and more. "
+        "The file is delivered as a platform-native attachment "
+        "(e.g., Signal file, Telegram document, Slack file upload). "
+        "Use this instead of pasting file contents as text when the "
+        "user asks to 'send', 'share', or 'attach' a file."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Absolute or ~/relative path to the file to send",
             },
-            "required": ["file_path"],
+            "caption": {
+                "type": "string",
+                "description": "Optional message to accompany the file",
+            },
         },
+        "required": ["file_path"],
     },
 }
 
