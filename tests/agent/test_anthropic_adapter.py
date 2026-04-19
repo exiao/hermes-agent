@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from agent.prompt_caching import apply_anthropic_cache_control
+from agent.prompt_caching import apply_anthropic_cache_control, make_cache_marker
 from agent.anthropic_adapter import (
     _is_oauth_token,
     _refresh_oauth_token,
@@ -730,7 +730,9 @@ class TestConvertMessages:
 
         assert assistant_blocks[0]["type"] == "text"
         assert assistant_blocks[0]["text"] == "Hello from assistant"
-        assert assistant_blocks[0]["cache_control"] == {"type": "ephemeral"}
+        # W1 (cache-ttl-1h-default): default marker now carries ttl='1h'.
+        # Use make_cache_marker() so the test tracks CACHE_TTL changes.
+        assert assistant_blocks[0]["cache_control"] == make_cache_marker()
 
     def test_tool_cache_control_is_preserved_on_tool_result_block(self):
         messages = apply_anthropic_cache_control([
@@ -752,7 +754,8 @@ class TestConvertMessages:
         assert tool_block["type"] == "tool_result"
         assert tool_block["tool_use_id"] == "tc_1"
         assert tool_block["content"] == "result"
-        assert tool_block["cache_control"] == {"type": "ephemeral"}
+        # W1 (cache-ttl-1h-default): default marker now carries ttl='1h'.
+        assert tool_block["cache_control"] == make_cache_marker()
 
     def test_preserved_thinking_blocks_are_rehydrated_before_tool_use(self):
         messages = [
