@@ -4963,6 +4963,27 @@ class AIAgent:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
 
+        # Belt-and-suspenders: if the user has providers.<provider>.base_url
+        # set (e.g. local proxy fronting a subscription endpoint), always
+        # prefer that over the entry's stored URL.  Pool entries can ship
+        # with a stale provider-default base_url baked in by seeding
+        # (PROVIDER_REGISTRY.inference_base_url), which would otherwise
+        # silently route around the user's proxy.  See
+        # ~/.hermes/plans/hermes-patches/credential-pool-honors-provider-base-url.md
+        try:
+            from agent.credential_pool import _get_configured_provider_base_url
+            _configured_proxy = _get_configured_provider_base_url(self.provider)
+        except Exception:
+            _configured_proxy = None
+        if _configured_proxy:
+            if runtime_base and runtime_base != _configured_proxy:
+                logger.info(
+                    "credential pool: overriding entry base_url %s with configured "
+                    "providers.%s.base_url %s",
+                    runtime_base, self.provider, _configured_proxy,
+                )
+            runtime_base = _configured_proxy
+
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
 

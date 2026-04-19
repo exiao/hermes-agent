@@ -343,6 +343,35 @@ def _get_custom_provider_config(pool_key: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _get_configured_provider_base_url(provider: str) -> Optional[str]:
+    """Return the user-configured base_url for a provider from config.yaml.
+
+    Reads ``providers.<provider>.base_url`` from the active config. Returns
+    None when unset, when the value is empty/whitespace, or when the config
+    cannot be loaded.
+
+    Used by pool seeding and credential swapping to make sure user-configured
+    proxy endpoints (e.g. providers.anthropic.base_url:
+    http://127.0.0.1:18801 fronting a Claude Code subscription) win over the
+    provider's canonical inference URL baked into PROVIDER_REGISTRY.
+
+    See ~/.hermes/plans/hermes-patches/credential-pool-honors-provider-base-url.md
+    """
+    if not provider:
+        return None
+    config = _load_config_safe()
+    if not config:
+        return None
+    providers_cfg = config.get("providers")
+    if not isinstance(providers_cfg, dict):
+        return None
+    pcfg = providers_cfg.get(provider)
+    if not isinstance(pcfg, dict):
+        return None
+    base_url = str(pcfg.get("base_url") or "").strip().rstrip("/")
+    return base_url or None
+
+
 def get_pool_strategy(provider: str) -> str:
     """Return the configured selection strategy for a provider."""
     config = _load_config_safe()
@@ -1112,18 +1141,28 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 except ImportError:
                     pass
                 active_sources.add(source_name)
+                # Honor user-configured proxy base_url so that rotations to
+                # this entry keep traffic on the proxy.  Otherwise the entry
+                # has base_url=None, falls through to self.base_url at swap
+                # time, and any prior swap that poisoned self.base_url with
+                # the canonical Anthropic URL gets propagated.  See
+                # ~/.hermes/plans/hermes-patches/credential-pool-honors-provider-base-url.md
+                _entry_payload = {
+                    "source": source_name,
+                    "auth_type": AUTH_TYPE_OAUTH,
+                    "access_token": creds.get("accessToken", ""),
+                    "refresh_token": creds.get("refreshToken"),
+                    "expires_at_ms": creds.get("expiresAt"),
+                    "label": label_from_token(creds.get("accessToken", ""), source_name),
+                }
+                _configured_base = _get_configured_provider_base_url(provider)
+                if _configured_base:
+                    _entry_payload["base_url"] = _configured_base
                 changed |= _upsert_entry(
                     entries,
                     provider,
                     source_name,
-                    {
-                        "source": source_name,
-                        "auth_type": AUTH_TYPE_OAUTH,
-                        "access_token": creds.get("accessToken", ""),
-                        "refresh_token": creds.get("refreshToken"),
-                        "expires_at_ms": creds.get("expiresAt"),
-                        "label": label_from_token(creds.get("accessToken", ""), source_name),
-                    },
+                    _entry_payload,
                 )
 
     elif provider == "nous":
@@ -1297,6 +1336,14 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             base_url = _resolve_kimi_base_url(token, pconfig.inference_base_url, env_url)
         elif provider == "zai":
             base_url = _resolve_zai_base_url(token, pconfig.inference_base_url, env_url)
+        # Respect user-configured providers.<provider>.base_url (e.g. local
+        # proxy fronting a subscription endpoint).  Without this, the
+        # PROVIDER_REGISTRY default would silently override the user's proxy
+        # on any credential swap. See
+        # ~/.hermes/plans/hermes-patches/credential-pool-honors-provider-base-url.md
+        configured_base = _get_configured_provider_base_url(provider)
+        if configured_base:
+            base_url = configured_base
         changed |= _upsert_entry(
             entries,
             provider,
