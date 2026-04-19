@@ -942,7 +942,9 @@ class TestBuildApiKwargs:
         assert kwargs["metadata"]["sessionId"] == "sess-123"
         assert kwargs["extra_body"]["vl_high_resolution_images"] is True
         assert isinstance(kwargs["messages"][0]["content"], list)
-        assert kwargs["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        # W1 (cache-ttl-1h-default): default marker now carries ttl='1h'.
+        from agent.prompt_caching import make_cache_marker
+        assert kwargs["messages"][0]["content"][0]["cache_control"] == make_cache_marker()
         assert kwargs["messages"][2]["content"][0]["text"] == "hi"
 
     def test_qwen_portal_normalizes_bare_string_content_parts(self, agent):
