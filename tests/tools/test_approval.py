@@ -777,10 +777,82 @@ class TestGitDestructiveOps:
         assert dangerous is False
 
     def test_safe_git_push_not_flagged(self):
-        """Normal push without --force must not be flagged."""
-        cmd = "git push origin main"
+        """Normal push to a feature branch without --force must not be flagged."""
+        cmd = "git push origin feature-branch"
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
+
+    def test_git_push_to_main_flagged(self):
+        """Push to main/master bypasses PR review policy and MUST be flagged.
+
+        See ~/.hermes/AGENTS.md — "Never push/merge to main. Eric merges."
+        """
+        for cmd in (
+            "git push origin main",
+            "git push origin master",
+            "git push origin +main",
+            "git push origin HEAD:main",
+            "git push origin main:main",
+            "git push upstream master",
+        ):
+            dangerous, _, desc = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+            assert "main/master" in (desc or ""), f"wrong reason for: {cmd} -> {desc}"
+
+    def test_git_push_force_with_lease_flagged(self):
+        """--force-with-lease still rewrites history and MUST be flagged."""
+        cmd = "git push --force-with-lease origin feature"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_gh_pr_merge_flagged(self):
+        """`gh pr merge` bypasses PR review and MUST be flagged."""
+        for cmd in ("gh pr merge 42 --squash", "gh pr merge 42", "gh pr merge"):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_gh_destructive_subcommands_flagged(self):
+        """gh release delete / repo delete / repo archive / workflow delete / api DELETE."""
+        for cmd in (
+            "gh release delete v1.0 --yes",
+            "gh repo delete fake/repo --yes",
+            "gh repo archive fake/repo",
+            "gh workflow delete my-workflow",
+            "gh api /repos/x/y -X DELETE",
+            "gh api /repos/x/y --method DELETE",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_gh_pr_close_not_flagged(self):
+        """`gh pr close` is reversible (gh pr reopen) — should not require approval."""
+        cmd = "gh pr close 42"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_gh_read_only_subcommands_not_flagged(self):
+        """Read-only gh commands must still be allowed."""
+        for cmd in (
+            "gh pr list",
+            "gh pr view 42",
+            "gh pr checkout 42",
+            "gh pr create --title test --body x",
+            "gh api /repos/x/y",
+            "gh api /repos/x/y -X GET",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
+    def test_git_push_to_branches_containing_main_not_flagged(self):
+        """Branch names that *contain* 'main' must not trigger the main/master rule."""
+        for cmd in (
+            "git push origin main-event",
+            "git push origin my-main",
+            "git push origin mainline",
+            "git push origin master-key",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
 
     def test_git_branch_lowercase_d_also_flagged(self):
         """git branch -d triggers approval too — IGNORECASE is global.
