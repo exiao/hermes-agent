@@ -132,6 +132,18 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
+    # Git merge-to-main protection: these bypass the PR review policy in
+    # ~/.hermes/AGENTS.md ("Never push/merge to main. Eric merges."). See the
+    # sibling PATH wrappers at ~/.local/bin/{gh,git} and ~/.claude/guard.sh
+    # and the ~/.hermes/plugins/block-dangerous-merges/ plugin for parallel
+    # enforcement at the shell and Claude-Code tool layers.
+    (r'\bgit\s+push\b\s+\S+\s+(?:\S+:)?(\+?main|\+?master)(?:\s|$)', "git push to main/master (bypasses PR review)"),
+    (r'\bgit\s+push\b\s+\S+\s+HEAD:(main|master)(?:\s|$)', "git push HEAD to main/master (bypasses PR review)"),
+    (r'\bgit\s+push\b.*--force-with-lease\b', "git force-with-lease push (rewrites remote history)"),
+    (r'\bgh\s+pr\s+merge\b', "gh pr merge (bypasses PR review — Eric merges)"),
+    (r'\bgh\s+(release|repo|workflow)\s+delete\b', "gh delete destructive resource"),
+    (r'\bgh\s+repo\s+archive\b', "gh repo archive (near-permanent change)"),
+    (r'\bgh\s+api\b.*(-X|--method)\s+DELETE\b', "gh api raw DELETE call"),
     # Script execution after chmod +x — catches the two-step pattern where
     # a script is first made executable then immediately run. The script
     # content may contain dangerous commands that individual patterns miss.
