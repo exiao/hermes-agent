@@ -3,6 +3,8 @@
 from unittest.mock import patch
 
 from hermes_cli.tools_config import (
+    _DEFAULT_OFF_TOOLSETS,
+    _apply_toolset_change,
     _configure_provider,
     _get_platform_tools,
     _platform_toolset_summary,
@@ -21,6 +23,7 @@ def test_get_platform_tools_uses_default_when_platform_not_configured():
     enabled = _get_platform_tools(config, "cli")
 
     assert enabled
+    assert enabled.isdisjoint(_DEFAULT_OFF_TOOLSETS)
 
 
 def test_configurable_toolsets_include_messaging():
@@ -32,12 +35,57 @@ def test_get_platform_tools_default_telegram_includes_messaging():
     assert "messaging" in enabled
 
 
+def test_get_platform_tools_homeassistant_platform_keeps_homeassistant_toolset():
+    enabled = _get_platform_tools({}, "homeassistant")
+
+    assert "homeassistant" in enabled
+
+
 def test_get_platform_tools_preserves_explicit_empty_selection():
     config = {"platform_toolsets": {"cli": []}}
 
     enabled = _get_platform_tools(config, "cli")
 
     assert enabled == set()
+
+
+def test_apply_toolset_change_from_default_does_not_enable_default_off_toolsets():
+    """Disabling one default toolset on a fresh config must not persist
+    default-off toolsets as explicitly enabled.
+    """
+    config = {}
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _apply_toolset_change(config, "cli", ["memory"], "disable")
+
+    saved = set(config["platform_toolsets"]["cli"])
+    assert "memory" not in saved
+    assert "terminal" in saved
+    assert saved.isdisjoint(_DEFAULT_OFF_TOOLSETS)
+
+
+def test_apply_toolset_change_can_enable_default_off_toolset_from_default():
+    config = {}
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _apply_toolset_change(config, "cli", ["homeassistant"], "enable")
+
+    saved = set(config["platform_toolsets"]["cli"])
+    assert "homeassistant" in saved
+    assert "terminal" in saved
+
+
+def test_get_platform_tools_handles_null_platform_toolsets():
+    """YAML `platform_toolsets:` with no value parses as None — the old
+    ``config.get("platform_toolsets", {})`` pattern would then crash with
+    ``NoneType has no attribute 'get'`` on the next line. Guard against that.
+    """
+    config = {"platform_toolsets": None}
+
+    enabled = _get_platform_tools(config, "cli")
+
+    # Falls through to defaults instead of raising
+    assert enabled
 
 
 def test_platform_toolset_summary_uses_explicit_platform_list():
