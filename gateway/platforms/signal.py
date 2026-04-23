@@ -493,6 +493,17 @@ class SignalAdapter(BasePlatformAdapter):
         if text and mentions:
             text = _render_mentions(text, mentions)
 
+        # Handle reactions — surface the emoji so the model sees it
+        reaction_data = data_message.get("reaction")
+        if reaction_data and not text:
+            emoji = reaction_data.get("emoji", "")
+            if emoji:
+                # "remove" key means the user un-reacted — skip silently
+                if reaction_data.get("isRemove"):
+                    logger.debug("Signal: ignoring reaction removal from %s", redact_phone(sender))
+                    return
+                text = f"[reacted {emoji}]"
+
         # Extract quote (reply-to) context from Signal dataMessage
         quote_data = data_message.get("quote") or {}
         reply_to_id = str(quote_data.get("id")) if quote_data.get("id") else None
@@ -574,6 +585,22 @@ class SignalAdapter(BasePlatformAdapter):
 
         logger.debug("Signal: message from %s in %s: %s",
                       redact_phone(sender), chat_id[:20], (text or "")[:50])
+
+        # Guard: drop messages with no text and no media.  These are typically
+        # Signal metadata events (expiration timer, profile key, group updates,
+        # remote deletes, stickers without a fallback) that slipped past the
+        # dataMessage check above.  Log the keys so we can identify what kinds
+        # of events are being dropped and whether we should handle them.
+        if not (text or "").strip() and not media_urls:
+            dm_keys = sorted(data_message.keys())
+            logger.info(
+                "Signal: dropping empty message from %s — "
+                "dataMessage keys: %s, raw snippet: %.300s",
+                redact_phone(sender),
+                dm_keys,
+                {k: data_message[k] for k in dm_keys if k != "groupInfo"},
+            )
+            return
 
         await self.handle_message(event)
 
