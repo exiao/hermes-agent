@@ -552,6 +552,8 @@ class SignalAdapter(BasePlatformAdapter):
                 msg_type = MessageType.VOICE
             elif any(mt.startswith("image/") for mt in media_types):
                 msg_type = MessageType.PHOTO
+            elif any(mt.startswith("video/") for mt in media_types):
+                msg_type = MessageType.VIDEO
             elif any(
                 not mt.startswith(("audio/", "image/", "video/"))
                 for mt in media_types
