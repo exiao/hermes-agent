@@ -939,10 +939,13 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
             resp = client.get(f"{server_url}/v1/models/{model}")
             if resp.status_code == 200:
                 data = resp.json()
-                # vLLM returns max_model_len
-                ctx = data.get("max_model_len") or data.get("context_length") or data.get("max_tokens")
-                if ctx and isinstance(ctx, (int, float)):
-                    return int(ctx)
+                # Use _extract_context_length for consistent key resolution
+                # across all codepaths (checks max_input_tokens, context_length,
+                # max_model_len, etc.).  Avoids confusing output-cap fields like
+                # max_tokens with the total context window.
+                ctx = _extract_context_length(data)
+                if ctx and ctx > 0:
+                    return ctx
 
             # Try /v1/models and find the model in the list.
             # Use _model_id_matches to handle "publisher/slug" vs bare "slug".
@@ -952,9 +955,9 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
                 models_list = data.get("data", [])
                 for m in models_list:
                     if _model_id_matches(m.get("id", ""), model):
-                        ctx = m.get("max_model_len") or m.get("context_length") or m.get("max_tokens")
-                        if ctx and isinstance(ctx, (int, float)):
-                            return int(ctx)
+                        ctx = _extract_context_length(m)
+                        if ctx and ctx > 0:
+                            return ctx
     except Exception:
         pass
 
