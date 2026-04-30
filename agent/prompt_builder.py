@@ -561,6 +561,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "preloaded": bool(frontmatter.get("preloaded", False)),
     }
 
 
@@ -692,7 +693,7 @@ def build_skills_system_prompt(
             ):
                 continue
             skills_by_category.setdefault(category, []).append(
-                (frontmatter_name, entry.get("description", ""))
+                (frontmatter_name, entry.get("description", ""), bool(entry.get("preloaded", False)))
             )
         category_descriptions = {
             str(k): str(v)
@@ -717,7 +718,7 @@ def build_skills_system_prompt(
             ):
                 continue
             skills_by_category.setdefault(entry["category"], []).append(
-                (entry["frontmatter_name"], entry["description"])
+                (entry["frontmatter_name"], entry["description"], entry.get("preloaded", False))
             )
 
         # Read category-level DESCRIPTION.md files
@@ -747,7 +748,7 @@ def build_skills_system_prompt(
     # precedence: we track seen names and skip duplicates from external dirs.
     seen_skill_names: set[str] = set()
     for cat_skills in skills_by_category.values():
-        for name, _desc in cat_skills:
+        for name, _desc, *_rest in cat_skills:
             seen_skill_names.add(name)
 
     for ext_dir in external_dirs:
@@ -773,7 +774,7 @@ def build_skills_system_prompt(
                     continue
                 seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    (frontmatter_name, entry["description"], entry.get("preloaded", False))
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
@@ -795,43 +796,81 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
-        index_lines = []
+        # Split skills into preloaded (shown individually) vs category-gated
+        preloaded_lines = []
+        category_counts: dict[str, int] = {}  # total skills per category
+        has_any_preloaded = False
+
         for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
             seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            for name, desc, preloaded in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                category_counts[category] = category_counts.get(category, 0) + 1
+                if preloaded:
+                    has_any_preloaded = True
+                    if desc:
+                        preloaded_lines.append(f"    - {name}: {desc}")
+                    else:
+                        preloaded_lines.append(f"    - {name}")
+
+        # Build category summary lines
+        category_lines = []
+        for category in sorted(category_counts.keys()):
+            count = category_counts[category]
+            cat_desc = category_descriptions.get(category, "")
+            if cat_desc:
+                category_lines.append(f"    - {category} ({count} skills): {cat_desc}")
+            else:
+                category_lines.append(f"    - {category} ({count} skills)")
+
+        # If no skills have preloaded: true, fall back to showing everything
+        if not has_any_preloaded:
+            index_lines = []
+            for category in sorted(skills_by_category.keys()):
+                cat_desc = category_descriptions.get(category, "")
+                if cat_desc:
+                    index_lines.append(f"  {category}: {cat_desc}")
                 else:
-                    index_lines.append(f"    - {name}")
+                    index_lines.append(f"  {category}:")
+                seen = set()
+                for name, desc, _preloaded in sorted(skills_by_category[category], key=lambda x: x[0]):
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    if desc:
+                        index_lines.append(f"    - {name}: {desc}")
+                    else:
+                        index_lines.append(f"    - {name}")
+            skills_block = "\n".join(index_lines)
+        else:
+            skills_block = (
+                "  ## Pre-loaded skills (load with SkillView):\n"
+                + "\n".join(preloaded_lines) + "\n\n"
+                "  ## Skill categories (call skills_list(category=...) to browse):\n"
+                + "\n".join(category_lines)
+            )
 
         result = (
             "## Skills (mandatory)\n"
             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+            "to your task, you MUST load it with SkillView(name) and follow its instructions. "
             "Err on the side of loading — it is always better to have context you don't need "
             "than to miss critical steps, pitfalls, or established workflows. "
             "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
             "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
+            "even if you think you could handle the task with basic tools like WebSearch or ShellExec. "
             "Skills also encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
+            "If a skill has issues, fix it with SkillManage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "
             "pitfalls you discovered, update it before finishing.\n"
             "\n"
             "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
+            + skills_block + "\n"
             "</available_skills>\n"
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
