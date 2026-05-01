@@ -10342,7 +10342,22 @@ class AIAgent:
                                    max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
                                    is_oauth=self._is_anthropic_oauth,
                                    preserve_dots=self._anthropic_preserve_dots())
-                    summary_response = self._anthropic_messages_create(_ant_kw)
+                    # Retry on transient Anthropic quota errors (400 "extra usage").
+                    # ~1.3% of requests hit per-minute rate limits transiently.
+                    # See hermes-patches/btw-quota-retry.md
+                    summary_response = None
+                    for _sq_attempt in range(3):
+                        try:
+                            summary_response = self._anthropic_messages_create(_ant_kw)
+                            break
+                        except Exception as _sq_err:
+                            if "extra usage" not in str(_sq_err) or _sq_attempt >= 2:
+                                raise
+                            logging.info(
+                                "%sSummary quota retry %d/3: %s",
+                                self.log_prefix, _sq_attempt + 1, str(_sq_err)[:120],
+                            )
+                            import time as _sqt; _sqt.sleep(3.0 * (_sq_attempt + 1))
                     _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=self._is_anthropic_oauth)
                     final_response = (_summary_result.content or "").strip()
                 else:
@@ -10372,7 +10387,20 @@ class AIAgent:
                                     is_oauth=self._is_anthropic_oauth,
                                     max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
                                     preserve_dots=self._anthropic_preserve_dots())
-                    retry_response = self._anthropic_messages_create(_ant_kw2)
+                    # Same transient quota retry as primary summary path above.
+                    retry_response = None
+                    for _sq2_attempt in range(3):
+                        try:
+                            retry_response = self._anthropic_messages_create(_ant_kw2)
+                            break
+                        except Exception as _sq2_err:
+                            if "extra usage" not in str(_sq2_err) or _sq2_attempt >= 2:
+                                raise
+                            logging.info(
+                                "%sSummary retry quota retry %d/3: %s",
+                                self.log_prefix, _sq2_attempt + 1, str(_sq2_err)[:120],
+                            )
+                            import time as _sqt2; _sqt2.sleep(3.0 * (_sq2_attempt + 1))
                     _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=self._is_anthropic_oauth)
                     final_response = (_retry_result.content or "").strip()
                 else:

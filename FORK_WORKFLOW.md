@@ -58,18 +58,30 @@ Notes that stay as MD (not code in this repo):
 ## Syncing with upstream
 
 ```bash
+git stash push --include-untracked -m "pre-upstream-sync"  # save any WIP first
 git fetch upstream
 git checkout main
 git merge --ff-only upstream/main        # must fast-forward; if not, something
                                          # committed to main directly — bad
-git push origin main
+git push origin main                     # NOTE: agent safety guards block this;
+                                         # Eric must run it manually, or use
+                                         # HERMES_BACKUP_BYPASS=1
 
 git checkout live-config
-git rebase main                          # or merge, your call — rebase keeps
-                                         # live-config's diff minimal
+git merge main                           # merge, not rebase — force-with-lease
+                                         # is blocked by safety guards so rebase
+                                         # can't be pushed. Merge keeps history
+                                         # but avoids the tooling conflict.
 # resolve any conflicts, then:
-git push --force-with-lease origin live-config
+git push origin live-config
+git stash pop                            # restore WIP if stashed
 ```
+
+**Why merge, not rebase:** The `block-dangerous-merges` guards block
+`--force-with-lease` and `--force` pushes at three layers (PATH wrapper,
+Claude Code hook, Hermes Agent plugin). Since rebase rewrites history
+and requires a force push, it's incompatible with the safety setup.
+Merge commits are noisier but push cleanly.
 
 Do this weekly, or when an upstream fix is needed.
 

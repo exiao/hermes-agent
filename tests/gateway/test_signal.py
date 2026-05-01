@@ -190,10 +190,20 @@ class TestSignalHelpers:
     def test_render_mentions(self):
         from gateway.platforms.signal import _render_mentions
         text = "Hello \uFFFC, how are you?"
-        mentions = [{"start": 6, "length": 1, "number": "+15559999999"}]
+        mentions = [{"start": 6, "length": 1, "number": "+155****9999"}]
+        # Without bot_account, other users render as @member
         result = _render_mentions(text, mentions)
-        assert "@+15559999999" in result
+        assert "@member" in result
         assert "\uFFFC" not in result
+        assert "+155****9999" not in result  # phone number must NOT leak
+
+    def test_render_mentions_bot_self(self):
+        from gateway.platforms.signal import _render_mentions
+        text = "Hey \uFFFC!"
+        mentions = [{"start": 4, "length": 1, "number": "+155****0000"}]
+        result = _render_mentions(text, mentions, bot_account="+155****0000")
+        assert "@assistant" in result
+        assert "+155****0000" not in result
 
     def test_render_mentions_no_mentions(self):
         from gateway.platforms.signal import _render_mentions

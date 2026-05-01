@@ -120,23 +120,41 @@ def _ext_to_mime(ext: str) -> str:
     return _EXT_TO_MIME.get(ext.lower(), "application/octet-stream")
 
 
-def _render_mentions(text: str, mentions: list) -> str:
-    """Replace Signal mention placeholders (\\uFFFC) with readable @identifiers.
+def _render_mentions(text: str, mentions: list, *, bot_account: str = "",
+                     sender_name: str = "") -> str:
+    """Replace Signal mention placeholders (\\uFFFC) with readable @names.
 
     Signal encodes @mentions as the Unicode object replacement character
     with out-of-band metadata containing the mentioned user's UUID/number.
+
+    We resolve mentions to display names instead of raw phone numbers to
+    prevent the LLM from interpreting ``@+15551234567 hey`` as a request
+    to send a message to that number.
     """
     if not mentions or "\uFFFC" not in text:
         return text
+
+    # Normalize bot account for comparison
+    bot_norm = bot_account.strip().lstrip("+") if bot_account else ""
+
     # Sort mentions by start position (reverse) to replace from end to start
     # so indices don't shift as we replace
     sorted_mentions = sorted(mentions, key=lambda m: m.get("start", 0), reverse=True)
     for mention in sorted_mentions:
         start = mention.get("start", 0)
         length = mention.get("length", 1)
-        # Use the mention's number or UUID as the replacement
-        identifier = mention.get("number") or mention.get("uuid") or "user"
-        replacement = f"@{identifier}"
+        number = mention.get("number") or ""
+        number_norm = number.strip().lstrip("+")
+
+        # Resolve to a readable name, never a raw phone number
+        if bot_norm and number_norm == bot_norm:
+            # Mentioning the bot itself
+            display = "assistant"
+        else:
+            # Another group member — use "member" to avoid leaking numbers
+            display = "member"
+
+        replacement = f"@{display}"
         text = text[:start] + replacement + text[start + length:]
     return text
 
@@ -503,7 +521,9 @@ class SignalAdapter(BasePlatformAdapter):
         text = data_message.get("message", "")
         mentions = data_message.get("mentions", [])
         if text and mentions:
-            text = _render_mentions(text, mentions)
+            text = _render_mentions(text, mentions,
+                                    bot_account=self.account,
+                                    sender_name=sender_name)
 
         # Handle reactions — surface the emoji so the model sees it
         reaction_data = data_message.get("reaction")
