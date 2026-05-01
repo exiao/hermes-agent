@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Optional
+from utils import atomic_json_write
 
 if sys.platform == "win32":
     import msvcrt
@@ -34,6 +35,10 @@ _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
 _gateway_lock_handle = None
+# Windows byte-range locks are mandatory for other readers. Lock a byte well
+# past the JSON payload so runtime status / PID readers can still read the file
+# while another process holds the mutual-exclusion lock.
+_WINDOWS_LOCK_OFFSET = 1024 * 1024
 
 
 def _get_pid_path() -> Path:
@@ -111,6 +116,11 @@ def _get_process_start_time(pid: int) -> Optional[int]:
         return int(stat_path.read_text().split()[21])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
         return None
+
+
+def get_process_start_time(pid: int) -> Optional[int]:
+    """Public wrapper for retrieving a process start time when available."""
+    return _get_process_start_time(pid)
 
 
 def _read_process_cmdline(pid: int) -> Optional[str]:
@@ -200,8 +210,7 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload))
+    atomic_json_write(path, payload, indent=None, separators=(",", ":"))
 
 
 def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
@@ -281,7 +290,7 @@ def _try_acquire_file_lock(handle) -> bool:
             if handle.tell() == 0:
                 handle.write("\n")
                 handle.flush()
-            handle.seek(0)
+            handle.seek(_WINDOWS_LOCK_OFFSET)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -293,7 +302,7 @@ def _try_acquire_file_lock(handle) -> bool:
 def _release_file_lock(handle) -> None:
     try:
         if _IS_WINDOWS:
-            handle.seek(0)
+            handle.seek(_WINDOWS_LOCK_OFFSET)
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -496,7 +505,8 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         if not stale:
             try:
                 os.kill(existing_pid, 0)
-            except (ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError, OSError):
+                # Windows raises OSError with WinError 87 for invalid pid check
                 stale = True
             else:
                 current_start = _get_process_start_time(existing_pid)
@@ -561,17 +571,43 @@ def release_scoped_lock(scope: str, identity: str) -> None:
         pass
 
 
-def release_all_scoped_locks() -> int:
-    """Remove all scoped lock files in the lock directory.
+def release_all_scoped_locks(
+    *,
+    owner_pid: Optional[int] = None,
+    owner_start_time: Optional[int] = None,
+) -> int:
+    """Remove scoped lock files in the lock directory.
 
     Called during --replace to clean up stale locks left by stopped/killed
-    gateway processes that did not release their locks gracefully.
+    gateway processes that did not release their locks gracefully. When an
+    ``owner_pid`` is provided, only lock records belonging to that gateway
+    process are removed. ``owner_start_time`` further narrows the match to
+    protect against PID reuse.
+
+    When no owner is provided, preserves the legacy behavior and removes every
+    scoped lock file in the directory.
+
     Returns the number of lock files removed.
     """
     lock_dir = _get_lock_dir()
     removed = 0
     if lock_dir.exists():
         for lock_file in lock_dir.glob("*.lock"):
+            if owner_pid is not None:
+                record = _read_json_file(lock_file)
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    record_pid = int(record.get("pid"))
+                except (TypeError, ValueError):
+                    continue
+                if record_pid != owner_pid:
+                    continue
+                if (
+                    owner_start_time is not None
+                    and record.get("start_time") != owner_start_time
+                ):
+                    continue
             try:
                 lock_file.unlink(missing_ok=True)
                 removed += 1
@@ -742,6 +778,10 @@ def get_running_pid(
             # rather than deleting the PID file as "stale".
             if _record_looks_like_gateway(record):
                 return pid
+            continue
+        except OSError:
+            # Windows raises OSError with WinError 87 for an invalid pid
+            # (process is definitely gone). Treat as "process doesn't exist".
             continue
 
         recorded_start = record.get("start_time")

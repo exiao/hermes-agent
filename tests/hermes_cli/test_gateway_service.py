@@ -5,11 +5,33 @@ import pwd
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import hermes_cli.gateway as gateway_cli
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
 )
+
+
+class TestUserSystemdPrivateSocketPreflight:
+    def test_preflight_accepts_private_socket_without_dbus_bus(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_user_dbus_socket_path", lambda: Path("/tmp/missing-bus"))
+        monkeypatch.setattr(gateway_cli, "_user_systemd_private_socket_path", lambda: Path("/tmp/private-socket"))
+        monkeypatch.setattr(Path, "exists", lambda self: str(self) == "/tmp/private-socket")
+
+        gateway_cli._preflight_user_systemd(auto_enable_linger=False)
+
+    def test_wait_for_user_dbus_socket_accepts_private_socket(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: calls.append("env"))
+        monkeypatch.setattr(gateway_cli, "_user_dbus_socket_path", lambda: Path("/tmp/missing-bus"))
+        monkeypatch.setattr(gateway_cli, "_user_systemd_private_socket_path", lambda: Path("/tmp/private-socket"))
+        monkeypatch.setattr(Path, "exists", lambda self: str(self) == "/tmp/private-socket")
+
+        assert gateway_cli._wait_for_user_dbus_socket(timeout=0.1) is True
+        assert calls == ["env"]
 
 
 class TestSystemdServiceRefresh:
@@ -93,7 +115,10 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
-        assert "TimeoutStopSec=60" in unit
+        # TimeoutStopSec must exceed the default drain_timeout (60s) so
+        # systemd doesn't SIGKILL the cgroup before post-interrupt cleanup
+        # (tool subprocess kill, adapter disconnect) runs — issue #8202.
+        assert "TimeoutStopSec=90" in unit
 
     def test_user_unit_includes_resolved_node_directory_in_path(self, monkeypatch):
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: "/home/test/.nvm/versions/node/v24.14.0/bin/node" if cmd == "node" else None)
@@ -109,7 +134,10 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
-        assert "TimeoutStopSec=60" in unit
+        # TimeoutStopSec must exceed the default drain_timeout (60s) so
+        # systemd doesn't SIGKILL the cgroup before post-interrupt cleanup
+        # (tool subprocess kill, adapter disconnect) runs — issue #8202.
+        assert "TimeoutStopSec=90" in unit
         assert "WantedBy=multi-user.target" in unit
 
 
@@ -227,7 +255,8 @@ class TestLaunchdServiceRecovery:
         target = f"{domain}/{label}"
 
         def fake_run(cmd, check=False, **kwargs):
-            calls.append(cmd)
+            if cmd and cmd[0] == "launchctl":
+                calls.append(cmd)
             if cmd == ["launchctl", "kickstart", target] and calls.count(cmd) == 1:
                 raise gateway_cli.subprocess.CalledProcessError(3, cmd, stderr="Could not find service")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -254,7 +283,8 @@ class TestLaunchdServiceRecovery:
         target = f"{domain}/{label}"
 
         def fake_run(cmd, check=False, **kwargs):
-            calls.append(cmd)
+            if cmd and cmd[0] == "launchctl":
+                calls.append(cmd)
             if cmd == ["launchctl", "kickstart", target] and calls.count(cmd) == 1:
                 raise gateway_cli.subprocess.CalledProcessError(113, cmd, stderr="Could not find service")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1081,6 +1111,136 @@ class TestEnsureUserSystemdEnv:
         result = gateway_cli._systemctl_cmd(system=True)
         assert result == ["systemctl"]
         assert calls == []
+
+
+class TestPreflightUserSystemd:
+    """Tests for _preflight_user_systemd() — D-Bus reachability before systemctl --user.
+
+    Covers issue #5130 / Rick's RHEL 9.6 SSH scenario: setup tries to start the
+    gateway via ``systemctl --user start`` in a shell with no user D-Bus session,
+    which previously failed with a raw ``CalledProcessError`` and no remediation.
+    """
+
+    def test_noop_when_bus_socket_exists(self, monkeypatch):
+        """Socket already there (desktop / linger + prior login) → no-op."""
+        monkeypatch.setattr(
+            gateway_cli, "_user_dbus_socket_path",
+            lambda: type("P", (), {"exists": lambda self: True})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        # Should not raise, no subprocess calls needed.
+        gateway_cli._preflight_user_systemd()
+
+    def test_raises_when_linger_disabled_and_loginctl_denied(self, monkeypatch):
+        """Rick's scenario: no D-Bus, no linger, non-root SSH → clear error."""
+        monkeypatch.setattr(
+            gateway_cli, "_user_dbus_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_linger_status", lambda: (False, ""),
+        )
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _: "/usr/bin/loginctl")
+
+        class _Result:
+            returncode = 1
+            stdout = ""
+            stderr = "Interactive authentication required."
+
+        monkeypatch.setattr(
+            gateway_cli.subprocess, "run", lambda *a, **kw: _Result(),
+        )
+
+        with pytest.raises(gateway_cli.UserSystemdUnavailableError) as exc_info:
+            gateway_cli._preflight_user_systemd()
+
+        msg = str(exc_info.value)
+        assert "sudo loginctl enable-linger" in msg
+        assert "hermes gateway run" in msg  # foreground fallback mentioned
+        assert "Interactive authentication required" in msg
+
+    def test_raises_when_loginctl_missing(self, monkeypatch):
+        """No loginctl binary at all → suggest sudo install + manual fix."""
+        monkeypatch.setattr(
+            gateway_cli, "_user_dbus_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_linger_status",
+            lambda: (None, "loginctl not found"),
+        )
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _: None)
+
+        with pytest.raises(gateway_cli.UserSystemdUnavailableError) as exc_info:
+            gateway_cli._preflight_user_systemd()
+
+        assert "sudo loginctl enable-linger" in str(exc_info.value)
+
+    def test_linger_enabled_but_socket_still_missing(self, monkeypatch):
+        """Edge case: linger says yes but the bus socket never came up."""
+        monkeypatch.setattr(
+            gateway_cli, "_user_dbus_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_linger_status", lambda: (True, ""),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_wait_for_user_dbus_socket", lambda timeout=3.0: False,
+        )
+
+        with pytest.raises(gateway_cli.UserSystemdUnavailableError) as exc_info:
+            gateway_cli._preflight_user_systemd()
+
+        assert "linger is enabled" in str(exc_info.value)
+
+    def test_enable_linger_succeeds_and_socket_appears(self, monkeypatch, capsys):
+        """Happy remediation path: polkit allows enable-linger, socket spawns."""
+        monkeypatch.setattr(
+            gateway_cli, "_user_dbus_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_user_systemd_private_socket_path",
+            lambda: type("P", (), {"exists": lambda self: False})(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_linger_status", lambda: (False, ""),
+        )
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _: "/usr/bin/loginctl")
+
+        class _OkResult:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(
+            gateway_cli.subprocess, "run", lambda *a, **kw: _OkResult(),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_wait_for_user_dbus_socket",
+            lambda timeout=5.0: True,
+        )
+
+        # Should not raise.
+        gateway_cli._preflight_user_systemd()
+        out = capsys.readouterr().out
+        assert "Enabled linger" in out
 
 
 class TestProfileArg:
