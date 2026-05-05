@@ -506,6 +506,7 @@ skills:
   # Every N tool-calling iterations, remind the model to consider saving a skill.
   # Set to 0 to disable.
   creation_nudge_interval: 15
+  creation_nudge_category: ""  # Default category for agent-created skills (empty = agent decides)
 
   # External skill directories — share skills across tools/agents without
   # copying them into ~/.hermes/skills/.  Each path is expanded (~ and ${VAR})

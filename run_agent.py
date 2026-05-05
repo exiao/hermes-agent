@@ -1776,9 +1776,11 @@ class AIAgent:
 
         # Skills config: nudge interval for skill creation reminders
         self._skill_nudge_interval = 10
+        self._skill_nudge_category = ""
         try:
             skills_config = _agent_cfg.get("skills", {})
             self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
+            self._skill_nudge_category = str(skills_config.get("creation_nudge_category", ""))
         except Exception:
             pass
 
@@ -3546,6 +3548,15 @@ class AIAgent:
             prompt = self._MEMORY_REVIEW_PROMPT
         else:
             prompt = self._SKILL_REVIEW_PROMPT
+
+        # Inject default category directive when configured
+        if review_skills and self._skill_nudge_category:
+            prompt += (
+                f"\n\nIMPORTANT: When creating NEW skills (action 4), "
+                f"always use category='{self._skill_nudge_category}'. "
+                f"Only use a different category if the skill clearly belongs "
+                f"to an existing one already in the library."
+            )
 
         def _run_review():
             import contextlib
