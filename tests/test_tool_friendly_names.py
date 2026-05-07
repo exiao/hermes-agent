@@ -45,7 +45,7 @@ def _build_progress_callback(display_config=None, progress_queue=None):
         for pattern, replacement in _rewrite_compiled:
             m = pattern.search(cmd_text)
             if m:
-                _r = replacement.replace("$1", r"\1").replace("$2", r"\2").replace("$3", r"\3")
+                _r = _re_mod.sub(r"\$(\d+)", r"\\\1", replacement)
                 return pattern.sub(_r, m.group(0))
 
         template = _tool_display.get(tool_name)

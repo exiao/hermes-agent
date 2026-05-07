@@ -13444,8 +13444,8 @@ class GatewayRunner:
             for pattern, replacement in _rewrite_compiled:
                 m = pattern.search(cmd_text)
                 if m:
-                    # Convert $1/$2 to \1/\2 for re.sub
-                    _r = replacement.replace("$1", r"\1").replace("$2", r"\2").replace("$3", r"\3")
+                    # Convert $N capture group refs to \N for re.sub
+                    _r = _re_mod.sub(r"\$(\d+)", r"\\\1", replacement)
                     return pattern.sub(_r, m.group(0))
 
             # 2. Static tool_display mapping
@@ -13526,6 +13526,7 @@ class GatewayRunner:
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
+            display_name = tool_name or ""
 
             # Try resolved display (rewrite rules → tool_display → None)
             _resolved = _resolve_tool_display(tool_name, preview, args)
@@ -13537,7 +13538,6 @@ class GatewayRunner:
                 elif args:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
-                    display_name = tool_name or ""
                     args_str = json.dumps(args, ensure_ascii=False, default=str)
                     # When tool_preview_length is 0 (default), don't truncate
                     # in verbose mode — the user explicitly asked for full
@@ -13546,10 +13546,8 @@ class GatewayRunner:
                         args_str = args_str[:_pl - 3] + "..."
                     msg = f"{emoji} {display_name}({list(args.keys())})\n{args_str}"
                 elif preview:
-                    display_name = tool_name or ""
                     msg = f"{emoji} {display_name}: \"{preview}\""
                 else:
-                    display_name = tool_name or ""
                     msg = f"{emoji} {display_name}..."
                 progress_queue.put(msg)
                 return
@@ -13563,12 +13561,10 @@ class GatewayRunner:
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                display_name = tool_name or ""
                 if len(preview) > _cap:
                     preview = preview[:_cap - 3] + "..."
                 msg = f"{emoji} {display_name}: \"{preview}\""
             else:
-                display_name = tool_name or ""
                 msg = f"{emoji} {display_name}..."
             
             # Dedup: collapse consecutive identical progress messages.
