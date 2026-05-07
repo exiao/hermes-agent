@@ -13401,20 +13401,67 @@ class GatewayRunner:
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
-        # Config-driven friendly names for tool progress messages.
-        # When display.tool_friendly_names is set, the mapped name is shown
-        # instead of the raw internal tool name (e.g. "Searching the web"
-        # instead of "WebSearch").  Empty/missing = raw names (default).
-        _tool_friendly_names = display_config.get("tool_friendly_names")
-        if not isinstance(_tool_friendly_names, dict):
-            _tool_friendly_names = {}
+        # Config-driven tool display names and rewrite rules.
+        #
+        # tool_display: dict mapping tool_name → display template.
+        #   Include {preview} to show args inline; omit to suppress them.
+        #   e.g. terminal: "Looking up data"        → "Looking up data..."
+        #        WebSearch: "Searching the web: {preview}" → "Searching the web: AAPL"
+        #
+        # tool_display_rewrite: dict mapping regex pattern → replacement string.
+        #   Matched against the raw preview/command text. First match wins.
+        #   Capture groups via $1, $2, etc.
+        #   e.g. "bloom earnings (.+)": "Looking up earnings data: $1"
+        import re as _re_mod
+        _tool_display = display_config.get("tool_display")
+        if not isinstance(_tool_display, dict):
+            _tool_display = {}
 
-        # Tools whose preview (query/argument) should still be shown even when
-        # a friendly name is active.  By default, tools with a friendly name
-        # suppress previews (raw shell commands, file paths, etc. are noise for
-        # end users).  List tool names here to opt back in.
-        _raw_show = display_config.get("tool_show_preview")
-        _tool_show_preview = set(_raw_show) if isinstance(_raw_show, list) else set()
+        _rewrite_rules_raw = display_config.get("tool_display_rewrite")
+        if not isinstance(_rewrite_rules_raw, dict):
+            _rewrite_rules_raw = {}
+        _rewrite_compiled = []
+        for _pat, _repl in _rewrite_rules_raw.items():
+            try:
+                _rewrite_compiled.append((_re_mod.compile(_pat), str(_repl)))
+            except _re_mod.error:
+                pass  # skip invalid patterns gracefully
+
+        # Legacy compat: also check old config keys
+        _legacy_friendly = display_config.get("tool_friendly_names")
+        if isinstance(_legacy_friendly, dict) and not _tool_display:
+            _tool_display = _legacy_friendly
+        _legacy_show = display_config.get("tool_show_preview")
+        _legacy_show_set = set(_legacy_show) if isinstance(_legacy_show, list) else set()
+
+        def _resolve_tool_display(tool_name, preview, args):
+            """Resolve final display text for a tool progress event."""
+            cmd_text = preview or ""
+            if not cmd_text and args:
+                cmd_text = args.get("command", args.get("code", ""))
+
+            # 1. Rewrite rules (first match wins)
+            for pattern, replacement in _rewrite_compiled:
+                m = pattern.search(cmd_text)
+                if m:
+                    # Convert $N capture group refs to \N for re.sub
+                    _r = _re_mod.sub(r"\$(\d+)", r"\\\1", replacement)
+                    return pattern.sub(_r, m.group(0))
+
+            # 2. Static tool_display mapping
+            template = _tool_display.get(tool_name)
+            if template is not None:
+                if "{preview}" in template:
+                    return template.replace("{preview}", preview or "")
+                # Legacy compat: if tool is in legacy tool_show_preview list,
+                # show preview even when template has no {preview} placeholder
+                elif tool_name in _legacy_show_set and preview:
+                    return f'{template}: "{preview}"'
+                else:
+                    return template + "..."
+
+            # 3. Fallback: None signals caller to use default behavior
+            return None
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
@@ -13479,14 +13526,15 @@ class GatewayRunner:
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
-            display_name = _tool_friendly_names.get(tool_name, tool_name or "")
-            _has_friendly = tool_name in _tool_friendly_names
-            _suppress_preview = _has_friendly and tool_name not in _tool_show_preview
+            display_name = tool_name or ""
+
+            # Try resolved display (rewrite rules → tool_display → None)
+            _resolved = _resolve_tool_display(tool_name, preview, args)
             
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
-                if _suppress_preview:
-                    msg = f"{emoji} {display_name}..."
+                if _resolved:
+                    msg = f"{emoji} {_resolved}"
                 elif args:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
@@ -13507,8 +13555,8 @@ class GatewayRunner:
             # "all" / "new" modes: short preview, respects tool_preview_length
             # config (defaults to 40 chars when unset to keep gateway messages
             # compact — unlike CLI spinners, these persist as permanent messages).
-            if _suppress_preview:
-                msg = f"{emoji} {display_name}..."
+            if _resolved:
+                msg = f"{emoji} {_resolved}"
             elif preview:
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()
