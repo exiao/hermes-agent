@@ -11954,8 +11954,9 @@ class GatewayRunner:
         # When display.tool_friendly_names is set, the mapped name is shown
         # instead of the raw internal tool name (e.g. "Searching the web"
         # instead of "WebSearch").  Empty/missing = raw names (default).
-        _raw_friendly = display_config.get("tool_friendly_names") if isinstance(display_config, dict) else None
-        _tool_friendly_names = _raw_friendly if isinstance(_raw_friendly, dict) else {}
+        _tool_friendly_names = display_config.get("tool_friendly_names")
+        if not isinstance(_tool_friendly_names, dict):
+            _tool_friendly_names = {}
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
@@ -12020,7 +12021,7 @@ class GatewayRunner:
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
-            display_name = _tool_friendly_names.get(tool_name, tool_name)
+            display_name = _tool_friendly_names.get(tool_name, tool_name or "")
             
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":

@@ -14,8 +14,9 @@ def _build_progress_callback(display_config=None, progress_queue=None):
     if progress_queue is None:
         progress_queue = queue.Queue()
 
-    _raw_friendly = display_config.get("tool_friendly_names") if isinstance(display_config, dict) else None
-    _tool_friendly_names = _raw_friendly if isinstance(_raw_friendly, dict) else {}
+    _tool_friendly_names = display_config.get("tool_friendly_names")
+    if not isinstance(_tool_friendly_names, dict):
+        _tool_friendly_names = {}
 
     def progress_callback(tool_name, preview=None, args=None):
         from agent.display import get_tool_emoji
