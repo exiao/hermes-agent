@@ -11958,6 +11958,12 @@ class GatewayRunner:
         if not isinstance(_tool_friendly_names, dict):
             _tool_friendly_names = {}
 
+        # Tools whose preview (query/argument) should still be shown even when
+        # a friendly name is active.  By default, tools with a friendly name
+        # suppress previews (raw shell commands, file paths, etc. are noise for
+        # end users).  List tool names here to opt back in.
+        _tool_show_preview = set(display_config.get("tool_show_preview") or [])
+
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             if not progress_queue or not _run_still_current():
@@ -12022,10 +12028,14 @@ class GatewayRunner:
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
             display_name = _tool_friendly_names.get(tool_name, tool_name or "")
+            _has_friendly = tool_name in _tool_friendly_names
+            _suppress_preview = _has_friendly and tool_name not in _tool_show_preview
             
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
-                if args:
+                if _suppress_preview:
+                    msg = f"{emoji} {display_name}..."
+                elif args:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
                     args_str = json.dumps(args, ensure_ascii=False, default=str)
@@ -12045,7 +12055,9 @@ class GatewayRunner:
             # "all" / "new" modes: short preview, respects tool_preview_length
             # config (defaults to 40 chars when unset to keep gateway messages
             # compact — unlike CLI spinners, these persist as permanent messages).
-            if preview:
+            if _suppress_preview:
+                msg = f"{emoji} {display_name}..."
+            elif preview:
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40

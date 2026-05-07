@@ -18,12 +18,18 @@ def _build_progress_callback(display_config=None, progress_queue=None):
     if not isinstance(_tool_friendly_names, dict):
         _tool_friendly_names = {}
 
+    _tool_show_preview = set(display_config.get("tool_show_preview") or [])
+
     def progress_callback(tool_name, preview=None, args=None):
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚙️")
-        display_name = _tool_friendly_names.get(tool_name, tool_name)
+        display_name = _tool_friendly_names.get(tool_name, tool_name or "")
+        _has_friendly = tool_name in _tool_friendly_names
+        _suppress_preview = _has_friendly and tool_name not in _tool_show_preview
 
-        if preview:
+        if _suppress_preview:
+            msg = f"{emoji} {display_name}..."
+        elif preview:
             msg = f'{emoji} {display_name}: "{preview}"'
         else:
             msg = f"{emoji} {display_name}..."
@@ -93,3 +99,43 @@ class TestToolFriendlyNames:
         cb, q = _build_progress_callback(display_config=config)
         msg = cb("WebSearch", preview="test")
         assert "WebSearch" in msg
+
+    # --- Preview suppression tests ---
+
+    def test_friendly_name_suppresses_preview_by_default(self):
+        """Tools with a friendly name hide their preview (raw args are noise)."""
+        config = {"tool_friendly_names": {"terminal": "Looking up data"}}
+        cb, q = _build_progress_callback(display_config=config)
+        msg = cb("terminal", preview="scripts/serper.sh 'AAPL'")
+        assert "Looking up data..." in msg
+        assert "serper" not in msg
+
+    def test_show_preview_opts_tool_back_in(self):
+        """tool_show_preview list re-enables preview for specific tools."""
+        config = {
+            "tool_friendly_names": {"WebSearch": "Searching the web"},
+            "tool_show_preview": ["WebSearch"],
+        }
+        cb, q = _build_progress_callback(display_config=config)
+        msg = cb("WebSearch", preview="AAPL earnings")
+        assert "Searching the web" in msg
+        assert "AAPL earnings" in msg
+
+    def test_unmapped_tool_still_shows_preview(self):
+        """Tools without a friendly name always show preview (no suppression)."""
+        config = {"tool_friendly_names": {"terminal": "Looking up data"}}
+        cb, q = _build_progress_callback(display_config=config)
+        msg = cb("WebSearch", preview="AAPL earnings")
+        assert "WebSearch" in msg
+        assert "AAPL earnings" in msg
+
+    def test_show_preview_empty_list(self):
+        """Empty tool_show_preview = all friendly-named tools suppress preview."""
+        config = {
+            "tool_friendly_names": {"terminal": "Looking up data"},
+            "tool_show_preview": [],
+        }
+        cb, q = _build_progress_callback(display_config=config)
+        msg = cb("terminal", preview="/root/.hermes/scripts/foo.sh")
+        assert "Looking up data..." in msg
+        assert "/root" not in msg
