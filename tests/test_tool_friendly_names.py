@@ -18,7 +18,8 @@ def _build_progress_callback(display_config=None, progress_queue=None):
     if not isinstance(_tool_friendly_names, dict):
         _tool_friendly_names = {}
 
-    _tool_show_preview = set(display_config.get("tool_show_preview") or [])
+    _raw_show = display_config.get("tool_show_preview")
+    _tool_show_preview = set(_raw_show) if isinstance(_raw_show, list) else set()
 
     def progress_callback(tool_name, preview=None, args=None):
         from agent.display import get_tool_emoji
@@ -139,3 +140,15 @@ class TestToolFriendlyNames:
         msg = cb("terminal", preview="/root/.hermes/scripts/foo.sh")
         assert "Looking up data..." in msg
         assert "/root" not in msg
+
+    def test_show_preview_string_value_ignored(self):
+        """If tool_show_preview is a string (not list), treat as empty."""
+        config = {
+            "tool_friendly_names": {"WebSearch": "Searching the web"},
+            "tool_show_preview": "WebSearch",
+        }
+        cb, q = _build_progress_callback(display_config=config)
+        msg = cb("WebSearch", preview="AAPL")
+        # String is not a list, so it's treated as empty = preview suppressed
+        assert "Searching the web..." in msg
+        assert "AAPL" not in msg

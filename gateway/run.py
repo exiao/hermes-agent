@@ -11962,7 +11962,8 @@ class GatewayRunner:
         # a friendly name is active.  By default, tools with a friendly name
         # suppress previews (raw shell commands, file paths, etc. are noise for
         # end users).  List tool names here to opt back in.
-        _tool_show_preview = set(display_config.get("tool_show_preview") or [])
+        _raw_show = display_config.get("tool_show_preview")
+        _tool_show_preview = set(_raw_show) if isinstance(_raw_show, list) else set()
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
