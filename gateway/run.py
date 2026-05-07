@@ -4692,16 +4692,27 @@ class GatewayRunner:
             # earlier /queue items) finishes.  Messages are NOT merged.
             if event.get_command() in ("queue", "q"):
                 queued_text = event.get_command_args().strip()
-                if not queued_text:
+                if not queued_text and not event.media_urls:
                     return "Usage: /queue <prompt>"
                 adapter = self.adapters.get(source.platform)
                 if adapter:
+                    # Carry over media attachments from the original event so
+                    # images/files sent alongside /queue are not silently lost.
+                    _q_msg_type = event.message_type
+                    if event.media_urls and _q_msg_type == MessageType.TEXT:
+                        _q_media_types = getattr(event, "media_types", None) or []
+                        if any(mt.startswith("image/") for mt in _q_media_types):
+                            _q_msg_type = MessageType.PHOTO
                     queued_event = MessageEvent(
                         text=queued_text,
-                        message_type=MessageType.TEXT,
+                        message_type=_q_msg_type,
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        media_urls=list(event.media_urls) if event.media_urls else [],
+                        media_types=list(event.media_types) if getattr(event, "media_types", None) else [],
+                        reply_to_message_id=getattr(event, "reply_to_message_id", None),
+                        reply_to_text=getattr(event, "reply_to_text", None),
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
@@ -5451,15 +5462,21 @@ class GatewayRunner:
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 
-        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            # Always inject the reply-to pointer — even when the quoted text
-            # already appears in history. The prefix isn't deduplication, it's
-            # disambiguation: it tells the agent *which* prior message the user
-            # is referencing. History can contain the same or similar text
-            # multiple times, and without an explicit pointer the agent has to
-            # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
-            message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+        if getattr(event, "reply_to_message_id", None):
+            reply_to_text = getattr(event, "reply_to_text", None)
+            if reply_to_text:
+                # Always inject the reply-to pointer — even when the quoted text
+                # already appears in history. The prefix isn't deduplication, it's
+                # disambiguation: it tells the agent *which* prior message the user
+                # is referencing. History can contain the same or similar text
+                # multiple times, and without an explicit pointer the agent has to
+                # guess (or answer for both subjects). Token overhead is minimal.
+                reply_snippet = reply_to_text[:500]
+                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+            else:
+                # The quoted message had no text (e.g. image-only, voice-only).
+                # Still inject a pointer so the agent knows this is a reply.
+                message_text = f'[Replying to a previous message (no text — may have been an image or file)]\n\n{message_text}'
 
         if "@" in message_text:
             try:
