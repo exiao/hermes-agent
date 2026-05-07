@@ -1,9 +1,6 @@
 """Tests for config-driven tool friendly names in gateway progress messages."""
 
-import json
 import queue
-import pytest
-from unittest.mock import patch, MagicMock
 
 
 def _build_progress_callback(display_config=None, progress_queue=None):
@@ -17,7 +14,8 @@ def _build_progress_callback(display_config=None, progress_queue=None):
     if progress_queue is None:
         progress_queue = queue.Queue()
 
-    _tool_friendly_names = (display_config.get("tool_friendly_names") or {}) if isinstance(display_config, dict) else {}
+    _raw_friendly = display_config.get("tool_friendly_names") if isinstance(display_config, dict) else None
+    _tool_friendly_names = _raw_friendly if isinstance(_raw_friendly, dict) else {}
 
     def progress_callback(tool_name, preview=None, args=None):
         from agent.display import get_tool_emoji
@@ -87,3 +85,10 @@ class TestToolFriendlyNames:
         assert not q.empty()
         queued = q.get_nowait()
         assert "Searching the web" in queued
+
+    def test_non_dict_friendly_names_ignored(self):
+        """If tool_friendly_names is a non-dict truthy value, treat as empty."""
+        config = {"tool_friendly_names": "oops"}
+        cb, q = _build_progress_callback(display_config=config)
+        msg = cb("WebSearch", preview="test")
+        assert "WebSearch" in msg

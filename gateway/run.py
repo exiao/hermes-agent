@@ -11954,7 +11954,8 @@ class GatewayRunner:
         # When display.tool_friendly_names is set, the mapped name is shown
         # instead of the raw internal tool name (e.g. "Searching the web"
         # instead of "WebSearch").  Empty/missing = raw names (default).
-        _tool_friendly_names = (display_config.get("tool_friendly_names") or {}) if isinstance(display_config, dict) else {}
+        _raw_friendly = display_config.get("tool_friendly_names") if isinstance(display_config, dict) else None
+        _tool_friendly_names = _raw_friendly if isinstance(_raw_friendly, dict) else {}
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
