@@ -52,6 +52,8 @@ def _build_progress_callback(display_config=None, progress_queue=None):
         if template is not None:
             if "{preview}" in template:
                 return template.replace("{preview}", preview or "")
+            elif tool_name in _legacy_show_set and preview:
+                return f'{template}: "{preview}"'
             else:
                 return template + "..."
 
@@ -249,3 +251,14 @@ class TestLegacyCompat:
         msg = cb("terminal")
         assert "New name..." in msg
         assert "Old name" not in msg
+
+    def test_legacy_show_preview_preserved(self):
+        """Legacy tool_show_preview still shows preview for mapped tools."""
+        config = {
+            "tool_friendly_names": {"WebSearch": "Searching the web"},
+            "tool_show_preview": ["WebSearch"],
+        }
+        cb, q = _build_progress_callback(display_config=config)
+        msg = cb("WebSearch", preview="AAPL earnings")
+        assert "Searching the web" in msg
+        assert "AAPL earnings" in msg

@@ -13453,6 +13453,10 @@ class GatewayRunner:
             if template is not None:
                 if "{preview}" in template:
                     return template.replace("{preview}", preview or "")
+                # Legacy compat: if tool is in legacy tool_show_preview list,
+                # show preview even when template has no {preview} placeholder
+                elif tool_name in _legacy_show_set and preview:
+                    return f'{template}: "{preview}"'
                 else:
                     return template + "..."
 
