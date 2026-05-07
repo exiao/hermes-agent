@@ -4709,8 +4709,10 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
-                        media_urls=list(event.media_urls) if event.media_urls else None,
-                        media_types=list(event.media_types) if getattr(event, "media_types", None) else None,
+                        media_urls=list(event.media_urls) if event.media_urls else [],
+                        media_types=list(event.media_types) if getattr(event, "media_types", None) else [],
+                        reply_to_message_id=getattr(event, "reply_to_message_id", None),
+                        reply_to_text=getattr(event, "reply_to_text", None),
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
