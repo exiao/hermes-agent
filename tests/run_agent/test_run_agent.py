@@ -95,6 +95,36 @@ def agent_with_memory_tool():
         return a
 
 
+def test_skip_memory_still_loads_store_when_memory_tool_enabled():
+    """Cron can suppress memory prompt injection while still using the memory tool."""
+    store = MagicMock()
+    store.format_for_system_prompt.return_value = "SHOULD NOT BE IN PROMPT"
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("memory"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("tools.memory_tool.MemoryStore", return_value=store) as memory_store_cls,
+    ):
+        a = AIAgent(
+            api_key="test-k...7890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=["memory"],
+        )
+
+    assert a._memory_store is store
+    memory_store_cls.assert_called_once()
+    store.load_from_disk.assert_called_once()
+    assert a._memory_enabled is False
+    assert a._user_profile_enabled is False
+    assert "SHOULD NOT BE IN PROMPT" not in a._build_system_prompt()
+
+
 def test_aiagent_reuses_existing_errors_log_handler():
     """Repeated AIAgent init should not accumulate duplicate errors.log handlers."""
     root_logger = logging.getLogger()

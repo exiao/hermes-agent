@@ -1731,20 +1731,28 @@ class AIAgent:
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
 
-        # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+        # Persistent memory (MEMORY.md + USER.md) -- loaded from disk.
+        # skip_memory suppresses prompt injection / provider memory, but if the
+        # memory tool is explicitly enabled the tool still needs a backing store
+        # for maintenance jobs such as memory-gc.
         self._memory_store = None
         self._memory_enabled = False
         self._user_profile_enabled = False
         self._memory_nudge_interval = 10
         self._turns_since_memory = 0
         self._iters_since_skill = 0
-        if not skip_memory:
+        mem_config = {}
+        _memory_tool_enabled = "memory" in self.valid_tool_names
+        if not skip_memory or _memory_tool_enabled:
             try:
                 mem_config = _agent_cfg.get("memory", {})
-                self._memory_enabled = mem_config.get("memory_enabled", False)
-                self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+                configured_memory_enabled = mem_config.get("memory_enabled", False)
+                configured_user_profile_enabled = mem_config.get("user_profile_enabled", False)
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
-                if self._memory_enabled or self._user_profile_enabled:
+                if not skip_memory:
+                    self._memory_enabled = configured_memory_enabled
+                    self._user_profile_enabled = configured_user_profile_enabled
+                if configured_memory_enabled or configured_user_profile_enabled:
                     from tools.memory_tool import MemoryStore
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
