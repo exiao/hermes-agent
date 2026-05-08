@@ -125,6 +125,30 @@ def test_skip_memory_still_loads_store_when_memory_tool_enabled():
     assert "SHOULD NOT BE IN PROMPT" not in a._build_system_prompt()
 
 
+def test_skip_memory_default_tools_does_not_load_store_for_memory_tool():
+    """skip_memory=True still blocks memory unless a toolset filter explicitly asks for it."""
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("memory"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("tools.memory_tool.MemoryStore") as memory_store_cls,
+    ):
+        a = AIAgent(
+            api_key="test-k...7890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=None,
+        )
+
+    assert a._memory_store is None
+    memory_store_cls.assert_not_called()
+
+
 def test_aiagent_reuses_existing_errors_log_handler():
     """Repeated AIAgent init should not accumulate duplicate errors.log handlers."""
     root_logger = logging.getLogger()

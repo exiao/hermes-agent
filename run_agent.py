@@ -1742,8 +1742,10 @@ class AIAgent:
         self._turns_since_memory = 0
         self._iters_since_skill = 0
         mem_config = {}
-        _memory_tool_enabled = "memory" in self.valid_tool_names
-        if not skip_memory or _memory_tool_enabled:
+        _memory_tool_explicitly_enabled = (
+            enabled_toolsets is not None and "memory" in self.valid_tool_names
+        )
+        if not skip_memory or _memory_tool_explicitly_enabled:
             try:
                 mem_config = _agent_cfg.get("memory", {})
                 configured_memory_enabled = mem_config.get("memory_enabled", False)
