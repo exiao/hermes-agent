@@ -100,6 +100,7 @@ def test_skip_memory_still_loads_store_when_memory_tool_enabled():
     store = MagicMock()
     store.format_for_system_prompt.return_value = "SHOULD NOT BE IN PROMPT"
     with (
+        patch("hermes_cli.config.load_config", return_value={}),
         patch(
             "run_agent.get_tool_definitions",
             return_value=_make_tool_defs("memory"),
