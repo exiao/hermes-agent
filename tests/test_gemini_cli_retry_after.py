@@ -33,6 +33,11 @@ def test_extract_retry_after_caps_to_max_seconds():
     assert _extract_retry_after_seconds(err, max_seconds=120) == 120
 
 
+def test_extract_retry_after_rejects_non_finite_values():
+    assert _extract_retry_after_seconds(RetryAfterError(retry_after="nan")) is None
+    assert _extract_retry_after_seconds(RetryAfterError(retry_after="inf")) is None
+
+
 def test_extract_retry_after_parses_gemini_reset_message():
     err = Exception(
         "Gemini quota exhausted (You have exhausted your capacity on this model. "
@@ -46,6 +51,11 @@ def test_short_google_capacity_wait_honors_cloudcode_retry_window():
     assert _is_short_google_capacity_wait(
         provider="google-gemini-cli",
         base_url="cloudcode-pa://google",
+        retry_after=13,
+    )
+    assert _is_short_google_capacity_wait(
+        provider=None,
+        base_url="CloudCode-PA://google",
         retry_after=13,
     )
 

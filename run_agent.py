@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 logger = logging.getLogger(__name__)
+import math
 import os
 import random
 import re
@@ -866,7 +867,7 @@ def _extract_retry_after_seconds(error: Exception, *, max_seconds: float | None 
             seconds = float(raw)
         except (TypeError, ValueError):
             continue
-        if seconds < 0:
+        if not math.isfinite(seconds) or seconds < 0:
             continue
         if max_seconds is not None:
             seconds = min(seconds, float(max_seconds))
@@ -882,7 +883,7 @@ def _is_short_google_capacity_wait(
         return False
     if retry_after > 60:
         return False
-    return provider == "google-gemini-cli" or str(base_url or "").startswith("cloudcode-pa://")
+    return provider == "google-gemini-cli" or str(base_url or "").lower().startswith("cloudcode-pa://")
 
 
 def _pool_may_recover_from_rate_limit(
@@ -13413,7 +13414,7 @@ class AIAgent:
                         }
 
                     # For rate limits, respect the provider's Retry-After signal if present
-                    _retry_after = _extract_retry_after_seconds(api_error, max_seconds=120)
+                    _retry_after = _extract_retry_after_seconds(api_error, max_seconds=120) if is_rate_limited else None
                     if (
                         _retry_after is not None
                         and _is_short_google_capacity_wait(
