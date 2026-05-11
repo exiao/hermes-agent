@@ -174,6 +174,17 @@ class TestBuildApiKwargsOpenRouter:
             "thinking_level": "high",
         }
 
+    def test_google_gemini_cli_omits_thinking_config(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "google-gemini-cli",
+            base_url="cloudcode-pa://google",
+            model="gemini-3.1-pro-preview",
+        )
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "extra_body" not in kwargs
+
     def test_should_sanitize_tool_calls_codex_vs_chat(self, monkeypatch):
         """Codex API should NOT sanitize, all other APIs should sanitize."""
         # Codex mode should NOT need sanitization
