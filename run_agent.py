@@ -834,6 +834,57 @@ def _routermint_headers() -> dict:
     }
 
 
+def _extract_retry_after_seconds(error: Exception, *, max_seconds: float | None = None) -> float | None:
+    """Return Retry-After seconds from SDK/custom errors.
+
+    Some provider adapters, including Gemini CloudCode, expose retry-after on
+    the exception object rather than an HTTP header.  The main retry loop must
+    honor both, otherwise a short Google capacity window (for example 13s) gets
+    retried with generic jitter (2s, ~6s, ...) and then falls back right before
+    the model recovers.
+    """
+    candidates = [getattr(error, "retry_after", None)]
+    message = str(error or "")
+    for pattern in (
+        r"quota will reset after\s+([0-9]+(?:\.[0-9]+)?)s",
+        r"retry(?:ing)?\s+(?:suggested\s+)?in\s+([0-9]+(?:\.[0-9]+)?)s",
+    ):
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            candidates.append(match.group(1))
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers and hasattr(headers, "get"):
+        candidates.extend([
+            headers.get("retry-after"),
+            headers.get("Retry-After"),
+        ])
+    for raw in candidates:
+        if raw in (None, ""):
+            continue
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if seconds < 0:
+            continue
+        if max_seconds is not None:
+            seconds = min(seconds, float(max_seconds))
+        return seconds
+    return None
+
+
+def _is_short_google_capacity_wait(
+    *, provider: str | None, base_url: str | None, retry_after: float | None
+) -> bool:
+    """True when Gemini CLI asked for a short wait we should honor before fallback."""
+    if retry_after is None:
+        return False
+    if retry_after > 60:
+        return False
+    return provider == "google-gemini-cli" or str(base_url or "").startswith("cloudcode-pa://")
+
+
 def _pool_may_recover_from_rate_limit(
     pool, *, provider: str | None = None, base_url: str | None = None
 ) -> bool:
@@ -12888,7 +12939,13 @@ class AIAgent:
                             provider=self.provider,
                             base_url=getattr(self, "base_url", None),
                         )
-                        if not pool_may_recover:
+                        retry_after_seconds = _extract_retry_after_seconds(api_error)
+                        short_google_capacity_wait = _is_short_google_capacity_wait(
+                            provider=self.provider,
+                            base_url=getattr(self, "base_url", None),
+                            retry_after=retry_after_seconds,
+                        )
+                        if not pool_may_recover and not short_google_capacity_wait:
                             self._emit_status("⚠️ Rate limited — switching to fallback provider...")
                             if self._try_activate_fallback(reason=classified.reason):
                                 retry_count = 0
@@ -13355,18 +13412,21 @@ class AIAgent:
                             "error": _final_summary,
                         }
 
-                    # For rate limits, respect the Retry-After header if present
-                    _retry_after = None
-                    if is_rate_limited:
-                        _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
-                        if _resp_headers and hasattr(_resp_headers, "get"):
-                            _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
-                            if _ra_raw:
-                                try:
-                                    _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
-                                except (TypeError, ValueError):
-                                    pass
-                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    # For rate limits, respect the provider's Retry-After signal if present
+                    _retry_after = _extract_retry_after_seconds(api_error, max_seconds=120)
+                    if (
+                        _retry_after is not None
+                        and _is_short_google_capacity_wait(
+                            provider=self.provider,
+                            base_url=getattr(self, "base_url", None),
+                            retry_after=_retry_after,
+                        )
+                    ):
+                        # Google often returns "reset after 0s" while the bucket
+                        # is still settling.  A tiny cushion avoids immediately
+                        # burning the final retry and falling back.
+                        _retry_after = max(_retry_after + 2.0, 3.0)
+                    wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
                     else:
