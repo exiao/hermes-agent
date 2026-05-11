@@ -512,6 +512,59 @@ class TestExplicitProviderRouting:
             for record in caplog.records
         )
 
+    def test_google_gemini_cli_oauth_resolves_cloudcode_client(self):
+        """Auxiliary tasks should use the same Cloud Code client as main chat."""
+        with patch(
+            "hermes_cli.auth.resolve_gemini_oauth_runtime_credentials",
+            return_value={
+                "api_key": "ya29.test-token",
+                "base_url": "cloudcode-pa://google",
+                "project_id": "test-project",
+            },
+        ):
+            client, model = resolve_provider_client(
+                "google-gemini-cli",
+                model="gemini-3.1-pro-preview",
+            )
+
+        try:
+            from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+            assert isinstance(client, GeminiCloudCodeClient)
+            assert model == "gemini-3.1-pro-preview"
+            assert client.api_key == "ya29.test-token"
+            assert client.base_url == "cloudcode-pa://google"
+        finally:
+            if client is not None:
+                client.close()
+
+    def test_google_gemini_cli_oauth_resolves_async_auxiliary_client(self):
+        """Async auxiliary consumers should not fall back to AsyncOpenAI."""
+        with patch(
+            "hermes_cli.auth.resolve_gemini_oauth_runtime_credentials",
+            return_value={
+                "api_key": "ya29.test-token",
+                "base_url": "cloudcode-pa://google",
+                "project_id": "test-project",
+            },
+        ):
+            client, model = resolve_provider_client(
+                "google-gemini-cli",
+                model="gemini-3.1-flash-lite-preview",
+                async_mode=True,
+            )
+
+        try:
+            from agent.auxiliary_client import AsyncGeminiCloudCodeAuxiliaryClient
+
+            assert isinstance(client, AsyncGeminiCloudCodeAuxiliaryClient)
+            assert model == "gemini-3.1-flash-lite-preview"
+            assert client.api_key == "ya29.test-token"
+            assert client.base_url == "cloudcode-pa://google"
+        finally:
+            if client is not None:
+                client.close()
+
 class TestGetTextAuxiliaryClient:
     """Test the full resolution chain for get_text_auxiliary_client."""
 
