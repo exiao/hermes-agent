@@ -912,6 +912,28 @@ class TestTranslateStreamEvent:
         )
         assert chunks[-1].choices[0].finish_reason == "tool_calls"
 
+    def test_text_and_terminal_chunks_have_openai_delta_attributes(self):
+        from agent.gemini_cloudcode_adapter import _translate_stream_event
+
+        counter = [0]
+        text_chunks = _translate_stream_event(
+            {"response": {"candidates": [{
+                "content": {"parts": [{"text": "hello"}]},
+            }]}},
+            model="m", tool_call_counter=counter,
+        )
+        text_delta = text_chunks[0].choices[0].delta
+        assert text_delta.content == "hello"
+        assert text_delta.tool_calls is None
+
+        terminal_chunks = _translate_stream_event(
+            {"response": {"candidates": [{"finishReason": "STOP"}]}},
+            model="m", tool_call_counter=counter,
+        )
+        terminal_delta = terminal_chunks[0].choices[0].delta
+        assert terminal_delta.content is None
+        assert terminal_delta.tool_calls is None
+
 
 class TestGeminiCloudCodeClient:
     def test_client_exposes_openai_interface(self):

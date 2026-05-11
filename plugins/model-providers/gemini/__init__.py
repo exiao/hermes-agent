@@ -35,6 +35,14 @@ class GeminiProfile(ProviderProfile):
         reasoning_config = context.get("reasoning_config")
         base_url = context.get("base_url") or self.base_url
 
+        # Code Assist already spends hidden thinking tokens even when no
+        # thinkingConfig is sent. Asking it to include thoughts by default makes
+        # tiny Hermes prompts burn the whole candidate budget and return empty
+        # text, then the agent retries/falls back. The official gemini-cli also
+        # omits thinkingConfig unless it has an explicit reason to send one.
+        if self.name == "google-gemini-cli":
+            return {}
+
         raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
         if not raw_thinking_config:
             return {}
