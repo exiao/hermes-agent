@@ -7066,6 +7066,18 @@ class AIAgent:
             or getattr(self, "_stream_callback", None) is not None
         )
 
+    def _provider_requires_non_streaming(self) -> bool:
+        """Return True for providers where Hermes must avoid forced SSE.
+
+        Google Code Assist OAuth accepts the non-streaming generateContent
+        endpoint while the streaming endpoint can return account/model-level
+        429s even for the same request.  Do not force stream=True for this
+        provider just because the gateway has a stream consumer attached.
+        """
+        provider = str(getattr(self, "provider", "") or "").lower()
+        base_url = str(getattr(self, "base_url", "") or "").lower()
+        return provider == "google-gemini-cli" or base_url.startswith("cloudcode-pa://")
+
     def _interruptible_streaming_api_call(
         self, api_kwargs: dict, *, on_first_delta: callable = None
     ):
@@ -11780,6 +11792,8 @@ class AIAgent:
                     # attempt — switch to non-streaming for the rest of this
                     # session instead of re-failing every retry.
                     if getattr(self, "_disable_streaming", False):
+                        _use_streaming = False
+                    elif self._provider_requires_non_streaming():
                         _use_streaming = False
                     # CopilotACPClient communicates via subprocess stdio and
                     # returns a plain SimpleNamespace — not an iterable

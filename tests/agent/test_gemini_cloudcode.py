@@ -936,6 +936,23 @@ class TestTranslateStreamEvent:
 
 
 class TestGeminiCloudCodeClient:
+    def test_text_stream_chunk_exposes_openai_delta_fields(self):
+        from agent.gemini_cloudcode_adapter import _translate_stream_event
+
+        chunks = _translate_stream_event(
+            {"response": {"candidates": [{
+                "content": {"parts": [{"text": "hello"}]},
+            }]}},
+            model="gemini-3.1-pro-preview",
+            tool_call_counter=[0],
+        )
+
+        delta = chunks[0].choices[0].delta
+        assert delta.content == "hello"
+        assert delta.tool_calls is None
+        assert delta.reasoning is None
+        assert delta.reasoning_content is None
+
     def test_client_exposes_openai_interface(self):
         from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
 

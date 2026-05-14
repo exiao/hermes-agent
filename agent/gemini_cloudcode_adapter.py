@@ -450,12 +450,19 @@ def _make_stream_chunk(
     finish_reason: Optional[str] = None,
     reasoning: str = "",
 ) -> _GeminiStreamChunk:
-    # The Hermes stream accumulator accesses ``delta.content`` and
-    # ``delta.tool_calls`` directly (matching OpenAI SDK chunk objects, where
-    # absent fields are present as None). Always include both attributes so
-    # Gemini final/reasoning-only chunks do not raise AttributeError mid-stream
-    # and get misclassified as an empty response.
-    delta_kwargs: Dict[str, Any] = {"role": "assistant", "content": content or None, "tool_calls": None}
+    # Match the OpenAI SDK's delta shape: absent fields are present as None.
+    # run_agent's streaming path accesses delta.content and delta.tool_calls
+    # directly, so omitting them turns a valid text/reasoning-only Gemini chunk
+    # into AttributeError("SimpleNamespace has no attribute 'tool_calls'").
+    delta_kwargs: Dict[str, Any] = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": None,
+        "reasoning": None,
+        "reasoning_content": None,
+    }
+    if content:
+        delta_kwargs["content"] = content
     if tool_call_delta is not None:
         delta_kwargs["tool_calls"] = [SimpleNamespace(
             index=tool_call_delta.get("index", 0),
