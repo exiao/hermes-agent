@@ -4403,6 +4403,26 @@ def _make_tc_delta(index=0, tc_id=None, name=None, arguments=None):
 class TestStreamingApiCall:
     """Tests for _streaming_api_call — voice TTS streaming pipeline."""
 
+    def test_google_gemini_cli_requires_non_streaming_even_with_consumer(self, agent):
+        agent.provider = "google-gemini-cli"
+        agent.base_url = "cloudcode-pa://google"
+        agent.stream_delta_callback = MagicMock()
+
+        assert agent._has_stream_consumers() is True
+        assert agent._provider_requires_non_streaming() is True
+
+    def test_cloudcode_marker_base_url_requires_non_streaming(self, agent):
+        agent.provider = "custom"
+        agent.base_url = "cloudcode-pa://google"
+
+        assert agent._provider_requires_non_streaming() is True
+
+    def test_regular_openai_compatible_provider_can_stream(self, agent):
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+
+        assert agent._provider_requires_non_streaming() is False
+
     def test_content_assembly(self, agent):
         chunks = [
             _make_chunk(content="Hel"),
