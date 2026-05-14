@@ -392,9 +392,8 @@ def _compute_tool_definitions(
                 tools_to_include.update(legacy_tools)
                 if not quiet_mode:
                     print(f"✅ Enabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
-            else:
-                if not quiet_mode:
-                    print(f"⚠️  Unknown toolset: {toolset_name}")
+            elif not quiet_mode:
+                print(f"⚠️  Unknown toolset: {toolset_name}")
     else:
         # Default: start with everything
         from toolsets import get_all_toolsets
@@ -417,9 +416,8 @@ def _compute_tool_definitions(
                 tools_to_include.difference_update(legacy_tools)
                 if not quiet_mode:
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
-            else:
-                if not quiet_mode:
-                    print(f"⚠️  Unknown toolset: {toolset_name}")
+            elif not quiet_mode:
+                print(f"⚠️  Unknown toolset: {toolset_name}")
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
@@ -589,6 +587,16 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                     # nullable "null" → None).
                     args[key] = coerced
                     continue
+                # If the string looks like a JSON array but _coerce_value
+                # failed to parse it, warn clearly instead of silently wrapping.
+                if value.strip().startswith("["):
+                    logger.warning(
+                        "coerce_tool_args: %s.%s looks like a JSON array string "
+                        "but could not be parsed — model may have emitted a "
+                        "JSON-encoded string instead of a native array. "
+                        "Falling back to single-element list.",
+                        tool_name, key,
+                    )
                 args[key] = [value]
                 logger.info(
                     "coerce_tool_args: wrapped bare string in list for %s.%s",
@@ -629,7 +637,7 @@ def _coerce_value(value: str, expected_type, schema: dict | None = None):
                 return result
         return value
 
-    if expected_type in ("integer", "number"):
+    if expected_type in {"integer", "number"}:
         return _coerce_number(value, integer_only=(expected_type == "integer"))
     if expected_type == "boolean":
         return _coerce_boolean(value)
@@ -676,7 +684,12 @@ def _coerce_json(value: str, expected_python_type: type):
     """
     try:
         parsed = json.loads(value)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "coerce_tool_args: failed to parse string as JSON for expected type %s: %s",
+            expected_python_type.__name__,
+            exc,
+        )
         return value
     if isinstance(parsed, expected_python_type):
         logger.debug(
@@ -684,6 +697,11 @@ def _coerce_json(value: str, expected_python_type: type):
             expected_python_type.__name__,
         )
         return parsed
+    logger.warning(
+        "coerce_tool_args: JSON-parsed value is %s, expected %s — skipping coercion",
+        type(parsed).__name__,
+        expected_python_type.__name__,
+    )
     return value
 
 
