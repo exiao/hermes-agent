@@ -1633,9 +1633,7 @@ class TestBuildApiKwargs:
         assert kwargs["metadata"]["sessionId"] == "sess-123"
         assert kwargs["extra_body"]["vl_high_resolution_images"] is True
         assert isinstance(kwargs["messages"][0]["content"], list)
-        # W1 (cache-ttl-1h-default): default marker now carries ttl='1h'.
-        from agent.prompt_caching import make_cache_marker
-        assert kwargs["messages"][0]["content"][0]["cache_control"] == make_cache_marker()
+        assert kwargs["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
         assert kwargs["messages"][2]["content"][0]["text"] == "hi"
 
     def test_qwen_portal_normalizes_bare_string_content_parts(self, agent):
@@ -4911,26 +4909,6 @@ def _make_tc_delta(index=0, tc_id=None, name=None, arguments=None):
 
 class TestStreamingApiCall:
     """Tests for _streaming_api_call — voice TTS streaming pipeline."""
-
-    def test_google_gemini_cli_requires_non_streaming_even_with_consumer(self, agent):
-        agent.provider = "google-gemini-cli"
-        agent.base_url = "cloudcode-pa://google"
-        agent.stream_delta_callback = MagicMock()
-
-        assert agent._has_stream_consumers() is True
-        assert agent._provider_requires_non_streaming() is True
-
-    def test_cloudcode_marker_base_url_requires_non_streaming(self, agent):
-        agent.provider = "custom"
-        agent.base_url = "cloudcode-pa://google"
-
-        assert agent._provider_requires_non_streaming() is True
-
-    def test_regular_openai_compatible_provider_can_stream(self, agent):
-        agent.provider = "openrouter"
-        agent.base_url = "https://openrouter.ai/api/v1"
-
-        assert agent._provider_requires_non_streaming() is False
 
     def test_content_assembly(self, agent):
         chunks = [

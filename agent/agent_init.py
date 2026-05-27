@@ -1070,17 +1070,30 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    # Cron jobs run with skip_memory=True but may explicitly enable the memory
+    # toolset so the agent can *write* memories without *reading* the full
+    # context.  Detect that case and still load the MemoryStore.
+    _memory_tool_explicitly_enabled = (
+        agent.enabled_toolsets is not None and "memory" in agent.enabled_toolsets
+    )
+    if not skip_memory or _memory_tool_explicitly_enabled:
         try:
             mem_config = _agent_cfg.get("memory", {})
-            agent._memory_enabled = mem_config.get("memory_enabled", False)
-            agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
-            agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
-            if agent._memory_enabled or agent._user_profile_enabled:
+            if not isinstance(mem_config, dict):
+                mem_config = {}
+            configured_memory_enabled = mem_config.get("memory_enabled", False)
+            configured_user_profile_enabled = mem_config.get("user_profile_enabled", False)
+            if not skip_memory:
+                agent._memory_enabled = configured_memory_enabled
+                agent._user_profile_enabled = configured_user_profile_enabled
+                agent._memory_nudge_interval = int(mem_config.get("nudge_interval") or 10)
+            else:
+                agent._memory_nudge_interval = 0
+            if configured_memory_enabled or configured_user_profile_enabled or _memory_tool_explicitly_enabled:
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(
-                    memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                    user_char_limit=mem_config.get("user_char_limit", 1375),
+                    memory_char_limit=mem_config.get("memory_char_limit") or 2200,
+                    user_char_limit=mem_config.get("user_char_limit") or 1375,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
