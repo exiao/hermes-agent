@@ -31,6 +31,11 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
+
+# Sentinel value used by the runtime provider system for providers that are
+# not natively known (named custom providers, third-party aggregators, etc.).
+# Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
+_RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -963,12 +968,6 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
-    # Shape-mirror (W8): do NOT synthesize a "Claude Code default" system prompt
-    # for the child.  With parent-shape snapshot attached (see below), the
-    # child's system is parent's verbatim value — any ephemeral overlay would
-    # break the byte-equal prefix that Anthropic caches on.  We keep the
-    # workspace_hint reference live (other call-sites still use it).
-    # Fallback: build the prompt for non-shape-mirror paths.
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1162,66 +1161,6 @@ def _build_child_agent(
                 parent_agent._active_children.append(child)
         else:
             parent_agent._active_children.append(child)
-
-    # ── Shape-mirror: attach parent's request snapshot to the child ──────
-    # The child's top-level API call will be built from this snapshot so the
-    # prefix (system + tools + message-prefix) byte-matches parent's, enabling
-    # Anthropic prompt-cache hits and ~10× quota reduction on Max subscriptions.
-    # See ~/.hermes/plans/hermes-patches/delegation-shape-mirror.md
-    snapshot = getattr(parent_agent, "_delegation_shape_snapshot", None)
-    # isinstance(dict) — not just truthy — because MagicMock-based tests
-    # auto-create a MagicMock attribute here that is truthy but isn't a real
-    # snapshot.  A real snapshot is always the dict returned by
-    # AIAgent.capture_delegation_snapshot().
-    if isinstance(snapshot, dict):
-        child._parent_shape_snapshot = snapshot
-        # Freeze the child's system prompt to parent's verbatim value.
-        # Without this, _build_system_prompt() would synthesize the child's
-        # own baseline (SOUL.md + child-specific additions) on the first turn.
-        child._frozen_system_prompt = snapshot.get("system")
-
-        # W13: shape-mirror compactor safety.
-        #
-        # When the child runs long and hits its compression threshold, the
-        # default compactor will (a) call _invalidate_system_prompt() +
-        # _build_system_prompt() and overwrite _cached_system_prompt, and
-        # (b) summarize the message prefix starting at protect_first_n=3.
-        # Either move breaks the byte-equal cache anchor the shape mirror
-        # spent W6-W11 setting up: turn N+1 sends a different system string
-        # or a different messages prefix, and the cache entry is evicted.
-        #
-        # We need two guards:
-        #   1. Tell the compactor the mirrored prefix is immutable head
-        #      content so summarization never touches it.  Bump
-        #      protect_first_n to cover the full prefix length + a small
-        #      margin (the +1 accounts for the user `goal` message that
-        #      gets appended on first turn).
-        #   2. Mark the child so its compactor call-site knows to reuse
-        #      _frozen_system_prompt instead of rebuilding from scratch.
-        #      The _compress_context patch in run_agent.py checks
-        #      _frozen_system_prompt and short-circuits the rebuild.
-        prefix = snapshot.get("messages_prefix") or []
-        try:
-            _prefix_len = len(prefix) if isinstance(prefix, list) else 0
-        except Exception:
-            _prefix_len = 0
-        # Keep the entire mirrored prefix + goal message out of the
-        # compactor's summarization window.  The default was 3 — bump it
-        # to whatever parent actually sent.
-        if _prefix_len > 0:
-            _compactor = getattr(child, "context_compressor", None)
-            if _compactor is not None:
-                try:
-                    _current = int(getattr(_compactor, "protect_first_n", 3))
-                except (TypeError, ValueError):
-                    _current = 3
-                # +1 for the user goal message; never shrink from default.
-                _compactor.protect_first_n = max(_current, _prefix_len + 1)
-                logger.debug(
-                    "[subagent-%d] compactor protect_first_n bumped to %d "
-                    "(mirrored prefix len=%d + 1 goal msg)",
-                    task_index, _compactor.protect_first_n, _prefix_len,
-                )
 
     # Announce the spawn immediately — the child may sit in a queue
     # for seconds if max_concurrent_children is saturated, so the TUI
@@ -1497,7 +1436,6 @@ def _run_single_child(
                 pass
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
-    _heartbeat_thread.start()
 
     # Register the live agent in the module-level registry so the TUI can
     # target it by subagent_id (kill, pause, status queries).  Unregistered
@@ -1528,6 +1466,7 @@ def _run_single_child(
         )
 
     try:
+        _heartbeat_thread.start()
         if child_progress_cb:
             try:
                 child_progress_cb("subagent.start", preview=goal)
@@ -1545,16 +1484,6 @@ def _run_single_child(
         wall_start = time.time()
         parent_reads_snapshot = (
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
-        )
-
-        # Shape-mirror: if the parent snapshotted its request shape, replay
-        # the parent's message prefix so the child's first API call hits the
-        # Anthropic prompt cache.
-        shape_snapshot = getattr(child, "_parent_shape_snapshot", None)
-        _conversation_history = (
-            shape_snapshot.get("messages_prefix") or []
-            if isinstance(shape_snapshot, dict)
-            else []
         )
 
         # Run child with a hard timeout to prevent indefinite blocking
@@ -1575,10 +1504,10 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            _run_kwargs: dict = dict(user_message=goal, task_id=child_task_id)
-            if _conversation_history:
-                _run_kwargs["conversation_history"] = _conversation_history
-            return child.run_conversation(**_run_kwargs)
+            return child.run_conversation(
+                user_message=goal,
+                task_id=child_task_id,
+            )
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
@@ -1725,7 +1654,7 @@ def _run_single_child(
                             trace_by_id[tc_id] = entry_t
                 elif msg.get("role") == "tool":
                     content = msg.get("content", "")
-                    is_error = bool(content and "error" in content[:80].lower())
+                    is_error = _looks_like_error_output(content)
                     result_meta = {
                         "result_bytes": len(content),
                         "status": "error" if is_error else "ok",
@@ -1750,49 +1679,7 @@ def _run_single_child(
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
-        _cache_read = getattr(child, "session_cache_read_tokens", 0)
-        _cache_write = getattr(child, "session_cache_write_tokens", 0)
         _model = getattr(child, "model", None)
-
-        # Coerce potentially-mock values to real numbers.  This matters for
-        # the cache-hit ratio math below, and mirrors what _run_single_child
-        # already does for input/output tokens a few lines up.
-        def _coerce_num(v):
-            return v if isinstance(v, (int, float)) else 0
-
-        _input_tokens = _coerce_num(_input_tokens)
-        _output_tokens = _coerce_num(_output_tokens)
-        _cache_read = _coerce_num(_cache_read)
-        _cache_write = _coerce_num(_cache_write)
-
-        # W12: shape-mirror telemetry.
-        # The whole point of the shape-mirror regime (W6-W11) is to make
-        # the child's first API call hit the parent's prompt cache.  Log
-        # the hit ratio so we can SEE in the gateway logs whether the
-        # cache actually hit, without having to scrape Anthropic dashboards.
-        #
-        # Denominator is (input + cache_read):  cache_read tokens are NOT
-        # counted in input_tokens by Anthropic, so total prompt size is the
-        # sum.  Cache hit ratio = cache_read / total_prompt.
-        total_prompt = _input_tokens + _cache_read
-        cache_hit_ratio = (
-            _cache_read / total_prompt if total_prompt > 0 else 0.0
-        )
-        try:
-            logger.info(
-                "[subagent-%d] 💾 cache: %d/%d tokens (%.0f%% hit, %d written) "
-                "model=%s api_calls=%d",
-                task_index,
-                int(_cache_read),
-                int(total_prompt),
-                cache_hit_ratio * 100,
-                int(_cache_write),
-                _model if isinstance(_model, str) else "?",
-                api_calls,
-            )
-        except Exception:
-            # Never let telemetry formatting crash a real delegation.
-            pass
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -1809,10 +1696,6 @@ def _run_single_child(
                 "output": (
                     _output_tokens if isinstance(_output_tokens, (int, float)) else 0
                 ),
-                # W12: cache accounting for shape-mirror health checks.
-                "cache_read": _cache_read,
-                "cache_write": _cache_write,
-                "cache_hit_ratio": round(cache_hit_ratio, 4),
             },
             "tool_trace": tool_trace,
             # Captured before the finally block calls child.close() so the
@@ -1958,9 +1841,13 @@ def _run_single_child(
 
     finally:
         # Stop the heartbeat thread so it doesn't keep touching parent activity
-        # after the child has finished (or failed).
+        # after the child has finished (or failed).  Guard the join: .start()
+        # now lives inside the try block, so if it raised (OS thread
+        # exhaustion) the thread was never started and Thread.join() would
+        # raise RuntimeError.  ident is None until start() succeeds.
         _heartbeat_stop.set()
-        _heartbeat_thread.join(timeout=5)
+        if _heartbeat_thread.ident is not None:
+            _heartbeat_thread.join(timeout=5)
 
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
@@ -2413,46 +2300,13 @@ def delegate_task(
 
     total_duration = round(time.monotonic() - overall_start, 2)
 
-    # W12: aggregate cache-hit telemetry across all child tasks.
-    # Gives the gateway operator a one-line rollup: "did the shape-mirror
-    # actually hit cache across all three children, or just one?"
-    agg_cache_read = 0
-    agg_cache_write = 0
-    agg_input = 0
-    agg_output = 0
-    for entry in results:
-        toks = entry.get("tokens") or {}
-        agg_cache_read += int(toks.get("cache_read", 0) or 0)
-        agg_cache_write += int(toks.get("cache_write", 0) or 0)
-        agg_input += int(toks.get("input", 0) or 0)
-        agg_output += int(toks.get("output", 0) or 0)
-    agg_total_prompt = agg_input + agg_cache_read
-    agg_hit_ratio = (
-        agg_cache_read / agg_total_prompt if agg_total_prompt > 0 else 0.0
-    )
-    try:
-        logger.info(
-            "[delegate] rollup: %d/%d prompt tokens cached (%.0f%% hit, "
-            "%d written) across %d task(s) in %.1fs",
-            agg_cache_read, agg_total_prompt,
-            agg_hit_ratio * 100, agg_cache_write,
-            len(results), total_duration,
-        )
-    except Exception:
-        pass
-
-    return json.dumps({
-        "results": results,
-        "total_duration_seconds": total_duration,
-        # W12: top-level cache rollup, easy for callers (and tests) to read.
-        "cache_summary": {
-            "input_tokens": agg_input,
-            "output_tokens": agg_output,
-            "cache_read_tokens": agg_cache_read,
-            "cache_write_tokens": agg_cache_write,
-            "cache_hit_ratio": round(agg_hit_ratio, 4),
+    return json.dumps(
+        {
+            "results": results,
+            "total_duration_seconds": total_duration,
         },
-    }, ensure_ascii=False)
+        ensure_ascii=False,
+    )
 
 
 def _resolve_child_credential_pool(effective_provider: Optional[str], parent_agent):
@@ -2513,6 +2367,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
+    configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
     if configured_base_url:
         # When delegation.api_key is not set, return None so _build_child_agent
@@ -2523,37 +2378,34 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         # callers to duplicate the key under delegation.api_key.
         api_key = configured_api_key  # None → inherited from parent in _build_child_agent
 
-        # W4: provider-based routing takes precedence over host inspection.
-        # Host-string matching only works for Anthropic's canonical endpoint
-        # (api.anthropic.com); it silently mis-routes local proxies / gateways
-        # that speak the Anthropic Messages protocol on a different host
-        # (e.g. claude-code-proxy on 127.0.0.1:18801 fronting a Max
-        # subscription). If the operator declares `delegation.provider`, trust
-        # it — fall back to host inspection only when unset.
-        if configured_provider:
-            provider = configured_provider
-            if provider == "anthropic":
-                api_mode = "anthropic_messages"
-            elif provider == "openai-codex":
-                api_mode = "codex_responses"
-            else:
-                api_mode = "chat_completions"
-        else:
-            base_lower = configured_base_url.lower()
+        # Use the shared URL-based api_mode detector (same path the main agent's
+        # runtime resolver uses) so Anthropic-compatible direct endpoints with a
+        # /anthropic suffix — Azure AI Foundry, MiniMax, Zhipu GLM, LiteLLM
+        # proxies — pick the right transport automatically. Without this,
+        # subagents would default to chat_completions and hit 404s on endpoints
+        # that only speak the Anthropic Messages protocol. Fixes #10213.
+        from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+        base_lower = configured_base_url.lower()
+        provider = "custom"
+        api_mode = _detect_api_mode_for_url(configured_base_url) or "chat_completions"
+        if (
+            base_url_hostname(configured_base_url) == "chatgpt.com"
+            and "/backend-api/codex" in base_lower
+        ):
+            provider = "openai-codex"
+            api_mode = "codex_responses"
+        elif base_url_hostname(configured_base_url) == "api.anthropic.com":
+            provider = "anthropic"
+            api_mode = "anthropic_messages"
+        elif "api.kimi.com/coding" in base_lower:
             provider = "custom"
-            api_mode = "chat_completions"
-            if (
-                base_url_hostname(configured_base_url) == "chatgpt.com"
-                and "/backend-api/codex" in base_lower
-            ):
-                provider = "openai-codex"
-                api_mode = "codex_responses"
-            elif base_url_hostname(configured_base_url) == "api.anthropic.com":
-                provider = "anthropic"
-                api_mode = "anthropic_messages"
-            elif "api.kimi.com/coding" in base_lower:
-                provider = "custom"
-                api_mode = "anthropic_messages"
+            api_mode = "anthropic_messages"
+
+        # Explicit delegation.api_mode in config always wins. Lets users force
+        # a transport for non-standard endpoints the URL heuristic can't detect.
+        if configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
+            api_mode = configured_api_mode
 
         return {
             "model": configured_model,
@@ -2595,7 +2447,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     return {
         "model": configured_model or runtime.get("model") or None,
-        "provider": runtime.get("provider"),
+        "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
