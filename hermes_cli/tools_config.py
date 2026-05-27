@@ -87,7 +87,7 @@ CONFIGURABLE_TOOLSETS = [
 # Video gen is off by default — it's a niche, paid, slow feature. Users
 # who want it opt in via `hermes tools` → Video Generation, which walks
 # them through provider + model selection.
-_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "rl", "spotify", "discord", "discord_admin", "video", "video_gen"}
+_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "rl", "spotify", "discord", "discord_admin", "video_gen"}
 
 # Platform-scoped toolsets: only appear in the `hermes tools` checklist for
 # these platforms, and only resolve/save for these platforms.  A toolset
