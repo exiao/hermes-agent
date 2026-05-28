@@ -8137,7 +8137,7 @@ class GatewayRunner:
                 # is referencing. History can contain the same or similar text
                 # multiple times, and without an explicit pointer the agent has to
                 # guess (or answer for both subjects). Token overhead is minimal.
-                reply_snippet = reply_to_text[:500]
+                reply_snippet = reply_to_text[:2000]
                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
             else:
                 # The quoted message had no text (e.g. image-only, voice-only).
