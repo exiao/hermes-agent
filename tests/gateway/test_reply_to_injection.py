@@ -115,9 +115,10 @@ async def test_no_prefix_without_reply_context():
 
 
 @pytest.mark.asyncio
-async def test_no_prefix_when_reply_to_text_is_empty():
-    """reply_to_message_id alone without text (e.g. a reply to a media-only
-    message) should not produce an empty `[Replying to: ""]` prefix."""
+async def test_no_text_reply_injects_generic_pointer():
+    """reply_to_message_id without text (e.g. a reply to a media-only
+    message) injects a generic no-text pointer so the agent knows the
+    message is a reply, per the always-inject behavior from #13676."""
     runner = _make_runner()
     source = _source()
     event = MessageEvent(
@@ -133,14 +134,16 @@ async def test_no_prefix_when_reply_to_text_is_empty():
         history=[],
     )
 
-    assert result == "hi"
+    assert result is not None
+    assert result.startswith("[Replying to a previous message (no text")
+    assert result.endswith("hi")
 
 
 @pytest.mark.asyncio
-async def test_reply_snippet_truncated_to_500_chars():
+async def test_reply_snippet_truncated_to_2000_chars():
     runner = _make_runner()
     source = _source()
-    long_text = "x" * 800
+    long_text = "x" * 2500
     event = MessageEvent(
         text="follow-up",
         source=source,
@@ -155,5 +158,5 @@ async def test_reply_snippet_truncated_to_500_chars():
     )
 
     assert result is not None
-    assert result.startswith('[Replying to: "' + "x" * 500 + '"]')
-    assert "x" * 501 not in result
+    assert result.startswith('[Replying to: "' + "x" * 2000 + '"]')
+    assert "x" * 2001 not in result
