@@ -772,12 +772,14 @@ def check_command_security(command: str) -> dict:
             summary = "security warning detected (details unavailable)"
 
     # Suppress warn verdicts that consist solely of a lookalike_tld finding for
-    # the .app TLD.  .app is a legitimate gTLD used by many production services
+    # a known-safe gTLD (.app, .dev).  These are legitimate Google-operated
+    # gTLDs used by many production services (e.g. *.workers.dev, *.web.app),
     # and the "can be confused with file extensions" heuristic generates false
-    # positives for normal API calls.  Any other finding (including other
-    # lookalike_tld entries for non-.app TLDs) preserves the warn action.
+    # positives for normal API calls.  Genuinely risky lookalike TLDs that
+    # collide with real filenames (.zip, .mov) are NOT suppressed here, so any
+    # such finding still preserves the warn action.
     if action == "warn" and findings:
-        non_suppressible = [f for f in findings if not _is_app_tld_finding(f)]
+        non_suppressible = [f for f in findings if not _is_safe_lookalike_tld_finding(f)]
         if not non_suppressible:
             action = "allow"
             findings = []
@@ -786,8 +788,16 @@ def check_command_security(command: str) -> dict:
     return {"action": action, "findings": findings, "summary": summary}
 
 
-def _is_app_tld_finding(finding: dict) -> bool:
-    """Return True if this finding is a lookalike_tld warning for the .app TLD only.
+# gTLDs that Tirith's lookalike_tld heuristic flags but which are legitimate,
+# Google-operated, HTTPS-only registries in wide production use. Suppressing
+# their warnings removes false positives without weakening protection against
+# filename-collision TLDs (.zip, .mov) used in real phishing.
+_SAFE_LOOKALIKE_TLDS = (".app", ".dev")
+
+
+def _is_safe_lookalike_tld_finding(finding: dict) -> bool:
+    """Return True if this finding is a lookalike_tld warning for a known-safe
+    gTLD (see ``_SAFE_LOOKALIKE_TLDS``).
 
     Checks the rule_id and inspects common value/detail field names that
     Tirith may use to carry the TLD string.
@@ -798,6 +808,14 @@ def _is_app_tld_finding(finding: dict) -> bool:
         return False
     for field in ("value", "tld", "detail", "description", "message"):
         val = finding.get(field)
-        if val is not None and ".app" in str(val).lower():
+        if val is None:
+            continue
+        low = str(val).lower()
+        if any(tld in low for tld in _SAFE_LOOKALIKE_TLDS):
             return True
     return False
+
+
+# Backwards-compatible alias. Earlier releases exposed this helper under a
+# .app-specific name; keep it importable so third-party callers/tests don't break.
+_is_app_tld_finding = _is_safe_lookalike_tld_finding

@@ -1285,6 +1285,32 @@ class TestAppTldSuppression:
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
+    def test_dev_lookalike_tld_suppressed(self, mock_cfg, mock_run):
+        """lookalike_tld for the .dev TLD is suppressed (Google gTLD, e.g.
+        *.workers.dev). Mirrors the .app suppression."""
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld", "value": ".dev",
+                     "message": "Domain uses '.dev' TLD"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".dev TLD warning"))
+        result = check_command_security(
+            "curl https://bloom-mcp-proxy.getbloom.workers.dev/")
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_mov_lookalike_tld_preserved(self, mock_cfg, mock_run):
+        """.mov collides with real filenames and stays flagged."""
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld", "value": ".mov",
+                     "message": "TLD .mov can be confused with video files"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".mov TLD warning"))
+        result = check_command_security("curl https://payload.mov")
+        assert result["action"] == "warn"
+        assert len(result["findings"]) == 1
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
     def test_block_verdict_never_suppressed(self, mock_cfg, mock_run):
         """block exit code is never downgraded, even if finding looks like .app."""
         mock_cfg.return_value = _CFG
@@ -1307,15 +1333,27 @@ class TestAppTldSuppression:
         assert result["action"] == "allow"
 
 
-class TestIsAppTldFinding:
-    """Unit tests for the _is_app_tld_finding helper."""
+class TestIsSafeLookalikeTldFinding:
+    """Unit tests for the _is_safe_lookalike_tld_finding helper."""
 
     def setup_method(self):
-        from tools.tirith_security import _is_app_tld_finding
-        self.fn = _is_app_tld_finding
+        from tools.tirith_security import _is_safe_lookalike_tld_finding
+        self.fn = _is_safe_lookalike_tld_finding
+
+    def test_backcompat_alias_importable(self):
+        from tools.tirith_security import (
+            _is_app_tld_finding, _is_safe_lookalike_tld_finding)
+        assert _is_app_tld_finding is _is_safe_lookalike_tld_finding
 
     def test_matching_value_field(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".app"})
+
+    def test_matching_dev_tld(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": ".dev"})
+
+    def test_matching_dev_message_field(self):
+        assert self.fn({"rule_id": "lookalike_tld",
+                        "message": "Domain uses '.dev' TLD"})
 
     def test_matching_tld_field(self):
         assert self.fn({"rule_id": "lookalike_tld", "tld": ".app"})
@@ -1331,8 +1369,11 @@ class TestIsAppTldFinding:
     def test_wrong_rule_id(self):
         assert not self.fn({"rule_id": "shortened_url", "value": ".app"})
 
-    def test_non_app_tld(self):
+    def test_zip_tld_not_safe(self):
         assert not self.fn({"rule_id": "lookalike_tld", "value": ".zip"})
+
+    def test_mov_tld_not_safe(self):
+        assert not self.fn({"rule_id": "lookalike_tld", "value": ".mov"})
 
     def test_no_tld_value_fields(self):
         assert not self.fn({"rule_id": "lookalike_tld", "severity": "low"})
@@ -1342,3 +1383,6 @@ class TestIsAppTldFinding:
 
     def test_case_insensitive_match(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".APP"})
+
+    def test_case_insensitive_dev_match(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": ".DEV"})
