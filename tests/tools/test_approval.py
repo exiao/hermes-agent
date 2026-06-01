@@ -671,6 +671,25 @@ class TestGatewayProtection:
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is False
 
+    def test_pkill_metro_with_trailing_gateway_word_not_flagged(self):
+        """A self-process word in an UNRELATED later subcommand must not trip
+        the guard. The pkill clause targets metro; 'gateway' only appears in a
+        separate echo after ';'."""
+        cmd = "(kill 10037 2>/dev/null; pkill -f metro); echo restart gateway done"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_pkill_metro_then_cd_gateway_ui_not_flagged(self):
+        cmd = "pkill -f expo; cd gateway-ui && npm start"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_pkill_hyphenated_api_gateway_not_flagged(self):
+        """Hyphenated dev-server name api-gateway is not the self process."""
+        cmd = 'pkill -f "node.*api-gateway"'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
 
 class TestNormalizationBypass:
     """Obfuscation techniques must not bypass dangerous command detection."""
@@ -822,6 +841,18 @@ class TestPgrepKillExpansion:
     def test_safe_kill_pid_not_flagged(self):
         """A plain 'kill 12345' (literal PID, no expansion) must stay safe."""
         cmd = "kill 12345"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_kill_pgrep_unrelated_target_not_flagged(self):
+        """kill $(pgrep -f metro) targets a dev server, not the agent's own
+        process — a normal dev action that must not be flagged."""
+        cmd = "kill $(pgrep -f metro)"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_kill_pgrep_hyphenated_api_gateway_not_flagged(self):
+        cmd = 'kill $(pgrep -f "node.*api-gateway")'
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
 
