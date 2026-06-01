@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -794,13 +795,27 @@ def check_command_security(command: str) -> dict:
 # filename-collision TLDs (.zip, .mov) used in real phishing.
 _SAFE_LOOKALIKE_TLDS = (".app", ".dev")
 
+# Match a safe gTLD only as a complete TLD token, never as a substring of a
+# longer label. Without the trailing boundary, a substring check would let a
+# genuinely risky domain like ``example.dev.zip`` or ``app-download.mov`` slip
+# through suppression (the safe TLD appears mid-string). The negative
+# lookahead forbids the TLD being followed by another DNS-label character
+# (alphanumerics, hyphen, underscore) or a further dotted label, so only a
+# real terminal ``.app`` / ``.dev`` matches.
+_SAFE_TLD_RE = re.compile(
+    r"(?:" + "|".join(re.escape(tld) for tld in _SAFE_LOOKALIKE_TLDS) + r")"
+    r"(?![A-Za-z0-9_-])(?!\.\w)"
+)
+
 
 def _is_safe_lookalike_tld_finding(finding: dict) -> bool:
     """Return True if this finding is a lookalike_tld warning for a known-safe
     gTLD (see ``_SAFE_LOOKALIKE_TLDS``).
 
     Checks the rule_id and inspects common value/detail field names that
-    Tirith may use to carry the TLD string.
+    Tirith may use to carry the TLD string. The safe TLD must appear as a
+    distinct terminal TLD token; substrings like ``example.dev.zip`` (where
+    ``.zip`` is the real, unsafe TLD) are not suppressed.
     """
     if not isinstance(finding, dict):
         return False
@@ -810,8 +825,7 @@ def _is_safe_lookalike_tld_finding(finding: dict) -> bool:
         val = finding.get(field)
         if val is None:
             continue
-        low = str(val).lower()
-        if any(tld in low for tld in _SAFE_LOOKALIKE_TLDS):
+        if _SAFE_TLD_RE.search(str(val).lower()):
             return True
     return False
 

@@ -1386,3 +1386,23 @@ class TestIsSafeLookalikeTldFinding:
 
     def test_case_insensitive_dev_match(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".DEV"})
+
+    def test_unsafe_tld_with_safe_substring_not_suppressed(self):
+        """A real .zip/.mov finding must not be suppressed just because a safe
+        TLD appears earlier in the string as a subdomain/label."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "example.dev.zip"})
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "app-download.mov"})
+        assert not self.fn({"rule_id": "lookalike_tld",
+                            "message": "Domain my.app.zip uses '.zip' TLD"})
+
+    def test_safe_tld_as_subdomain_label_not_matched(self):
+        """`.dev`/`.app` as a non-terminal label does not count as safe."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "foo.dev.example.zip"})
+
+    def test_safe_tld_with_trailing_path_or_punctuation(self):
+        """A genuine safe TLD still matches when followed by a slash, quote,
+        or end-of-string."""
+        assert self.fn({"rule_id": "lookalike_tld", "value": "getbloom.workers.dev"})
+        assert self.fn({"rule_id": "lookalike_tld",
+                        "message": "Domain uses '.dev' TLD"})
+        assert self.fn({"rule_id": "lookalike_tld", "value": "https://x.app/"})
