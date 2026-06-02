@@ -2954,7 +2954,45 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
     # config.yaml (auxiliary.<task>.provider) still win over this.
     main_provider = str(runtime_provider or _read_main_provider() or "")
     main_model = str(runtime_model or _read_main_model() or "")
-    if (main_provider and main_model
+
+    # Provider/model source-mismatch guard.
+    # main_provider and main_model are resolved independently, so they can come
+    # from different sources: a live runtime can supply the provider while the
+    # model falls back to the config.yaml default. When that happens the pair
+    # may be incompatible — observed in cron workers where runtime_provider was
+    # "openai-codex" but runtime_model was empty, so main_model became the
+    # config default "claude-opus-4-8" and got sent to the ChatGPT/Codex
+    # endpoint (HTTP 400 "model not supported when using Codex").
+    #
+    # If the provider is from the runtime but the model is NOT, don't trust the
+    # config-default model with that runtime provider. Prefer the provider's own
+    # registered aux default; if it has none (OAuth providers like openai-codex
+    # return ""), SKIP Step-1 entirely and fall through to the Step-2 chain.
+    # We must skip rather than pass an empty model, because
+    # resolve_provider_client() re-reads _read_main_model() for an empty model —
+    # which would re-introduce the very config default we are trying to avoid.
+    skip_step1 = False
+    if runtime_provider and not runtime_model and main_model:
+        _provider_default = _get_aux_model_for_provider(runtime_provider)
+        if _provider_default:
+            logger.info(
+                "Auxiliary auto-detect: runtime provider %s has no runtime "
+                "model; using its registered default %r instead of the "
+                "config-default %r to avoid a provider/model mismatch",
+                runtime_provider, _provider_default, main_model,
+            )
+            main_model = _provider_default
+        else:
+            logger.info(
+                "Auxiliary auto-detect: runtime provider %s supplied no model "
+                "and has no registered aux default; skipping Step-1 to avoid "
+                "pairing it with the config-default model %r (falling through "
+                "to the provider chain)",
+                runtime_provider, main_model,
+            )
+            skip_step1 = True
+
+    if (not skip_step1 and main_provider and main_model
             and main_provider not in {"auto", ""}):
         resolved_provider = main_provider
         explicit_base_url = None

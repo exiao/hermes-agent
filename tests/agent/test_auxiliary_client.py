@@ -3389,3 +3389,94 @@ class TestAuxUnhealthyCache:
             )
             # After the 402, OpenRouter is in the unhealthy cache.
             assert _is_provider_unhealthy("openrouter") is True
+
+
+class TestResolveAutoProviderModelSourceMismatch:
+    """Step-1 guard: don't pair a runtime provider with a config-default model.
+
+    Regression for the cron-worker compression bug. A cron session running on
+    ``openai-codex`` initialized its context compressor with an empty model, so
+    at compress time ``runtime_provider`` was "openai-codex" but
+    ``runtime_model`` was empty. Step-1 then filled ``main_model`` from the
+    config default ("claude-opus-4-8") and shipped it to the ChatGPT/Codex
+    endpoint, which 400'd ("model not supported when using Codex"). When the
+    provider comes from the runtime but the model does NOT, the resolver must
+    drop the config-default model and use the provider's own default instead.
+    """
+
+    def test_runtime_provider_without_runtime_model_drops_config_default(self):
+        from agent.auxiliary_client import _resolve_auto
+
+        codex_client = MagicMock()
+        captured = {}
+
+        def _fake_resolve(provider, model, **kwargs):
+            captured["provider"] = provider
+            captured["model"] = model
+            return codex_client, model
+
+        with patch("agent.auxiliary_client._read_main_provider", return_value=""), \
+             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
+             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value="gpt-5.5"), \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=_fake_resolve):
+            client, model = _resolve_auto(main_runtime={"provider": "openai-codex", "model": ""})
+
+        # The poisoned config-default model must NOT reach the Codex endpoint.
+        assert captured["model"] != "claude-opus-4-8"
+        assert captured["model"] == "gpt-5.5"
+        assert captured["provider"] == "openai-codex"
+        assert client is codex_client
+
+    def test_runtime_provider_with_runtime_model_is_trusted(self):
+        """When the runtime supplies BOTH provider and model, leave them be."""
+        from agent.auxiliary_client import _resolve_auto
+
+        codex_client = MagicMock()
+        captured = {}
+
+        def _fake_resolve(provider, model, **kwargs):
+            captured["provider"] = provider
+            captured["model"] = model
+            return codex_client, model
+
+        with patch("agent.auxiliary_client._read_main_provider", return_value=""), \
+             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
+             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value="gpt-5.5") as aux_default, \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=_fake_resolve):
+            client, model = _resolve_auto(
+                main_runtime={"provider": "openai-codex", "model": "gpt-5.5-codex"}
+            )
+
+        # Runtime model is honored; provider-default lookup is not consulted.
+        assert captured["model"] == "gpt-5.5-codex"
+        aux_default.assert_not_called()
+        assert client is codex_client
+
+    def test_codex_without_default_skips_step1_not_poisons_model(self):
+        """The real cron case: openai-codex has NO registered aux default
+        (``_get_aux_model_for_provider`` returns ""). The guard must SKIP
+        Step-1 and fall through to the Step-2 chain — NOT call
+        resolve_provider_client with an empty model (which would re-read the
+        config default and ship claude to Codex again).
+        """
+        from agent.auxiliary_client import _resolve_auto
+
+        step2_client = MagicMock()
+
+        with patch("agent.auxiliary_client._read_main_provider", return_value=""), \
+             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
+             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""), \
+             patch("agent.auxiliary_client.resolve_provider_client") as step1, \
+             patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_nous", return_value=(step2_client, "nous-model")), \
+             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
+             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+            client, model = _resolve_auto(
+                main_runtime={"provider": "openai-codex", "model": ""}
+            )
+
+        # Step-1 must be skipped entirely — the poisoned model never goes out.
+        step1.assert_not_called()
+        # Fell through to the Step-2 provider chain.
+        assert client is step2_client
+        assert model == "nous-model"
