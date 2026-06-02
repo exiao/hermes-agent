@@ -325,15 +325,30 @@ def run_conversation(
             _agent_base_url = getattr(agent, "base_url", "") or ""
             _agent_api_key = getattr(agent, "api_key", "") or ""
             _agent_api_mode = getattr(agent, "api_mode", "") or ""
-            if (getattr(_compressor, "model", "") != _agent_model
-                    or getattr(_compressor, "provider", "") != _agent_provider):
-                from agent.model_metadata import get_model_context_length
-                _ctx_len = get_model_context_length(
-                    _agent_model,
-                    base_url=_agent_base_url,
-                    api_key=_agent_api_key,
-                    provider=_agent_provider,
-                ) or getattr(_compressor, "context_length", 0)
+            _model_changed = getattr(_compressor, "model", "") != _agent_model
+            # Re-sync when ANY backend field drifts, not just model/provider:
+            # base_url/api_key/api_mode change on failover, credential
+            # rotation, or custom-endpoint adjustment, and a stale compressor
+            # would otherwise compress against the wrong endpoint or with a
+            # revoked key (401/connection errors).
+            if (_model_changed
+                    or getattr(_compressor, "provider", "") != _agent_provider
+                    or getattr(_compressor, "base_url", "") != _agent_base_url
+                    or getattr(_compressor, "api_key", "") != _agent_api_key
+                    or getattr(_compressor, "api_mode", "") != _agent_api_mode):
+                # Only re-probe context length when the MODEL changed; for a
+                # pure credential/endpoint swap the window is unchanged, so
+                # reuse the current value and avoid a needless probe.
+                if _model_changed:
+                    from agent.model_metadata import get_model_context_length
+                    _ctx_len = get_model_context_length(
+                        _agent_model,
+                        base_url=_agent_base_url,
+                        api_key=_agent_api_key,
+                        provider=_agent_provider,
+                    ) or getattr(_compressor, "context_length", 0)
+                else:
+                    _ctx_len = getattr(_compressor, "context_length", 0)
                 _compressor.update_model(
                     _agent_model,
                     _ctx_len,

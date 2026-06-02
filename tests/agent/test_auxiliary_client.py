@@ -3451,3 +3451,32 @@ class TestResolveAutoProviderModelSourceMismatch:
         assert captured["model"] == "gpt-5.5-codex"
         aux_default.assert_not_called()
         assert client is codex_client
+
+    def test_codex_without_default_skips_step1_not_poisons_model(self):
+        """The real cron case: openai-codex has NO registered aux default
+        (``_get_aux_model_for_provider`` returns ""). The guard must SKIP
+        Step-1 and fall through to the Step-2 chain — NOT call
+        resolve_provider_client with an empty model (which would re-read the
+        config default and ship claude to Codex again).
+        """
+        from agent.auxiliary_client import _resolve_auto
+
+        step2_client = MagicMock()
+
+        with patch("agent.auxiliary_client._read_main_provider", return_value=""), \
+             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
+             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""), \
+             patch("agent.auxiliary_client.resolve_provider_client") as step1, \
+             patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_nous", return_value=(step2_client, "nous-model")), \
+             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
+             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+            client, model = _resolve_auto(
+                main_runtime={"provider": "openai-codex", "model": ""}
+            )
+
+        # Step-1 must be skipped entirely — the poisoned model never goes out.
+        step1.assert_not_called()
+        # Fell through to the Step-2 provider chain.
+        assert client is step2_client
+        assert model == "nous-model"
