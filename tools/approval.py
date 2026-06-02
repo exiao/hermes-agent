@@ -385,24 +385,29 @@ DANGEROUS_PATTERNS = [
     (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     # Self-termination protection: prevent agent from killing its own process.
-    # Scope the match to the SAME pkill/killall clause ([^;&|<>]* stops at a
-    # command separator AND at redirection operators) so an unrelated later
-    # subcommand mentioning "gateway" (e.g. `pkill -f metro; echo restart
-    # gateway`) or a redirect to a log path (`pkill -f metro > /tmp/gateway.log`)
-    # is not flagged. The process marker is matched via _SELF_PROC_TOKEN so
-    # hyphenated dev-server names like `api-gateway` / `gateway-ui` do not trip
-    # it, while the agent's own `hermes-gateway*` service still does.
-    (r'\b(pkill|killall)\b[^;&|<>]*' + _SELF_PROC_TOKEN, "kill hermes/gateway process (self-termination)"),
+    # Scope the match to the SAME pkill/killall clause: `[^;&|]*` stops at a
+    # command separator (`;`/`&`/`|`) so an unrelated later subcommand
+    # mentioning "gateway" (e.g. `pkill -f metro; echo restart gateway`) is not
+    # flagged. Redirections (`> /tmp/gateway.log`) are neutralized BEFORE this
+    # pattern runs (see _REDIRECT_TOKEN_RE in detect_dangerous_command), so a
+    # redirect to a log path with a self keyword is not a false positive, while
+    # a real target after a leading redirect (`kill 2>/dev/null $(pgrep -f
+    # hermes)`) is still caught. The process marker is matched via
+    # _SELF_PROC_TOKEN so hyphenated dev-server names like `api-gateway` /
+    # `gateway-ui` do not trip it, while the agent's own `hermes-gateway*`
+    # service still does.
+    (r'\b(pkill|killall)\b[^;&|]*' + _SELF_PROC_TOKEN, "kill hermes/gateway process (self-termination)"),
     # Self-termination via kill + command substitution (pgrep/pidof).
     # The name-based pattern above catches `pkill hermes` but not
     # `kill -9 $(pgrep -f hermes)` because the substitution is opaque
     # to regex at detection time. Catch the structural pattern instead, but
     # only when the pgrep target is the agent's own process — killing an
     # unrelated process by pgrep (e.g. `kill $(pgrep -f metro)`) is a normal
-    # dev action and must not be flagged. `<`/`>` are excluded so a redirect to
-    # a log path containing a self-process keyword is not a false positive.
-    (r'\bkill\b[^;&|<>]*\$\(\s*pgrep\b[^)]*' + _SELF_PROC_TOKEN, "kill process via pgrep expansion (self-termination)"),
-    (r'\bkill\b[^;&|<>]*`\s*pgrep\b[^`]*' + _SELF_PROC_TOKEN, "kill process via backtick pgrep expansion (self-termination)"),
+    # dev action and must not be flagged. Redirections are neutralized before
+    # matching (see _REDIRECT_TOKEN_RE) so a redirect to a log path containing
+    # a self keyword is not a false positive.
+    (r'\bkill\b[^;&|]*\$\(\s*pgrep\b[^)]*' + _SELF_PROC_TOKEN, "kill process via pgrep expansion (self-termination)"),
+    (r'\bkill\b[^;&|]*`\s*pgrep\b[^`]*' + _SELF_PROC_TOKEN, "kill process via backtick pgrep expansion (self-termination)"),
     # File copy/move/edit into sensitive system paths (/etc/ and macOS
     # /private/etc/ mirror).
     (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),
@@ -509,6 +514,27 @@ def _normalize_command_for_detection(command: str) -> str:
     return command
 
 
+# Redirection token: an optional leading fd number, a redirect operator
+# (`>`, `>>`, `<`, `&>`, `&>>`), optional whitespace, then the target word.
+# Used to NEUTRALIZE redirections before self-termination matching: a redirect
+# target is not a kill target, so `pkill -f metro > /tmp/gateway.log` must not
+# match on the "gateway" in the log path, while `kill 2>/dev/null $(pgrep -f
+# hermes)` (redirect BEFORE the real target) must still match. Stripping the
+# whole redirect token (operator + path) handles both orderings; clause
+# separators (;&|) are deliberately left intact so the scan still stops at a
+# new command.  Applied ONLY to the self-termination patterns — other guards
+# (raw block-device writes `> /dev/sda`, heredoc/process-substitution exec)
+# legitimately key off `>`/`<` and must see them unmodified.
+_REDIRECT_TOKEN_RE = re.compile(r'\s*\d*(?:&>>?|>>?|<)\s*[^\s;&|<>]+')
+
+# Descriptions of the self-termination patterns that need redirect-stripping.
+_SELF_TERM_DESCRIPTIONS = frozenset({
+    "kill hermes/gateway process (self-termination)",
+    "kill process via pgrep expansion (self-termination)",
+    "kill process via backtick pgrep expansion (self-termination)",
+})
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
@@ -516,8 +542,14 @@ def detect_dangerous_command(command: str) -> tuple:
         (is_dangerous, pattern_key, description) or (False, None, None)
     """
     command_lower = _normalize_command_for_detection(command).lower()
+    # A redirect-stripped view used ONLY for the self-termination patterns, so a
+    # redirect target containing a self-process keyword (`> /tmp/gateway.log`)
+    # is not a false positive while a real target after a leading redirect
+    # (`kill 2>/dev/null $(pgrep -f hermes)`) is still caught.
+    command_no_redir = _REDIRECT_TOKEN_RE.sub(' ', command_lower)
     for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
-        if pattern_re.search(command_lower):
+        target = command_no_redir if description in _SELF_TERM_DESCRIPTIONS else command_lower
+        if pattern_re.search(target):
             pattern_key = description
             return (True, pattern_key, description)
     return (False, None, None)

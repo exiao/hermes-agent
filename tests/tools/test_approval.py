@@ -713,6 +713,23 @@ class TestGatewayProtection:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, cmd
 
+    def test_self_kill_with_leading_redirect_still_flagged(self):
+        """A redirect placed BEFORE the real kill target (valid bash) must not
+        let a genuine self-termination slip through. Regression: excluding
+        `<`/`>` from the clause scan stopped matching at the first redirect
+        operator, so `kill 2>/dev/null $(pgrep -f hermes-gateway)` — which
+        really kills the gateway — was no longer flagged."""
+        for cmd in (
+            "kill 2>/dev/null $(pgrep -f hermes-gateway)",
+            "kill > /tmp/hermes.log $(pgrep -f hermes-gateway)",
+            "pkill > /tmp/x.log -f hermes-gateway",
+            "kill -9 $(pgrep -f hermes-gateway) 2>/dev/null",
+            "pkill -f hermes-gateway >> /tmp/x.log",
+            "pkill -f hermes-gateway &> /tmp/x.log",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
 
 class TestNormalizationBypass:
     """Obfuscation techniques must not bypass dangerous command detection."""
