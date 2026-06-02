@@ -246,13 +246,27 @@ def _parse_claude_version(model: str) -> Optional[Tuple[int, int]]:
     return None
 
 
+def _substring_fallback_match(model: str, substrings) -> bool:
+    """Fallback capability check for model names the version parser can't read.
+
+    Only consulted when ``_parse_claude_version`` returns None (non-Claude /
+    digit-less names). Gated on ``"claude"`` being present so a version-like
+    token in an unrelated name (e.g. ``gpt-4-7b``, ``qwen3-4-7``) is not a
+    false positive: those route to other providers and must not inherit the
+    Claude server-managed contract.
+    """
+    if "claude" not in model.lower():
+        return False
+    return any(v in model for v in substrings)
+
+
 def _supports_adaptive_thinking(model: str) -> bool:
     """Return True for Claude 4.6+ models that support adaptive thinking."""
     version = _parse_claude_version(model)
     if version is not None:
         major, minor = version
         return (major == 4 and minor >= 6) or major >= 5
-    return any(v in model for v in _ADAPTIVE_THINKING_SUBSTRINGS)
+    return _substring_fallback_match(model, _ADAPTIVE_THINKING_SUBSTRINGS)
 
 
 def _supports_xhigh_effort(model: str) -> bool:
@@ -267,7 +281,7 @@ def _supports_xhigh_effort(model: str) -> bool:
     if version is not None:
         major, minor = version
         return (major == 4 and minor >= 7) or major >= 5
-    return any(v in model for v in _XHIGH_EFFORT_SUBSTRINGS)
+    return _substring_fallback_match(model, _XHIGH_EFFORT_SUBSTRINGS)
 
 
 def _forbids_sampling_params(model: str) -> bool:
@@ -281,7 +295,7 @@ def _forbids_sampling_params(model: str) -> bool:
     if version is not None:
         major, minor = version
         return (major == 4 and minor >= 7) or major >= 5
-    return any(v in model for v in _NO_SAMPLING_PARAMS_SUBSTRINGS)
+    return _substring_fallback_match(model, _NO_SAMPLING_PARAMS_SUBSTRINGS)
 
 
 def _supports_fast_mode(model: str) -> bool:

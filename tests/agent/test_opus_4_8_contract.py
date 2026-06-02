@@ -110,6 +110,15 @@ class TestParseClaudeVersion:
         from agent.anthropic_adapter import _parse_claude_version
         assert _parse_claude_version(model) is None
 
+    @pytest.mark.parametrize("model", ["gpt-4-7b", "qwen3-4-7", "some-4-8-model"])
+    def test_non_claude_version_token_is_not_a_false_positive(self, model: str) -> None:
+        """A version-like token (4-7/4-8) inside a non-Claude name must NOT
+        inherit the Claude server-managed contract. The parser returns None and
+        the substring fallback is gated on 'claude' being present."""
+        assert _forbids_sampling_params(model) is False
+        assert _supports_xhigh_effort(model) is False
+        assert _supports_adaptive_thinking(model) is False
+
 
 class TestFutureModelContractInferred:
     """A future Claude family (4.9, 5.0) inherits the 4.7+ contract from its
