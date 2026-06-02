@@ -3170,6 +3170,14 @@ def run_conversation(
             _normalize_kwargs = {}
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
+                # Main conversation loop tools are all global-registry tools, so
+                # enable the registry-guarded strip regardless of the OAuth flag.
+                # The mcp_ prefix can arrive via the local billing proxy or on
+                # paths where _is_anthropic_oauth drifts to False; without this
+                # every prefixed builtin call falls through to the fuzzy fallback
+                # repairer (silent wrong-tool-routing risk). Call-scoped paths
+                # (MCP sampling) do NOT set this, keeping conservative behavior.
+                _normalize_kwargs["registry_strip"] = True
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason

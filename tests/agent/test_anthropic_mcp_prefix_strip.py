@@ -101,18 +101,61 @@ class TestAnthropicMcpPrefixStrip:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "mcp_composio_COMPOSIO_SEARCH_TOOLS"
 
-    def test_no_strip_when_flag_false(self):
-        """When strip_tool_prefix=False, names are never modified."""
+    def test_registry_strip_fires_when_flag_false(self):
+        """registry_strip=True strips a registry-safe prefix even when the OAuth
+        flag is False.
+
+        Regression for the bakeoff bug: on the main conversation loop the prefix
+        arrives via the local billing proxy / paths where _is_anthropic_oauth is
+        False. registry_strip (set by the main loop) must still strip, otherwise
+        every call falls through to the fuzzy fallback repairer.
+        """
         transport = self._get_transport()
         block = _make_tool_use_block("mcp_read_file")
         response = _make_response(block)
 
         registry = _FakeRegistry({"read_file"})
         with patch("tools.registry.registry", registry):
-            result = transport.normalize_response(response, strip_tool_prefix=False)
+            result = transport.normalize_response(
+                response, strip_tool_prefix=False, registry_strip=True
+            )
+
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "read_file"
+
+    def test_no_strip_when_both_flags_false(self):
+        """Call-scoped paths (MCP sampling) pass neither flag set / registry_strip
+        off: a prefixed name is NOT rewritten, so a sampling server's tool is
+        never silently remapped to a same-named global tool."""
+        transport = self._get_transport()
+        block = _make_tool_use_block("mcp_read_file")
+        response = _make_response(block)
+
+        # Global registry has 'read_file', but this is a call-scoped sampling
+        # tool literally named 'mcp_read_file'; it must be left untouched.
+        registry = _FakeRegistry({"read_file"})
+        with patch("tools.registry.registry", registry):
+            result = transport.normalize_response(
+                response, strip_tool_prefix=False, registry_strip=False
+            )
 
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "mcp_read_file"
+
+    def test_native_mcp_preserved_with_registry_strip(self):
+        """Native MCP server tools are preserved even with registry_strip=True."""
+        transport = self._get_transport()
+        block = _make_tool_use_block("mcp_composio_SEARCH")
+        response = _make_response(block)
+
+        registry = _FakeRegistry({"mcp_composio_SEARCH", "read_file"})
+        with patch("tools.registry.registry", registry):
+            result = transport.normalize_response(
+                response, strip_tool_prefix=False, registry_strip=True
+            )
+
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "mcp_composio_SEARCH"
 
     def test_no_strip_when_not_mcp_prefixed(self):
         """Non-mcp_ names are untouched regardless of strip flag."""
