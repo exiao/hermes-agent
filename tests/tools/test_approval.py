@@ -730,6 +730,56 @@ class TestGatewayProtection:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is True, cmd
 
+    def test_self_kill_with_fd_dup_redirect_still_flagged(self):
+        """An fd-dup redirect (`2>&1`) before the real target must not stop the
+        clause scan at its trailing `&`. Regression: `2>&1` left the `&` in the
+        scan view, which the clause regex `[^;&|]*` treated as a separator, so
+        the pgrep/hermes-gateway target after it was never reached."""
+        for cmd in (
+            "kill 2>&1 $(pgrep -f hermes-gateway)",
+            "pkill 2>&1 -f hermes-gateway",
+            "kill -9 $(pgrep -f hermes-gateway) 2>&-",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
+    def test_pkill_quoted_alternation_self_target_flagged(self):
+        """A `|` inside a quoted pkill pattern is part of pkill's regex argument,
+        not a shell pipeline, so `pkill -f "api-gateway|hermes-gateway"` really
+        kills the gateway and must be flagged. Regression: the clause scan
+        `[^;&|]*` stopped at the quoted `|`."""
+        for cmd in (
+            'pkill -f "api-gateway|hermes-gateway"',
+            "pkill -f 'metro|hermes'",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
+    def test_bare_hermes_lookalike_processes_not_flagged(self):
+        """Unrelated process names that merely start with `hermes` (no hyphen
+        boundary) must not be treated as the self process. Regression: the
+        `hermes(?:-...)?` alternative had no trailing boundary, so `hermesd`,
+        `hermes_backend`, `hermes2` matched."""
+        for cmd in (
+            "pkill -f hermesd",
+            "pkill -f hermes_backend",
+            "pkill -f hermes2",
+            "kill $(pgrep -f hermesd)",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
+
+    def test_regex_obfuscated_pgrep_self_target_flagged(self):
+        """pgrep -f treats its argument as a regex, so a single-char class like
+        `h[e]rmes` still matches the hermes process. Collapsing `[x]` -> `x` on
+        the self-term scan view catches this obfuscation."""
+        for cmd in (
+            "kill $(pgrep -f 'h[e]rmes-gatewa[y]')",
+            "kill $(pgrep -f 'hermes-gatewa[y]')",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
 
 class TestNormalizationBypass:
     """Obfuscation techniques must not bypass dangerous command detection."""

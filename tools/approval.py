@@ -170,7 +170,7 @@ _COMMAND_TAIL = r'(?:\s*(?:&&|\|\||;).*)?$'
 # This keeps `hermes-gateway*` (the agent's own service) flagged as
 # self-termination while still ignoring hyphenated dev-server names.
 _SELF_PROC_TOKEN = (
-    r'(?:(?<![\w-])hermes(?:-[\w.-]*)?|(?<![\w-])gateway(?![\w-])|cli\.py)'
+    r'(?:(?<![\w-])hermes(?:-[\w.-]*)?(?![\w])|(?<![\w-])gateway(?![\w-])|cli\.py)'
 )
 
 # =========================================================================
@@ -525,7 +525,23 @@ def _normalize_command_for_detection(command: str) -> str:
 # new command.  Applied ONLY to the self-termination patterns — other guards
 # (raw block-device writes `> /dev/sda`, heredoc/process-substitution exec)
 # legitimately key off `>`/`<` and must see them unmodified.
-_REDIRECT_TOKEN_RE = re.compile(r'\s*\d*(?:&>>?|>>?|<)\s*[^\s;&|<>]+')
+_REDIRECT_TOKEN_RE = re.compile(
+    r'\s*\d*(?:'
+    # fd-dup (`2>&1`, `>&2`, `2>&-`, `2<&0`): operator + `&` + optional fd/`-`.
+    # Stripped wholesale so the trailing `&` is not mistaken for a clause sep
+    # (`kill 2>&1 $(pgrep -f hermes)` must still reach the pgrep target).
+    r'[<>]&\d*-?'
+    # redirect-to-target (`> /tmp/gateway.log`, `2>>x`, `&>x`): operator + path.
+    r'|(?:&>>?|>>?|<)\s*[^\s;&|<>]+'
+    r')'
+)
+
+# Single-character regex character classes used to obfuscate a pgrep target,
+# e.g. `pgrep -f 'h[e]rmes-gatewa[y]'`. pgrep -f treats its argument as a regex,
+# so `h[e]rmes` still matches the `hermes` process. Collapse `[x]` -> `x` (but
+# not negated classes `[^x]`) on the self-termination scan view so obfuscated
+# self-targets are still detected. Applied ONLY to the self-term scan.
+_SINGLE_CHAR_CLASS_RE = re.compile(r'\[([^\]^])\]')
 
 # Descriptions of the self-termination patterns that need redirect-stripping.
 _SELF_TERM_DESCRIPTIONS = frozenset({
@@ -535,6 +551,32 @@ _SELF_TERM_DESCRIPTIONS = frozenset({
 })
 
 
+def _build_self_term_scan_view(command_lower: str) -> str:
+    """Build the command view used ONLY for self-termination pattern matching.
+
+    Three transforms, in order:
+      1. Strip redirect tokens (`> /tmp/gateway.log`, fd-dups like `2>&1`) so a
+         redirect target with a self keyword is not a false positive, while a
+         real kill target after a leading redirect is still reached.
+      2. Neutralize clause separators (`;`, `&`, `|`) that appear INSIDE quotes:
+         in `pkill -f "api-gateway|hermes-gateway"` the `|` is part of pkill's
+         regex argument, not a shell pipeline, so it must not end the clause.
+      3. Collapse single-char regex classes (`h[e]rmes` -> `hermes`): pgrep -f
+         treats its argument as a regex, so `[e]` is an obfuscated `e`.
+    """
+    view = _REDIRECT_TOKEN_RE.sub(' ', command_lower)
+
+    # Neutralize `;&|` inside single- or double-quoted spans (replace with space).
+    def _scrub_quoted(m: re.Match) -> str:
+        return m.group(0).translate({ord(';'): ' ', ord('&'): ' ', ord('|'): ' '})
+
+    view = re.sub(r'"[^"]*"|\'[^\']*\'', _scrub_quoted, view)
+
+    # Collapse `[x]` -> `x` (positive single-char classes only).
+    view = _SINGLE_CHAR_CLASS_RE.sub(r'\1', view)
+    return view
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
@@ -542,13 +584,13 @@ def detect_dangerous_command(command: str) -> tuple:
         (is_dangerous, pattern_key, description) or (False, None, None)
     """
     command_lower = _normalize_command_for_detection(command).lower()
-    # A redirect-stripped view used ONLY for the self-termination patterns, so a
-    # redirect target containing a self-process keyword (`> /tmp/gateway.log`)
-    # is not a false positive while a real target after a leading redirect
-    # (`kill 2>/dev/null $(pgrep -f hermes)`) is still caught.
-    command_no_redir = _REDIRECT_TOKEN_RE.sub(' ', command_lower)
+    # A scan view used ONLY for the self-termination patterns (redirect-stripped,
+    # in-quote separators neutralized, single-char regex classes collapsed) so
+    # obfuscated/redirected self-kills are still caught while redirect targets
+    # with a self keyword are not false positives.
+    self_term_view = _build_self_term_scan_view(command_lower)
     for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
-        target = command_no_redir if description in _SELF_TERM_DESCRIPTIONS else command_lower
+        target = self_term_view if description in _SELF_TERM_DESCRIPTIONS else command_lower
         if pattern_re.search(target):
             pattern_key = description
             return (True, pattern_key, description)
