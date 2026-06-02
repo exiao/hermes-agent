@@ -87,11 +87,23 @@ class AnthropicTransport(ProviderTransport):
         from agent.anthropic_adapter import _to_plain_data
         from agent.transports.types import ToolCall
 
-        # Accepted for backward compatibility with callers that still pass it,
-        # but no longer required: the mcp_ strip below is registry-driven, not
-        # flag-gated (see the tool_use branch for why).
-        _ = kwargs.get("strip_tool_prefix", False)
+        # strip_tool_prefix: the OAuth/Claude-Code flag. When set, strip the
+        #   injected mcp_ prefix for tools the registry recognizes.
+        # registry_strip: opt-in for the MAIN conversation loop, where every tool
+        #   is a global-registry tool. It performs the same registry-guarded strip
+        #   regardless of the OAuth flag, because the prefix can also arrive via
+        #   the local billing proxy or on non-anthropic_messages paths where the
+        #   flag drifts to False — leaving every call to fall through to the fuzzy
+        #   fallback repairer (a silent wrong-tool-routing risk). It is OFF by
+        #   default so call-scoped paths (MCP sampling via auxiliary_client, which
+        #   forward tools by name that may not be in the global registry) keep the
+        #   conservative flag-gated behavior and never rewrite a sampling server's
+        #   tool to a same-named global tool.
+        strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
+        registry_strip = kwargs.get("registry_strip", False)
         _MCP_PREFIX = "mcp_"
+
+        from tools.registry import registry as _tool_registry
 
         text_parts = []
         reasoning_parts = []
@@ -108,29 +120,18 @@ class AnthropicTransport(ProviderTransport):
                     reasoning_details.append(block_dict)
             elif block.type == "tool_use":
                 name = block.name
-                # Strip a single leading ``mcp_`` whenever the registry proves
+                # Strip a single leading ``mcp_`` only when the registry proves
                 # it is safe: the stripped name resolves AND the prefixed name
-                # does not. This is the real guard — the OAuth/Claude-Code path
-                # (and the local billing proxy) prefix builtin tool names with
-                # ``mcp_`` on the way out, and they must be stripped back on the
-                # way in. We do NOT gate this on ``strip_tool_prefix`` /
-                # ``_is_anthropic_oauth`` because that flag drifts across
-                # re-inits, token refreshes, subagent threads, and non-
-                # anthropic_messages request paths (e.g. chat_completions via a
-                # local proxy). When the flag was False but the prefix still
-                # arrived, every tool call fell through to the fuzzy fallback
-                # repairer (difflib cutoff 0.7) — a silent wrong-tool-routing
-                # risk. The registry check below already encodes the only safe
-                # condition, so the flag is unnecessary.
-                #
-                # Native MCP server tools (from mcp_servers: in config.yaml) are
-                # registered under their FULL mcp_<server>_<tool> name, so
-                # get_entry(name) is truthy and they are correctly NOT stripped.
-                # Genuine hallucinations (neither name resolves) are kept as-is
-                # and still reach the fuzzy fallback. GH-25255.
-                if name.startswith(_MCP_PREFIX):
+                # does not. The OAuth/Claude-Code path (and the local billing
+                # proxy) prefix builtin tool names with ``mcp_`` on the way out
+                # and they must be stripped back on the way in. Native MCP server
+                # tools (mcp_servers: in config.yaml) are registered under their
+                # FULL mcp_<server>_<tool> name, so get_entry(name) is truthy and
+                # they are correctly NOT stripped. Genuine hallucinations (neither
+                # name resolves) are kept as-is and still reach the fuzzy
+                # fallback. GH-25255.
+                if (strip_tool_prefix or registry_strip) and name.startswith(_MCP_PREFIX):
                     stripped = name[len(_MCP_PREFIX):]
-                    from tools.registry import registry as _tool_registry
                     if (_tool_registry.get_entry(stripped)
                             and not _tool_registry.get_entry(name)):
                         name = stripped
