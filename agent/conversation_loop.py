@@ -308,6 +308,43 @@ def run_conversation(
     except Exception:
         pass
 
+    # Keep the context compressor's runtime in sync with the agent's RESOLVED
+    # model/provider. The compressor is built once at agent init, sometimes
+    # before the live model/provider are known (e.g. cron workers where it
+    # initialized with model="" provider=none). At compress time it passes its
+    # own model/provider as main_runtime; if those are stale/blank the auxiliary
+    # resolver pairs the wrong model with the wrong provider (observed: the
+    # config default `claude-opus-4-8` sent to a Codex/ChatGPT endpoint -> 400
+    # "model not supported when using Codex"). Re-sync every turn (idempotent)
+    # so compression always targets the same backend the agent is using.
+    try:
+        _compressor = getattr(agent, "context_compressor", None)
+        _agent_model = getattr(agent, "model", "") or ""
+        if _compressor is not None and _agent_model and hasattr(_compressor, "update_model"):
+            _agent_provider = getattr(agent, "provider", "") or ""
+            _agent_base_url = getattr(agent, "base_url", "") or ""
+            _agent_api_key = getattr(agent, "api_key", "") or ""
+            _agent_api_mode = getattr(agent, "api_mode", "") or ""
+            if (getattr(_compressor, "model", "") != _agent_model
+                    or getattr(_compressor, "provider", "") != _agent_provider):
+                from agent.model_metadata import get_model_context_length
+                _ctx_len = get_model_context_length(
+                    _agent_model,
+                    base_url=_agent_base_url,
+                    api_key=_agent_api_key,
+                    provider=_agent_provider,
+                ) or getattr(_compressor, "context_length", 0)
+                _compressor.update_model(
+                    _agent_model,
+                    _ctx_len,
+                    base_url=_agent_base_url,
+                    api_key=_agent_api_key,
+                    provider=_agent_provider,
+                    api_mode=_agent_api_mode,
+                )
+    except Exception:
+        logger.debug("Could not sync compressor runtime to agent model", exc_info=True)
+
     # Tag all log records on this thread with the session ID so
     # ``hermes logs --session <id>`` can filter a single conversation.
     from hermes_logging import set_session_context

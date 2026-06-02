@@ -2948,6 +2948,28 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
     # config.yaml (auxiliary.<task>.provider) still win over this.
     main_provider = str(runtime_provider or _read_main_provider() or "")
     main_model = str(runtime_model or _read_main_model() or "")
+
+    # Provider/model source-mismatch guard.
+    # main_provider and main_model are resolved independently, so they can come
+    # from different sources: a live runtime can supply the provider while the
+    # model falls back to the config.yaml default. When that happens the pair
+    # may be incompatible — observed in cron workers where runtime_provider was
+    # "openai-codex" but runtime_model was empty, so main_model became the
+    # config default "claude-opus-4-8" and got sent to the ChatGPT/Codex
+    # endpoint (HTTP 400 "model not supported when using Codex"). If the
+    # provider is from the runtime but the model is NOT, don't trust the
+    # config-default model with that runtime provider: drop it so the
+    # provider's own default aux model is used instead.
+    if runtime_provider and not runtime_model and main_model:
+        _provider_default = _get_aux_model_for_provider(runtime_provider)
+        logger.info(
+            "Auxiliary auto-detect: runtime provider %s has no runtime model; "
+            "ignoring config-default model %r to avoid a provider/model mismatch "
+            "(using provider default %r)",
+            runtime_provider, main_model, _provider_default or "<provider default>",
+        )
+        main_model = _provider_default or ""
+
     if (main_provider and main_model
             and main_provider not in {"auto", ""}):
         resolved_provider = main_provider
