@@ -2373,6 +2373,12 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
         "unrecognized request argument",
         "unrecognized parameter",
         "invalid parameter",
+        # Anthropic Opus 4.7+ phrases a removed parameter as a deprecation
+        # rather than "unsupported": "`temperature` is deprecated for this
+        # model." Treat that as the same retry-without-the-param condition.
+        "is deprecated",
+        "deprecated for this model",
+        "no longer supported",
     ))
 
 

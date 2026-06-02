@@ -43,6 +43,10 @@ class TestIsUnsupportedParameterError:
         # arbitrary future params
         ("seed", "HTTP 400: unrecognized parameter: seed"),
         ("top_p", "Error: top_p is not supported for this model"),
+        # Anthropic Opus 4.7+ deprecation phrasing (the exact wire message)
+        ("temperature", "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': '`temperature` is deprecated for this model.'}}"),
+        ("temperature", "temperature is deprecated for this model"),
+        ("max_tokens", "max_tokens is no longer supported"),
     ])
     def test_matches_real_provider_messages(self, param, message):
         assert _is_unsupported_parameter_error(RuntimeError(message), param) is True
