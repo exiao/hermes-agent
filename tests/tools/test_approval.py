@@ -690,6 +690,29 @@ class TestGatewayProtection:
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
 
+    def test_pkill_hermes_gateway_service_detected(self):
+        """The agent's own service IS named hermes-gateway (and profile units
+        like hermes-gateway-default). Killing it must still be flagged even
+        though it is hyphenated."""
+        for cmd in (
+            "pkill -f hermes-gateway",
+            "pkill -f hermes-gateway-default",
+            'kill $(pgrep -f "hermes-gateway")',
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
+    def test_pkill_metro_redirect_to_gateway_logfile_not_flagged(self):
+        """A redirect target containing a self-process keyword must not trip
+        the guard — the killed process is metro, not the gateway."""
+        for cmd in (
+            "pkill -f metro > /tmp/gateway.log",
+            "pkill -f metro 2> /tmp/hermes.log",
+            "kill $(pgrep -f metro) > /var/log/hermes-gateway.log",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
+
 
 class TestNormalizationBypass:
     """Obfuscation techniques must not bypass dangerous command detection."""

@@ -159,12 +159,19 @@ _SENSITIVE_WRITE_TARGET = (
 _PROJECT_SENSITIVE_WRITE_TARGET = rf'(?:{_PROJECT_ENV_PATH}|{_PROJECT_CONFIG_PATH})'
 _COMMAND_TAIL = r'(?:\s*(?:&&|\|\||;).*)?$'
 
-# Self-process markers used by the self-termination guards. Matched as a
-# standalone token: the preceding boundary forbids a leading word-char or
-# hyphen so hyphenated dev-server names (api-gateway, gateway-ui) do not match,
-# and the trailing boundary forbids a following word-char or hyphen so
-# `gatewayd`, `hermesctl`, etc. do not match. `cli.py` is matched literally.
-_SELF_PROC_TOKEN = r'(?<![\w-])(?:hermes|gateway|cli\.py)(?![\w-])'
+# Self-process markers used by the self-termination guards. Three alternatives:
+#   1. `hermes` with an optional hyphenated suffix — matches `hermes`,
+#      `hermes-gateway`, and profile units like `hermes-gateway-default`. The
+#      leading boundary `(?<![\w-])` keeps `myhermes` / `x-hermes` from matching.
+#   2. standalone `gateway` — the boundaries forbid a leading or trailing
+#      word-char/hyphen so unrelated names (`api-gateway`, `gateway-ui`,
+#      `gatewayd`) do not match, but a bare `gateway` process does.
+#   3. `cli.py`, matched literally.
+# This keeps `hermes-gateway*` (the agent's own service) flagged as
+# self-termination while still ignoring hyphenated dev-server names.
+_SELF_PROC_TOKEN = (
+    r'(?:(?<![\w-])hermes(?:-[\w.-]*)?|(?<![\w-])gateway(?![\w-])|cli\.py)'
+)
 
 # =========================================================================
 # Hardline (unconditional) blocklist
@@ -378,21 +385,24 @@ DANGEROUS_PATTERNS = [
     (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     # Self-termination protection: prevent agent from killing its own process.
-    # Scope the match to the SAME pkill/killall clause ([^;&|]* stops at a
-    # command separator) so an unrelated later subcommand mentioning "gateway"
-    # (e.g. `pkill -f metro; echo restart gateway`) is not flagged. The process
-    # marker is matched as a standalone token via _SELF_PROC_TOKEN so hyphenated
-    # dev-server names like `api-gateway` / `gateway-ui` do not trip it.
-    (r'\b(pkill|killall)\b[^;&|]*' + _SELF_PROC_TOKEN, "kill hermes/gateway process (self-termination)"),
+    # Scope the match to the SAME pkill/killall clause ([^;&|<>]* stops at a
+    # command separator AND at redirection operators) so an unrelated later
+    # subcommand mentioning "gateway" (e.g. `pkill -f metro; echo restart
+    # gateway`) or a redirect to a log path (`pkill -f metro > /tmp/gateway.log`)
+    # is not flagged. The process marker is matched via _SELF_PROC_TOKEN so
+    # hyphenated dev-server names like `api-gateway` / `gateway-ui` do not trip
+    # it, while the agent's own `hermes-gateway*` service still does.
+    (r'\b(pkill|killall)\b[^;&|<>]*' + _SELF_PROC_TOKEN, "kill hermes/gateway process (self-termination)"),
     # Self-termination via kill + command substitution (pgrep/pidof).
     # The name-based pattern above catches `pkill hermes` but not
     # `kill -9 $(pgrep -f hermes)` because the substitution is opaque
     # to regex at detection time. Catch the structural pattern instead, but
     # only when the pgrep target is the agent's own process — killing an
     # unrelated process by pgrep (e.g. `kill $(pgrep -f metro)`) is a normal
-    # dev action and must not be flagged.
-    (r'\bkill\b[^;&|]*\$\(\s*pgrep\b[^)]*' + _SELF_PROC_TOKEN, "kill process via pgrep expansion (self-termination)"),
-    (r'\bkill\b[^;&|]*`\s*pgrep\b[^`]*' + _SELF_PROC_TOKEN, "kill process via backtick pgrep expansion (self-termination)"),
+    # dev action and must not be flagged. `<`/`>` are excluded so a redirect to
+    # a log path containing a self-process keyword is not a false positive.
+    (r'\bkill\b[^;&|<>]*\$\(\s*pgrep\b[^)]*' + _SELF_PROC_TOKEN, "kill process via pgrep expansion (self-termination)"),
+    (r'\bkill\b[^;&|<>]*`\s*pgrep\b[^`]*' + _SELF_PROC_TOKEN, "kill process via backtick pgrep expansion (self-termination)"),
     # File copy/move/edit into sensitive system paths (/etc/ and macOS
     # /private/etc/ mirror).
     (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),
