@@ -87,7 +87,10 @@ class AnthropicTransport(ProviderTransport):
         from agent.anthropic_adapter import _to_plain_data
         from agent.transports.types import ToolCall
 
-        strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
+        # Accepted for backward compatibility with callers that still pass it,
+        # but no longer required: the mcp_ strip below is registry-driven, not
+        # flag-gated (see the tool_use branch for why).
+        _ = kwargs.get("strip_tool_prefix", False)
         _MCP_PREFIX = "mcp_"
 
         text_parts = []
@@ -105,14 +108,28 @@ class AnthropicTransport(ProviderTransport):
                     reasoning_details.append(block_dict)
             elif block.type == "tool_use":
                 name = block.name
-                if strip_tool_prefix and name.startswith(_MCP_PREFIX):
+                # Strip a single leading ``mcp_`` whenever the registry proves
+                # it is safe: the stripped name resolves AND the prefixed name
+                # does not. This is the real guard — the OAuth/Claude-Code path
+                # (and the local billing proxy) prefix builtin tool names with
+                # ``mcp_`` on the way out, and they must be stripped back on the
+                # way in. We do NOT gate this on ``strip_tool_prefix`` /
+                # ``_is_anthropic_oauth`` because that flag drifts across
+                # re-inits, token refreshes, subagent threads, and non-
+                # anthropic_messages request paths (e.g. chat_completions via a
+                # local proxy). When the flag was False but the prefix still
+                # arrived, every tool call fell through to the fuzzy fallback
+                # repairer (difflib cutoff 0.7) — a silent wrong-tool-routing
+                # risk. The registry check below already encodes the only safe
+                # condition, so the flag is unnecessary.
+                #
+                # Native MCP server tools (from mcp_servers: in config.yaml) are
+                # registered under their FULL mcp_<server>_<tool> name, so
+                # get_entry(name) is truthy and they are correctly NOT stripped.
+                # Genuine hallucinations (neither name resolves) are kept as-is
+                # and still reach the fuzzy fallback. GH-25255.
+                if name.startswith(_MCP_PREFIX):
                     stripped = name[len(_MCP_PREFIX):]
-                    # Only strip the mcp_ prefix for OAuth-injected tools
-                    # (where Hermes adds the prefix when sending to Anthropic
-                    # and must remove it on the way back).  Native MCP server
-                    # tools (from mcp_servers: in config.yaml) are registered
-                    # in the tool registry under their FULL mcp_<server>_<tool>
-                    # name and must NOT be stripped.  GH-25255.
                     from tools.registry import registry as _tool_registry
                     if (_tool_registry.get_entry(stripped)
                             and not _tool_registry.get_entry(name)):

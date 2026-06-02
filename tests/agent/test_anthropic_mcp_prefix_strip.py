@@ -101,8 +101,15 @@ class TestAnthropicMcpPrefixStrip:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "mcp_composio_COMPOSIO_SEARCH_TOOLS"
 
-    def test_no_strip_when_flag_false(self):
-        """When strip_tool_prefix=False, names are never modified."""
+    def test_strips_registry_safe_prefix_regardless_of_flag(self):
+        """The registry-safe strip fires even when strip_tool_prefix=False.
+
+        Regression for the bakeoff bug: the prefix arrives on responses through
+        non-anthropic_messages paths (e.g. chat_completions via a local proxy)
+        where _is_anthropic_oauth / strip_tool_prefix is False. The strip must
+        still happen because the registry proves it is safe; otherwise every
+        call falls through to the fuzzy fallback repairer.
+        """
         transport = self._get_transport()
         block = _make_tool_use_block("mcp_read_file")
         response = _make_response(block)
@@ -112,7 +119,20 @@ class TestAnthropicMcpPrefixStrip:
             result = transport.normalize_response(response, strip_tool_prefix=False)
 
         assert len(result.tool_calls) == 1
-        assert result.tool_calls[0].name == "mcp_read_file"
+        assert result.tool_calls[0].name == "read_file"
+
+    def test_native_mcp_preserved_regardless_of_flag(self):
+        """Native MCP server tools are preserved even with strip_tool_prefix=False."""
+        transport = self._get_transport()
+        block = _make_tool_use_block("mcp_composio_SEARCH")
+        response = _make_response(block)
+
+        registry = _FakeRegistry({"mcp_composio_SEARCH", "read_file"})
+        with patch("tools.registry.registry", registry):
+            result = transport.normalize_response(response, strip_tool_prefix=False)
+
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "mcp_composio_SEARCH"
 
     def test_no_strip_when_not_mcp_prefixed(self):
         """Non-mcp_ names are untouched regardless of strip flag."""
