@@ -75,18 +75,21 @@ ADAPTIVE_EFFORT_MAP = {
 
 # Models that accept the "xhigh" output_config.effort level.  Opus 4.7 added
 # xhigh as a distinct level between high and max; older adaptive-thinking
-# models (4.6) reject it with a 400.  Keep this substring list in sync with
-# the Anthropic migration guide as new model families ship.
-_XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7")
+# models (4.6) reject it with a 400.  Primary detection is numeric (see
+# _parse_claude_version + _supports_xhigh_effort); this list is the FALLBACK
+# for names the parser can't read (third-party Anthropic-compatible models).
+_XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8")
 
 # Models where extended thinking is deprecated/removed (4.6+ behavior: adaptive
 # is the only supported mode; 4.7 additionally forbids manual thinking entirely
-# and drops temperature/top_p/top_k).
-_ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7")
+# and drops temperature/top_p/top_k).  FALLBACK list — see _parse_claude_version.
+_ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7", "4-8", "4.8")
 
 # Models where temperature/top_p/top_k return 400 if set to non-default values.
-# This is the Opus 4.7 contract; future 4.x+ models are expected to follow it.
-_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7")
+# This is the Opus 4.7 contract; 4.8 and later follow it.  Primary detection is
+# numeric; this list is the FALLBACK for unparseable names — see
+# _parse_claude_version + _forbids_sampling_params.
+_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8")
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 
 # ── Max output token limits per Anthropic model ───────────────────────
@@ -94,6 +97,8 @@ _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 # max_tokens as a mandatory field.  Previously we hardcoded 16384, which
 # starves thinking-enabled models (thinking tokens count toward the limit).
 _ANTHROPIC_OUTPUT_LIMITS = {
+    # Claude 4.8
+    "claude-opus-4-8":   128_000,
     # Claude 4.7
     "claude-opus-4-7":   128_000,
     # Claude 4.6
@@ -205,9 +210,63 @@ def _resolve_anthropic_messages_max_tokens(
     )
 
 
+def _parse_claude_version(model: str) -> Optional[Tuple[int, int]]:
+    """Extract ``(major, minor)`` from a Claude model name, or None.
+
+    Numeric version parsing future-proofs the capability checks below: when a
+    new family ships (4.9, 5.0, ...) the contract is inferred from the version
+    number instead of requiring a manual substring-list edit (the omission of
+    which is exactly what broke 4.8 and motivated this change).
+
+    Handles the dotted (``claude-opus-4.8``) and dashed (``claude-opus-4-8``)
+    forms, an optional family segment (opus/sonnet/haiku), provider prefixes
+    (``anthropic/``, ``anthropic.``), and date-stamped suffixes
+    (``claude-opus-4-8-20250715``). The minor component is capped at two digits
+    with a trailing-digit guard so an 8-digit date stamp on a minor-less name
+    (``claude-sonnet-4-20250514``) parses as ``(4, 0)`` rather than mistaking
+    the date for the minor version. Returns None for non-Claude / unparseable
+    names (e.g. ``minimax``, ``qwen3``), so callers fall back to the substring
+    lists for third-party Anthropic-compatible models.
+    """
+    import re
+
+    m = model.lower().replace(".", "-")
+    if "claude" not in m:
+        return None
+    # claude-<family?>-<major>-<minor>  (family optional: opus/sonnet/haiku/...).
+    # minor is 1-2 digits with a no-trailing-digit guard so a date stamp
+    # (e.g. ...-4-20250514) is NOT read as the minor version.
+    match = re.search(r"claude-(?:[a-z]+-)?(\d+)-(\d{1,2})(?!\d)", m)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    # Single-component fallback: claude-3-opus, claude-opus-4 -> minor 0.
+    match = re.search(r"claude-(?:[a-z]+-)?(\d+)", m)
+    if match:
+        return int(match.group(1)), 0
+    return None
+
+
+def _substring_fallback_match(model: str, substrings) -> bool:
+    """Fallback capability check for model names the version parser can't read.
+
+    Only consulted when ``_parse_claude_version`` returns None (non-Claude /
+    digit-less names). Gated on ``"claude"`` being present so a version-like
+    token in an unrelated name (e.g. ``gpt-4-7b``, ``qwen3-4-7``) is not a
+    false positive: those route to other providers and must not inherit the
+    Claude server-managed contract.
+    """
+    if "claude" not in model.lower():
+        return False
+    return any(v in model for v in substrings)
+
+
 def _supports_adaptive_thinking(model: str) -> bool:
     """Return True for Claude 4.6+ models that support adaptive thinking."""
-    return any(v in model for v in _ADAPTIVE_THINKING_SUBSTRINGS)
+    version = _parse_claude_version(model)
+    if version is not None:
+        major, minor = version
+        return (major == 4 and minor >= 6) or major >= 5
+    return _substring_fallback_match(model, _ADAPTIVE_THINKING_SUBSTRINGS)
 
 
 def _supports_xhigh_effort(model: str) -> bool:
@@ -218,7 +277,11 @@ def _supports_xhigh_effort(model: str) -> bool:
     and reject xhigh with an HTTP 400. Callers should downgrade xhigh→max
     when this returns False.
     """
-    return any(v in model for v in _XHIGH_EFFORT_SUBSTRINGS)
+    version = _parse_claude_version(model)
+    if version is not None:
+        major, minor = version
+        return (major == 4 and minor >= 7) or major >= 5
+    return _substring_fallback_match(model, _XHIGH_EFFORT_SUBSTRINGS)
 
 
 def _forbids_sampling_params(model: str) -> bool:
@@ -228,7 +291,11 @@ def _forbids_sampling_params(model: str) -> bool:
     expected to follow suit.  Callers should omit these fields entirely rather
     than passing zero/default values (the API rejects anything non-null).
     """
-    return any(v in model for v in _NO_SAMPLING_PARAMS_SUBSTRINGS)
+    version = _parse_claude_version(model)
+    if version is not None:
+        major, minor = version
+        return (major == 4 and minor >= 7) or major >= 5
+    return _substring_fallback_match(model, _NO_SAMPLING_PARAMS_SUBSTRINGS)
 
 
 def _supports_fast_mode(model: str) -> bool:
