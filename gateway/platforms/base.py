@@ -2802,6 +2802,48 @@ class BasePlatformAdapter(ABC):
 
 
     @staticmethod
+    def _span_is_only_real_media_tag(span_text: str) -> bool:
+        """Return True if a protected span's content is ONLY a single
+        ``MEDIA:<path>`` tag pointing at a file that actually exists under the
+        media allowlist.
+
+        Existence + allowlist gate for the #35695 code/inline/blockquote
+        masking: a *documentation example* tag (``MEDIA:/path/to/file.png``)
+        does not resolve to a real file, so it stays masked and is never
+        delivered. But when the agent wraps a tag it deliberately produced via
+        ``send_file`` (which points at an existing cache artifact) in inline
+        code or a fenced block — a natural thing to do while explaining the
+        reply — that real tag must NOT be masked away, or the attachment is
+        silently dropped (user-reported recurring bug, 2026-06-03).
+
+        ``validate_media_delivery_path`` enforces the credential/system
+        denylist, so a backticked ``MEDIA:/etc/passwd`` returns None here and
+        stays masked.
+        """
+        # Strip code fences / backticks / blockquote markers / whitespace so we
+        # can test whether the *only* meaningful content is one MEDIA tag.
+        inner = span_text.strip().strip("`").strip()
+        if inner.startswith("```"):
+            inner = inner[3:]
+        if inner.endswith("```"):
+            inner = inner[:-3]
+        inner = inner.lstrip("> ").strip()
+        # First non-blank line only; a multi-line block with prose is still an
+        # example and must remain masked.
+        lines = [ln for ln in inner.splitlines() if ln.strip()]
+        if len(lines) != 1:
+            return False
+        line = lines[0].strip().strip("`").strip()
+        m = re.match(r'^MEDIA:\s*(?P<path>\S.*?)\s*$', line, re.IGNORECASE)
+        if not m:
+            return False
+        path = m.group("path").strip().strip("`\"'").rstrip(",.;:)}]")
+        try:
+            return validate_media_delivery_path(os.path.expanduser(path)) is not None
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    @staticmethod
     def _mask_protected_spans(content: str) -> str:
         """Replace content inside fenced code blocks, inline code spans,
         and blockquotes with spaces to prevent MEDIA: false positives.
@@ -2809,6 +2851,9 @@ class BasePlatformAdapter(ABC):
         Preserves character count so regex match offsets stay valid.
         Skips masking backtick-quoted paths in MEDIA: tags (e.g.
         ``MEDIA:`/path/to/file.png` ``) to avoid breaking path extraction.
+        Also skips a code/inline/blockquote span whose only content is a real
+        ``MEDIA:<path>`` tag for an existing allowlisted file, so an agent
+        wrapping a deliberately-sent file in backticks doesn't lose it.
         """
         chars = list(content)
         n = len(chars)
@@ -2818,6 +2863,8 @@ class BasePlatformAdapter(ABC):
 
         # Fenced code blocks: ```...```
         for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
+            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
+                continue  # real send_file artifact wrapped in a fence — deliver it
             spans.append((m.start(), m.end()))
 
         # Inline code: `...` but NOT backtick-quoted paths in MEDIA: tags
@@ -2827,10 +2874,14 @@ class BasePlatformAdapter(ABC):
             prefix = content[max(0, start - 20):start]
             if re.search(r'MEDIA:\s*$', prefix):
                 continue  # This is a MEDIA path quote, not inline code
+            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
+                continue  # whole real MEDIA tag wrapped in inline code — deliver it
             spans.append((start, m.end()))
 
         # Blockquote lines: > at line start
         for m in re.finditer(r'^>.*$', content, re.MULTILINE):
+            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
+                continue
             spans.append((m.start(), m.end()))
 
         # Apply masking

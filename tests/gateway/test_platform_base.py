@@ -458,6 +458,93 @@ class TestExtractMedia:
         assert [p for p, _ in media] == ["/r/a.png"]
         assert "`MEDIA:/ex/b.png`" in cleaned
 
+    # --- Existence-gated unmasking: a REAL send_file artifact wrapped in
+    # inline code / a fenced block / a blockquote must still be delivered.
+    # Regression for the recurring "I echoed the MEDIA tag in backticks and the
+    # attachment silently vanished" bug (2026-06-03). A documentation EXAMPLE
+    # tag (nonexistent path) must stay masked — #35695 behavior is preserved.
+
+    def _patch_safe_root(self, monkeypatch, root):
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (root,),
+        )
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        monkeypatch.delenv("HERMES_MEDIA_ALLOW_DIRS", raising=False)
+
+    def test_real_media_in_inline_code_is_delivered(self, tmp_path, monkeypatch):
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"Here is the shot: `MEDIA:{f}`\nLet me know."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(f)]
+        assert "MEDIA:" not in cleaned  # delivered tag stripped from visible text
+
+    def test_real_media_in_fenced_block_is_delivered(self, tmp_path, monkeypatch):
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"Run:\n```\nMEDIA:{f}\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(f)]
+
+    def test_real_media_in_blockquote_is_delivered(self, tmp_path, monkeypatch):
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"> MEDIA:{f}"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(f)]
+
+    def test_example_media_in_inline_code_stays_masked(self, tmp_path, monkeypatch):
+        """A nonexistent example path wrapped in inline code must NOT be
+        delivered even with the existence gate (#35695 preserved)."""
+        root = tmp_path / "cache"
+        root.mkdir()
+        self._patch_safe_root(monkeypatch, root)
+
+        content = "Use `MEDIA:/path/to/example.png` in your reply."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert "MEDIA:" in cleaned  # preserved as text
+
+    def test_example_media_in_fenced_block_with_prose_stays_masked(
+        self, tmp_path, monkeypatch
+    ):
+        """A fenced block containing prose plus an example tag is still an
+        example region and must stay masked even if the path happened to
+        exist — the span is not 'only' a MEDIA tag."""
+        root = tmp_path / "cache"
+        f = root / "real.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"Example:\n```text\nsee below\nMEDIA:{f}\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
+    def test_denylisted_path_in_inline_code_stays_masked(self, tmp_path, monkeypatch):
+        """A backticked MEDIA: tag pointing at a credential/system path must
+        never be unmasked — validate_media_delivery_path returns None."""
+        root = tmp_path / "cache"
+        root.mkdir()
+        self._patch_safe_root(monkeypatch, root)
+
+        content = "See `MEDIA:/etc/passwd`"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
 
 class TestMediaInsideSerializedJson:
     """Regression coverage for #34375 — MEDIA: embedded in serialized JSON
