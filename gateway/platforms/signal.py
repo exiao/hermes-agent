@@ -431,10 +431,10 @@ class SignalAdapter(BasePlatformAdapter):
                         f"{self.http_url}/api/v1/check", timeout=10.0
                     )
                     if resp.status_code == 200:
-                        # Daemon is alive but SSE is idle — update activity to
-                        # avoid repeated warnings (connection may just be quiet)
-                        self._last_sse_activity = time.time()
-                        logger.debug("Signal: daemon healthy, SSE idle")
+                        # Daemon is alive but SSE is stale — a healthy HTTP endpoint
+                        # does NOT mean the SSE stream is still open. Force reconnect.
+                        logger.warning("Signal: daemon healthy but SSE idle for %.0fs, forcing reconnect", elapsed)
+                        self._force_reconnect()
                     else:
                         logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)
                         self._force_reconnect()
