@@ -721,6 +721,115 @@ class TestGatewayProtection:
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is False
 
+    def test_pkill_metro_with_trailing_gateway_word_not_flagged(self):
+        """A self-process word in an UNRELATED later subcommand must not trip
+        the guard. The pkill clause targets metro; 'gateway' only appears in a
+        separate echo after ';'."""
+        cmd = "(kill 10037 2>/dev/null; pkill -f metro); echo restart gateway done"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_pkill_metro_then_cd_gateway_ui_not_flagged(self):
+        cmd = "pkill -f expo; cd gateway-ui && npm start"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_pkill_hyphenated_api_gateway_not_flagged(self):
+        """Hyphenated dev-server name api-gateway is not the self process."""
+        cmd = 'pkill -f "node.*api-gateway"'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_pkill_hermes_gateway_service_detected(self):
+        """The agent's own service IS named hermes-gateway (and profile units
+        like hermes-gateway-default). Killing it must still be flagged even
+        though it is hyphenated."""
+        for cmd in (
+            "pkill -f hermes-gateway",
+            "pkill -f hermes-gateway-default",
+            'kill $(pgrep -f "hermes-gateway")',
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
+    def test_pkill_metro_redirect_to_gateway_logfile_not_flagged(self):
+        """A redirect target containing a self-process keyword must not trip
+        the guard — the killed process is metro, not the gateway."""
+        for cmd in (
+            "pkill -f metro > /tmp/gateway.log",
+            "pkill -f metro 2> /tmp/hermes.log",
+            "kill $(pgrep -f metro) > /var/log/hermes-gateway.log",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
+
+    def test_self_kill_with_leading_redirect_still_flagged(self):
+        """A redirect placed BEFORE the real kill target (valid bash) must not
+        let a genuine self-termination slip through. Regression: excluding
+        `<`/`>` from the clause scan stopped matching at the first redirect
+        operator, so `kill 2>/dev/null $(pgrep -f hermes-gateway)` — which
+        really kills the gateway — was no longer flagged."""
+        for cmd in (
+            "kill 2>/dev/null $(pgrep -f hermes-gateway)",
+            "kill > /tmp/hermes.log $(pgrep -f hermes-gateway)",
+            "pkill > /tmp/x.log -f hermes-gateway",
+            "kill -9 $(pgrep -f hermes-gateway) 2>/dev/null",
+            "pkill -f hermes-gateway >> /tmp/x.log",
+            "pkill -f hermes-gateway &> /tmp/x.log",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
+    def test_self_kill_with_fd_dup_redirect_still_flagged(self):
+        """An fd-dup redirect (`2>&1`) before the real target must not stop the
+        clause scan at its trailing `&`. Regression: `2>&1` left the `&` in the
+        scan view, which the clause regex `[^;&|]*` treated as a separator, so
+        the pgrep/hermes-gateway target after it was never reached."""
+        for cmd in (
+            "kill 2>&1 $(pgrep -f hermes-gateway)",
+            "pkill 2>&1 -f hermes-gateway",
+            "kill -9 $(pgrep -f hermes-gateway) 2>&-",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
+    def test_pkill_quoted_alternation_self_target_flagged(self):
+        """A `|` inside a quoted pkill pattern is part of pkill's regex argument,
+        not a shell pipeline, so `pkill -f "api-gateway|hermes-gateway"` really
+        kills the gateway and must be flagged. Regression: the clause scan
+        `[^;&|]*` stopped at the quoted `|`."""
+        for cmd in (
+            'pkill -f "api-gateway|hermes-gateway"',
+            "pkill -f 'metro|hermes'",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
+    def test_bare_hermes_lookalike_processes_not_flagged(self):
+        """Unrelated process names that merely start with `hermes` (no hyphen
+        boundary) must not be treated as the self process. Regression: the
+        `hermes(?:-...)?` alternative had no trailing boundary, so `hermesd`,
+        `hermes_backend`, `hermes2` matched."""
+        for cmd in (
+            "pkill -f hermesd",
+            "pkill -f hermes_backend",
+            "pkill -f hermes2",
+            "kill $(pgrep -f hermesd)",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
+
+    def test_regex_obfuscated_pgrep_self_target_flagged(self):
+        """pgrep -f treats its argument as a regex, so a single-char class like
+        `h[e]rmes` still matches the hermes process. Collapsing `[x]` -> `x` on
+        the self-term scan view catches this obfuscation."""
+        for cmd in (
+            "kill $(pgrep -f 'h[e]rmes-gatewa[y]')",
+            "kill $(pgrep -f 'hermes-gatewa[y]')",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
 
 class TestNormalizationBypass:
     """Obfuscation techniques must not bypass dangerous command detection."""
@@ -872,6 +981,18 @@ class TestPgrepKillExpansion:
     def test_safe_kill_pid_not_flagged(self):
         """A plain 'kill 12345' (literal PID, no expansion) must stay safe."""
         cmd = "kill 12345"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_kill_pgrep_unrelated_target_not_flagged(self):
+        """kill $(pgrep -f metro) targets a dev server, not the agent's own
+        process — a normal dev action that must not be flagged."""
+        cmd = "kill $(pgrep -f metro)"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_kill_pgrep_hyphenated_api_gateway_not_flagged(self):
+        cmd = 'kill $(pgrep -f "node.*api-gateway")'
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
 
