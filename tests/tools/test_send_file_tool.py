@@ -181,9 +181,16 @@ class TestExtractLocalFilesExpanded:
             with patch("os.path.isfile", side_effect=lambda p: p in expanded):
                 return BasePlatformAdapter.extract_local_files(content)
 
+    # NOTE: bare paths in untagged prose only auto-ship for document/data
+    # extensions. Code/config/log extensions (.py/.js/.ts/.sh/.css/.log...) are
+    # intentionally excluded from the bare-path detector — auto-shipping a
+    # source file the model merely mentioned in prose is a surprise. Those
+    # extensions still deliver via an explicit MEDIA: tag (see
+    # TestExtractMediaExpandedExtensions). See tests/gateway/
+    # test_extract_local_files.py::test_no_media_extensions for the rationale.
     @pytest.mark.parametrize("ext", [
         "pdf", "txt", "md", "csv", "json", "yaml", "yml",
-        "py", "js", "ts", "sh", "html", "css", "zip", "log",
+        "html", "zip",
     ])
     def test_bare_path_detected(self, ext):
         content = f"Check the file /tmp/data.{ext} for details"
