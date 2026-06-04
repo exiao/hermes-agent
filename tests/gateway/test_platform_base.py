@@ -625,6 +625,44 @@ class TestExtractMedia:
         media, _ = BasePlatformAdapter.extract_media(content)
         assert media == []
 
+    def test_unsupported_ext_wrapper_not_deleted(self, tmp_path, monkeypatch):
+        """A fenced tag whose path exists but has an undeliverable extension
+        (MEDIA:/tmp/x.env) is never extracted by MEDIA_TAG_CLEANUP_RE, so its
+        wrapper must NOT be deleted from cleaned text — otherwise an example
+        block vanishes with no attachment sent. Regression for codex P2."""
+        root = tmp_path / "cache"
+        root.mkdir(parents=True)
+        bad = root / "config.env"
+        bad.write_text("x")
+        good = root / "real.png"
+        good.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"```\nMEDIA:{bad}\n```\nMEDIA:{good}"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(good)]
+        assert f"MEDIA:{bad}" in cleaned  # example fence preserved
+        assert "```" in cleaned
+
+    def test_nested_inline_in_masked_fence_not_deleted(self, tmp_path, monkeypatch):
+        """An inline `MEDIA:...` example INSIDE a masked fenced block must not
+        be independently deleted by wrapper cleanup. A real tag elsewhere
+        delivers; the fenced example (incl. its inline tag) survives verbatim.
+        Regression for codex P2 (nested wrapper)."""
+        root = tmp_path / "cache"
+        root.mkdir(parents=True)
+        a = root / "a.png"
+        b = root / "b.png"
+        a.write_bytes(b"\x89PNG")
+        b.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"MEDIA:{a}\n```\nUse `MEDIA:{b}` to send\n```"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(a)]
+        assert f"`MEDIA:{b}`" in cleaned  # nested example preserved verbatim
+        assert "```" in cleaned
+
     def test_example_media_in_inline_code_stays_masked(self, tmp_path, monkeypatch):
         """A nonexistent example path wrapped in inline code must NOT be
         delivered even with the existence gate (#35695 preserved)."""

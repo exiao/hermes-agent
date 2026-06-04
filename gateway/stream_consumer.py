@@ -47,6 +47,25 @@ _NEW_SEGMENT = object()
 _COMMENTARY = object()
 
 
+# Fenced block / inline code / blockquote whose body is now only whitespace
+# (left behind after a MEDIA: tag inside it was stripped for display).
+_EMPTY_FENCE_RE = re.compile(r'```[^\n]*\n\s*```', re.DOTALL)
+_EMPTY_INLINE_CODE_RE = re.compile(r'`\s*`')
+_EMPTY_BLOCKQUOTE_LINE_RE = re.compile(r'^[ \t]*>[ \t]*$', re.MULTILINE)
+
+
+def _strip_empty_media_wrappers(text: str) -> str:
+    """Remove code-fence / inline-code / blockquote wrappers left empty after a
+    MEDIA: tag inside them was stripped, so the streamed display doesn't render
+    a stray empty code block or quote line beside the delivered attachment."""
+    if "`" not in text and ">" not in text:
+        return text
+    text = _EMPTY_FENCE_RE.sub("", text)
+    text = _EMPTY_INLINE_CODE_RE.sub("", text)
+    text = _EMPTY_BLOCKQUOTE_LINE_RE.sub("", text)
+    return text
+
+
 @dataclass
 class StreamConsumerConfig:
     """Runtime config for a single stream consumer instance."""
@@ -716,6 +735,12 @@ class GatewayStreamConsumer:
             return text
         cleaned = text.replace("[[audio_as_voice]]", "")
         cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
+        # A stripped MEDIA tag can leave an empty wrapper behind — e.g. a
+        # streamed ```\nMEDIA:/x.png\n``` collapses to an empty ``` block, or
+        # `MEDIA:/x.png` to empty backticks — which would render as a stray
+        # empty code block / quote next to the (separately delivered)
+        # attachment. Drop wrappers whose body is now only whitespace.
+        cleaned = _strip_empty_media_wrappers(cleaned)
         # Collapse excessive blank lines left behind by removed tags
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
         # Strip trailing whitespace/newlines but preserve leading content

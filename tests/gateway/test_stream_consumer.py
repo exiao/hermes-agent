@@ -62,6 +62,22 @@ class TestCleanForDisplay:
         # Should not have 3+ consecutive newlines
         assert "\n\n\n" not in result
 
+    def test_fenced_media_leaves_no_empty_fence(self):
+        """A streamed fenced MEDIA directive must not leave an empty ``` block
+        in the displayed text. Regression for codex P2 (streaming path)."""
+        text = "Here:\n```\nMEDIA:/tmp/hermes/shot.png\n```"
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert "MEDIA:" not in result
+        assert "```" not in result
+        assert "Here:" in result
+
+    def test_inline_and_blockquote_media_leave_no_empty_wrapper(self):
+        """Inline-code and blockquote MEDIA directives leave no empty wrapper."""
+        inline = GatewayStreamConsumer._clean_for_display("See `MEDIA:/tmp/a.png`")
+        assert "`" not in inline
+        quote = GatewayStreamConsumer._clean_for_display("> MEDIA:/tmp/a.png")
+        assert quote.strip() == "" or ">" not in quote
+
     def test_media_only_response(self):
         """Response that is entirely MEDIA: tags returns empty/whitespace."""
         text = "MEDIA:/tmp/image.png"
