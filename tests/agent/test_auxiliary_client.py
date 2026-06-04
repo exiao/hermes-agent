@@ -3776,10 +3776,12 @@ class TestResolveProviderClientAutoModelPollution:
 
         codex_client = MagicMock()
 
-        with patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
-             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""), \
-             patch("agent.auxiliary_client._resolve_auto", return_value=(codex_client, "gpt-5.5")):
+        with (
+            patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"),
+            patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"),
+            patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""),
+            patch("agent.auxiliary_client._resolve_auto", return_value=(codex_client, "gpt-5.5")),
+        ):
             client, model = resolve_provider_client(
                 "auto",
                 model=None,
@@ -3799,10 +3801,12 @@ class TestResolveProviderClientAutoModelPollution:
 
         some_client = MagicMock()
 
-        with patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
-             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""), \
-             patch("agent.auxiliary_client._resolve_auto", return_value=(some_client, "gpt-5.5")):
+        with (
+            patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"),
+            patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"),
+            patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""),
+            patch("agent.auxiliary_client._resolve_auto", return_value=(some_client, "gpt-5.5")),
+        ):
             client, model = resolve_provider_client(
                 "auto",
                 model="gemini-3-flash-preview",
@@ -3820,11 +3824,15 @@ class TestResolveProviderClientAutoModelPollution:
 
         anthropic_client = MagicMock()
 
-        with patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
-             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""), \
-             patch("agent.auxiliary_client._resolve_auto",
-                   return_value=(anthropic_client, "claude-opus-4-8")):
+        with (
+            patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"),
+            patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"),
+            patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""),
+            patch(
+                "agent.auxiliary_client._resolve_auto",
+                return_value=(anthropic_client, "claude-opus-4-8"),
+            ),
+        ):
             client, model = resolve_provider_client(
                 "auto",
                 model=None,
