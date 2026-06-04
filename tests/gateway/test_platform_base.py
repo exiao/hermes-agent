@@ -495,6 +495,41 @@ class TestExtractMedia:
         media, _ = BasePlatformAdapter.extract_media(content)
         assert [p for p, _ in media] == [str(f)]
 
+    def test_fenced_media_leaves_no_empty_fence_in_cleaned(
+        self, tmp_path, monkeypatch
+    ):
+        """After a fenced MEDIA tag is delivered, the surrounding fence must be
+        removed from cleaned text — not left as an empty ``` block the gateway
+        would send alongside the attachment. Regression for codex P2 (PR #24,
+        3rd re-review)."""
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"```\nMEDIA:{f}\n```"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(f)]
+        assert "```" not in cleaned
+        assert cleaned.strip() == ""
+
+    def test_inline_and_blockquote_media_leave_no_wrapper_in_cleaned(
+        self, tmp_path, monkeypatch
+    ):
+        """Same wrapper-removal for inline code and blockquote forms."""
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        _, cleaned_inline = BasePlatformAdapter.extract_media(f"Here: `MEDIA:{f}`")
+        assert "`" not in cleaned_inline
+
+        _, cleaned_quote = BasePlatformAdapter.extract_media(f"> MEDIA:{f}")
+        assert ">" not in cleaned_quote
+
     def test_real_media_in_language_fenced_block_is_delivered(
         self, tmp_path, monkeypatch
     ):

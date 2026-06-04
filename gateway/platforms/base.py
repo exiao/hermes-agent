@@ -2874,6 +2874,32 @@ class BasePlatformAdapter(ABC):
         return True
 
     @staticmethod
+    def _delivered_media_wrapper_spans(content: str) -> list:
+        """Return (start, end) spans of code-fence / inline-code / blockquote
+        wrappers whose entire content is real, deliverable MEDIA tag(s).
+
+        These are exactly the spans ``_mask_protected_spans`` leaves UNMASKED
+        so their tags get extracted. After delivery the whole wrapper must be
+        removed from the user-visible text — deleting only the inner ``MEDIA:``
+        tag would leave an empty ``` fence / `` `` / ``>`` behind, which the
+        gateway would render as an empty code block alongside the attachment.
+        """
+        spans: list = []
+        for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
+            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
+                spans.append((m.start(), m.end()))
+        for m in re.finditer(r'`[^`\n]+`', content):
+            prefix = content[max(0, m.start() - 20):m.start()]
+            if re.search(r'MEDIA:\s*$', prefix):
+                continue  # backtick-quoted MEDIA path, not a wrapper
+            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
+                spans.append((m.start(), m.end()))
+        for m in re.finditer(r'(?:^>.*(?:\n|$))+', content, re.MULTILINE):
+            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
+                spans.append((m.start(), m.end()))
+        return spans
+
+    @staticmethod
     def _mask_protected_spans(content: str) -> str:
         """Replace content inside fenced code blocks, inline code spans,
         and blockquotes with spaces to prevent MEDIA: false positives.
@@ -3040,9 +3066,22 @@ class BasePlatformAdapter(ABC):
             masked_cleaned = BasePlatformAdapter._mask_protected_spans(cleaned)
             masked_cleaned = BasePlatformAdapter._mask_json_string_media(masked_cleaned)
             spans = [m.span() for m in media_pattern.finditer(masked_cleaned)]
+            # A delivered tag that was wrapped in a fence / inline code /
+            # blockquote leaves an empty wrapper behind if we delete only the
+            # MEDIA: text. Remove the whole wrapper span instead, so no empty
+            # ``` block / `` / quote is rendered alongside the attachment.
+            spans += BasePlatformAdapter._delivered_media_wrapper_spans(cleaned)
             if spans:
+                # Merge overlapping spans (a wrapper fully contains its inner
+                # tag span) so deletion ranges don't double-delete or corrupt.
+                merged = []
+                for start, end in sorted(spans):
+                    if merged and start <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                    else:
+                        merged.append((start, end))
                 chars = list(cleaned)
-                for start, end in sorted(spans, reverse=True):
+                for start, end in sorted(merged, reverse=True):
                     del chars[start:end]
                 cleaned = "".join(chars)
                 cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
