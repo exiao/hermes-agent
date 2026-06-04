@@ -3085,20 +3085,29 @@ class BasePlatformAdapter(ABC):
     def _strip_delivered_media_text(text: str) -> str:
         """Remove delivered ``MEDIA:`` tags from user-visible text.
 
-        Masks a length-equal copy to *locate* the real tag spans, deletes those
-        from the unmasked text, and additionally removes any code-fence /
-        inline-code / blockquote wrapper whose entire content was real
-        deliverable tag(s) — otherwise an empty ``` block / `` `` / ``>`` is
-        left behind and rendered alongside the attachment. Protected example
-        spans (code/quote/JSON) survive verbatim. Shared by ``extract_media``
-        and the streaming display path so both strip identically.
+        Masks a length-equal copy (code/quote/inline + JSON string values) to
+        *locate* the real, deliverable tag spans, deletes those, and also
+        removes any wrapper whose entire content was deliverable tag(s) — but
+        ONLY a wrapper that actually contains one of those extracted spans, so
+        a backticked tag nested inside a masked blockquote / JSON example (which
+        is never delivered) is left untouched. Protected example spans survive
+        verbatim. Shared by ``extract_media`` and the streaming display path.
         """
         masked = BasePlatformAdapter._mask_protected_spans(text)
         masked = BasePlatformAdapter._mask_json_string_media(masked)
-        spans = [m.span() for m in MEDIA_TAG_CLEANUP_RE.finditer(masked)]
-        spans += BasePlatformAdapter._delivered_media_wrapper_spans(text)
-        if not spans:
+        # Real, deliverable tag spans (the masked copy respects every protected
+        # region, so a masked/JSON-embedded example tag is NOT here).
+        tag_spans = [m.span() for m in MEDIA_TAG_CLEANUP_RE.finditer(masked)]
+        if not tag_spans:
             return text
+        # Wrapper spans, but only those that actually contain a delivered tag —
+        # this prevents deleting a wrapper around a tag that masking suppressed.
+        wrapper_spans = [
+            (ws, we)
+            for (ws, we) in BasePlatformAdapter._delivered_media_wrapper_spans(text)
+            if any(ws <= ts and te <= we for ts, te in tag_spans)
+        ]
+        spans = tag_spans + wrapper_spans
         # Merge overlapping spans (a wrapper fully contains its inner tag span)
         # so deletion ranges don't double-delete or corrupt offsets.
         merged: list = []
