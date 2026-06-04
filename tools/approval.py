@@ -998,9 +998,12 @@ def _get_allow_execute_code() -> bool:
     """Whether execute_code scripts are pre-trusted (skip the whole-script prompt).
 
     Opt-in via ``approvals.allow_execute_code: true``. Narrow by design: only
-    suppresses the execute_code whole-script approval. The hardline floor and
-    per-call terminal() guards the script issues still run independently, and
-    the cron branch (cron_mode) is evaluated before this flag.
+    suppresses the execute_code whole-script approval. terminal() calls the
+    script issues back into Hermes still run through the hardline floor and
+    per-call guards independently, and the cron branch (cron_mode) is evaluated
+    before this flag. NOTE: direct Python calls inside the script (os.system,
+    subprocess, ...) bypass all Hermes guards entirely regardless of this flag
+    — only terminal() callbacks into Hermes are ever guarded.
     """
     val = _get_approval_config().get("allow_execute_code", False)
     if isinstance(val, str):
@@ -1659,8 +1662,10 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
     # Opt-in pre-trust: approvals.allow_execute_code lets the user say "I trust
     # execute_code in this instance, stop prompting". Checked AFTER the cron
     # branch (cron still honors cron_mode) and AFTER the yolo/off bypass, but
-    # BEFORE the gateway/ask manual prompt. The hardline floor and the per-call
-    # terminal() guards the script issues still run independently.
+    # BEFORE the gateway/ask manual prompt. terminal() calls the script issues
+    # back into Hermes still run through the hardline floor and per-call guards
+    # independently. NOTE: direct Python calls inside the script (os.system,
+    # subprocess, ...) bypass all Hermes guards entirely regardless of this flag.
     if _get_allow_execute_code():
         return {"approved": True, "message": None}
 
