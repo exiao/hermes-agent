@@ -2802,6 +2802,157 @@ class BasePlatformAdapter(ABC):
 
 
     @staticmethod
+    def _span_is_only_real_media_tag(span_text: str) -> bool:
+        """Return True if a protected span's content is ONLY one or more
+        ``MEDIA:<path>`` tags, each pointing at a file that actually exists and
+        passes the media-delivery validator.
+
+        Existence + allowlist gate for the #35695 code/inline/blockquote
+        masking: a *documentation example* tag (``MEDIA:/path/to/file.png``)
+        does not resolve to a real file, so it stays masked and is never
+        delivered. But when the agent wraps a tag it deliberately produced via
+        ``send_file`` (which points at an existing cache artifact) in inline
+        code or a fenced block — a natural thing to do while explaining the
+        reply — that real tag must NOT be masked away, or the attachment is
+        silently dropped (user-reported recurring bug, 2026-06-03).
+
+        Multiple tags in one span are supported: ``send_file`` instructs the
+        model to emit one ``MEDIA:`` line per file, and models commonly group
+        those lines in a single fenced block. Every non-blank line must be a
+        real tag — a span with ANY prose line (or any tag that fails the
+        validator) stays masked, preserving the example guard.
+
+        ``validate_media_delivery_path`` enforces the credential/system
+        denylist, so a backticked ``MEDIA:/etc/passwd`` returns None here and
+        stays masked.
+        """
+        # Parse the span's structure so the fence/quote framing is consumed
+        # from its real position, never guessed from content. (A bare fence
+        # whose first content line is a single prose word like "Example" must
+        # NOT be mistaken for a language-qualified fence.)
+        text = span_text.strip()
+        if text.startswith("```"):
+            # Fenced block: ```<info-string>\n <body> \n``` — the opening
+            # info string (language) lives on the first line and is consumed
+            # structurally here, so it never competes with a content line.
+            nl = text.find("\n")
+            if nl == -1:
+                return False  # malformed single-line fence, no body
+            body = text[nl + 1:]
+            rstripped = body.rstrip()
+            if rstripped.endswith("```"):
+                body = rstripped[:-3]
+            inner = body
+        else:
+            # Inline code or blockquote: strip wrapping backticks only.
+            inner = text.strip("`")
+        # Non-blank lines; a leading blockquote ('>') marker is stripped
+        # per-line so a quoted tag is recognized, but a quoted prose line is
+        # kept as content (and fails the MEDIA match below, masking the span).
+        lines = []
+        for ln in inner.splitlines():
+            s = ln.strip()
+            if s.startswith(">"):
+                s = s[1:].strip()
+            if s:
+                lines.append(s)
+        if not lines:
+            return False
+        # Every remaining line must be a real, deliverable MEDIA tag. One prose
+        # line (or one example/denylisted tag) masks the whole span. The line
+        # must match the SAME extractor grammar (MEDIA_TAG_CLEANUP_RE, which is
+        # ext-restricted) that actually delivers tags — otherwise an existing
+        # but undeliverable file (e.g. MEDIA:/tmp/x.env) would wrongly count as
+        # "real" and get its wrapper deleted without anything being sent.
+        for line in lines:
+            stripped = line.strip("`").strip()
+            tm = MEDIA_TAG_CLEANUP_RE.fullmatch(stripped)
+            if not tm:
+                return False
+            path = tm.group("path").strip()
+            if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
+                path = path[1:-1].strip()
+            path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+            try:
+                if validate_media_delivery_path(os.path.expanduser(path)) is None:
+                    return False
+            except (OSError, RuntimeError, ValueError):
+                return False
+        return True
+
+    @staticmethod
+    def _classify_protected_spans(content: str):
+        """Single source of truth for protected-span detection.
+
+        Returns ``(masked_spans, delivered_spans)``:
+
+        * ``masked_spans`` — fenced blocks / inline code / blockquotes that hold
+          prose examples and must be blanked so a ``MEDIA:`` inside them is
+          never extracted.
+        * ``delivered_spans`` — wrappers whose entire content is real,
+          deliverable ``MEDIA:`` tag(s); these are left unmasked (so the tags
+          extract) and the whole wrapper is removed from the visible text after
+          delivery.
+
+        Fenced blocks are scanned first and own their character range; inline
+        and blockquote candidates that fall INSIDE any fenced block are skipped
+        so a masked fenced example can't have a nested inline span re-classified
+        independently (and vice versa).
+        """
+        masked: list = []
+        delivered: list = []
+        fence_ranges: list = []
+
+        def _inside_fence(start: int, end: int) -> bool:
+            return any(fs <= start and end <= fe for fs, fe in fence_ranges)
+
+        # Fenced code blocks: ```...``` (scanned first; they own their range).
+        for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
+            fence_ranges.append((m.start(), m.end()))
+            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
+                delivered.append((m.start(), m.end()))
+            else:
+                masked.append((m.start(), m.end()))
+
+        # Inline code: `...` but NOT backtick-quoted paths in MEDIA: tags, and
+        # NOT spans nested inside a fenced block already classified above.
+        for m in re.finditer(r'`[^`\n]+`', content):
+            start = m.start()
+            if _inside_fence(start, m.end()):
+                continue
+            prefix = content[max(0, start - 20):start]
+            if re.search(r'MEDIA:\s*$', prefix):
+                continue  # backtick-quoted MEDIA path, not inline code
+            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
+                delivered.append((start, m.end()))
+            else:
+                masked.append((start, m.end()))
+
+        # Blockquotes: a contiguous run of > lines is ONE span (so a quoted
+        # example with prose stays masked as a unit). Skip runs inside a fence.
+        for m in re.finditer(r'(?:^>.*(?:\n|$))+', content, re.MULTILINE):
+            if _inside_fence(m.start(), m.end()):
+                continue
+            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
+                delivered.append((m.start(), m.end()))
+            else:
+                masked.append((m.start(), m.end()))
+
+        return masked, delivered
+
+    @staticmethod
+    def _delivered_media_wrapper_spans(content: str) -> list:
+        """Return (start, end) spans of wrappers whose entire content is real,
+        deliverable MEDIA tag(s) — the spans ``_mask_protected_spans`` leaves
+        UNMASKED. After delivery the whole wrapper is removed from the visible
+        text; deleting only the inner ``MEDIA:`` tag would leave an empty
+        ``` fence / `` `` / ``>`` behind, which the gateway would render as an
+        empty block alongside the attachment.
+        """
+        _masked, delivered = BasePlatformAdapter._classify_protected_spans(content)
+        return delivered
+
+    @staticmethod
     def _mask_protected_spans(content: str) -> str:
         """Replace content inside fenced code blocks, inline code spans,
         and blockquotes with spaces to prevent MEDIA: false positives.
@@ -2809,36 +2960,16 @@ class BasePlatformAdapter(ABC):
         Preserves character count so regex match offsets stay valid.
         Skips masking backtick-quoted paths in MEDIA: tags (e.g.
         ``MEDIA:`/path/to/file.png` ``) to avoid breaking path extraction.
+        Also skips a code/inline/blockquote span whose only content is a real
+        ``MEDIA:<path>`` tag for an existing allowlisted file, so an agent
+        wrapping a deliberately-sent file in backticks doesn't lose it.
         """
         chars = list(content)
-        n = len(chars)
-
-        # Build list of (start, end) spans to mask
-        spans: list = []
-
-        # Fenced code blocks: ```...```
-        for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
-            spans.append((m.start(), m.end()))
-
-        # Inline code: `...` but NOT backtick-quoted paths in MEDIA: tags
-        for m in re.finditer(r'`[^`\n]+`', content):
-            start = m.start()
-            # Check if this is a backtick-quoted path after MEDIA:
-            prefix = content[max(0, start - 20):start]
-            if re.search(r'MEDIA:\s*$', prefix):
-                continue  # This is a MEDIA path quote, not inline code
-            spans.append((start, m.end()))
-
-        # Blockquote lines: > at line start
-        for m in re.finditer(r'^>.*$', content, re.MULTILINE):
-            spans.append((m.start(), m.end()))
-
-        # Apply masking
-        for start, end in spans:
+        masked, _delivered = BasePlatformAdapter._classify_protected_spans(content)
+        for start, end in masked:
             for i in range(start, end):
                 if chars[i] != '\n':
                     chars[i] = ' '
-
         return ''.join(chars)
 
 
@@ -2945,26 +3076,54 @@ class BasePlatformAdapter(ABC):
                     # and dropping every other attachment in the response.
                     continue
 
-        # Remove the delivered MEDIA tags from the user-visible text. Mask a
-        # length-equal copy of ``cleaned`` (same union of protected regions) to
-        # *locate* the real tag spans, then delete exactly those spans from the
-        # *unmasked* ``cleaned``. Masking is only a locator — protected spans
-        # (code blocks, quotes, JSON-embedded MEDIA: text) must survive verbatim
-        # in the delivered text, not be blanked to whitespace. Masking
-        # ``cleaned`` (not ``content``) keeps offsets valid after the
-        # [[audio_as_voice]] / [[as_document]] directives are removed.
         if media:
-            masked_cleaned = BasePlatformAdapter._mask_protected_spans(cleaned)
-            masked_cleaned = BasePlatformAdapter._mask_json_string_media(masked_cleaned)
-            spans = [m.span() for m in media_pattern.finditer(masked_cleaned)]
-            if spans:
-                chars = list(cleaned)
-                for start, end in sorted(spans, reverse=True):
-                    del chars[start:end]
-                cleaned = "".join(chars)
-                cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-        
+            cleaned = BasePlatformAdapter._strip_delivered_media_text(cleaned).strip()
+
         return media, cleaned
+
+    @staticmethod
+    def _strip_delivered_media_text(text: str) -> str:
+        """Remove delivered ``MEDIA:`` tags from user-visible text.
+
+        Masks a length-equal copy (code/quote/inline + JSON string values) to
+        *locate* the real, deliverable tag spans, deletes those, and also
+        removes any wrapper whose entire content was deliverable tag(s) — but
+        ONLY a wrapper that actually contains one of those extracted spans, so
+        a backticked tag nested inside a masked blockquote / JSON example (which
+        is never delivered) is left untouched. Protected example spans survive
+        verbatim. Shared by ``extract_media`` and the streaming display path.
+        """
+        masked = BasePlatformAdapter._mask_protected_spans(text)
+        masked = BasePlatformAdapter._mask_json_string_media(masked)
+        # Real, deliverable tag spans (the masked copy respects every protected
+        # region, so a masked/JSON-embedded example tag is NOT here).
+        tag_spans = [m.span() for m in MEDIA_TAG_CLEANUP_RE.finditer(masked)]
+        if not tag_spans:
+            return text
+        # Wrapper spans, but only those that actually contain a delivered tag —
+        # this prevents deleting a wrapper around a tag that masking suppressed.
+        wrapper_spans = [
+            (ws, we)
+            for (ws, we) in BasePlatformAdapter._delivered_media_wrapper_spans(text)
+            if any(ws <= ts and te <= we for ts, te in tag_spans)
+        ]
+        spans = tag_spans + wrapper_spans
+        # Merge overlapping spans (a wrapper fully contains its inner tag span)
+        # so deletion ranges don't double-delete or corrupt offsets.
+        merged: list = []
+        for start, end in sorted(spans):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        chars = list(text)
+        for start, end in sorted(merged, reverse=True):
+            del chars[start:end]
+        out = "".join(chars)
+        # Collapse blank lines left behind by removed spans. Caller applies its
+        # own edge trim (extract_media strips both ends; streaming rstrips only,
+        # to preserve leading content for continuation-prefix comparisons).
+        return re.sub(r'\n{3,}', '\n\n', out)
 
     @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:

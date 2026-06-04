@@ -458,6 +458,250 @@ class TestExtractMedia:
         assert [p for p, _ in media] == ["/r/a.png"]
         assert "`MEDIA:/ex/b.png`" in cleaned
 
+    # --- Existence-gated unmasking: a REAL send_file artifact wrapped in
+    # inline code / a fenced block / a blockquote must still be delivered.
+    # Regression for the recurring "I echoed the MEDIA tag in backticks and the
+    # attachment silently vanished" bug (2026-06-03). A documentation EXAMPLE
+    # tag (nonexistent path) must stay masked — #35695 behavior is preserved.
+
+    def _patch_safe_root(self, monkeypatch, root):
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (root,),
+        )
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        monkeypatch.delenv("HERMES_MEDIA_ALLOW_DIRS", raising=False)
+
+    def test_real_media_in_inline_code_is_delivered(self, tmp_path, monkeypatch):
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"Here is the shot: `MEDIA:{f}`\nLet me know."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(f)]
+        assert "MEDIA:" not in cleaned  # delivered tag stripped from visible text
+
+    def test_real_media_in_fenced_block_is_delivered(self, tmp_path, monkeypatch):
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"Run:\n```\nMEDIA:{f}\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(f)]
+
+    def test_fenced_media_leaves_no_empty_fence_in_cleaned(
+        self, tmp_path, monkeypatch
+    ):
+        """After a fenced MEDIA tag is delivered, the surrounding fence must be
+        removed from cleaned text — not left as an empty ``` block the gateway
+        would send alongside the attachment. Regression for codex P2 (PR #24,
+        3rd re-review)."""
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"```\nMEDIA:{f}\n```"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(f)]
+        assert "```" not in cleaned
+        assert cleaned.strip() == ""
+
+    def test_inline_and_blockquote_media_leave_no_wrapper_in_cleaned(
+        self, tmp_path, monkeypatch
+    ):
+        """Same wrapper-removal for inline code and blockquote forms."""
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        _, cleaned_inline = BasePlatformAdapter.extract_media(f"Here: `MEDIA:{f}`")
+        assert "`" not in cleaned_inline
+
+        _, cleaned_quote = BasePlatformAdapter.extract_media(f"> MEDIA:{f}")
+        assert ">" not in cleaned_quote
+
+    def test_real_media_in_language_fenced_block_is_delivered(
+        self, tmp_path, monkeypatch
+    ):
+        """A language-qualified fence (```text\\nMEDIA:/...\\n```) — the form
+        the agent commonly emits while explaining a reply — must still deliver
+        the wrapped real tag. Regression for codex P2 on PR #24: the bare-fence
+        path worked but the leading language token left the span 'multi-line'
+        and the attachment silently dropped."""
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        for lang in ("text", "bash", "console"):
+            content = f"Run:\n```{lang}\nMEDIA:{f}\n```"
+            media, _ = BasePlatformAdapter.extract_media(content)
+            assert [p for p, _ in media] == [str(f)], f"lang={lang!r} dropped tag"
+
+    def test_real_media_in_blockquote_is_delivered(self, tmp_path, monkeypatch):
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"> MEDIA:{f}"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(f)]
+
+    def test_multiple_real_media_in_one_fence_all_delivered(
+        self, tmp_path, monkeypatch
+    ):
+        """send_file tells the model to emit one MEDIA: line per file; models
+        commonly group those lines in a single fenced block. Every real tag in
+        the block must be delivered, not silently dropped. Regression for codex
+        P2 on PR #24 (the 'len(lines) != 1' guard masked the whole block)."""
+        root = tmp_path / "cache"
+        root.mkdir(parents=True)
+        f1 = root / "a.png"
+        f2 = root / "b.png"
+        f1.write_bytes(b"\x89PNG")
+        f2.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"Here are your files:\n```\nMEDIA:{f1}\nMEDIA:{f2}\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert {p for p, _ in media} == {str(f1), str(f2)}
+
+    def test_mixed_real_and_example_media_in_fence_stays_masked(
+        self, tmp_path, monkeypatch
+    ):
+        """A fence mixing one real tag with one nonexistent example tag is not
+        an all-real span — it stays masked so the example is never delivered
+        (and the real one falls back to a bare tag elsewhere if intended)."""
+        root = tmp_path / "cache"
+        root.mkdir(parents=True)
+        f1 = root / "a.png"
+        f1.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"```\nMEDIA:{f1}\nMEDIA:/path/to/nope.png\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
+    def test_bare_fence_prose_first_line_stays_masked(self, tmp_path, monkeypatch):
+        """A bare fence whose first content line is a single prose word
+        (```\\nExample\\nMEDIA:/real.png\\n```) must NOT be treated as a
+        language-qualified fence — the prose line keeps the span masked even
+        when the path exists. Regression for codex P2 (PR #24 re-review)."""
+        root = tmp_path / "cache"
+        f = root / "report.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"```\nExample\nMEDIA:{f}\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
+    def test_blockquote_example_with_prose_stays_masked(self, tmp_path, monkeypatch):
+        """A multi-line blockquote example ('> Example output:' then
+        '> MEDIA:/real.png') is ONE span; the prose line keeps the whole quote
+        masked even when the path exists. Regression for codex P2 (PR #24
+        re-review) — blockquote lines were evaluated independently."""
+        root = tmp_path / "cache"
+        f = root / "report.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"> Example output:\n> MEDIA:{f}"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
+    def test_unsupported_ext_wrapper_not_deleted(self, tmp_path, monkeypatch):
+        """A fenced tag whose path exists but has an undeliverable extension
+        (MEDIA:/tmp/x.env) is never extracted by MEDIA_TAG_CLEANUP_RE, so its
+        wrapper must NOT be deleted from cleaned text — otherwise an example
+        block vanishes with no attachment sent. Regression for codex P2."""
+        root = tmp_path / "cache"
+        root.mkdir(parents=True)
+        bad = root / "config.env"
+        bad.write_text("x")
+        good = root / "real.png"
+        good.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"```\nMEDIA:{bad}\n```\nMEDIA:{good}"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(good)]
+        assert f"MEDIA:{bad}" in cleaned  # example fence preserved
+        assert "```" in cleaned
+
+    def test_nested_inline_in_masked_fence_not_deleted(self, tmp_path, monkeypatch):
+        """An inline `MEDIA:...` example INSIDE a masked fenced block must not
+        be independently deleted by wrapper cleanup. A real tag elsewhere
+        delivers; the fenced example (incl. its inline tag) survives verbatim.
+        Regression for codex P2 (nested wrapper)."""
+        root = tmp_path / "cache"
+        root.mkdir(parents=True)
+        a = root / "a.png"
+        b = root / "b.png"
+        a.write_bytes(b"\x89PNG")
+        b.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"MEDIA:{a}\n```\nUse `MEDIA:{b}` to send\n```"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert [p for p, _ in media] == [str(a)]
+        assert f"`MEDIA:{b}`" in cleaned  # nested example preserved verbatim
+        assert "```" in cleaned
+
+    def test_example_media_in_inline_code_stays_masked(self, tmp_path, monkeypatch):
+        """A nonexistent example path wrapped in inline code must NOT be
+        delivered even with the existence gate (#35695 preserved)."""
+        root = tmp_path / "cache"
+        root.mkdir()
+        self._patch_safe_root(monkeypatch, root)
+
+        content = "Use `MEDIA:/path/to/example.png` in your reply."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert "MEDIA:" in cleaned  # preserved as text
+
+    def test_example_media_in_fenced_block_with_prose_stays_masked(
+        self, tmp_path, monkeypatch
+    ):
+        """A fenced block containing prose plus an example tag is still an
+        example region and must stay masked even if the path happened to
+        exist — the span is not 'only' a MEDIA tag."""
+        root = tmp_path / "cache"
+        f = root / "real.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"Example:\n```text\nsee below\nMEDIA:{f}\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
+    def test_denylisted_path_in_inline_code_stays_masked(self, tmp_path, monkeypatch):
+        """A backticked MEDIA: tag pointing at a credential/system path must
+        never be unmasked — validate_media_delivery_path returns None."""
+        root = tmp_path / "cache"
+        root.mkdir()
+        self._patch_safe_root(monkeypatch, root)
+
+        content = "See `MEDIA:/etc/passwd`"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
 
 class TestMediaInsideSerializedJson:
     """Regression coverage for #34375 — MEDIA: embedded in serialized JSON

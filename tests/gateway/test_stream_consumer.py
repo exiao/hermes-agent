@@ -35,11 +35,15 @@ class TestCleanForDisplay:
         assert "Audio generated" in result
 
     def test_media_tag_with_quotes(self):
-        """MEDIA: tags wrapped in quotes or backticks are removed."""
-        for wrapper in ['`MEDIA:/path/file.png`', '"MEDIA:/path/file.png"', "'MEDIA:/path/file.png'"]:
-            text = f"Result: {wrapper}"
+        """Streaming display mirrors extract_media: a bare or single-quoted
+        MEDIA tag is stripped, while a code-wrapped (inline) example stays
+        visible as protected text."""
+        for text in ["Result: MEDIA:/path/file.png", "Result: 'MEDIA:/path/file.png'"]:
             result = GatewayStreamConsumer._clean_for_display(text)
-            assert "MEDIA:" not in result, f"Failed for wrapper: {wrapper}"
+            assert "MEDIA:" not in result, f"Failed for: {text}"
+        # Inline-code example (protected) stays visible.
+        inline = GatewayStreamConsumer._clean_for_display("Result: `MEDIA:/path/file.png`")
+        assert "`MEDIA:/path/file.png`" in inline
 
     def test_audio_as_voice_stripped(self):
         """[[audio_as_voice]] directive is removed."""
@@ -49,7 +53,7 @@ class TestCleanForDisplay:
         assert "MEDIA:" not in result
 
     def test_multiple_media_tags(self):
-        """Multiple MEDIA: tags are all removed."""
+        """Multiple bare MEDIA: tags are all removed."""
         text = "Here are two files:\nMEDIA:/tmp/a.png\nMEDIA:/tmp/b.jpg"
         result = GatewayStreamConsumer._clean_for_display(text)
         assert "MEDIA:" not in result
@@ -61,6 +65,34 @@ class TestCleanForDisplay:
         result = GatewayStreamConsumer._clean_for_display(text)
         # Should not have 3+ consecutive newlines
         assert "\n\n\n" not in result
+
+    def test_protected_fenced_example_stays_visible(self):
+        """A fenced MEDIA example with a nonexistent path is not delivered, so
+        the streamed display keeps the whole fence visible — matching the
+        finalized extract_media text instead of blanking it mid-stream.
+        Regression for codex P2 (streaming path)."""
+        text = "Here:\n```text\nMEDIA:/path/to/example.png\n```"
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert "```" in result
+        assert "MEDIA:/path/to/example.png" in result
+
+    def test_fenced_real_media_leaves_no_empty_fence(self, tmp_path, monkeypatch):
+        """A streamed fenced tag pointing at a real allowlisted file IS
+        delivered, and its fence must not be left empty in the display."""
+        import gateway.platforms.base as base_mod
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        monkeypatch.setattr(base_mod, "MEDIA_DELIVERY_SAFE_ROOTS", (root,))
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        monkeypatch.delenv("HERMES_MEDIA_ALLOW_DIRS", raising=False)
+
+        text = f"Here:\n```\nMEDIA:{f}\n```"
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert "MEDIA:" not in result
+        assert "```" not in result
+        assert "Here:" in result
 
     def test_media_only_response(self):
         """Response that is entirely MEDIA: tags returns empty/whitespace."""

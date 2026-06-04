@@ -715,10 +715,15 @@ class GatewayStreamConsumer:
         if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
             return text
         cleaned = text.replace("[[audio_as_voice]]", "")
-        cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
-        # Collapse excessive blank lines left behind by removed tags
-        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-        # Strip trailing whitespace/newlines but preserve leading content
+        # Mirror extract_media exactly: strip only deliverable MEDIA tags (and
+        # their now-empty wrappers), while leaving protected examples — tags in
+        # code blocks / inline code / blockquotes, or pointing at denylisted /
+        # non-deliverable paths — visible. This keeps the streamed view
+        # consistent with the finalized text the adapter delivers, instead of
+        # blanking an example mid-stream that then reappears at finalization.
+        cleaned = _BasePlatformAdapter._strip_delivered_media_text(cleaned)
+        # Streaming rstrips only (preserve leading content for continuation
+        # prefix comparisons); _strip_delivered_media_text does not edge-trim.
         return cleaned.rstrip()
 
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
