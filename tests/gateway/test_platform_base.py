@@ -525,6 +525,41 @@ class TestExtractMedia:
         media, _ = BasePlatformAdapter.extract_media(content)
         assert [p for p, _ in media] == [str(f)]
 
+    def test_multiple_real_media_in_one_fence_all_delivered(
+        self, tmp_path, monkeypatch
+    ):
+        """send_file tells the model to emit one MEDIA: line per file; models
+        commonly group those lines in a single fenced block. Every real tag in
+        the block must be delivered, not silently dropped. Regression for codex
+        P2 on PR #24 (the 'len(lines) != 1' guard masked the whole block)."""
+        root = tmp_path / "cache"
+        root.mkdir(parents=True)
+        f1 = root / "a.png"
+        f2 = root / "b.png"
+        f1.write_bytes(b"\x89PNG")
+        f2.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"Here are your files:\n```\nMEDIA:{f1}\nMEDIA:{f2}\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert {p for p, _ in media} == {str(f1), str(f2)}
+
+    def test_mixed_real_and_example_media_in_fence_stays_masked(
+        self, tmp_path, monkeypatch
+    ):
+        """A fence mixing one real tag with one nonexistent example tag is not
+        an all-real span — it stays masked so the example is never delivered
+        (and the real one falls back to a bare tag elsewhere if intended)."""
+        root = tmp_path / "cache"
+        root.mkdir(parents=True)
+        f1 = root / "a.png"
+        f1.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"```\nMEDIA:{f1}\nMEDIA:/path/to/nope.png\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
     def test_example_media_in_inline_code_stays_masked(self, tmp_path, monkeypatch):
         """A nonexistent example path wrapped in inline code must NOT be
         delivered even with the existence gate (#35695 preserved)."""

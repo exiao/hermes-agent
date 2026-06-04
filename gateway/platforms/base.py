@@ -2803,9 +2803,9 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def _span_is_only_real_media_tag(span_text: str) -> bool:
-        """Return True if a protected span's content is ONLY a single
-        ``MEDIA:<path>`` tag pointing at a file that actually exists under the
-        media allowlist.
+        """Return True if a protected span's content is ONLY one or more
+        ``MEDIA:<path>`` tags, each pointing at a file that actually exists and
+        passes the media-delivery validator.
 
         Existence + allowlist gate for the #35695 code/inline/blockquote
         masking: a *documentation example* tag (``MEDIA:/path/to/file.png``)
@@ -2816,41 +2816,58 @@ class BasePlatformAdapter(ABC):
         reply — that real tag must NOT be masked away, or the attachment is
         silently dropped (user-reported recurring bug, 2026-06-03).
 
+        Multiple tags in one span are supported: ``send_file`` instructs the
+        model to emit one ``MEDIA:`` line per file, and models commonly group
+        those lines in a single fenced block. Every non-blank line must be a
+        real tag — a span with ANY prose line (or any tag that fails the
+        validator) stays masked, preserving the example guard.
+
         ``validate_media_delivery_path`` enforces the credential/system
         denylist, so a backticked ``MEDIA:/etc/passwd`` returns None here and
         stays masked.
         """
         # Strip code fences / backticks / blockquote markers / whitespace so we
-        # can test whether the *only* meaningful content is one MEDIA tag.
+        # can test whether the *only* meaningful content is MEDIA tags.
         inner = span_text.strip().strip("`").strip()
         if inner.startswith("```"):
             inner = inner[3:]
         if inner.endswith("```"):
             inner = inner[:-3]
         inner = inner.lstrip("> ").strip()
-        # First non-blank line only; a multi-line block with prose is still an
-        # example and must remain masked.
-        lines = [ln for ln in inner.splitlines() if ln.strip()]
+        # Non-blank lines; blockquote ('>') markers are stripped per-line.
+        lines = [
+            ln.strip().lstrip(">").strip()
+            for ln in inner.splitlines()
+            if ln.strip()
+        ]
+        lines = [ln for ln in lines if ln]
         # A language-qualified fence (```text\nMEDIA:/...\n```) leaves the bare
         # language token ("text", "bash", ...) as its own leading line. Drop a
         # single leading line that is just a fence language identifier so the
-        # tag underneath is still recognized; a leading line with spaces/prose
-        # is NOT a language tag and keeps the span masked as an example.
-        if len(lines) == 2 and re.fullmatch(
-            r'[A-Za-z0-9_+-]+', lines[0].strip()
-        ) and not lines[0].strip().upper().startswith("MEDIA:"):
+        # tag(s) underneath are still recognized; a leading line with
+        # spaces/prose is NOT a language tag and keeps the span masked.
+        if (
+            len(lines) >= 2
+            and re.fullmatch(r'[A-Za-z0-9_+-]+', lines[0])
+            and not lines[0].upper().startswith("MEDIA:")
+        ):
             lines = lines[1:]
-        if len(lines) != 1:
+        if not lines:
             return False
-        line = lines[0].strip().strip("`").strip()
-        m = re.match(r'^MEDIA:\s*(?P<path>\S.*?)\s*$', line, re.IGNORECASE)
-        if not m:
-            return False
-        path = m.group("path").strip().strip("`\"'").rstrip(",.;:)}]")
-        try:
-            return validate_media_delivery_path(os.path.expanduser(path)) is not None
-        except (OSError, RuntimeError, ValueError):
-            return False
+        # Every remaining line must be a real, deliverable MEDIA tag. One prose
+        # line (or one example/denylisted tag) masks the whole span.
+        for line in lines:
+            stripped = line.strip("`").strip()
+            m = re.match(r'^MEDIA:\s*(?P<path>\S.*?)\s*$', stripped, re.IGNORECASE)
+            if not m:
+                return False
+            path = m.group("path").strip().strip("`\"'").rstrip(",.;:)}]")
+            try:
+                if validate_media_delivery_path(os.path.expanduser(path)) is None:
+                    return False
+            except (OSError, RuntimeError, ValueError):
+                return False
+        return True
 
     @staticmethod
     def _mask_protected_spans(content: str) -> str:
