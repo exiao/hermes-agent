@@ -2831,6 +2831,15 @@ class BasePlatformAdapter(ABC):
         # First non-blank line only; a multi-line block with prose is still an
         # example and must remain masked.
         lines = [ln for ln in inner.splitlines() if ln.strip()]
+        # A language-qualified fence (```text\nMEDIA:/...\n```) leaves the bare
+        # language token ("text", "bash", ...) as its own leading line. Drop a
+        # single leading line that is just a fence language identifier so the
+        # tag underneath is still recognized; a leading line with spaces/prose
+        # is NOT a language tag and keeps the span masked as an example.
+        if len(lines) == 2 and re.fullmatch(
+            r'[A-Za-z0-9_+-]+', lines[0].strip()
+        ) and not lines[0].strip().upper().startswith("MEDIA:"):
+            lines = lines[1:]
         if len(lines) != 1:
             return False
         line = lines[0].strip().strip("`").strip()

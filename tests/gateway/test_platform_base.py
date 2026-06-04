@@ -495,6 +495,25 @@ class TestExtractMedia:
         media, _ = BasePlatformAdapter.extract_media(content)
         assert [p for p, _ in media] == [str(f)]
 
+    def test_real_media_in_language_fenced_block_is_delivered(
+        self, tmp_path, monkeypatch
+    ):
+        """A language-qualified fence (```text\\nMEDIA:/...\\n```) — the form
+        the agent commonly emits while explaining a reply — must still deliver
+        the wrapped real tag. Regression for codex P2 on PR #24: the bare-fence
+        path worked but the leading language token left the span 'multi-line'
+        and the attachment silently dropped."""
+        root = tmp_path / "cache"
+        f = root / "shot.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        for lang in ("text", "bash", "console"):
+            content = f"Run:\n```{lang}\nMEDIA:{f}\n```"
+            media, _ = BasePlatformAdapter.extract_media(content)
+            assert [p for p, _ in media] == [str(f)], f"lang={lang!r} dropped tag"
+
     def test_real_media_in_blockquote_is_delivered(self, tmp_path, monkeypatch):
         root = tmp_path / "cache"
         f = root / "shot.png"
