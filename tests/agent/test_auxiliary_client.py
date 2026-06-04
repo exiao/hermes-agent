@@ -3748,3 +3748,88 @@ class TestResolveAutoProviderModelSourceMismatch:
         # Fell through to the Step-2 provider chain.
         assert client is step2_client
         assert model == "nous-model"
+
+
+class TestResolveProviderClientAutoModelPollution:
+    """``resolve_provider_client(provider="auto")`` must not let the
+    self-fallback config-default model override what ``_resolve_auto``
+    resolved.
+
+    Regression for the live compression bug: a session that has failed over
+    to ``openai-codex`` (while config ``model.default`` is still
+    ``claude-opus-4-8``) called compression with ``model=None``. The
+    self-fallback at the top of ``resolve_provider_client`` filled ``model``
+    with ``_read_main_model()`` = "claude-opus-4-8". ``_resolve_auto``
+    correctly resolved the live Codex provider + "gpt-5.5", but the final
+    ``model or resolved`` then preferred the poisoned "claude-opus-4-8" and
+    paired it with the Codex client → HTTP 400 ("model not supported when
+    using Codex"). Compression silently degraded to a no-op fallback marker.
+
+    Why it only bit Codex: when the main provider IS anthropic, the poisoned
+    config default equals what auto resolves to, so ``model or resolved`` is a
+    harmless no-op. Only a fallback session whose live provider differs from
+    ``model.default`` triggers the mismatch.
+    """
+
+    def test_auto_no_caller_model_uses_resolved_not_config_default(self):
+        from agent.auxiliary_client import resolve_provider_client
+
+        codex_client = MagicMock()
+
+        with patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"), \
+             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
+             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""), \
+             patch("agent.auxiliary_client._resolve_auto", return_value=(codex_client, "gpt-5.5")):
+            client, model = resolve_provider_client(
+                "auto",
+                model=None,
+                main_runtime={"provider": "openai-codex", "model": "gpt-5.5"},
+            )
+
+        # The poisoned config default must NOT win over the resolved model.
+        assert model == "gpt-5.5"
+        assert model != "claude-opus-4-8"
+        assert client is codex_client
+
+    def test_auto_explicit_caller_model_is_still_honored(self):
+        """An explicit per-task model override (the caller asked for it) must
+        still win over auto-detection — only the self-fallback default is
+        suppressed."""
+        from agent.auxiliary_client import resolve_provider_client
+
+        some_client = MagicMock()
+
+        with patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"), \
+             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
+             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""), \
+             patch("agent.auxiliary_client._resolve_auto", return_value=(some_client, "gpt-5.5")):
+            client, model = resolve_provider_client(
+                "auto",
+                model="gemini-3-flash-preview",
+                main_runtime={"provider": "openai-codex", "model": "gpt-5.5"},
+            )
+
+        # Caller-supplied model wins (it was explicit, not a self-fallback).
+        assert model == "gemini-3-flash-preview"
+        assert client is some_client
+
+    def test_auto_anthropic_session_still_resolves_claude(self):
+        """The pre-existing happy path: an anthropic session with no caller
+        model still compresses on claude. The fix must not regress it."""
+        from agent.auxiliary_client import resolve_provider_client
+
+        anthropic_client = MagicMock()
+
+        with patch("agent.auxiliary_client._read_main_provider", return_value="anthropic"), \
+             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
+             patch("agent.auxiliary_client._get_aux_model_for_provider", return_value=""), \
+             patch("agent.auxiliary_client._resolve_auto",
+                   return_value=(anthropic_client, "claude-opus-4-8")):
+            client, model = resolve_provider_client(
+                "auto",
+                model=None,
+                main_runtime={"provider": "anthropic", "model": "claude-opus-4-8"},
+            )
+
+        assert model == "claude-opus-4-8"
+        assert client is anthropic_client

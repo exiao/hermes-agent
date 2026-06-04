@@ -3425,6 +3425,18 @@ def resolve_provider_client(
     # main_model also empty), the branches still hit their own
     # missing-credentials returns and ``_resolve_auto`` falls through to
     # the Step-2 chain as before.
+    #
+    # Record whether the CALLER explicitly supplied a model BEFORE the
+    # self-fallback below overwrites it with the config default.  The
+    # ``provider == "auto"`` branch needs this distinction: ``_resolve_auto``
+    # does its own (runtime-aware) model resolution, so the self-fallback
+    # default must never win over it — otherwise a fallback session whose
+    # live provider differs from ``model.default`` (e.g. an openai-codex
+    # session while config default is claude-opus-4-8) gets the wrong-family
+    # config model paired with the resolved provider's client → HTTP 400
+    # ("model not supported when using Codex").  Only a model the caller
+    # asked for should override auto-detection.
+    _caller_supplied_model = bool(model)
     if not model:
         model = _get_aux_model_for_provider(provider) or _read_main_model() or model
 
@@ -3482,16 +3494,26 @@ def resolve_provider_client(
         client, resolved = _resolve_auto(main_runtime=main_runtime)
         if client is None:
             return None, None
+        # ``_resolve_auto`` already performed runtime-aware model resolution
+        # (it sees the live provider/model via ``main_runtime`` and applies the
+        # Step-1 source-mismatch guard).  A model that originated from the
+        # self-fallback above (config default / provider aux default) must NOT
+        # override that — on a fallback session whose live provider differs
+        # from ``model.default`` it would re-pair the wrong-family config model
+        # with the resolved client (the openai-codex + claude-opus-4-8 → 400
+        # bug).  Only honor ``model`` here when the CALLER explicitly asked for
+        # one; otherwise defer to what auto-detection resolved.
+        override_model = model if _caller_supplied_model else None
         # When auto-detection lands on a non-OpenRouter provider (e.g. a
         # local server), an OpenRouter-formatted model override like
         # "google/gemini-3-flash-preview" won't work.  Drop it and use
         # the provider's own default model instead.
-        if model and "/" in model and resolved and "/" not in resolved:
+        if override_model and "/" in override_model and resolved and "/" not in resolved:
             logger.debug(
                 "Dropping OpenRouter-format model %r for non-OpenRouter "
-                "auxiliary provider (using %r instead)", model, resolved)
-            model = None
-        final_model = model or resolved
+                "auxiliary provider (using %r instead)", override_model, resolved)
+            override_model = None
+        final_model = override_model or resolved
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
