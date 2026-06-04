@@ -2826,32 +2826,36 @@ class BasePlatformAdapter(ABC):
         denylist, so a backticked ``MEDIA:/etc/passwd`` returns None here and
         stays masked.
         """
-        # Strip code fences / backticks / blockquote markers / whitespace so we
-        # can test whether the *only* meaningful content is MEDIA tags.
-        inner = span_text.strip().strip("`").strip()
-        if inner.startswith("```"):
-            inner = inner[3:]
-        if inner.endswith("```"):
-            inner = inner[:-3]
-        inner = inner.lstrip("> ").strip()
-        # Non-blank lines; blockquote ('>') markers are stripped per-line.
-        lines = [
-            ln.strip().lstrip(">").strip()
-            for ln in inner.splitlines()
-            if ln.strip()
-        ]
-        lines = [ln for ln in lines if ln]
-        # A language-qualified fence (```text\nMEDIA:/...\n```) leaves the bare
-        # language token ("text", "bash", ...) as its own leading line. Drop a
-        # single leading line that is just a fence language identifier so the
-        # tag(s) underneath are still recognized; a leading line with
-        # spaces/prose is NOT a language tag and keeps the span masked.
-        if (
-            len(lines) >= 2
-            and re.fullmatch(r'[A-Za-z0-9_+-]+', lines[0])
-            and not lines[0].upper().startswith("MEDIA:")
-        ):
-            lines = lines[1:]
+        # Parse the span's structure so the fence/quote framing is consumed
+        # from its real position, never guessed from content. (A bare fence
+        # whose first content line is a single prose word like "Example" must
+        # NOT be mistaken for a language-qualified fence.)
+        text = span_text.strip()
+        if text.startswith("```"):
+            # Fenced block: ```<info-string>\n <body> \n``` — the opening
+            # info string (language) lives on the first line and is consumed
+            # structurally here, so it never competes with a content line.
+            nl = text.find("\n")
+            if nl == -1:
+                return False  # malformed single-line fence, no body
+            body = text[nl + 1:]
+            rstripped = body.rstrip()
+            if rstripped.endswith("```"):
+                body = rstripped[:-3]
+            inner = body
+        else:
+            # Inline code or blockquote: strip wrapping backticks only.
+            inner = text.strip("`")
+        # Non-blank lines; a leading blockquote ('>') marker is stripped
+        # per-line so a quoted tag is recognized, but a quoted prose line is
+        # kept as content (and fails the MEDIA match below, masking the span).
+        lines = []
+        for ln in inner.splitlines():
+            s = ln.strip()
+            if s.startswith(">"):
+                s = s[1:].strip()
+            if s:
+                lines.append(s)
         if not lines:
             return False
         # Every remaining line must be a real, deliverable MEDIA tag. One prose
@@ -2904,8 +2908,10 @@ class BasePlatformAdapter(ABC):
                 continue  # whole real MEDIA tag wrapped in inline code — deliver it
             spans.append((start, m.end()))
 
-        # Blockquote lines: > at line start
-        for m in re.finditer(r'^>.*$', content, re.MULTILINE):
+        # Blockquote lines: contiguous run of > lines is ONE span, so a quoted
+        # example ("> Example output:" then "> MEDIA:/x.png") is evaluated
+        # together — the prose line keeps the whole quote masked.
+        for m in re.finditer(r'(?:^>.*(?:\n|$))+', content, re.MULTILINE):
             if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
                 continue
             spans.append((m.start(), m.end()))

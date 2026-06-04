@@ -560,6 +560,36 @@ class TestExtractMedia:
         media, _ = BasePlatformAdapter.extract_media(content)
         assert media == []
 
+    def test_bare_fence_prose_first_line_stays_masked(self, tmp_path, monkeypatch):
+        """A bare fence whose first content line is a single prose word
+        (```\\nExample\\nMEDIA:/real.png\\n```) must NOT be treated as a
+        language-qualified fence — the prose line keeps the span masked even
+        when the path exists. Regression for codex P2 (PR #24 re-review)."""
+        root = tmp_path / "cache"
+        f = root / "report.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"```\nExample\nMEDIA:{f}\n```"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
+    def test_blockquote_example_with_prose_stays_masked(self, tmp_path, monkeypatch):
+        """A multi-line blockquote example ('> Example output:' then
+        '> MEDIA:/real.png') is ONE span; the prose line keeps the whole quote
+        masked even when the path exists. Regression for codex P2 (PR #24
+        re-review) — blockquote lines were evaluated independently."""
+        root = tmp_path / "cache"
+        f = root / "report.png"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"\x89PNG")
+        self._patch_safe_root(monkeypatch, root)
+
+        content = f"> Example output:\n> MEDIA:{f}"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == []
+
     def test_example_media_in_inline_code_stays_masked(self, tmp_path, monkeypatch):
         """A nonexistent example path wrapped in inline code must NOT be
         delivered even with the existence gate (#35695 preserved)."""
