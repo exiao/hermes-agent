@@ -229,6 +229,53 @@ def test_guard_session_yolo_bypasses(gw_session):
         A.disable_session_yolo(gw_session)
 
 
+def test_guard_allow_execute_code_flag_bypasses(gw_session, monkeypatch):
+    """approvals.allow_execute_code: true pre-trusts the whole script — even
+    with a denier registered, the flag short-circuits before the prompt."""
+    monkeypatch.setattr(A, "_get_allow_execute_code", lambda: True)
+    _register_resolver(gw_session, "deny")
+    res = A.check_execute_code_guard("import os", "local")
+    assert res["approved"] is True
+    # One-shot contract preserved: nothing persists to the session allowlist.
+    assert A.is_approved(gw_session, "execute_code") is False
+
+
+def test_guard_allow_execute_code_flag_off_still_prompts(gw_session, monkeypatch):
+    """With the flag off (default), a registered denier still blocks — proving
+    the bypass is gated on the flag, not always-on."""
+    monkeypatch.setattr(A, "_get_allow_execute_code", lambda: False)
+    _register_resolver(gw_session, "deny")
+    res = A.check_execute_code_guard("import os", "local")
+    assert res["approved"] is False
+    assert res["outcome"] == "denied"
+
+
+def test_guard_allow_execute_code_does_not_override_cron_deny(monkeypatch):
+    """The flag must NOT punch through cron_mode: deny. Cron has no user to
+    consent, so a cron-deny session blocks execute_code regardless of the
+    flag (the cron branch is evaluated first)."""
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    monkeypatch.setattr(A, "_get_allow_execute_code", lambda: True)
+    res = A.check_execute_code_guard("import os", "local")
+    assert res["approved"] is False
+    assert res["outcome"] == "blocked"
+
+
+def test_get_allow_execute_code_reads_config(monkeypatch):
+    """_get_allow_execute_code coerces config values: bool, truthy strings."""
+    monkeypatch.setattr(A, "_get_approval_config", lambda: {"allow_execute_code": True})
+    assert A._get_allow_execute_code() is True
+    monkeypatch.setattr(A, "_get_approval_config", lambda: {"allow_execute_code": "true"})
+    assert A._get_allow_execute_code() is True
+    monkeypatch.setattr(A, "_get_approval_config", lambda: {"allow_execute_code": "no"})
+    assert A._get_allow_execute_code() is False
+    monkeypatch.setattr(A, "_get_approval_config", lambda: {})
+    assert A._get_allow_execute_code() is False
+
+
 # ---------------------------------------------------------------------------
 # 4. Env scrubbing (#27303)
 # ---------------------------------------------------------------------------

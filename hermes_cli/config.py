@@ -1793,6 +1793,16 @@ DEFAULT_CONFIG = {
         "mode": "manual",
         "timeout": 60,
         "cron_mode": "deny",
+        # When true, execute_code scripts are pre-trusted: the per-script
+        # approval prompt (check_execute_code_guard) is skipped in gateway/ask
+        # sessions. Narrow by design — only the execute_code whole-script
+        # prompt is suppressed. terminal() calls the script issues back into
+        # Hermes still run through the hardline floor and per-call guards, and
+        # cron still honors cron_mode. WARNING: direct Python calls inside the
+        # script (os.system, subprocess, shutil, open(), ...) bypass all Hermes
+        # guards entirely — they always did, prompt or no prompt — so only
+        # enable this when you trust this instance to run agent-authored Python.
+        "allow_execute_code": False,
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system
