@@ -1217,6 +1217,11 @@ def init_agent(
     # targets.
     agent._task_completion_guidance = bool(_agent_section.get("task_completion_guidance", True))
 
+    # When True, fallback attempt/switch status lines emit live (CLI + gateway)
+    # instead of being buffered and dropped on successful recovery.  Default
+    # False preserves the quiet "only surface on terminal failure" behavior.
+    agent._announce_fallback = bool(_agent_section.get("announce_fallback", False))
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

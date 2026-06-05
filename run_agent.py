@@ -799,6 +799,18 @@ class AIAgent:
             # Never break the retry loop on a buffer hiccup.
             pass
 
+    def _announce_or_buffer_fallback(self, message: str) -> None:
+        """Emit a fallback status line live when ``announce_fallback`` is set,
+        otherwise buffer it (dropped on successful recovery).
+
+        Lets users opt into seeing fallbacks happen in real time (CLI +
+        gateway/Signal) without the default retry-noise flooding.
+        """
+        if getattr(self, "_announce_fallback", False):
+            self._emit_status(message)
+        else:
+            self._buffer_status(message)
+
     def _buffer_vprint(self, message: str) -> None:
         """Buffer a vprint(force=True) retry/fallback line."""
         try:
