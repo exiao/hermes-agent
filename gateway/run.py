@@ -17064,6 +17064,13 @@ class GatewayRunner:
             should_send_media_as_audio as _should_send_media_as_audio,
         )
 
+        # Capture [[as_document]] before extract_media strips it, so an image
+        # MEDIA path emitted for the large/lossless case (e.g. info-graph on
+        # Telegram, where sendPhoto recompresses) is delivered with original
+        # bytes via send_document instead of send_image_file. Mirrors the
+        # normal dispatch path in gateway/platforms/base.py.
+        force_document_attachments = "[[as_document]]" in response
+
         media_files, cleaned = adapter.extract_media(response)
         media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
         images, text_content = adapter.extract_images(cleaned)
@@ -17095,7 +17102,7 @@ class GatewayRunner:
                     await adapter.send_video(
                         chat_id=source.chat_id, video_path=media_path, metadata=metadata,
                     )
-                elif _ext in _IMAGE_EXTS:
+                elif _ext in _IMAGE_EXTS and not force_document_attachments:
                     await adapter.send_image_file(
                         chat_id=source.chat_id, image_path=media_path, metadata=metadata,
                     )

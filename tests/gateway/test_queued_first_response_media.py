@@ -70,7 +70,7 @@ class _RecordingAdapter(BasePlatformAdapter):
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 # _send_response_with_media does not touch instance state, so a bare stub
@@ -126,5 +126,19 @@ def test_media_only_response_sends_attachment_without_empty_text(tmp_path):
     _run(_send(SimpleNamespace(), adapter, _source(), f"MEDIA:{img}"))
 
     assert adapter.sent_image_files == [str(img)]
-    # No empty/whitespace-only text message should be sent.
-    assert all(t.strip() for t in adapter.sent_text)
+    # No text message should be sent at all for media-only responses.
+    assert not adapter.sent_text
+
+
+def test_as_document_directive_routes_image_to_send_document(tmp_path):
+    """An image MEDIA path with [[as_document]] must preserve bytes via
+    send_document, not recompress through send_image_file."""
+    img = tmp_path / "lossless.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+    adapter = _RecordingAdapter()
+    response = f"[[as_document]]\nHigh-res chart attached.\nMEDIA:{img}"
+
+    _run(_send(SimpleNamespace(), adapter, _source(), response))
+
+    assert adapter.sent_documents == [str(img)], "image must route to send_document under [[as_document]]"
+    assert adapter.sent_image_files == []
