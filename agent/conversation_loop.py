@@ -1474,7 +1474,7 @@ def run_conversation(
                     # rate-limit symptom.  Switch to fallback immediately
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
-                        agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                        getattr(agent, "_announce_or_buffer_fallback", agent._buffer_status)("⚠️ Empty/malformed response — switching to fallback...")
                     if agent._try_activate_fallback():
                         retry_count = 0
                         compression_attempts = 0
@@ -1545,7 +1545,7 @@ def run_conversation(
                     if retry_count >= max_retries:
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
-                            agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
+                            getattr(agent, "_announce_or_buffer_fallback", agent._buffer_status)(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
                         if agent._try_activate_fallback():
                             retry_count = 0
                             compression_attempts = 0
@@ -2790,11 +2790,11 @@ def run_conversation(
                     )
                     if not pool_may_recover:
                         if classified.reason == FailoverReason.billing:
-                            agent._buffer_status(
+                            getattr(agent, "_announce_or_buffer_fallback", agent._buffer_status)(
                                 "⚠️ Billing or credits exhausted — switching to fallback provider..."
                             )
                         else:
-                            agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                            getattr(agent, "_announce_or_buffer_fallback", agent._buffer_status)("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
                             retry_count = 0
                             compression_attempts = 0
@@ -3192,9 +3192,9 @@ def run_conversation(
                     # abort silently (#35314, #17446).
                     if agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
-                            agent._announce_or_buffer_fallback("⚠️ Provider safety filter blocked this request — trying fallback...")
+                            getattr(agent, "_announce_or_buffer_fallback", agent._buffer_status)("⚠️ Provider safety filter blocked this request — trying fallback...")
                         else:
-                            agent._announce_or_buffer_fallback(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                            getattr(agent, "_announce_or_buffer_fallback", agent._buffer_status)(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                     if agent._try_activate_fallback():
                         retry_count = 0
                         compression_attempts = 0
@@ -3338,7 +3338,7 @@ def run_conversation(
                         continue
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
-                        agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                        getattr(agent, "_announce_or_buffer_fallback", agent._buffer_status)(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                     if agent._try_activate_fallback():
                         retry_count = 0
                         compression_attempts = 0

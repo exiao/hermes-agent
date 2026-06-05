@@ -1147,6 +1147,24 @@ agent:
   tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
 ```
 
+## Fallback Announcements
+
+When the primary model fails and Hermes switches to a [fallback provider](features/fallback-providers.md), the "trying fallback..." / "switching to fallback..." status lines are buffered by default and only surfaced if the turn ultimately fails. Successful fallbacks recover silently.
+
+Set `announce_fallback: true` to see fallbacks live (in the CLI and on gateway platforms like Signal) as they happen, instead of only on terminal failure:
+
+```yaml
+agent:
+  announce_fallback: false   # true → emit fallback status lines live
+```
+
+| Value | Behavior |
+|-------|----------|
+| `false` (default) | Fallback status lines are buffered and dropped on successful recovery; surfaced only when every fallback is exhausted and the turn fails. |
+| `true` | Each fallback attempt and provider switch is emitted immediately to the CLI and gateway, so you always see when a fallback fires and which provider caught it. |
+
+This only changes when the messages are shown, not the fallback behavior itself. Backend logs (`agent.log`) record every fallback regardless of this setting.
+
 ## TTS Configuration
 
 ```yaml
