@@ -17038,6 +17038,83 @@ class GatewayRunner:
 
     # ------------------------------------------------------------------
 
+    async def _send_response_with_media(
+        self,
+        adapter,
+        source,
+        response: str,
+        metadata=None,
+    ) -> None:
+        """Send a non-streamed agent response, delivering any MEDIA:/image tags.
+
+        The normal (non-queued) delivery path runs through the adapter's
+        message dispatch, which extracts MEDIA: tags, image URLs, and bare
+        local file paths and ships them as native attachments. The queued
+        follow-up drain delivered its "first response" via a raw
+        ``adapter.send()`` instead, so an attachment-bearing first response
+        (e.g. a ``MEDIA:/path.png`` emitted by send_file on a ``/queue`` turn)
+        had its tag sent as literal text and the file was never delivered.
+
+        This mirrors the background-task / ``/btw`` paths: extract media and
+        images, send the cleaned text, then route each attachment by type.
+        Best-effort per attachment so one bad file can't drop the rest.
+        """
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            should_send_media_as_audio as _should_send_media_as_audio,
+        )
+
+        # Capture [[as_document]] before extract_media strips it, so an image
+        # MEDIA path emitted for the large/lossless case (e.g. info-graph on
+        # Telegram, where sendPhoto recompresses) is delivered with original
+        # bytes via send_document instead of send_image_file. Mirrors the
+        # normal dispatch path in gateway/platforms/base.py.
+        force_document_attachments = "[[as_document]]" in response
+
+        media_files, cleaned = adapter.extract_media(response)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        images, text_content = adapter.extract_images(cleaned)
+
+        if text_content and text_content.strip():
+            await adapter.send(source.chat_id, text_content, metadata=metadata)
+
+        for image_url, alt_text in (images or []):
+            try:
+                await adapter.send_image(
+                    chat_id=source.chat_id,
+                    image_url=image_url,
+                    caption=alt_text,
+                    metadata=metadata,
+                )
+            except Exception:
+                logger.debug("Queued first-response image delivery failed", exc_info=True)
+
+        _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        for media_path, _is_voice in (media_files or []):
+            _ext = os.path.splitext(media_path)[1].lower()
+            try:
+                if _should_send_media_as_audio(source.platform, _ext, _is_voice):
+                    await adapter.send_voice(
+                        chat_id=source.chat_id, audio_path=media_path, metadata=metadata,
+                    )
+                elif _ext in _VIDEO_EXTS:
+                    await adapter.send_video(
+                        chat_id=source.chat_id, video_path=media_path, metadata=metadata,
+                    )
+                elif _ext in _IMAGE_EXTS and not force_document_attachments:
+                    await adapter.send_image_file(
+                        chat_id=source.chat_id, image_path=media_path, metadata=metadata,
+                    )
+                else:
+                    await adapter.send_document(
+                        chat_id=source.chat_id, file_path=media_path, metadata=metadata,
+                    )
+            except Exception:
+                logger.debug("Queued first-response media delivery failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+
     async def _run_agent(
         self,
         message: str,
@@ -19158,8 +19235,13 @@ class GatewayRunner:
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
+                            # Use the media-aware sender, not a raw adapter.send():
+                            # a first response can carry MEDIA:/image tags (e.g. a
+                            # send_file attachment on a /queue turn). A plain send
+                            # would ship the tag as literal text and drop the file.
+                            await self._send_response_with_media(
+                                adapter,
+                                source,
                                 first_response,
                                 metadata=_status_thread_metadata,
                             )
