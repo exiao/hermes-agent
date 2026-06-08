@@ -1561,6 +1561,21 @@ def resolve_provider(
     if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"
 
+    # Auto-detect an OpenRouter credential added via `hermes auth add openrouter`
+    # (manual pool entry, no env var). Without this, a key that only lives in
+    # the credential pool is invisible to auto-detection — the user sees
+    # `hermes auth list` showing the credential while requests go out with no
+    # Authorization header ("HTTP 401: Missing Authentication header"). The
+    # env-var check above only covers keys exported as OPENROUTER_API_KEY /
+    # OPENAI_API_KEY. See issue #42130.
+    try:
+        from agent.credential_pool import load_pool as _load_pool
+
+        if _load_pool("openrouter").has_credentials():
+            return "openrouter"
+    except Exception as e:
+        logger.debug("Could not check OpenRouter credential pool: %s", e)
+
     # Auto-detect API-key providers by checking their env vars
     for pid, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
@@ -2037,6 +2052,25 @@ def _refresh_qwen_cli_tokens(tokens: Dict[str, Any], timeout_seconds: float = 20
     return refreshed
 
 
+def _mark_qwen_oauth_active(creds: Dict[str, Any]) -> None:
+    """Set active_provider to qwen-oauth in auth.json.
+
+    Qwen OAuth tokens live in the Qwen CLI credential file managed by
+    _save_qwen_cli_tokens / resolve_qwen_runtime_credentials. This function
+    only writes a minimal provider-state entry (base_url for display) and
+    sets active_provider so that get_active_provider() and
+    _model_section_has_credentials() detect the provider for the setup wizard
+    and status commands.
+    """
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        state: Dict[str, Any] = {}
+        if creds.get("base_url"):
+            state["base_url"] = str(creds["base_url"])
+        _save_provider_state(auth_store, "qwen-oauth", state)
+        _save_auth_store(auth_store)
+
+
 def resolve_qwen_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -2099,6 +2133,24 @@ def get_qwen_auth_status() -> Dict[str, Any]:
 # uses to construct a GeminiCloudCodeClient instead of the default OpenAI SDK.
 # Actual HTTP traffic goes to https://cloudcode-pa.googleapis.com/v1internal:*.
 # =============================================================================
+
+def _mark_google_gemini_cli_active(creds: Dict[str, Any]) -> None:
+    """Set active_provider to google-gemini-cli in auth.json.
+
+    The actual OAuth tokens live in the Google credential file managed by
+    agent.google_oauth. This function only writes a minimal provider-state
+    entry (email for display) and sets active_provider so that
+    get_active_provider() and _model_section_has_credentials() detect the
+    provider for the setup wizard and status commands.
+    """
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        state: Dict[str, Any] = {}
+        if creds.get("email"):
+            state["email"] = str(creds["email"])
+        _save_provider_state(auth_store, "google-gemini-cli", state)
+        _save_auth_store(auth_store)
+
 
 def resolve_gemini_oauth_runtime_credentials(
     *,
