@@ -1247,7 +1247,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 api_mode=agent.api_mode,
             )
 
-        agent._buffer_status(
+        getattr(agent, "_announce_or_buffer_fallback", agent._buffer_status)(
             f"🔄 Primary model failed — switching to fallback: "
             f"{fb_model} via {fb_provider}"
         )
