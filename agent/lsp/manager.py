@@ -116,6 +116,19 @@ class _BackgroundLoop:
             fut.cancel()
             raise
 
+    def spawn(self, coro) -> None:
+        """Schedule a long-lived coroutine on the loop, fire-and-forget.
+
+        Unlike :meth:`run`, does not block the caller or surface a result —
+        used to launch the background idle-reaper sweep.
+        """
+        from agent.async_utils import safe_schedule_threadsafe
+        if self._loop is None:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return
+        safe_schedule_threadsafe(coro, self._loop)
+
     def stop(self) -> None:
         loop = self._loop
         if loop is None:
@@ -182,6 +195,14 @@ class LSPService:
         # out anything in the baseline so the agent only sees errors
         # introduced by the current edit.
         self._delta_baseline: Dict[str, List[Dict[str, Any]]] = {}
+
+        # Start the idle-reaper sweep.  Without this, one client per
+        # (server_id, workspace_root) is spawned lazily and never released
+        # until the process exits — on an always-on gateway that means LSP
+        # servers accumulate for its whole lifetime (67 leaked ≈ 15.6 GB seen
+        # 2026-06-10).  This is what makes _idle_timeout / _last_used live.
+        if self._enabled:
+            self._loop.spawn(self._reap_idle_loop())
 
     @classmethod
     def create_from_config(cls) -> Optional["LSPService"]:
@@ -576,6 +597,48 @@ class LSPService:
             *(c.shutdown() for c in clients),
             return_exceptions=True,
         )
+
+    async def _reap_idle_loop(self) -> None:
+        """Periodically shut down clients idle longer than ``_idle_timeout``.
+
+        Runs forever on the background loop.  Sweeps at half the idle
+        timeout (clamped to [15s, 60s]) so a server lives at most ~1.5x the
+        timeout past its last use.  A reaped server simply re-spawns on the
+        next request for its workspace, so this is safe to run aggressively.
+        """
+        interval = max(15.0, min(60.0, self._idle_timeout / 2))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._reap_idle_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.debug("idle reaper sweep failed: %s", e)
+
+    async def _reap_idle_once(self) -> None:
+        now = time.time()
+        stale: List[Tuple[Tuple[str, str], LSPClient, float]] = []
+        with self._state_lock:
+            for key, last in list(self._last_used.items()):
+                idle = now - last
+                if idle <= self._idle_timeout:
+                    continue
+                if key in self._spawning:
+                    continue
+                client = self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+                if client is not None:
+                    stale.append((key, client, idle))
+        for key, client, idle in stale:
+            try:
+                await client.shutdown()
+                logger.info(
+                    "[lsp] reaped idle server %s (%s) after %.0fs idle",
+                    key[0], key[1], idle,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("idle shutdown failed for %s: %s", key, e)
 
     # ------------------------------------------------------------------
     # status / introspection (used by ``hermes lsp status``)
