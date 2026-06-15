@@ -32,6 +32,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
@@ -1261,8 +1262,110 @@ def _video_to_base64_data_url(video_path: Path, mime_type: Optional[str] = None)
     return f"data:{mime};base64,{encoded}"
 
 
+# Hosts whose watch/share URLs are HTML pages, not direct media. A naive GET
+# returns the page HTML; the bytes must be extracted with yt-dlp instead.
+_STREAMING_HOSTS = (
+    "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com",
+    "twitter.com", "x.com", "tiktok.com", "facebook.com", "fb.watch",
+    "instagram.com", "twitch.tv", "reddit.com", "v.redd.it",
+)
+
+# Leading magic bytes that identify real video containers. Used to reject
+# non-video payloads (e.g. an HTML watch page) BEFORE they reach the model,
+# which otherwise silently hallucinates an answer from garbage input.
+_VIDEO_MAGIC_SIGNATURES = (
+    b"\x1aE\xdf\xa3",   # EBML — Matroska / WebM
+    b"RIFF",            # AVI (RIFF....AVI )
+    b"\x00\x00\x01\xba",  # MPEG program stream
+    b"\x00\x00\x01\xb3",  # MPEG video stream
+)
+
+
+def _looks_like_video_bytes(head: bytes) -> bool:
+    """Confirm a byte prefix is a real video container (allowlist).
+
+    Anything not matching a known video signature (e.g. an HTML watch page,
+    JSON error body) returns False and is rejected before reaching the model.
+    """
+    if not head:
+        return False
+    # ISO base media (MP4/MOV/M4V): 'ftyp' box at offset 4.
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return True
+    return any(head.startswith(sig) for sig in _VIDEO_MAGIC_SIGNATURES)
+
+
+def _is_streaming_host(video_url: str) -> bool:
+    host = (urlparse(video_url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return any(host == h or host.endswith("." + h) for h in _STREAMING_HOSTS)
+
+
+async def _extract_stream_to_file(video_url: str, destination: Path) -> Path:
+    """Use yt-dlp to pull a real video file from a streaming/watch URL.
+
+    YouTube/Vimeo/X share URLs serve an HTML page, not media, so a plain GET
+    yields page HTML. yt-dlp resolves the actual stream. Caps the format below
+    the API payload limit (accounting for base64 inflation).
+    """
+    import asyncio
+
+    ytdlp = shutil.which("yt-dlp")
+    if not ytdlp:
+        raise RuntimeError(
+            "This is a streaming/watch URL (e.g. YouTube) that does not serve a "
+            "direct video file, and yt-dlp is not installed to extract it. "
+            "Install yt-dlp or pass a direct video file URL / local path."
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Base64 + data-URL encoding inflates bytes ~33%, so the raw file must stay
+    # well under the base64 cap to survive the downstream payload check. Target
+    # ~70% of the cap and prefer smaller resolutions first.
+    raw_cap = int(_MAX_VIDEO_BASE64_BYTES * 0.70)
+    # yt-dlp picks the extension; give it a template and find the result.
+    out_template = str(destination.with_suffix(".%(ext)s"))
+    proc = await asyncio.create_subprocess_exec(
+        ytdlp,
+        "-f",
+        "best[height<=480][ext=mp4]/best[height<=480]/best[height<=720]/best",
+        "--no-playlist",
+        "--max-filesize", str(raw_cap),
+        "-o", out_template,
+        video_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=180.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"yt-dlp timed out extracting video from {video_url[:80]}")
+
+    if proc.returncode != 0:
+        err = (stderr or b"").decode("utf-8", "replace")[-400:]
+        raise RuntimeError(f"yt-dlp failed to extract video: {err}")
+
+    # Locate whatever file yt-dlp produced from the template stem.
+    stem = destination.stem
+    matches = sorted(destination.parent.glob(f"{stem}.*"))
+    matches = [m for m in matches if m.is_file()]
+    if not matches:
+        raise RuntimeError("yt-dlp reported success but produced no output file.")
+    produced = matches[0]
+    if produced != destination:
+        produced.rename(destination)
+    return destination
+
+
 async def _download_video(video_url: str, destination: Path, max_retries: int = 3) -> Path:
-    """Download video from URL with SSRF protection and retry."""
+    """Download video from URL with SSRF protection and retry.
+
+    Validates that the downloaded bytes are actually a video container and
+    rejects non-video payloads (e.g. an HTML watch page) so they never reach
+    the model, which would otherwise hallucinate an answer from the garbage.
+    """
     import asyncio
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1308,10 +1411,24 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                 if blocked:
                     raise PermissionError(blocked["message"])
 
+                ctype = (response.headers.get("content-type") or "").lower()
+                if ctype and ("text/html" in ctype or "application/json" in ctype
+                              or ctype.startswith("text/")):
+                    raise ValueError(
+                        f"URL returned non-video content (Content-Type: {ctype}). "
+                        f"This is likely a web page, not a direct video file."
+                    )
+
                 body = response.content
                 if len(body) > _MAX_VIDEO_BASE64_BYTES:
                     raise ValueError(
                         f"Video too large ({len(body)} bytes, max {_MAX_VIDEO_BASE64_BYTES})"
+                    )
+                if not _looks_like_video_bytes(body[:64]):
+                    raise ValueError(
+                        "Downloaded bytes are not a recognized video container "
+                        "(got what looks like an HTML/text page, not media). "
+                        "Provide a direct video file URL or local path."
                     )
                 destination.write_bytes(body)
 
@@ -1377,6 +1494,17 @@ async def video_analyze_tool(
             logger.info("Using local video file: %s", video_url)
             temp_video_path = local_path
             should_cleanup = False
+        elif _is_streaming_host(video_url):
+            # YouTube/Vimeo/X share URLs serve HTML, not media — extract the
+            # real stream with yt-dlp instead of a naive GET.
+            blocked = check_website_access(video_url)
+            if blocked:
+                raise PermissionError(blocked["message"])
+            logger.info("Streaming host detected; extracting via yt-dlp: %s", video_url[:60])
+            temp_dir = get_hermes_dir("cache/video", "temp_video_files")
+            temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
+            await _extract_stream_to_file(video_url, temp_video_path)
+            should_cleanup = True
         elif await _validate_image_url_async(video_url):
             blocked = check_website_access(video_url)
             if blocked:
