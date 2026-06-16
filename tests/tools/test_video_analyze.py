@@ -1,4 +1,5 @@
 """Tests for video_analyze tool in tools/vision_tools.py."""
+import pytest
 
 import asyncio
 import json
@@ -329,3 +330,206 @@ class TestVideoToolsetRegistration:
         from toolsets import TOOLSETS
         assert "video" in TOOLSETS
         assert "video_analyze" in TOOLSETS["video"]["tools"]
+
+
+# ---------------------------------------------------------------------------
+# Content validation + streaming-host extraction (fix/video-content-validation)
+# ---------------------------------------------------------------------------
+
+
+from tools.vision_tools import (  # noqa: E402
+    _looks_like_video_bytes,
+    _is_streaming_host,
+    _download_video,
+    _extract_stream_to_file,
+)
+
+
+class TestLooksLikeVideoBytes:
+    """Reject non-video payloads (HTML pages) before they reach the model."""
+
+    def test_html_doctype_rejected(self):
+        assert _looks_like_video_bytes(b"<!DOCTYPE html><html><head>") is False
+
+    def test_html_tag_rejected(self):
+        assert _looks_like_video_bytes(b"<html lang='en'>") is False
+
+    def test_leading_whitespace_html_rejected(self):
+        assert _looks_like_video_bytes(b"   \n<!doctype html>") is False
+
+    def test_json_rejected(self):
+        assert _looks_like_video_bytes(b'{"error": "not found"}') is False
+
+    def test_empty_rejected(self):
+        assert _looks_like_video_bytes(b"") is False
+
+    def test_mp4_ftyp_accepted(self):
+        assert _looks_like_video_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00") is True
+
+    def test_webm_ebml_accepted(self):
+        assert _looks_like_video_bytes(b"\x1aE\xdf\xa3\x01\x00\x00\x00") is True
+
+    def test_avi_riff_accepted(self):
+        assert _looks_like_video_bytes(b"RIFF\x00\x00\x00\x00AVI ") is True
+
+    def test_mpeg_ps_accepted(self):
+        assert _looks_like_video_bytes(b"\x00\x00\x01\xba\x21\x00") is True
+
+    def test_mov_moov_accepted(self):
+        # QuickTime files can lead with 'moov'/'mdat' instead of 'ftyp'.
+        assert _looks_like_video_bytes(b"\x00\x00\x00\x18moov\x00\x00\x00\x00") is True
+
+    def test_mov_mdat_accepted(self):
+        assert _looks_like_video_bytes(b"\x00\x00\x10\x00mdat\x00\x00\x00\x00") is True
+
+    def test_riff_webp_rejected(self):
+        # RIFF also wraps WebP images; only AVI at offset 8 is a video.
+        assert _looks_like_video_bytes(b"RIFF\x00\x00\x00\x00WEBPVP8 ") is False
+
+    def test_riff_wav_rejected(self):
+        assert _looks_like_video_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ") is False
+
+
+class TestIsStreamingHost:
+    """Detect URLs that serve HTML watch pages instead of direct media."""
+
+    def test_youtube_watch(self):
+        assert _is_streaming_host("https://www.youtube.com/watch?v=abc123") is True
+
+    def test_youtu_be(self):
+        assert _is_streaming_host("https://youtu.be/abc123") is True
+
+    def test_x_status(self):
+        assert _is_streaming_host("https://x.com/user/status/1") is True
+
+    def test_twitter_status(self):
+        assert _is_streaming_host("https://twitter.com/user/status/1") is True
+
+    def test_vimeo(self):
+        assert _is_streaming_host("https://vimeo.com/12345") is True
+
+    def test_direct_mp4_not_streaming(self):
+        assert _is_streaming_host("https://cdn.example.com/clip.mp4") is False
+
+    def test_lookalike_domain_not_streaming(self):
+        # Must not match a domain that merely contains 'youtube'.
+        assert _is_streaming_host("https://fakeyoutube.evil.com/x") is False
+
+
+class TestDownloadVideoRejectsNonVideo:
+    """_download_video must raise on HTML/text payloads, not pass them through."""
+
+    def _mk_response(self, *, content, content_type):
+        resp = MagicMock()
+        resp.headers = {"content-type": content_type, "content-length": str(len(content))}
+        resp.content = content
+        resp.url = "https://example.com/fake.mp4"
+        resp.is_redirect = False
+        resp.next_request = None
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def _patch_client(self, resp):
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        return client
+
+    def test_html_content_type_rejected(self, tmp_path):
+        resp = self._mk_response(
+            content=b"<!DOCTYPE html><html>...</html>", content_type="text/html")
+        dest = tmp_path / "out.mp4"
+        with patch("tools.vision_tools.httpx.AsyncClient", return_value=self._patch_client(resp)), \
+             patch("tools.vision_tools.check_website_access", return_value=None):
+            with pytest.raises(Exception) as exc:
+                asyncio.run(_download_video("https://example.com/page", dest, max_retries=1))
+            assert "non-video" in str(exc.value).lower() or "not a recognized" in str(exc.value).lower()
+        assert not dest.exists()
+
+    def test_html_bytes_without_content_type_rejected(self, tmp_path):
+        # No giveaway Content-Type, but the body is clearly HTML.
+        resp = self._mk_response(
+            content=b"<html><head><title>YouTube</title></head>", content_type="")
+        dest = tmp_path / "out.mp4"
+        with patch("tools.vision_tools.httpx.AsyncClient", return_value=self._patch_client(resp)), \
+             patch("tools.vision_tools.check_website_access", return_value=None):
+            with pytest.raises(Exception) as exc:
+                asyncio.run(_download_video("https://example.com/page", dest, max_retries=1))
+            assert "not a recognized" in str(exc.value).lower()
+        assert not dest.exists()
+
+    def test_real_video_bytes_accepted(self, tmp_path):
+        body = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 256
+        resp = self._mk_response(content=body, content_type="video/mp4")
+        dest = tmp_path / "out.mp4"
+        with patch("tools.vision_tools.httpx.AsyncClient", return_value=self._patch_client(resp)), \
+             patch("tools.vision_tools.check_website_access", return_value=None):
+            result = asyncio.run(_download_video("https://example.com/clip.mp4", dest, max_retries=1))
+            assert result == dest
+            assert dest.read_bytes() == body
+
+
+class TestExtractStreamMissingYtdlp:
+    """When yt-dlp is absent, fail honestly with a clear message."""
+
+    def test_no_ytdlp_raises_clear_error(self, tmp_path):
+        dest = tmp_path / "out.mp4"
+        with patch("tools.vision_tools.shutil.which", return_value=None):
+            with pytest.raises(RuntimeError) as exc:
+                asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
+            assert "yt-dlp" in str(exc.value).lower()
+
+
+class TestExtractStreamPicksVideoFile:
+    """yt-dlp output selection: ignore sidecars, keep the real container ext."""
+
+    def _fake_proc(self, returncode=0):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = returncode
+        proc.kill = MagicMock()
+        return proc
+
+    def _run(self, tmp_path, produced_names):
+        dest = tmp_path / "temp_video_abc.mp4"
+
+        async def fake_exec(*args, **kwargs):
+            # Simulate yt-dlp writing files with the destination stem.
+            for name in produced_names:
+                (tmp_path / name).write_bytes(b"\x00\x00\x00\x18ftypmp42")
+            return self._fake_proc()
+
+        with patch("tools.vision_tools.shutil.which", return_value="/usr/bin/yt-dlp"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            return asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
+
+    def test_ignores_sidecar_files(self, tmp_path):
+        # .info.json sorts before .mp4 alphabetically; must not be selected.
+        result = self._run(tmp_path, ["temp_video_abc.info.json", "temp_video_abc.mp4"])
+        assert result.suffix == ".mp4"
+        assert result.name == "temp_video_abc.mp4"
+
+    def test_preserves_webm_extension(self, tmp_path):
+        # yt-dlp fell back to webm; we must keep .webm, not force .mp4.
+        result = self._run(tmp_path, ["temp_video_abc.webm"])
+        assert result.suffix == ".webm"
+
+    def test_no_video_output_raises(self, tmp_path):
+        with pytest.raises(RuntimeError) as exc:
+            self._run(tmp_path, ["temp_video_abc.info.json", "temp_video_abc.jpg"])
+        assert "no video output" in str(exc.value).lower()
+
+    def test_no_config_flag_passed(self, tmp_path):
+        dest = tmp_path / "temp_video_abc.mp4"
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["args"] = args
+            (tmp_path / "temp_video_abc.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+            return self._fake_proc()
+
+        with patch("tools.vision_tools.shutil.which", return_value="/usr/bin/yt-dlp"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
+        assert "--no-config" in captured["args"]
