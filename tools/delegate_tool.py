@@ -129,6 +129,86 @@ _SUBAGENT_TOOLSETS = sorted(
 )
 _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
+# Map common wrong toolset names to their canonical registry keys. Without
+# this, _build_child_agent's intersection silently drops any name that isn't an
+# exact key, so a typo like "ShellExec" launches a child with no shell and the
+# failure only surfaces later as "subagent had file-only tools". The entries
+# below come from a session-history audit of names actually passed to
+# delegate_task (display names, mcp_-prefixed names, and plain typos).
+_TOOLSET_ALIASES: Dict[str, str] = {
+    # tool display-name / typo -> canonical toolset
+    "shellexec": "terminal",
+    "shell": "terminal",
+    "bash": "terminal",
+    "sessionsearch": "session_search",
+    "filesystem": "file",
+    "files": "file",
+    "code": "code_execution",
+    "codeexecution": "code_execution",
+    "web_search": "web",
+    "websearch": "web",
+    "image": "image_gen",
+    "images": "image_gen",
+}
+
+
+def _normalize_toolset_names(names):
+    """Normalize requested toolset names to canonical registry keys.
+
+    Accepts common wrong spellings instead of silently dropping them:
+    - explicit aliases in ``_TOOLSET_ALIASES`` (display names, typos),
+    - a leading ``mcp_`` prefix when the remainder is a valid toolset
+      (e.g. ``mcp_terminal`` -> ``terminal``),
+    - case-insensitive matches against canonical keys and aliases
+      (e.g. ``SessionSearch`` -> ``session_search``).
+
+    Unknown names that resolve to nothing are dropped with a WARNING (no
+    longer fully silent). Order is preserved and duplicates collapsed.
+    Returns ``None`` unchanged so callers can distinguish "no toolsets given"
+    from "empty list".
+    """
+    if names is None:
+        return None
+
+    valid = set(TOOLSETS)
+    resolved: List[str] = []
+    seen: set = set()
+
+    for raw in names:
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip()
+        if not name:
+            continue
+        canonical = None
+        if name in valid:
+            canonical = name
+        else:
+            lowered = name.lower()
+            if lowered in valid:
+                canonical = lowered
+            elif lowered in _TOOLSET_ALIASES:
+                canonical = _TOOLSET_ALIASES[lowered]
+            elif lowered.startswith("mcp_") and lowered[4:] in valid:
+                canonical = lowered[4:]
+            elif lowered.startswith("mcp_") and lowered[4:] in _TOOLSET_ALIASES:
+                canonical = _TOOLSET_ALIASES[lowered[4:]]
+
+        if canonical is None:
+            logger.warning(
+                "delegate_task: unknown toolset %r ignored "
+                "(valid toolsets: %s)",
+                raw,
+                _TOOLSET_LIST_STR,
+            )
+            continue
+        if canonical not in seen:
+            seen.add(canonical)
+            resolved.append(canonical)
+
+    return resolved
+
+
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
@@ -975,6 +1055,12 @@ def _build_child_agent(
         }
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
+
+    if toolsets:
+        # Map common wrong names (display names, mcp_ prefixes, typos) to
+        # canonical keys BEFORE intersecting, so a request like ["ShellExec"]
+        # resolves to ["terminal"] instead of being silently dropped.
+        toolsets = _normalize_toolset_names(toolsets)
 
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.

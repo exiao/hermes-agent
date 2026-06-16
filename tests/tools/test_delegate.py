@@ -1632,6 +1632,32 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             ["web", "browser", "mcp-MiniMax"],
         )
 
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_normalizes_alias_toolset_names(self, mock_cfg):
+        # Regression: a wrong name like "ShellExec" must resolve to "terminal"
+        # instead of being silently dropped (which left the child shell-less).
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test alias normalization",
+                context=None,
+                toolsets=["mcp_terminal", "file"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            sorted(MockAgent.call_args[1]["enabled_toolsets"]),
+            ["file", "terminal"],
+        )
+
     @patch(
         "tools.delegate_tool._load_config",
         return_value={"inherit_mcp_toolsets": False},
