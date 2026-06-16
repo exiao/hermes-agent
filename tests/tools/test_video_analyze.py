@@ -602,3 +602,86 @@ class TestExtractStreamPolicyRecheck:
             result = asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
             assert result.suffix == ".mp4"
             assert calls["n"] == 2
+
+
+class TestExtractStreamNonZeroExitPolicy:
+    """A non-zero yt-dlp exit must fail fast when empty, and still enforce the
+    policy on any URLs it did resolve (no silent bypass)."""
+
+    def _fake_proc(self, *, returncode=0, stdout=b"", stderr=b""):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(stdout, stderr))
+        proc.returncode = returncode
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        return proc
+
+    def test_nonzero_exit_no_output_raises(self, tmp_path):
+        dest = tmp_path / "temp_video_abc.mp4"
+        resolve_proc = self._fake_proc(returncode=1, stdout=b"", stderr=b"boom")
+
+        async def fake_exec(*args, **kwargs):
+            return resolve_proc
+
+        with patch("tools.vision_tools.shutil.which", return_value="/usr/bin/yt-dlp"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_exec), \
+             patch("tools.vision_tools.check_website_access", return_value=None):
+            with pytest.raises(RuntimeError) as exc:
+                asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
+            assert "failed to resolve" in str(exc.value).lower()
+
+    def test_nonzero_exit_with_blocked_url_still_enforced(self, tmp_path):
+        # yt-dlp warns (exit 1) but still printed a resolved URL; the policy
+        # check must run on it rather than being skipped.
+        dest = tmp_path / "temp_video_abc.mp4"
+        resolve_proc = self._fake_proc(
+            returncode=1, stdout=b"https://blocked-cdn.internal/stream.mp4\n"
+        )
+
+        async def fake_exec(*args, **kwargs):
+            return resolve_proc
+
+        def fake_policy(url):
+            return {"message": "blocked host"} if "blocked-cdn" in url else None
+
+        with patch("tools.vision_tools.shutil.which", return_value="/usr/bin/yt-dlp"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_exec), \
+             patch("tools.vision_tools.check_website_access", side_effect=fake_policy):
+            with pytest.raises(PermissionError) as exc:
+                asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
+            assert "blocked" in str(exc.value).lower()
+
+
+class TestDirectMediaPreservesSuffix:
+    """Direct streaming-host media keeps its real container extension so the
+    suffix-based MIME detection downstream doesn't mislabel it as mp4."""
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_webm_url_keeps_webm_suffix(self, tmp_path, monkeypatch):
+        captured = {}
+
+        async def fake_validate(url):
+            return True
+
+        async def fake_download(url, destination, **kwargs):
+            captured["suffix"] = destination.suffix
+            destination.write_bytes(b"\x1aE\xdf\xa3" + b"\x00" * 64)
+            return destination
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "OK"
+
+        monkeypatch.setattr("tools.vision_tools.get_hermes_dir", lambda *a, **k: tmp_path)
+        with patch("tools.vision_tools._validate_image_url_async", side_effect=fake_validate), \
+             patch("tools.vision_tools._download_video", side_effect=fake_download), \
+             patch("tools.vision_tools.check_website_access", return_value=None), \
+             patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response), \
+             patch("tools.vision_tools.extract_content_or_reasoning", return_value="OK"):
+            result = self._run(video_analyze_tool("https://v.redd.it/abc/clip.webm", "What?"))
+
+        data = json.loads(result)
+        assert data["success"] is True
+        assert captured["suffix"] == ".webm"
