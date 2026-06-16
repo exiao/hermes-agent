@@ -375,6 +375,20 @@ class TestLooksLikeVideoBytes:
     def test_mpeg_ps_accepted(self):
         assert _looks_like_video_bytes(b"\x00\x00\x01\xba\x21\x00") is True
 
+    def test_mov_moov_accepted(self):
+        # QuickTime files can lead with 'moov'/'mdat' instead of 'ftyp'.
+        assert _looks_like_video_bytes(b"\x00\x00\x00\x18moov\x00\x00\x00\x00") is True
+
+    def test_mov_mdat_accepted(self):
+        assert _looks_like_video_bytes(b"\x00\x00\x10\x00mdat\x00\x00\x00\x00") is True
+
+    def test_riff_webp_rejected(self):
+        # RIFF also wraps WebP images; only AVI at offset 8 is a video.
+        assert _looks_like_video_bytes(b"RIFF\x00\x00\x00\x00WEBPVP8 ") is False
+
+    def test_riff_wav_rejected(self):
+        assert _looks_like_video_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ") is False
+
 
 class TestIsStreamingHost:
     """Detect URLs that serve HTML watch pages instead of direct media."""
@@ -465,3 +479,57 @@ class TestExtractStreamMissingYtdlp:
             with pytest.raises(RuntimeError) as exc:
                 asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
             assert "yt-dlp" in str(exc.value).lower()
+
+
+class TestExtractStreamPicksVideoFile:
+    """yt-dlp output selection: ignore sidecars, keep the real container ext."""
+
+    def _fake_proc(self, returncode=0):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = returncode
+        proc.kill = MagicMock()
+        return proc
+
+    def _run(self, tmp_path, produced_names):
+        dest = tmp_path / "temp_video_abc.mp4"
+
+        async def fake_exec(*args, **kwargs):
+            # Simulate yt-dlp writing files with the destination stem.
+            for name in produced_names:
+                (tmp_path / name).write_bytes(b"\x00\x00\x00\x18ftypmp42")
+            return self._fake_proc()
+
+        with patch("tools.vision_tools.shutil.which", return_value="/usr/bin/yt-dlp"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            return asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
+
+    def test_ignores_sidecar_files(self, tmp_path):
+        # .info.json sorts before .mp4 alphabetically; must not be selected.
+        result = self._run(tmp_path, ["temp_video_abc.info.json", "temp_video_abc.mp4"])
+        assert result.suffix == ".mp4"
+        assert result.name == "temp_video_abc.mp4"
+
+    def test_preserves_webm_extension(self, tmp_path):
+        # yt-dlp fell back to webm; we must keep .webm, not force .mp4.
+        result = self._run(tmp_path, ["temp_video_abc.webm"])
+        assert result.suffix == ".webm"
+
+    def test_no_video_output_raises(self, tmp_path):
+        with pytest.raises(RuntimeError) as exc:
+            self._run(tmp_path, ["temp_video_abc.info.json", "temp_video_abc.jpg"])
+        assert "no video output" in str(exc.value).lower()
+
+    def test_no_config_flag_passed(self, tmp_path):
+        dest = tmp_path / "temp_video_abc.mp4"
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["args"] = args
+            (tmp_path / "temp_video_abc.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+            return self._fake_proc()
+
+        with patch("tools.vision_tools.shutil.which", return_value="/usr/bin/yt-dlp"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
+        assert "--no-config" in captured["args"]

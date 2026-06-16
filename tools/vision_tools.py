@@ -1275,10 +1275,14 @@ _STREAMING_HOSTS = (
 # which otherwise silently hallucinates an answer from garbage input.
 _VIDEO_MAGIC_SIGNATURES = (
     b"\x1aE\xdf\xa3",   # EBML — Matroska / WebM
-    b"RIFF",            # AVI (RIFF....AVI )
     b"\x00\x00\x01\xba",  # MPEG program stream
     b"\x00\x00\x01\xb3",  # MPEG video stream
 )
+
+# ISO-BMFF / QuickTime top-level box types found at offset 4. MOV files do not
+# always lead with 'ftyp' — valid QuickTime streams can open with 'moov',
+# 'mdat', 'free', 'skip', or 'wide' — so check the whole known-box set.
+_ISO_BMFF_BOX_TYPES = (b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide")
 
 
 def _looks_like_video_bytes(head: bytes) -> bool:
@@ -1289,8 +1293,12 @@ def _looks_like_video_bytes(head: bytes) -> bool:
     """
     if not head:
         return False
-    # ISO base media (MP4/MOV/M4V): 'ftyp' box at offset 4.
-    if len(head) >= 12 and head[4:8] == b"ftyp":
+    # ISO base media / QuickTime (MP4/MOV/M4V): a known box type at offset 4.
+    if len(head) >= 12 and head[4:8] in _ISO_BMFF_BOX_TYPES:
+        return True
+    # RIFF AVI specifically: 'RIFF' at 0, 'AVI ' at 8. RIFF also wraps WebP
+    # images and WAV audio, so the generic prefix alone is not enough.
+    if len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"AVI ":
         return True
     return any(head.startswith(sig) for sig in _VIDEO_MAGIC_SIGNATURES)
 
@@ -1328,6 +1336,7 @@ async def _extract_stream_to_file(video_url: str, destination: Path) -> Path:
     out_template = str(destination.with_suffix(".%(ext)s"))
     proc = await asyncio.create_subprocess_exec(
         ytdlp,
+        "--no-config",
         "-f",
         "best[height<=480][ext=mp4]/best[height<=480]/best[height<=720]/best",
         "--no-playlist",
@@ -1347,16 +1356,21 @@ async def _extract_stream_to_file(video_url: str, destination: Path) -> Path:
         err = (stderr or b"").decode("utf-8", "replace")[-400:]
         raise RuntimeError(f"yt-dlp failed to extract video: {err}")
 
-    # Locate whatever file yt-dlp produced from the template stem.
+    # Locate the video file yt-dlp produced from the template stem. A user's
+    # global yt-dlp config can emit sidecar files (.info.json, .jpg, .vtt) with
+    # the same stem, so restrict matches to supported video extensions. Keep
+    # whatever container yt-dlp actually produced (e.g. .webm) rather than
+    # forcing a .mp4 suffix the bytes don't match — _detect_video_mime_type is
+    # suffix-based downstream.
     stem = destination.stem
-    matches = sorted(destination.parent.glob(f"{stem}.*"))
-    matches = [m for m in matches if m.is_file()]
+    video_exts = set(_VIDEO_MIME_TYPES.keys())
+    matches = sorted(
+        m for m in destination.parent.glob(f"{stem}.*")
+        if m.is_file() and m.suffix.lower() in video_exts
+    )
     if not matches:
-        raise RuntimeError("yt-dlp reported success but produced no output file.")
-    produced = matches[0]
-    if produced != destination:
-        produced.rename(destination)
-    return destination
+        raise RuntimeError("yt-dlp reported success but produced no video output file.")
+    return matches[0]
 
 
 async def _download_video(video_url: str, destination: Path, max_retries: int = 3) -> Path:
@@ -1503,7 +1517,7 @@ async def video_analyze_tool(
             logger.info("Streaming host detected; extracting via yt-dlp: %s", video_url[:60])
             temp_dir = get_hermes_dir("cache/video", "temp_video_files")
             temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
-            await _extract_stream_to_file(video_url, temp_video_path)
+            temp_video_path = await _extract_stream_to_file(video_url, temp_video_path)
             should_cleanup = True
         elif await _validate_image_url_async(video_url):
             blocked = check_website_access(video_url)
