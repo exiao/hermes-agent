@@ -533,3 +533,72 @@ class TestExtractStreamPicksVideoFile:
              patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
             asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
         assert "--no-config" in captured["args"]
+
+
+from tools.vision_tools import _is_direct_media_url  # noqa: E402
+
+
+class TestIsDirectMediaUrl:
+    """Direct media URLs on streaming hosts should bypass yt-dlp."""
+
+    def test_reddit_dash_mp4(self):
+        assert _is_direct_media_url("https://v.redd.it/abc/DASH_720.mp4") is True
+
+    def test_webm_path(self):
+        assert _is_direct_media_url("https://cdn.example.com/clip.webm") is True
+
+    def test_youtube_watch_not_direct(self):
+        assert _is_direct_media_url("https://youtube.com/watch?v=abc") is False
+
+    def test_query_string_ignored(self):
+        # Extension lives in the path, not the query.
+        assert _is_direct_media_url("https://x.com/i/status/1?foo=bar") is False
+
+
+class TestExtractStreamPolicyRecheck:
+    """yt-dlp-resolved media URLs must pass the website-access policy."""
+
+    def _fake_proc(self, *, returncode=0, stdout=b""):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(stdout, b""))
+        proc.returncode = returncode
+        proc.kill = MagicMock()
+        return proc
+
+    def test_blocked_resolved_url_raises(self, tmp_path):
+        dest = tmp_path / "temp_video_abc.mp4"
+        resolve_proc = self._fake_proc(stdout=b"https://blocked-cdn.internal/stream.mp4\n")
+
+        async def fake_exec(*args, **kwargs):
+            return resolve_proc
+
+        def fake_policy(url):
+            if "blocked-cdn" in url:
+                return {"message": "blocked host"}
+            return None
+
+        with patch("tools.vision_tools.shutil.which", return_value="/usr/bin/yt-dlp"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_exec), \
+             patch("tools.vision_tools.check_website_access", side_effect=fake_policy):
+            with pytest.raises(PermissionError) as exc:
+                asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
+            assert "blocked" in str(exc.value).lower()
+
+    def test_allowed_resolved_url_proceeds(self, tmp_path):
+        dest = tmp_path / "temp_video_abc.mp4"
+        calls = {"n": 0}
+
+        async def fake_exec(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return self._fake_proc(stdout=b"https://ok-cdn.example/stream.mp4\n")
+            # Second call is the real download; write the output file.
+            (tmp_path / "temp_video_abc.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+            return self._fake_proc()
+
+        with patch("tools.vision_tools.shutil.which", return_value="/usr/bin/yt-dlp"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_exec), \
+             patch("tools.vision_tools.check_website_access", return_value=None):
+            result = asyncio.run(_extract_stream_to_file("https://youtube.com/watch?v=x", dest))
+            assert result.suffix == ".mp4"
+            assert calls["n"] == 2

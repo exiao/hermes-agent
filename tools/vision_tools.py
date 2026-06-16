@@ -1310,6 +1310,17 @@ def _is_streaming_host(video_url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in _STREAMING_HOSTS)
 
 
+def _is_direct_media_url(video_url: str) -> bool:
+    """True when the URL path ends in a supported video file extension.
+
+    A streaming host can also serve direct media (e.g. a v.redd.it
+    `DASH_720.mp4` URL). Those need no yt-dlp extraction and should go through
+    the normal validated download path, which works even when yt-dlp is absent.
+    """
+    path = (urlparse(video_url).path or "").lower()
+    return any(path.endswith(ext) for ext in _VIDEO_MIME_TYPES)
+
+
 async def _extract_stream_to_file(video_url: str, destination: Path) -> Path:
     """Use yt-dlp to pull a real video file from a streaming/watch URL.
 
@@ -1328,6 +1339,35 @@ async def _extract_stream_to_file(video_url: str, destination: Path) -> Path:
         )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # Reapply the website-access policy to the media/CDN URLs yt-dlp resolves.
+    # yt-dlp downloads from a host the original watch URL doesn't reveal, so a
+    # permitted watch page could otherwise fetch bytes from a blocked CDN. Ask
+    # yt-dlp for the resolved direct URLs first and run them through the policy.
+    resolve = await asyncio.create_subprocess_exec(
+        ytdlp,
+        "--no-config",
+        "-f",
+        "best[height<=480][ext=mp4]/best[height<=480]/best[height<=720]/best",
+        "--no-playlist",
+        "--get-url",
+        video_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        resolved_out, resolve_err = await asyncio.wait_for(resolve.communicate(), timeout=60.0)
+    except asyncio.TimeoutError:
+        resolve.kill()
+        raise RuntimeError(f"yt-dlp timed out resolving media URL for {video_url[:80]}")
+    if resolve.returncode == 0:
+        for media_url in (resolved_out or b"").decode("utf-8", "replace").splitlines():
+            media_url = media_url.strip()
+            if not media_url:
+                continue
+            blocked = check_website_access(media_url)
+            if blocked:
+                raise PermissionError(blocked["message"])
+
     # Base64 + data-URL encoding inflates bytes ~33%, so the raw file must stay
     # well under the base64 cap to survive the downstream payload check. Target
     # ~70% of the cap and prefer smaller resolutions first.
@@ -1508,9 +1548,11 @@ async def video_analyze_tool(
             logger.info("Using local video file: %s", video_url)
             temp_video_path = local_path
             should_cleanup = False
-        elif _is_streaming_host(video_url):
+        elif _is_streaming_host(video_url) and not _is_direct_media_url(video_url):
             # YouTube/Vimeo/X share URLs serve HTML, not media — extract the
-            # real stream with yt-dlp instead of a naive GET.
+            # real stream with yt-dlp instead of a naive GET. Direct media URLs
+            # on the same hosts (e.g. v.redd.it/.../DASH_720.mp4) fall through
+            # to the validated download path below, which needs no yt-dlp.
             blocked = check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
