@@ -174,7 +174,9 @@ def _get_toolset_canonical_map() -> Dict[str, str]:
         from tools.registry import registry
 
         for name in registry.get_registered_toolset_names():
-            canonical_by_lower[str(name).lower()] = str(name)
+            name_lower = str(name).lower()
+            if name_lower not in static_toolsets:
+                canonical_by_lower[name_lower] = str(name)
         for alias, canonical in registry.get_registered_toolset_aliases().items():
             alias_lower = str(alias).lower()
             if canonical and alias_lower not in static_toolsets:
@@ -1116,11 +1118,11 @@ def _build_child_agent(
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
+        child_toolsets = _strip_blocked_tools(child_toolsets)
         if child_toolsets and _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
         child_toolsets = _strip_blocked_tools(parent_enabled)
     elif parent_toolsets:
