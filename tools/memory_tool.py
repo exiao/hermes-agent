@@ -115,13 +115,22 @@ def _spill_norm_tokens(text: str) -> set:
     return {t for t in "".join(c if c.isalnum() else " " for c in text.lower()).split() if len(t) > 2}
 
 
-def _spill_too_similar(line: str, existing_lines, threshold: float = 0.6) -> bool:
-    """True if `line` is a token-set near-duplicate of any existing pending line."""
-    a = _spill_norm_tokens(line)
+def _spill_strip_metadata(content: str) -> str:
+    """Drop a leading `[date][tag]` metadata prefix so dedup compares the fact text,
+    not the shared date/tag tokens that make unrelated same-day entries look similar."""
+    return content.split("] ", 2)[-1] if "] " in content else content
+
+
+def _spill_too_similar(content: str, existing_contents, threshold: float = 0.6) -> bool:
+    """True if `content` is a token-set near-duplicate of any existing pending entry.
+
+    Both sides are metadata-stripped first so a shared `[date][tag]` prefix can't
+    push two distinct facts over the threshold."""
+    a = _spill_norm_tokens(_spill_strip_metadata(content))
     if not a:
         return False
-    for ex in existing_lines:
-        b = _spill_norm_tokens(ex)
+    for ex in existing_contents:
+        b = _spill_norm_tokens(_spill_strip_metadata(ex))
         if not b:
             continue
         if len(a & b) / len(a | b) >= threshold:
@@ -129,32 +138,46 @@ def _spill_too_similar(line: str, existing_lines, threshold: float = 0.6) -> boo
     return False
 
 
-def _spill_to_pending(target: str, content: str) -> bool:
+def _spill_to_pending(target: str, content: str) -> str:
     """Append an over-limit entry to ~/.hermes/episodes/.pending.md for memory-gc.
 
     Mirrors the proven `_spill()` in plugins/memory-session-end/__init__.py:
-    writes `TARGET\\tLINE\\n` with two-layer dedup (80-char substring guard plus
-    a token-set Jaccard check) so repeated overflow does not pile duplicates.
-    Returns True if written, False if deduped away. Fail-open: never raises.
+    writes one `TARGET\\\\tLINE\\\\n` record with two-layer dedup (80-char substring
+    guard plus a token-set Jaccard check). Dedup is scoped to the SAME target and
+    compares the metadata-stripped fact text, so a `memory\\\\t` line never suppresses
+    a distinct `user` add and a shared date/tag prefix never collapses two facts.
+    Newlines in the content are flattened to keep the one-record-per-line format
+    a line-oriented drain expects.
+
+    Returns "written", "deduped", or "error". Never raises.
     """
     try:
+        flat = " ".join(content.split()) if ("\n" in content or "\r" in content) else content
         episodes_dir = get_hermes_home() / "episodes"
         episodes_dir.mkdir(parents=True, exist_ok=True)
         path = episodes_dir / ".pending.md"
-        content_key = content.split("] ", 2)[-1][:80].lower() if "] " in content else content[:80].lower()
+        content_key = _spill_strip_metadata(flat)[:80].lower()
         if path.exists():
             existing_raw = path.read_text(encoding="utf-8")
-            if content_key in existing_raw.lower():
-                return False
-            existing_lines = [ln for ln in existing_raw.splitlines() if ln.strip()]
-            if _spill_too_similar(content, existing_lines):
-                return False
+            # Parse `TARGET\tCONTENT` records, keeping only the same target's
+            # content column so prefixes/other-target entries don't false-match.
+            same_target_contents = []
+            for ln in existing_raw.splitlines():
+                if not ln.strip():
+                    continue
+                tgt, _, rest = ln.partition("\t")
+                if rest and tgt == target:
+                    same_target_contents.append(rest)
+            if any(content_key in ex.lower() for ex in same_target_contents):
+                return "deduped"
+            if _spill_too_similar(flat, same_target_contents):
+                return "deduped"
         with path.open("a", encoding="utf-8") as f:
-            f.write(f"{target}\t{content}\n")
-        return True
+            f.write(f"{target}\t{flat}\n")
+        return "written"
     except Exception:
         logger.exception("memory spill to pending failed")
-        return False
+        return "error"
 
 
 class MemoryStore:
@@ -379,7 +402,24 @@ class MemoryStore:
                 # entry to the pending queue. memory-gc drains pending nightly
                 # and places/relocates it. Saves never silently lose a fact.
                 current = self._char_count(target)
-                spilled = _spill_to_pending(target, content)
+                spill_status = _spill_to_pending(target, content)
+                if spill_status == "error":
+                    # The spill write itself failed (unwritable episodes/, disk
+                    # full, .pending.md is a directory, ...). The fact is in
+                    # neither hot memory nor the queue — report failure so the
+                    # caller can retry or free space rather than lose it.
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Hot memory full at {current:,}/{limit:,} chars and "
+                            f"spilling to .pending.md failed (see logs). The entry "
+                            f"was NOT saved. 'remove' a stale entry and re-add, or "
+                            f"free up the episodes/ directory and retry."
+                        ),
+                        "usage": f"{current:,}/{limit:,}",
+                        "spilled_to_pending": False,
+                    }
+                spilled = spill_status == "written"
                 note = (
                     "queued to .pending.md; memory-gc will place it tonight"
                     if spilled
