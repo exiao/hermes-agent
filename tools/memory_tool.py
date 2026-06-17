@@ -110,6 +110,53 @@ def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     }
 
 
+def _spill_norm_tokens(text: str) -> set:
+    """Lowercase alphanumeric token set for Jaccard near-dup detection."""
+    return {t for t in "".join(c if c.isalnum() else " " for c in text.lower()).split() if len(t) > 2}
+
+
+def _spill_too_similar(line: str, existing_lines, threshold: float = 0.6) -> bool:
+    """True if `line` is a token-set near-duplicate of any existing pending line."""
+    a = _spill_norm_tokens(line)
+    if not a:
+        return False
+    for ex in existing_lines:
+        b = _spill_norm_tokens(ex)
+        if not b:
+            continue
+        if len(a & b) / len(a | b) >= threshold:
+            return True
+    return False
+
+
+def _spill_to_pending(target: str, content: str) -> bool:
+    """Append an over-limit entry to ~/.hermes/episodes/.pending.md for memory-gc.
+
+    Mirrors the proven `_spill()` in plugins/memory-session-end/__init__.py:
+    writes `TARGET\\tLINE\\n` with two-layer dedup (80-char substring guard plus
+    a token-set Jaccard check) so repeated overflow does not pile duplicates.
+    Returns True if written, False if deduped away. Fail-open: never raises.
+    """
+    try:
+        episodes_dir = get_hermes_home() / "episodes"
+        episodes_dir.mkdir(parents=True, exist_ok=True)
+        path = episodes_dir / ".pending.md"
+        content_key = content.split("] ", 2)[-1][:80].lower() if "] " in content else content[:80].lower()
+        if path.exists():
+            existing_raw = path.read_text(encoding="utf-8")
+            if content_key in existing_raw.lower():
+                return False
+            existing_lines = [ln for ln in existing_raw.splitlines() if ln.strip()]
+            if _spill_too_similar(content, existing_lines):
+                return False
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"{target}\t{content}\n")
+        return True
+    except Exception:
+        logger.exception("memory spill to pending failed")
+        return False
+
+
 class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
@@ -326,18 +373,27 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(new_entries))
 
             if new_total > limit:
+                # Hot memory is full. Rather than refuse and drop the fact
+                # (the old behavior — lossy when the file is dominated by
+                # permanent [rule]/[meta] entries GC cannot evict), spill the
+                # entry to the pending queue. memory-gc drains pending nightly
+                # and places/relocates it. Saves never silently lose a fact.
                 current = self._char_count(target)
+                spilled = _spill_to_pending(target, content)
+                note = (
+                    "queued to .pending.md; memory-gc will place it tonight"
+                    if spilled
+                    else "already queued or near-duplicate of a pending entry"
+                )
                 return {
-                    "success": False,
-                    "error": (
-                        f"Memory at {current:,}/{limit:,} chars. "
-                        f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Consolidate now: use 'replace' to merge overlapping entries into "
-                        f"shorter ones or 'remove' stale or less important entries (see "
-                        f"current_entries below), then retry this add — all in this turn."
+                    "success": True,
+                    "message": (
+                        f"Hot memory full at {current:,}/{limit:,} chars — "
+                        f"entry {note}. To surface it immediately instead, "
+                        f"'remove' a stale entry and re-add."
                     ),
-                    "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
+                    "spilled_to_pending": spilled,
                 }
 
             entries.append(content)

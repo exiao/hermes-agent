@@ -287,16 +287,19 @@ class TestMemoryStoreAdd:
         assert result["success"] is True  # No error, just a note
         assert len(store.memory_entries) == 1  # Not duplicated
 
-    def test_add_exceeding_limit_rejected(self, store):
-        # Fill up to near limit
+    def test_add_exceeding_limit_spills_to_pending(self, store, tmp_path, monkeypatch):
+        # Overflow must NOT drop the fact. It spills to .pending.md (the queue
+        # memory-gc drains nightly) and reports success so the model moves on.
+        monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+        (tmp_path / "episodes").mkdir(exist_ok=True)
         store.add("memory", "x" * 490)
         result = store.add("memory", "this will exceed the limit")
-        assert result["success"] is False
-        assert "exceed" in result["error"].lower()
-        # Overflow response gives the model what it needs to consolidate in-turn
-        assert "current_entries" in result
+        assert result["success"] is True
+        assert result["spilled_to_pending"] is True
         assert "usage" in result
-        assert "retry" in result["error"].lower()
+        pending = (tmp_path / "episodes" / ".pending.md").read_text()
+        assert "this will exceed the limit" in pending
+        assert pending.startswith("memory\t")
 
     def test_replace_exceeding_limit_returns_consolidation_context(self, store):
         # A replace that blows the budget should mirror the add-overflow shape:
