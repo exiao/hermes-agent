@@ -160,3 +160,18 @@ class TestToolMediaReSendFileExtensions:
         match = _TOOL_MEDIA_RE.search(media_tag)
         assert match is not None, f"Should match: {media_tag}"
         assert match.group(1) == expected_path
+
+
+class TestToolMediaReSendFileEdges:
+    def test_send_file_paths_with_spaces_match(self):
+        match = _TOOL_MEDIA_RE.search("MEDIA:/tmp/My Folder/report.md")
+        assert match is not None
+        assert match.group(1) == "/tmp/My Folder/report.md"
+
+    def test_ext_alternation_builder_deduplicates_and_escapes_metacharacters(self):
+        from gateway.run import _build_tool_media_ext_alternation
+
+        assert (
+            _build_tool_media_ext_alternation((".gz", ".tar.gz", ".gz"))
+            == r"tar\.gz|gz"
+        )

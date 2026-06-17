@@ -211,6 +211,96 @@ caption
         assert tags == ["MEDIA:/s/SKILL.md", "MEDIA:/w/coverage.json"]
         assert voice is False
 
+    def test_gateway_auto_append_send_file_ignores_caption_media_examples(self):
+        """send_file captions are prepended before the validated MEDIA line;
+        only the returned file_path tag should be eligible for auto-append.
+        """
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send the report"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_sf", "function": {"name": "send_file"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_sf",
+                "content": (
+                    "Caption example MEDIA:/private/secret.md\n"
+                    "MEDIA:/safe/report.md"
+                ),
+            },
+            {"role": "assistant", "content": "Sent."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == ["MEDIA:/safe/report.md"]
+        assert voice is False
+
+    def test_gateway_auto_append_send_file_paths_with_spaces(self):
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send the report"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_sf", "function": {"name": "send_file"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_sf",
+                "content": "MEDIA:/tmp/My Folder/report.md",
+            },
+            {"role": "assistant", "content": "Sent."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == ["MEDIA:/tmp/My Folder/report.md"]
+        assert voice is False
+
+    def test_gateway_auto_append_adds_unechoed_send_file_tags_from_partial_batch(self):
+        from gateway.run import _append_missing_auto_media_tags
+
+        messages = [
+            {"role": "user", "content": "send both files"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "a", "function": {"name": "send_file"}},
+                    {"id": "b", "function": {"name": "send_file"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "MEDIA:/tmp/first.md"},
+            {"role": "tool", "tool_call_id": "b", "content": "MEDIA:/tmp/second.md"},
+        ]
+
+        response = _append_missing_auto_media_tags(
+            "Here is the first file\nMEDIA:/tmp/first.md",
+            messages,
+            history_offset=0,
+        )
+
+        assert response.count("MEDIA:/tmp/first.md") == 1
+        assert response.endswith("MEDIA:/tmp/second.md")
+
+    def test_history_media_paths_use_widened_shared_matcher(self):
+        from gateway.run import _collect_history_media_paths
+
+        history = [
+            {"role": "tool", "content": "MEDIA:/repo/pipeline/prompts.py"},
+            {"role": "tool", "content": "MEDIA:/tmp/My Folder/report.md"},
+        ]
+
+        assert _collect_history_media_paths(history) == {
+            "/repo/pipeline/prompts.py",
+            "/tmp/My Folder/report.md",
+        }
+
     def test_media_tags_not_extracted_from_history(self):
         """MEDIA tags from previous turns should NOT be extracted again."""
         # Simulate conversation history with a TTS call from a previous turn

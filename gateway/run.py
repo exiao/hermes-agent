@@ -702,17 +702,69 @@ from gateway.platforms.base import (
     MEDIA_TAG_EXTRA_EXTS as _MEDIA_TAG_EXTRA_EXTS,
 )
 
-_TOOL_MEDIA_EXT_ALTERNATION = "|".join(
-    sorted(
-        (e.lstrip(".") for e in (*_MEDIA_DELIVERY_EXTS, *_MEDIA_TAG_EXTRA_EXTS)),
-        key=len,
-        reverse=True,
+
+def _build_tool_media_ext_alternation(extensions) -> str:
+    return "|".join(
+        sorted(
+            {re.escape(e.lstrip(".")) for e in extensions},
+            key=len,
+            reverse=True,
+        )
     )
+
+
+_TOOL_MEDIA_EXT_ALTERNATION = _build_tool_media_ext_alternation(
+    (*_MEDIA_DELIVERY_EXTS, *_MEDIA_TAG_EXTRA_EXTS)
+)
+_TOOL_MEDIA_PATH_PATTERN = (
+    r'(?:[A-Za-z]:[/\\]|/|~\/)\S+(?:[^\S\n]+(?!MEDIA:)\S+)*?\.(?:'
+    + _TOOL_MEDIA_EXT_ALTERNATION
+    + r')'
 )
 _TOOL_MEDIA_RE = re.compile(
-    r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:' + _TOOL_MEDIA_EXT_ALTERNATION + r'))',
+    r'MEDIA:\s*(' + _TOOL_MEDIA_PATH_PATTERN + r')(?=[\s`"\',;:)\]}]|$)',
     re.IGNORECASE,
 )
+_TOOL_MEDIA_LINE_RE = re.compile(
+    r'^\s*MEDIA:\s*(' + _TOOL_MEDIA_PATH_PATTERN + r')\s*$',
+    re.IGNORECASE,
+)
+
+
+def _clean_tool_media_path(path: str) -> str:
+    return path.strip().rstrip('\",}')
+
+
+def _iter_tool_media_paths(content: str, tool_name: Optional[str] = None):
+    if tool_name == "send_file":
+        # send_file returns ``<optional caption>\nMEDIA:<validated path>``.
+        # Captions are user/model-controlled text and can contain MEDIA examples,
+        # so only trust the final standalone MEDIA line returned by the tool.
+        for line in reversed(content.splitlines()):
+            match = _TOOL_MEDIA_LINE_RE.match(line)
+            if match:
+                path = _clean_tool_media_path(match.group(1))
+                if path:
+                    yield path
+                return
+        return
+
+    for match in _TOOL_MEDIA_RE.finditer(content):
+        path = _clean_tool_media_path(match.group(1))
+        if path:
+            yield path
+
+
+def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
+    media_paths: set = set()
+    for msg in agent_history:
+        if msg.get("role") not in {"tool", "function"}:
+            continue
+        content = str(msg.get("content") or "")
+        if "MEDIA:" not in content:
+            continue
+        media_paths.update(_iter_tool_media_paths(content))
+    return media_paths
 
 
 def _collect_auto_append_media_tags(
@@ -768,14 +820,47 @@ def _collect_auto_append_media_tags(
         content = str(msg.get("content") or "")
         if "MEDIA:" not in content:
             continue
-        for match in _TOOL_MEDIA_RE.finditer(content):
-            path = match.group(1).strip().rstrip('\",}')
-            if path and path not in history_media_paths:
+        tool_name = tool_name_by_call_id.get(call_id)
+        for path in _iter_tool_media_paths(content, tool_name=tool_name):
+            if path not in history_media_paths:
                 media_tags.append(f"MEDIA:{path}")
         if "[[audio_as_voice]]" in content:
             has_voice_directive = True
 
     return media_tags, has_voice_directive
+
+
+def _append_missing_auto_media_tags(
+    final_response: str,
+    messages: List[Dict[str, Any]],
+    history_offset: int = 0,
+    history_media_paths: Optional[set] = None,
+) -> str:
+    media_tags, has_voice_directive = _collect_auto_append_media_tags(
+        messages,
+        history_offset=history_offset,
+        history_media_paths=history_media_paths,
+    )
+    if not media_tags:
+        return final_response
+
+    existing_paths = set(_iter_tool_media_paths(final_response))
+    seen_paths = set(existing_paths)
+    unique_tags = []
+    for tag in media_tags:
+        path = tag.removeprefix("MEDIA:")
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        unique_tags.append(tag)
+
+    if not unique_tags:
+        return final_response
+
+    if has_voice_directive and "[[audio_as_voice]]" not in final_response:
+        unique_tags.insert(0, "[[audio_as_voice]]")
+    return final_response + "\n" + "\n".join(unique_tags)
+
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -14757,22 +14842,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.
-            _history_media_paths: set = set()
-            for _hm in agent_history:
-                if _hm.get("role") in {"tool", "function"}:
-                    _hc = _hm.get("content", "")
-                    if "MEDIA:" in _hc:
-                        _TOOL_MEDIA_RE = re.compile(
-                            r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-                            r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-                            r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-                            r'txt|csv|apk|ipa))',
-                            re.IGNORECASE
-                        )
-                        for _match in _TOOL_MEDIA_RE.finditer(_hc):
-                            _p = _match.group(1).strip().rstrip('",}')
-                            if _p:
-                                _history_media_paths.add(_p)
+            _history_media_paths = _collect_history_media_paths(agent_history)
             
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -15071,23 +15141,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # also the sole guard on the fallback branch taken when mid-run
             # context compression shrinks the message list below the original
             # history length, preserving the compression-safe behaviour of #160.
-            if "MEDIA:" not in final_response:
-                media_tags, has_voice_directive = _collect_auto_append_media_tags(
-                    result.get("messages", []),
-                    history_offset=len(agent_history),
-                    history_media_paths=_history_media_paths,
-                )
-
-                if media_tags:
-                    seen = set()
-                    unique_tags = []
-                    for tag in media_tags:
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
-                    if has_voice_directive:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
+            final_response = _append_missing_auto_media_tags(
+                final_response,
+                result.get("messages", []),
+                history_offset=len(agent_history),
+                history_media_paths=_history_media_paths,
+            )
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
