@@ -688,20 +688,97 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
 # ordinary outputs. Only tools that intentionally create deliverable media
 # artifacts should be eligible for automatic append when the model omits them
 # from the final gateway reply.
-_AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool"}
+_AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool", "send_file"}
 
 
-# Extension-anchored MEDIA: matcher for tool results. Mirrors the dispatch-site
-# pattern so a bare ``MEDIA:`` token in prose (no deliverable extension) is never
-# auto-appended. Kept local to the auto-append path; the producer-tool allowlist
-# below is the primary guard, this is the secondary precision guard.
+# Extension-anchored MEDIA: matcher for tool results. Built from the shared
+# base-adapter extension sources (delivery exts + the send_file tag-only
+# superset that covers code/config/log files) so it can never drift from what
+# the dispatch site actually delivers. A bare ``MEDIA:`` token in prose with no
+# deliverable extension is still never auto-appended; the producer-tool
+# allowlist below is the primary guard, this is the secondary precision guard.
+from gateway.platforms.base import (
+    MEDIA_DELIVERY_EXTS as _MEDIA_DELIVERY_EXTS,
+    MEDIA_TAG_EXTRA_EXTS as _MEDIA_TAG_EXTRA_EXTS,
+)
+
+
+def _build_tool_media_ext_alternation(extensions) -> str:
+    return "|".join(
+        sorted(
+            {re.escape(e.lstrip(".")) for e in extensions},
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+_TOOL_MEDIA_EXT_ALTERNATION = _build_tool_media_ext_alternation(
+    (*_MEDIA_DELIVERY_EXTS, *_MEDIA_TAG_EXTRA_EXTS)
+)
+_TOOL_MEDIA_PATH_PATTERN = (
+    r'(?:[A-Za-z]:[/\\]|/|~\/)\S+(?:[^\S\n]+(?!MEDIA:)\S+)*?\.(?:'
+    + _TOOL_MEDIA_EXT_ALTERNATION
+    + r')'
+)
 _TOOL_MEDIA_RE = re.compile(
-    r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-    r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-    r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-    r'txt|csv|apk|ipa))',
+    r"MEDIA:\s*[`\"']?(" + _TOOL_MEDIA_PATH_PATTERN + r")[`\"']?(?=[\s`\"',;:)\]}]|$)",
     re.IGNORECASE,
 )
+_TOOL_MEDIA_LINE_RE = re.compile(
+    r"^\s*MEDIA:\s*[`\"']?(" + _TOOL_MEDIA_PATH_PATTERN + r")[`\"']?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_tool_media_path(path: str) -> str:
+    return path.strip().strip('`\"\'').rstrip(",}")
+
+
+def _iter_tool_media_paths(content: str, tool_name: Optional[str] = None):
+    if tool_name == "send_file":
+        # send_file returns ``<optional caption>\nMEDIA:<validated path>``.
+        # Captions and appended subdirectory hints can contain MEDIA examples,
+        # so only trust the final standalone MEDIA line in the actual tool result.
+        content = content.split("\n[Subdirectory context discovered:", 1)[0]
+        for line in reversed(content.splitlines()):
+            match = _TOOL_MEDIA_LINE_RE.match(line)
+            if match:
+                path = _clean_tool_media_path(match.group(1))
+                if path:
+                    yield path
+                return
+        return
+
+    for match in _TOOL_MEDIA_RE.finditer(content):
+        path = _clean_tool_media_path(match.group(1))
+        if path:
+            yield path
+
+
+def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
+    media_paths: set = set()
+    tool_name_by_call_id: Dict[str, str] = {}
+    for msg in agent_history:
+        if msg.get("role") != "assistant":
+            continue
+        for call in msg.get("tool_calls") or []:
+            call_id = call.get("id") or call.get("call_id")
+            fn = call.get("function") or {}
+            name = str(fn.get("name") or call.get("name") or "")
+            if call_id and name:
+                tool_name_by_call_id[str(call_id)] = name
+
+    for msg in agent_history:
+        if msg.get("role") not in {"tool", "function"}:
+            continue
+        content = str(msg.get("content") or "")
+        if "MEDIA:" not in content:
+            continue
+        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+        tool_name = tool_name_by_call_id.get(call_id)
+        media_paths.update(_iter_tool_media_paths(content, tool_name=tool_name))
+    return media_paths
 
 
 def _collect_auto_append_media_tags(
@@ -730,6 +807,7 @@ def _collect_auto_append_media_tags(
     history_media_paths = history_media_paths or set()
     # Only trust the slice boundary when the message list still contains the
     # full history prefix. Otherwise scan everything (compression-safe fallback).
+    use_history_dedup = not (history_offset and len(messages) >= history_offset)
     if history_offset and len(messages) >= history_offset:
         new_messages = messages[history_offset:]
     else:
@@ -757,14 +835,56 @@ def _collect_auto_append_media_tags(
         content = str(msg.get("content") or "")
         if "MEDIA:" not in content:
             continue
-        for match in _TOOL_MEDIA_RE.finditer(content):
-            path = match.group(1).strip().rstrip('\",}')
-            if path and path not in history_media_paths:
+        tool_name = tool_name_by_call_id.get(call_id)
+        for path in _iter_tool_media_paths(content, tool_name=tool_name):
+            if not use_history_dedup or path not in history_media_paths:
                 media_tags.append(f"MEDIA:{path}")
         if "[[audio_as_voice]]" in content:
             has_voice_directive = True
 
     return media_tags, has_voice_directive
+
+
+def _iter_deliverable_reply_media_paths(content: str):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    for path, _is_voice in BasePlatformAdapter.extract_media(content)[0]:
+        path = _clean_tool_media_path(path)
+        if path:
+            yield path
+
+
+def _append_missing_auto_media_tags(
+    final_response: str,
+    messages: List[Dict[str, Any]],
+    history_offset: int = 0,
+    history_media_paths: Optional[set] = None,
+) -> str:
+    media_tags, has_voice_directive = _collect_auto_append_media_tags(
+        messages,
+        history_offset=history_offset,
+        history_media_paths=history_media_paths,
+    )
+    if not media_tags:
+        return final_response
+
+    existing_paths = set(_iter_deliverable_reply_media_paths(final_response))
+    seen_paths = set(existing_paths)
+    unique_tags = []
+    for tag in media_tags:
+        path = tag.removeprefix("MEDIA:")
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        unique_tags.append(tag)
+
+    if not unique_tags:
+        return final_response
+
+    if has_voice_directive and "[[audio_as_voice]]" not in final_response:
+        unique_tags.insert(0, "[[audio_as_voice]]")
+    return final_response + "\n" + "\n".join(unique_tags)
+
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -14746,22 +14866,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.
-            _history_media_paths: set = set()
-            for _hm in agent_history:
-                if _hm.get("role") in {"tool", "function"}:
-                    _hc = _hm.get("content", "")
-                    if "MEDIA:" in _hc:
-                        _TOOL_MEDIA_RE = re.compile(
-                            r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-                            r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-                            r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-                            r'txt|csv|apk|ipa))',
-                            re.IGNORECASE
-                        )
-                        for _match in _TOOL_MEDIA_RE.finditer(_hc):
-                            _p = _match.group(1).strip().rstrip('",}')
-                            if _p:
-                                _history_media_paths.add(_p)
+            _history_media_paths = _collect_history_media_paths(agent_history)
             
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -15056,27 +15161,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # list) can never leak onto a later text-only reply. (Fixes #34608)
             #
             # Path-based deduplication against _history_media_paths (collected
-            # before run_conversation) is retained as a secondary guard. It is
-            # also the sole guard on the fallback branch taken when mid-run
-            # context compression shrinks the message list below the original
-            # history length, preserving the compression-safe behaviour of #160.
-            if "MEDIA:" not in final_response:
-                media_tags, has_voice_directive = _collect_auto_append_media_tags(
-                    result.get("messages", []),
-                    history_offset=len(agent_history),
-                    history_media_paths=_history_media_paths,
-                )
-
-                if media_tags:
-                    seen = set()
-                    unique_tags = []
-                    for tag in media_tags:
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
-                    if has_voice_directive:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
+            # before run_conversation) is used only on the fallback branch taken
+            # when mid-run context compression shrinks the message list below
+            # the original history length. When the current-turn slice is intact,
+            # a repeated send_file of the same path should be delivered again.
+            final_response = _append_missing_auto_media_tags(
+                final_response,
+                result.get("messages", []),
+                history_offset=len(agent_history),
+                history_media_paths=_history_media_paths,
+            )
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).

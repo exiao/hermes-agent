@@ -136,6 +136,46 @@ caption
         assert tags == []
         assert voice is False
 
+    def test_gateway_auto_append_uses_deliverable_final_reply_tags_only(self):
+        from gateway.run import _append_missing_auto_media_tags
+
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_file", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "call_file", "content": "MEDIA:/tmp/report.md"},
+        ]
+        response = '{"file":"MEDIA:/tmp/report.md"}'
+
+        assert _append_missing_auto_media_tags(response, messages) == (
+            '{"file":"MEDIA:/tmp/report.md"}\nMEDIA:/tmp/report.md'
+        )
+
+    def test_gateway_auto_append_counts_inline_deliverable_reply_tags(self):
+        from gateway.run import _append_missing_auto_media_tags
+
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_file", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "call_file", "content": "MEDIA:/tmp/report.md"},
+        ]
+
+        assert _append_missing_auto_media_tags(
+            'Already sent MEDIA:"/tmp/report.md"',
+            messages,
+        ) == 'Already sent MEDIA:"/tmp/report.md"'
+
+    def test_history_scan_uses_send_file_standalone_tag_rules(self):
+        from gateway.run import _collect_history_media_paths
+
+        history = [
+            {"role": "assistant", "tool_calls": [{"id": "call_file", "function": {"name": "send_file"}}]},
+            {
+                "role": "tool",
+                "tool_call_id": "call_file",
+                "content": "Caption has MEDIA:/tmp/example.md\nMEDIA:/tmp/report.md",
+            },
+        ]
+
+        assert _collect_history_media_paths(history) == {"/tmp/report.md"}
+
     def test_gateway_auto_append_keeps_real_tts_media_tag(self):
         """TTS tool media tags are still auto-appended when the model omits them."""
         from gateway.run import _collect_auto_append_media_tags
@@ -159,7 +199,211 @@ caption
         tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
         assert tags == ["MEDIA:/tmp/voice.ogg"]
         assert voice is True
-    
+
+    def test_gateway_auto_append_keeps_send_file_media_tag(self):
+        """send_file media tags are auto-appended even when the model forgets to
+        echo them in the final reply (the original silent-drop bug). Covers a
+        code-file extension (.py) the old hardcoded tool-result matcher omitted.
+        """
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send me the compile prompt file"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_sf", "function": {"name": "send_file"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_sf",
+                "content": "prompts.py\nMEDIA:/repo/pipeline/prompts.py",
+            },
+            {"role": "assistant", "content": "Sent."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == ["MEDIA:/repo/pipeline/prompts.py"]
+        assert voice is False
+
+    def test_gateway_auto_append_send_file_markdown_and_json(self):
+        """send_file delivers .md/.json — extensions the pre-fix tool-result
+        matcher dropped, so a batch of doc/data files vanished silently.
+        """
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send the skill and coverage files"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "a", "function": {"name": "send_file"}},
+                    {"id": "b", "function": {"name": "send_file"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "MEDIA:/s/SKILL.md"},
+            {"role": "tool", "tool_call_id": "b", "content": "MEDIA:/w/coverage.json"},
+            {"role": "assistant", "content": "Both sent."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == ["MEDIA:/s/SKILL.md", "MEDIA:/w/coverage.json"]
+        assert voice is False
+
+    def test_gateway_auto_append_send_file_ignores_caption_media_examples(self):
+        """send_file captions are prepended before the validated MEDIA line;
+        only the returned file_path tag should be eligible for auto-append.
+        """
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send the report"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_sf", "function": {"name": "send_file"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_sf",
+                "content": (
+                    "Caption example MEDIA:/private/secret.md\n"
+                    "MEDIA:/safe/report.md"
+                ),
+            },
+            {"role": "assistant", "content": "Sent."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == ["MEDIA:/safe/report.md"]
+        assert voice is False
+
+    def test_gateway_auto_append_send_file_paths_with_spaces(self):
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send the report"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_sf", "function": {"name": "send_file"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_sf",
+                "content": "MEDIA:/tmp/My Folder/report.md",
+            },
+            {"role": "assistant", "content": "Sent."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == ["MEDIA:/tmp/My Folder/report.md"]
+        assert voice is False
+
+    def test_gateway_auto_append_adds_unechoed_send_file_tags_from_partial_batch(self):
+        from gateway.run import _append_missing_auto_media_tags
+
+        messages = [
+            {"role": "user", "content": "send both files"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "a", "function": {"name": "send_file"}},
+                    {"id": "b", "function": {"name": "send_file"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "MEDIA:/tmp/first.md"},
+            {"role": "tool", "tool_call_id": "b", "content": "MEDIA:/tmp/second.md"},
+        ]
+
+        response = _append_missing_auto_media_tags(
+            "Here is the first file\nMEDIA:/tmp/first.md",
+            messages,
+            history_offset=0,
+        )
+
+        assert response.count("MEDIA:/tmp/first.md") == 1
+        assert response.endswith("MEDIA:/tmp/second.md")
+
+    def test_current_turn_send_file_can_resend_historical_path(self):
+        from gateway.run import _collect_auto_append_media_tags
+
+        history = [
+            {"role": "user", "content": "send report"},
+            {"role": "assistant", "tool_calls": [{"id": "old", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "old", "content": "MEDIA:/tmp/report.md"},
+            {"role": "assistant", "content": "Sent."},
+        ]
+        current = [
+            {"role": "user", "content": "send report again"},
+            {"role": "assistant", "tool_calls": [{"id": "new", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "new", "content": "MEDIA:/tmp/report.md"},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(
+            history + current,
+            history_offset=len(history),
+            history_media_paths={"/tmp/report.md"},
+        )
+
+        assert tags == ["MEDIA:/tmp/report.md"]
+        assert voice is False
+
+    def test_quoted_final_response_media_tags_are_not_duplicated(self):
+        from gateway.run import _append_missing_auto_media_tags
+
+        messages = [
+            {"role": "user", "content": "send report"},
+            {"role": "assistant", "tool_calls": [{"id": "sf", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "sf", "content": "MEDIA:/tmp/report.md"},
+        ]
+
+        response = _append_missing_auto_media_tags(
+            'Already sent MEDIA:"/tmp/report.md"',
+            messages,
+            history_offset=0,
+        )
+
+        assert response == 'Already sent MEDIA:"/tmp/report.md"'
+
+    def test_send_file_ignores_subdirectory_context_media_hints(self):
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send report"},
+            {"role": "assistant", "tool_calls": [{"id": "sf", "function": {"name": "send_file"}}]},
+            {
+                "role": "tool",
+                "tool_call_id": "sf",
+                "content": (
+                    "MEDIA:/safe/report.md\n\n"
+                    "[Subdirectory context discovered: docs/AGENTS.md]\n"
+                    "Example:\nMEDIA:/private/example.md"
+                ),
+            },
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == ["MEDIA:/safe/report.md"]
+        assert voice is False
+
+    def test_history_media_paths_use_widened_shared_matcher(self):
+        from gateway.run import _collect_history_media_paths
+
+        history = [
+            {"role": "tool", "content": "MEDIA:/repo/pipeline/prompts.py"},
+            {"role": "tool", "content": "MEDIA:/tmp/My Folder/report.md"},
+        ]
+
+        assert _collect_history_media_paths(history) == {
+            "/repo/pipeline/prompts.py",
+            "/tmp/My Folder/report.md",
+        }
+
     def test_media_tags_not_extracted_from_history(self):
         """MEDIA tags from previous turns should NOT be extracted again."""
         # Simulate conversation history with a TTS call from a previous turn
