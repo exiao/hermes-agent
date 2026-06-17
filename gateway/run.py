@@ -688,18 +688,29 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
 # ordinary outputs. Only tools that intentionally create deliverable media
 # artifacts should be eligible for automatic append when the model omits them
 # from the final gateway reply.
-_AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool"}
+_AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool", "send_file"}
 
 
-# Extension-anchored MEDIA: matcher for tool results. Mirrors the dispatch-site
-# pattern so a bare ``MEDIA:`` token in prose (no deliverable extension) is never
-# auto-appended. Kept local to the auto-append path; the producer-tool allowlist
-# below is the primary guard, this is the secondary precision guard.
+# Extension-anchored MEDIA: matcher for tool results. Built from the shared
+# base-adapter extension sources (delivery exts + the send_file tag-only
+# superset that covers code/config/log files) so it can never drift from what
+# the dispatch site actually delivers. A bare ``MEDIA:`` token in prose with no
+# deliverable extension is still never auto-appended; the producer-tool
+# allowlist below is the primary guard, this is the secondary precision guard.
+from gateway.platforms.base import (
+    MEDIA_DELIVERY_EXTS as _MEDIA_DELIVERY_EXTS,
+    MEDIA_TAG_EXTRA_EXTS as _MEDIA_TAG_EXTRA_EXTS,
+)
+
+_TOOL_MEDIA_EXT_ALTERNATION = "|".join(
+    sorted(
+        (e.lstrip(".") for e in (*_MEDIA_DELIVERY_EXTS, *_MEDIA_TAG_EXTRA_EXTS)),
+        key=len,
+        reverse=True,
+    )
+)
 _TOOL_MEDIA_RE = re.compile(
-    r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-    r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-    r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-    r'txt|csv|apk|ipa))',
+    r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:' + _TOOL_MEDIA_EXT_ALTERNATION + r'))',
     re.IGNORECASE,
 )
 

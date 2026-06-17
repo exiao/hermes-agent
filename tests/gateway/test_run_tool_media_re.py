@@ -20,16 +20,10 @@ import re
 import pytest
 
 
-# Reconstruct the exact _TOOL_MEDIA_RE pattern from gateway/run.py
-# The pattern is built by concatenating raw string parts:
-#   r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|...))'
-_TOOL_MEDIA_RE = re.compile(
-    r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-    r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-    r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-    r'txt|csv|apk|ipa))',
-    re.IGNORECASE,
-)
+# Use the REAL compiled pattern from run.py so this test tracks the shipped
+# regex (it is now built from the shared base-adapter extension sources, so a
+# literal copy here would silently go stale when those lists change).
+from gateway.run import _TOOL_MEDIA_RE
 
 
 # Reconstruct the pre-fix pattern (without Windows anchor) for regression proof
@@ -145,3 +139,24 @@ class TestToolMediaReWindowsPaths:
         """File extensions are matched case-insensitively."""
         match = _TOOL_MEDIA_RE.search(media_tag)
         assert match is not None, f"Should match: {media_tag}"
+
+
+class TestToolMediaReSendFileExtensions:
+    """send_file delivers code/doc/data files; the tool-result matcher must
+    cover the same extension superset the dispatch site accepts, or those tags
+    auto-append-drop silently (the original batch-of-prompt-files bug).
+    """
+
+    @pytest.mark.parametrize("media_tag, expected_path", [
+        ("MEDIA:/repo/pipeline/prompts.py", "/repo/pipeline/prompts.py"),
+        ("MEDIA:/s/SKILL.md", "/s/SKILL.md"),
+        ("MEDIA:/w/coverage.json", "/w/coverage.json"),
+        ("MEDIA:/site/index.html", "/site/index.html"),
+        ("MEDIA:/site/style.css", "/site/style.css"),
+        ("MEDIA:/logs/gateway.log", "/logs/gateway.log"),
+        ("MEDIA:/cfg/app.toml", "/cfg/app.toml"),
+    ])
+    def test_send_file_extensions_match(self, media_tag, expected_path):
+        match = _TOOL_MEDIA_RE.search(media_tag)
+        assert match is not None, f"Should match: {media_tag}"
+        assert match.group(1) == expected_path

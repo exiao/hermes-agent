@@ -159,7 +159,58 @@ caption
         tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
         assert tags == ["MEDIA:/tmp/voice.ogg"]
         assert voice is True
-    
+
+    def test_gateway_auto_append_keeps_send_file_media_tag(self):
+        """send_file media tags are auto-appended even when the model forgets to
+        echo them in the final reply (the original silent-drop bug). Covers a
+        code-file extension (.py) the old hardcoded tool-result matcher omitted.
+        """
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send me the compile prompt file"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_sf", "function": {"name": "send_file"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_sf",
+                "content": "prompts.py\nMEDIA:/repo/pipeline/prompts.py",
+            },
+            {"role": "assistant", "content": "Sent."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == ["MEDIA:/repo/pipeline/prompts.py"]
+        assert voice is False
+
+    def test_gateway_auto_append_send_file_markdown_and_json(self):
+        """send_file delivers .md/.json — extensions the pre-fix tool-result
+        matcher dropped, so a batch of doc/data files vanished silently.
+        """
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send the skill and coverage files"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "a", "function": {"name": "send_file"}},
+                    {"id": "b", "function": {"name": "send_file"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "MEDIA:/s/SKILL.md"},
+            {"role": "tool", "tool_call_id": "b", "content": "MEDIA:/w/coverage.json"},
+            {"role": "assistant", "content": "Both sent."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        assert tags == ["MEDIA:/s/SKILL.md", "MEDIA:/w/coverage.json"]
+        assert voice is False
+
     def test_media_tags_not_extracted_from_history(self):
         """MEDIA tags from previous turns should NOT be extracted again."""
         # Simulate conversation history with a TTS call from a previous turn
