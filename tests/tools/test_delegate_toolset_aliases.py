@@ -10,8 +10,10 @@ Run with:  python -m pytest tests/tools/test_delegate_toolset_aliases.py -v
 
 import logging
 import unittest
+from unittest.mock import patch
 
 from tools.delegate_tool import _normalize_toolset_names
+from tools.registry import ToolRegistry
 
 
 class TestToolsetAliasNormalization(unittest.TestCase):
@@ -38,6 +40,22 @@ class TestToolsetAliasNormalization(unittest.TestCase):
         # A leading mcp_ on an otherwise-valid toolset is stripped.
         self.assertEqual(_normalize_toolset_names(["mcp_web"]), ["web"])
         self.assertEqual(_normalize_toolset_names(["mcp_vision"]), ["vision"])
+
+    def test_registry_backed_toolsets_are_accepted_case_insensitively(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="minimax_generate",
+            toolset="mcp-MiniMax",
+            schema={"description": "Generate via MiniMax"},
+            handler=lambda _args: "{}",
+        )
+        reg.register_toolset_alias("MiniMax", "mcp-MiniMax")
+
+        with patch("tools.registry.registry", reg):
+            self.assertEqual(
+                _normalize_toolset_names(["mcp-minimax", "MiniMax", "minimax"]),
+                ["mcp-MiniMax"],
+            )
 
     def test_canonical_names_pass_through_unchanged(self):
         names = ["terminal", "file", "web", "session_search", "memory"]

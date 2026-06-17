@@ -1658,6 +1658,62 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             ["file", "terminal"],
         )
 
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_accepts_dynamic_registry_toolsets(self, mock_cfg):
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="minimax_generate",
+            toolset="mcp-MiniMax",
+            schema={"description": "Generate via MiniMax"},
+            handler=lambda _args: "{}",
+        )
+        reg.register_toolset_alias("MiniMax", "mcp-MiniMax")
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["mcp-MiniMax", "terminal"]
+
+        with patch("tools.registry.registry", reg), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test dynamic toolset normalization",
+                context=None,
+                toolsets=["mcp-minimax"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            MockAgent.call_args[1]["enabled_toolsets"],
+            ["mcp-MiniMax"],
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_preserves_explicit_unresolvable_toolsets_as_empty(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file", "web"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test unknown toolset narrowing",
+                context=None,
+                toolsets=["totally_bogus"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], [])
+
     @patch(
         "tools.delegate_tool._load_config",
         return_value={"inherit_mcp_toolsets": False},

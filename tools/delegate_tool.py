@@ -30,7 +30,7 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
-from toolsets import TOOLSETS
+from toolsets import TOOLSETS, get_toolset_names
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -152,6 +152,35 @@ _TOOLSET_ALIASES: Dict[str, str] = {
 }
 
 
+def _get_toolset_canonical_map() -> Dict[str, str]:
+    """Return case-folded toolset names/aliases mapped to canonical names.
+
+    ``TOOLSETS`` only contains built-in static toolsets. Plugin and MCP
+    toolsets are registered dynamically, so normalization must read the live
+    toolset registry as well. Registry aliases (for example an MCP server name
+    like ``MiniMax`` pointing at canonical ``mcp-MiniMax``) map to their
+    canonical target so later parent-toolset intersection sees the same key the
+    parent session carries.
+    """
+    canonical_by_lower: Dict[str, str] = {}
+
+    for name in get_toolset_names():
+        canonical_by_lower[str(name).lower()] = str(name)
+
+    try:
+        from tools.registry import registry
+
+        for name in registry.get_registered_toolset_names():
+            canonical_by_lower[str(name).lower()] = str(name)
+        for alias, canonical in registry.get_registered_toolset_aliases().items():
+            if canonical:
+                canonical_by_lower[str(alias).lower()] = str(canonical)
+    except Exception:
+        pass
+
+    return canonical_by_lower
+
+
 def _normalize_toolset_names(names):
     """Normalize requested toolset names to canonical registry keys.
 
@@ -170,7 +199,8 @@ def _normalize_toolset_names(names):
     if names is None:
         return None
 
-    valid = set(TOOLSETS)
+    valid = _get_toolset_canonical_map()
+    valid_display = ", ".join(f"'{n}'" for n in sorted(set(valid.values()), key=str.lower))
     resolved: List[str] = []
     seen: set = set()
 
@@ -181,25 +211,27 @@ def _normalize_toolset_names(names):
         if not name:
             continue
         canonical = None
-        if name in valid:
-            canonical = name
-        else:
-            lowered = name.lower()
-            if lowered in valid:
-                canonical = lowered
-            elif lowered in _TOOLSET_ALIASES:
-                canonical = _TOOLSET_ALIASES[lowered]
-            elif lowered.startswith("mcp_") and lowered[4:] in valid:
-                canonical = lowered[4:]
-            elif lowered.startswith("mcp_") and lowered[4:] in _TOOLSET_ALIASES:
-                canonical = _TOOLSET_ALIASES[lowered[4:]]
+        lowered = name.lower()
+        if lowered in valid:
+            canonical = valid[lowered]
+        elif lowered in _TOOLSET_ALIASES:
+            canonical = _TOOLSET_ALIASES[lowered]
+        elif lowered.startswith("mcp_"):
+            unprefixed = lowered[4:]
+            dashed = f"mcp-{unprefixed}"
+            if unprefixed in valid:
+                canonical = valid[unprefixed]
+            elif dashed in valid:
+                canonical = valid[dashed]
+            elif unprefixed in _TOOLSET_ALIASES:
+                canonical = _TOOLSET_ALIASES[unprefixed]
 
         if canonical is None:
             logger.warning(
                 "delegate_task: unknown toolset %r ignored "
                 "(valid toolsets: %s)",
                 raw,
-                _TOOLSET_LIST_STR,
+                valid_display or _TOOLSET_LIST_STR,
             )
             continue
         if canonical not in seen:
@@ -1056,19 +1088,20 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    explicit_toolsets = toolsets is not None
+    if explicit_toolsets:
         # Map common wrong names (display names, mcp_ prefixes, typos) to
         # canonical keys BEFORE intersecting, so a request like ["ShellExec"]
         # resolves to ["terminal"] instead of being silently dropped.
-        toolsets = _normalize_toolset_names(toolsets)
+        toolsets = _normalize_toolset_names(toolsets) or []
 
-    if toolsets:
+    if explicit_toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        if child_toolsets and _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
