@@ -13680,7 +13680,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # bubbles must NEVER echo the command or code to the user — only a
         # sanitized friendly label (via tool_display / tool_display_rewrite) or
         # a generic "{name}…" line. See plans/hermes-patches/no-raw-command-preview.md.
-        _CODE_BEARING_TOOLS = {"terminal", "execute_code"}
+        # `process` belongs here too: its write/submit actions send raw stdin
+        # `data` (e.g. a command piped into a background shell), and
+        # build_tool_preview() echoes that data, so it is part of the same
+        # terminal/code surface even though it isn't a standalone code tool.
+        _CODE_BEARING_TOOLS = {"terminal", "execute_code", "process"}
 
         # Config-driven tool display names and rewrite rules.
         #

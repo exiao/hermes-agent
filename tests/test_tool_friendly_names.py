@@ -65,7 +65,7 @@ def _build_progress_callback(display_config=None, progress_queue=None,
 
         return None
 
-    _CODE_BEARING_TOOLS = {"terminal", "execute_code"}
+    _CODE_BEARING_TOOLS = {"terminal", "execute_code", "process"}
 
     def progress_callback(tool_name, preview=None, args=None):
         from agent.display import get_tool_emoji
@@ -168,6 +168,21 @@ class TestToolDisplay:
         msg = cb("execute_code", preview="print(open('/etc/passwd').read())")
         assert "passwd" not in msg
         assert "print(" not in msg
+
+    def test_process_stdin_never_leaks(self):
+        """`process` submit/write stdin is part of the terminal surface: with
+        hide_code_in_progress, a command piped into a background shell must not
+        appear in the progress bubble."""
+        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=True)
+        msg = cb("process", preview='submit "cat ~/.hermes/.env"')
+        assert ".env" not in msg
+        assert "cat " not in msg
+
+    def test_process_stdin_shown_when_hide_off(self):
+        """Default (hide off): process previews still flow through as before."""
+        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=False)
+        msg = cb("process", preview='submit "echo hi"')
+        assert "echo hi" in msg
 
     def test_default_keeps_bash_block_for_code_block_platforms(self):
         """Default (hide off): a markdown adapter still renders the full ```bash block."""

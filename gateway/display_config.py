@@ -129,7 +129,12 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
-    "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
+    # WhatsApp is the canonical customer-facing channel and its adapter declares
+    # supports_code_blocks=True, so without this a model-authored terminal/process
+    # command (incl. a secret-reading heredoc) would render as a raw ```bash block
+    # to an end user. Default hide_code_in_progress ON here; personal installs can
+    # still opt out via display.platforms.whatsapp.hide_code_in_progress: false.
+    "whatsapp":        {**_TIER_MEDIUM, "hide_code_in_progress": True},  # Baileys bridge supports /edit
     "bluebubbles":     _TIER_LOW,
     "weixin":          _TIER_LOW,
     "wecom":           _TIER_LOW,
