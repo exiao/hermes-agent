@@ -1310,6 +1310,17 @@ def _is_streaming_host(video_url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in _STREAMING_HOSTS)
 
 
+def _is_direct_media_url(video_url: str) -> bool:
+    """True when the URL path ends in a supported video file extension.
+
+    A streaming host can also serve direct media (e.g. a v.redd.it
+    `DASH_720.mp4` URL). Those need no yt-dlp extraction and should go through
+    the normal validated download path, which works even when yt-dlp is absent.
+    """
+    path = (urlparse(video_url).path or "").lower()
+    return any(path.endswith(ext) for ext in _VIDEO_MIME_TYPES)
+
+
 async def _extract_stream_to_file(video_url: str, destination: Path) -> Path:
     """Use yt-dlp to pull a real video file from a streaming/watch URL.
 
@@ -1328,6 +1339,42 @@ async def _extract_stream_to_file(video_url: str, destination: Path) -> Path:
         )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # Reapply the website-access policy to the media/CDN URLs yt-dlp resolves.
+    # yt-dlp downloads from a host the original watch URL doesn't reveal, so a
+    # permitted watch page could otherwise fetch bytes from a blocked CDN. Ask
+    # yt-dlp for the resolved direct URLs first and run them through the policy.
+    resolve = await asyncio.create_subprocess_exec(
+        ytdlp,
+        "--no-config",
+        "-f",
+        "best[height<=480][ext=mp4]/best[height<=480]/best[height<=720]/best",
+        "--no-playlist",
+        "--get-url",
+        video_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        resolved_out, resolve_err = await asyncio.wait_for(resolve.communicate(), timeout=60.0)
+    except asyncio.TimeoutError:
+        resolve.kill()
+        await resolve.wait()
+        raise RuntimeError(f"yt-dlp timed out resolving media URL for {video_url[:80]}")
+    # A non-zero exit with no output means resolution failed outright — fail fast
+    # instead of falling through to a download that's guaranteed to error. A
+    # non-zero exit that still emitted URLs (non-fatal warning) must NOT skip the
+    # policy check, or a permitted watch page could fetch bytes from a blocked CDN.
+    if resolve.returncode != 0 and not resolved_out:
+        err = (resolve_err or b"").decode("utf-8", "replace")[-400:]
+        raise RuntimeError(f"yt-dlp failed to resolve media URL: {err}")
+    for media_url in (resolved_out or b"").decode("utf-8", "replace").splitlines():
+        media_url = media_url.strip()
+        if not media_url:
+            continue
+        blocked = check_website_access(media_url)
+        if blocked:
+            raise PermissionError(blocked["message"])
+
     # Base64 + data-URL encoding inflates bytes ~33%, so the raw file must stay
     # well under the base64 cap to survive the downstream payload check. Target
     # ~70% of the cap and prefer smaller resolutions first.
@@ -1508,9 +1555,11 @@ async def video_analyze_tool(
             logger.info("Using local video file: %s", video_url)
             temp_video_path = local_path
             should_cleanup = False
-        elif _is_streaming_host(video_url):
+        elif _is_streaming_host(video_url) and not _is_direct_media_url(video_url):
             # YouTube/Vimeo/X share URLs serve HTML, not media — extract the
-            # real stream with yt-dlp instead of a naive GET.
+            # real stream with yt-dlp instead of a naive GET. Direct media URLs
+            # on the same hosts (e.g. v.redd.it/.../DASH_720.mp4) fall through
+            # to the validated download path below, which needs no yt-dlp.
             blocked = check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
@@ -1524,7 +1573,13 @@ async def video_analyze_tool(
             if blocked:
                 raise PermissionError(blocked["message"])
             temp_dir = get_hermes_dir("cache/video", "temp_video_files")
-            temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
+            # Preserve the URL's real media extension so the suffix-based
+            # _detect_video_mime_type downstream doesn't mislabel webm/mov bytes
+            # as video/mp4. Direct streaming-host media (e.g. v.redd.it/clip.webm)
+            # reaches this branch and must keep its true container.
+            url_suffix = Path(urlparse(video_url).path or "").suffix.lower()
+            suffix = url_suffix if url_suffix in _VIDEO_MIME_TYPES else ".mp4"
+            temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}{suffix}"
             await _download_video(video_url, temp_video_path)
             should_cleanup = True
         else:
