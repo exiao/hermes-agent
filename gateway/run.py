@@ -951,7 +951,7 @@ def _append_missing_auto_media_tags_to_result(
         return final_response
     final_response = _append_missing_auto_media_tags(
         final_response,
-        result.get("messages", []),
+        result.get("messages") or [],
         history_offset=history_offset,
         history_media_paths=history_media_paths,
         history_tool_call_ids=history_tool_call_ids,

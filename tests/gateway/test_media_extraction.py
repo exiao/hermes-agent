@@ -432,6 +432,16 @@ caption
         assert response == "Sent.\nMEDIA:/tmp/report.md"
         assert result["final_response"] == "Sent.\nMEDIA:/tmp/report.md"
 
+    def test_append_missing_auto_media_tags_to_result_handles_none_messages(self):
+        from gateway.run import _append_missing_auto_media_tags_to_result
+
+        result = {"final_response": "Sent.", "messages": None}
+
+        response = _append_missing_auto_media_tags_to_result(result, history_offset=0)
+
+        assert response == "Sent."
+        assert result["final_response"] == "Sent."
+
     @pytest.mark.asyncio
     async def test_background_task_auto_appends_send_file_media(self, monkeypatch, tmp_path):
         from gateway.config import Platform
