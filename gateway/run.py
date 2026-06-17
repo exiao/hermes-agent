@@ -13788,6 +13788,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             )
         )
+        # When on (opt-in, customer-facing channels), code-bearing tools
+        # (terminal, execute_code) never echo their command/code to the
+        # channel — only a sanitized label. Default off preserves the full
+        # ```bash command block for CLI/personal platforms.
+        hide_code_in_progress = bool(
+            resolve_display_setting(
+                user_config,
+                platform_key,
+                "hide_code_in_progress",
+                False,
+            )
+        )
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
@@ -13857,6 +13869,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
+
+        # Tools whose args carry raw shell commands / code. Their progress
+        # bubbles must NEVER echo the command or code to the user — only a
+        # sanitized friendly label (via tool_display / tool_display_rewrite) or
+        # a generic "{name}…" line. See plans/hermes-patches/no-raw-command-preview.md.
+        # `process` belongs here too: its write/submit actions send raw stdin
+        # `data` (e.g. a command piped into a background shell), and
+        # build_tool_preview() echoes that data, so it is part of the same
+        # terminal/code surface even though it isn't a standalone code tool.
+        _CODE_BEARING_TOOLS = {"terminal", "execute_code", "process"}
 
         # Config-driven tool display names and rewrite rules.
         #
@@ -13988,25 +14010,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Try resolved display (rewrite rules → tool_display → None)
             _resolved = _resolve_tool_display(tool_name, preview, args)
 
-            # Markdown-capable platforms render a terminal command as a native
-            # ```bash fenced block (full command, no quotes, no label, no
-            # truncation) instead of the noisy `terminal: "cmd…"` line.  Gated
-            # on the adapter's ``supports_code_blocks`` capability so every
-            # markdown-rendering platform (and plugin adapters that opt in) gets
-            # it, while plain-text platforms keep the compact line.
+            # Code-bearing tools (terminal, execute_code) carry raw shell/code
+            # in their args. Two policies, chosen per-platform:
+            #   hide_code_in_progress=True  (customer-facing, e.g. WhatsApp):
+            #     NEVER echo the command/code — only a sanitized friendly label
+            #     (_resolved) or a generic "{name}…" line. Closes the leak path
+            #     that posted raw shell (incl. a secret-reading heredoc) to a
+            #     public user.
+            #   hide_code_in_progress=False (default, CLI/personal):
+            #     markdown-capable adapters render the terminal command as a
+            #     native ```bash fenced block (full command, no truncation),
+            #     which is the long-standing developer-friendly behavior.
+            _is_code_bearing = tool_name in _CODE_BEARING_TOOLS
             _bash_block = None
-            try:
-                _progress_adapter = self.adapters.get(source.platform)
-            except Exception:
-                _progress_adapter = None
-            if (
-                getattr(_progress_adapter, "supports_code_blocks", False)
-                and tool_name == "terminal"
-                and isinstance(args, dict)
-                and isinstance(args.get("command"), str)
-                and args["command"].strip()
-            ):
-                _bash_block = f"```bash\n{args['command'].rstrip()}\n```"
+            if not hide_code_in_progress:
+                try:
+                    _progress_adapter = self.adapters.get(source.platform)
+                except Exception:
+                    _progress_adapter = None
+                if (
+                    getattr(_progress_adapter, "supports_code_blocks", False)
+                    and tool_name == "terminal"
+                    and isinstance(args, dict)
+                    and isinstance(args.get("command"), str)
+                    and args["command"].strip()
+                ):
+                    _bash_block = f"```bash\n{args['command'].rstrip()}\n```"
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
@@ -14014,6 +14043,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = _bash_block
                 elif _resolved:
                     msg = f"{emoji} {_resolved}"
+                elif _is_code_bearing and hide_code_in_progress:
+                    msg = f"{emoji} {display_name}..."
                 elif args:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
@@ -14038,6 +14069,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 msg = _bash_block
             elif _resolved:
                 msg = f"{emoji} {_resolved}"
+            elif _is_code_bearing and hide_code_in_progress:
+                msg = f"{emoji} {display_name}..."
             elif preview:
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()

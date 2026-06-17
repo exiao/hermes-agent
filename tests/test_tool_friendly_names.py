@@ -3,11 +3,17 @@
 import queue
 
 
-def _build_progress_callback(display_config=None, progress_queue=None):
+def _build_progress_callback(display_config=None, progress_queue=None,
+                             hide_code_in_progress=False, supports_code_blocks=False):
     """Build a minimal progress_callback closure matching gateway/run.py logic.
 
     This mirrors the relevant subset of GatewayRunner._handle_incoming_message
     so we can test the display mapping without spinning up a full gateway.
+
+    hide_code_in_progress mirrors the per-platform display setting; when False
+    (default) a markdown-capable adapter (supports_code_blocks=True) renders a
+    terminal command as a ```bash block. When True, code-bearing tools never
+    echo their command/code.
     """
     import re as _re_mod
 
@@ -59,14 +65,33 @@ def _build_progress_callback(display_config=None, progress_queue=None):
 
         return None
 
+    _CODE_BEARING_TOOLS = {"terminal", "execute_code", "process"}
+
     def progress_callback(tool_name, preview=None, args=None):
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚙️")
 
         _resolved = _resolve_tool_display(tool_name, preview, args)
+        _is_code_bearing = tool_name in _CODE_BEARING_TOOLS
 
-        if _resolved:
+        _bash_block = None
+        if not hide_code_in_progress:
+            if (
+                supports_code_blocks
+                and tool_name == "terminal"
+                and isinstance(args, dict)
+                and isinstance(args.get("command"), str)
+                and args["command"].strip()
+            ):
+                _bash_block = f"```bash\n{args['command'].rstrip()}\n```"
+
+        if _bash_block is not None:
+            msg = _bash_block
+        elif _resolved:
             msg = f"{emoji} {_resolved}"
+        elif _is_code_bearing and hide_code_in_progress:
+            # Never echo raw command/code — generic label only.
+            msg = f"{emoji} {tool_name}..."
         elif preview:
             msg = f'{emoji} {tool_name}: "{preview}"'
         else:
@@ -105,11 +130,74 @@ class TestToolDisplay:
         assert "serper" not in msg
 
     def test_unmapped_tool_falls_through(self):
-        """Tools not in the mapping keep their raw name."""
+        """Unmapped NON-code tools keep their raw name + preview."""
         config = {"tool_display": {"WebSearch": "Searching the web: {preview}"}}
         cb, q = _build_progress_callback(display_config=config)
-        msg = cb("terminal", preview="ls -la")
+        msg = cb("read_file", preview="notes.md")
+        assert "read_file" in msg
+        assert "notes.md" in msg
+
+    def test_unmapped_terminal_never_echoes_command(self):
+        """With hide_code_in_progress, an unmapped `terminal` shows a generic label."""
+        config = {"tool_display": {"WebSearch": "Searching the web: {preview}"}}
+        cb, q = _build_progress_callback(display_config=config, hide_code_in_progress=True,
+                                         supports_code_blocks=True)
+        msg = cb("terminal", preview="ls -la /root/.hermes", args={"command": "ls -la /root/.hermes"})
         assert "terminal" in msg
+        assert "ls -la" not in msg
+        assert "/root/.hermes" not in msg
+
+    def test_terminal_secret_heredoc_never_leaks(self):
+        """The real leak case: with hide_code_in_progress, a heredoc must not appear."""
+        secret_cmd = (
+            "python3 - <<'PY'\n"
+            "import os\n"
+            "s=os.environ.get('BLOOMBOT_WHATSAPP_SECRET')\n"
+            "open('/root/.hermes/.env')\n"
+            "PY"
+        )
+        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=True,
+                                         supports_code_blocks=True)
+        msg = cb("terminal", args={"command": secret_cmd})
+        for leak in ("BLOOMBOT_WHATSAPP_SECRET", "/root/.hermes/.env", "python3", "import os"):
+            assert leak not in msg
+
+    def test_unmapped_execute_code_never_echoes_code(self):
+        """With hide_code_in_progress, `execute_code` never echoes its code preview."""
+        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=True)
+        msg = cb("execute_code", preview="print(open('/etc/passwd').read())")
+        assert "passwd" not in msg
+        assert "print(" not in msg
+
+    def test_process_stdin_never_leaks(self):
+        """`process` submit/write stdin is part of the terminal surface: with
+        hide_code_in_progress, a command piped into a background shell must not
+        appear in the progress bubble."""
+        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=True)
+        msg = cb("process", preview='submit "cat ~/.hermes/.env"')
+        assert ".env" not in msg
+        assert "cat " not in msg
+
+    def test_process_stdin_shown_when_hide_off(self):
+        """Default (hide off): process previews still flow through as before."""
+        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=False)
+        msg = cb("process", preview='submit "echo hi"')
+        assert "echo hi" in msg
+
+    def test_default_keeps_bash_block_for_code_block_platforms(self):
+        """Default (hide off): a markdown adapter still renders the full ```bash block."""
+        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=False,
+                                         supports_code_blocks=True)
+        msg = cb("terminal", args={"command": "ls -la /root/.hermes"})
+        assert "```bash" in msg
+        assert "ls -la /root/.hermes" in msg
+
+    def test_default_plain_platform_unaffected(self):
+        """Default (hide off) on a non-code-block platform keeps the old preview line."""
+        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=False,
+                                         supports_code_blocks=False)
+        msg = cb("terminal", preview="ls -la")
+        assert "ls -la" in msg
 
     def test_empty_display_dict(self):
         """Empty dict = same as no config."""

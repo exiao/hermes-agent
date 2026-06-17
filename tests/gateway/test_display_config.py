@@ -80,6 +80,35 @@ class TestResolveDisplaySetting:
 
 
 # ---------------------------------------------------------------------------
+# hide_code_in_progress defaults
+# ---------------------------------------------------------------------------
+
+class TestHideCodeInProgressDefaults:
+    """Code-bearing tool previews must be hidden by default on customer-facing
+    channels but shown by default on personal/CLI ones."""
+
+    def test_whatsapp_hides_code_by_default(self):
+        """WhatsApp declares supports_code_blocks=True and is the canonical
+        customer channel, so with stock config it must default to hiding raw
+        commands/code rather than falling through to the global False."""
+        from gateway.display_config import resolve_display_setting
+        assert resolve_display_setting({}, "whatsapp", "hide_code_in_progress") is True
+
+    def test_whatsapp_opt_out_still_possible(self):
+        """A personal WhatsApp install can opt back out explicitly."""
+        from gateway.display_config import resolve_display_setting
+        config = {"display": {"platforms": {"whatsapp": {"hide_code_in_progress": False}}}}
+        assert resolve_display_setting(config, "whatsapp", "hide_code_in_progress") is False
+
+    def test_personal_platforms_keep_code_visible(self):
+        """Telegram/Discord/global default keep the developer-friendly full command."""
+        from gateway.display_config import resolve_display_setting
+        assert resolve_display_setting({}, "telegram", "hide_code_in_progress") is False
+        assert resolve_display_setting({}, "discord", "hide_code_in_progress") is False
+        assert resolve_display_setting({}, "unknown_platform", "hide_code_in_progress") is False
+
+
+# ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides
 # ---------------------------------------------------------------------------
 

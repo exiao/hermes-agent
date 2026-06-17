@@ -40,6 +40,13 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+    # When true, tool-progress for code-bearing tools (terminal, execute_code)
+    # never echoes the raw command/code to the channel — it shows only a
+    # sanitized friendly label (tool_display / tool_display_rewrite) or a
+    # generic "{name}…" line. Default OFF: CLI/personal platforms keep the
+    # full ```bash command block. Customer-facing channels (e.g. WhatsApp)
+    # should opt in so a model-authored command/secret can't leak to a user.
+    "hide_code_in_progress": False,
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
@@ -122,7 +129,12 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
-    "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
+    # WhatsApp is the canonical customer-facing channel and its adapter declares
+    # supports_code_blocks=True, so without this a model-authored terminal/process
+    # command (incl. a secret-reading heredoc) would render as a raw ```bash block
+    # to an end user. Default hide_code_in_progress ON here; personal installs can
+    # still opt out via display.platforms.whatsapp.hide_code_in_progress: false.
+    "whatsapp":        {**_TIER_MEDIUM, "hide_code_in_progress": True},  # Baileys bridge supports /edit
     "bluebubbles":     _TIER_LOW,
     "weixin":          _TIER_LOW,
     "wecom":           _TIER_LOW,
@@ -224,6 +236,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "hide_code_in_progress",
     }:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
