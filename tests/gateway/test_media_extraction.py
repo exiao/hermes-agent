@@ -149,6 +149,19 @@ caption
             '{"file":"MEDIA:/tmp/report.md"}\nMEDIA:/tmp/report.md'
         )
 
+    def test_gateway_auto_append_counts_inline_deliverable_reply_tags(self):
+        from gateway.run import _append_missing_auto_media_tags
+
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_file", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "call_file", "content": "MEDIA:/tmp/report.md"},
+        ]
+
+        assert _append_missing_auto_media_tags(
+            'Already sent MEDIA:"/tmp/report.md"',
+            messages,
+        ) == 'Already sent MEDIA:"/tmp/report.md"'
+
     def test_history_scan_uses_send_file_standalone_tag_rules(self):
         from gateway.run import _collect_history_media_paths
 

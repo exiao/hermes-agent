@@ -846,12 +846,12 @@ def _collect_auto_append_media_tags(
 
 
 def _iter_deliverable_reply_media_paths(content: str):
-    for line in content.splitlines():
-        match = _TOOL_MEDIA_LINE_RE.match(line)
-        if match:
-            path = _clean_tool_media_path(match.group(1))
-            if path:
-                yield path
+    from gateway.platforms.base import BasePlatformAdapter
+
+    for path, _is_voice in BasePlatformAdapter.extract_media(content)[0]:
+        path = _clean_tool_media_path(path)
+        if path:
+            yield path
 
 
 def _append_missing_auto_media_tags(
