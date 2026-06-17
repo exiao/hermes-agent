@@ -29,6 +29,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import ntpath
 import os
 import re
 import shlex
@@ -735,6 +736,20 @@ def _clean_tool_media_path(path: str) -> str:
     return path.strip().strip('`\"\'').rstrip(",}")
 
 
+def _media_path_dedup_key(path: str) -> str:
+    """Return a stable key for comparing equivalent MEDIA paths.
+
+    Windows tags may appear with either slash style (``C:/x`` vs ``C:\\x``),
+    while POSIX tags should keep POSIX path semantics. Normalize drive-letter
+    paths with ``ntpath`` so final-response echoes dedupe against send_file's
+    returned path even when the separators/case differ.
+    """
+    path = _clean_tool_media_path(str(path or ""))
+    if re.match(r"^[A-Za-z]:[/\\]", path):
+        return ntpath.normcase(ntpath.normpath(path))
+    return os.path.normcase(os.path.normpath(path))
+
+
 def _iter_tool_media_paths(content: str, tool_name: Optional[str] = None):
     if tool_name == "send_file":
         # send_file returns ``<optional caption>\nMEDIA:<validated path>``.
@@ -781,10 +796,23 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
     return media_paths
 
 
+def _collect_history_tool_call_ids(agent_history: List[Dict[str, Any]]) -> set:
+    tool_call_ids: set = set()
+    for msg in agent_history:
+        if msg.get("role") != "assistant":
+            continue
+        for call in msg.get("tool_calls") or []:
+            call_id = call.get("id") or call.get("call_id")
+            if call_id:
+                tool_call_ids.add(str(call_id))
+    return tool_call_ids
+
+
 def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
+    history_tool_call_ids: Optional[set] = None,
 ) -> tuple[List[str], bool]:
     """Collect real media tags from current-turn producer-tool results only.
 
@@ -804,7 +832,10 @@ def _collect_auto_append_media_tags(
     ``history_media_paths`` for dedup, preserving the compression-safe behaviour
     of #160. The producer-tool allowlist still applies on the fallback path.
     """
-    history_media_paths = history_media_paths or set()
+    history_media_path_keys = {
+        _media_path_dedup_key(path) for path in (history_media_paths or set())
+    }
+    history_tool_call_ids = {str(call_id) for call_id in (history_tool_call_ids or set())}
     # Only trust the slice boundary when the message list still contains the
     # full history prefix. Otherwise scan everything (compression-safe fallback).
     use_history_dedup = not (history_offset and len(messages) >= history_offset)
@@ -837,7 +868,17 @@ def _collect_auto_append_media_tags(
             continue
         tool_name = tool_name_by_call_id.get(call_id)
         for path in _iter_tool_media_paths(content, tool_name=tool_name):
-            if not use_history_dedup or path not in history_media_paths:
+            path_key = _media_path_dedup_key(path)
+            is_historical_tool_result = bool(
+                use_history_dedup
+                and history_tool_call_ids
+                and call_id in history_tool_call_ids
+            )
+            if (
+                not use_history_dedup
+                or not is_historical_tool_result
+                or path_key not in history_media_path_keys
+            ):
                 media_tags.append(f"MEDIA:{path}")
         if "[[audio_as_voice]]" in content:
             has_voice_directive = True
@@ -859,23 +900,28 @@ def _append_missing_auto_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
+    history_tool_call_ids: Optional[set] = None,
 ) -> str:
     media_tags, has_voice_directive = _collect_auto_append_media_tags(
         messages,
         history_offset=history_offset,
         history_media_paths=history_media_paths,
+        history_tool_call_ids=history_tool_call_ids,
     )
     if not media_tags:
         return final_response
 
-    existing_paths = set(_iter_deliverable_reply_media_paths(final_response))
-    seen_paths = set(existing_paths)
+    seen_paths = {
+        _media_path_dedup_key(path)
+        for path in _iter_deliverable_reply_media_paths(final_response)
+    }
     unique_tags = []
     for tag in media_tags:
         path = tag.removeprefix("MEDIA:")
-        if path in seen_paths:
+        path_key = _media_path_dedup_key(path)
+        if path_key in seen_paths:
             continue
-        seen_paths.add(path)
+        seen_paths.add(path_key)
         unique_tags.append(tag)
 
     if not unique_tags:
@@ -884,6 +930,34 @@ def _append_missing_auto_media_tags(
     if has_voice_directive and "[[audio_as_voice]]" not in final_response:
         unique_tags.insert(0, "[[audio_as_voice]]")
     return final_response + "\n" + "\n".join(unique_tags)
+
+
+def _append_missing_auto_media_tags_to_result(
+    result: Optional[Dict[str, Any]],
+    history_offset: int = 0,
+    history_media_paths: Optional[set] = None,
+    history_tool_call_ids: Optional[set] = None,
+) -> str:
+    """Append tool-emitted MEDIA tags and persist them on result dict.
+
+    Several delivery paths (queued first replies, background runs) read
+    ``result["final_response"]`` after the gateway helper runs. Mutating the
+    returned dict keeps those paths from losing the auto-appended tags.
+    """
+    if not isinstance(result, dict):
+        return ""
+    final_response = str(result.get("final_response") or "")
+    if not final_response:
+        return final_response
+    final_response = _append_missing_auto_media_tags(
+        final_response,
+        result.get("messages", []),
+        history_offset=history_offset,
+        history_media_paths=history_media_paths,
+        history_tool_call_ids=history_tool_call_ids,
+    )
+    result["final_response"] = final_response
+    return final_response
 
 
 # ---------------------------------------------------------------------------
@@ -9931,7 +10005,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             result = await self._run_in_executor_with_context(run_sync)
 
-            response = result.get("final_response", "") if result else ""
+            response = _append_missing_auto_media_tags_to_result(result, history_offset=0)
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
@@ -14867,6 +14941,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.
             _history_media_paths = _collect_history_media_paths(agent_history)
+            _history_tool_call_ids = _collect_history_tool_call_ids(agent_history)
             
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -15165,11 +15240,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # when mid-run context compression shrinks the message list below
             # the original history length. When the current-turn slice is intact,
             # a repeated send_file of the same path should be delivered again.
-            final_response = _append_missing_auto_media_tags(
-                final_response,
-                result.get("messages", []),
+            final_response = _append_missing_auto_media_tags_to_result(
+                result,
                 history_offset=len(agent_history),
                 history_media_paths=_history_media_paths,
+                history_tool_call_ids=_history_tool_call_ids,
             )
             
             # Sync session_id: the agent may have created a new session during

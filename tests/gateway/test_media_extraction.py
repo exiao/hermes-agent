@@ -13,6 +13,8 @@ text-only reply, even when the path-based dedup set fails to capture it.
 
 import pytest
 import re
+import sys
+import types
 
 
 def extract_media_tags_fixed(result_messages, history_len):
@@ -352,6 +354,33 @@ caption
         assert tags == ["MEDIA:/tmp/report.md"]
         assert voice is False
 
+    def test_compression_fallback_current_send_file_can_resend_historical_path(self):
+        """Compression fallback scans all returned messages, but a fresh
+        current-turn send_file tool result must still resend a path that also
+        exists in history.
+        """
+        from gateway.run import _collect_auto_append_media_tags
+
+        compressed_messages = [
+            {"role": "system", "content": "Earlier context was compressed."},
+            {"role": "user", "content": "send report again"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "new", "function": {"name": "send_file"}}],
+            },
+            {"role": "tool", "tool_call_id": "new", "content": "MEDIA:/tmp/report.md"},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(
+            compressed_messages,
+            history_offset=50,
+            history_media_paths={"/tmp/report.md"},
+            history_tool_call_ids={"old"},
+        )
+
+        assert tags == ["MEDIA:/tmp/report.md"]
+        assert voice is False
+
     def test_quoted_final_response_media_tags_are_not_duplicated(self):
         from gateway.run import _append_missing_auto_media_tags
 
@@ -368,6 +397,119 @@ caption
         )
 
         assert response == 'Already sent MEDIA:"/tmp/report.md"'
+
+    def test_windows_media_echo_paths_are_deduped_across_separators(self):
+        from gateway.run import _append_missing_auto_media_tags
+
+        messages = [
+            {"role": "user", "content": "send report"},
+            {"role": "assistant", "tool_calls": [{"id": "sf", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "sf", "content": r"MEDIA:C:\Users\me\report.md"},
+        ]
+
+        response = _append_missing_auto_media_tags(
+            "Already sent MEDIA:C:/Users/me/report.md",
+            messages,
+            history_offset=0,
+        )
+
+        assert response == "Already sent MEDIA:C:/Users/me/report.md"
+
+    def test_auto_append_updates_result_for_queued_first_response(self):
+        from gateway.run import _append_missing_auto_media_tags_to_result
+
+        result = {
+            "final_response": "Sent.",
+            "messages": [
+                {"role": "user", "content": "send report"},
+                {"role": "assistant", "tool_calls": [{"id": "sf", "function": {"name": "send_file"}}]},
+                {"role": "tool", "tool_call_id": "sf", "content": "MEDIA:/tmp/report.md"},
+            ],
+        }
+
+        response = _append_missing_auto_media_tags_to_result(result, history_offset=0)
+
+        assert response == "Sent.\nMEDIA:/tmp/report.md"
+        assert result["final_response"] == "Sent.\nMEDIA:/tmp/report.md"
+
+    @pytest.mark.asyncio
+    async def test_background_task_auto_appends_send_file_media(self, monkeypatch, tmp_path):
+        from gateway.config import Platform
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        media_path = tmp_path / "report.md"
+        media_path.write_text("hello", encoding="utf-8")
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                pass
+
+            def run_conversation(self, user_message, task_id=None):
+                return {
+                    "final_response": "Sent.",
+                    "messages": [
+                        {"role": "assistant", "tool_calls": [{"id": "sf", "function": {"name": "send_file"}}]},
+                        {"role": "tool", "tool_call_id": "sf", "content": f"MEDIA:{media_path}"},
+                    ],
+                }
+
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = FakeAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        class Adapter:
+            name = "stub"
+            extract_media = staticmethod(BasePlatformAdapter.extract_media)
+            extract_images = staticmethod(lambda content: ([], content))
+
+            def __init__(self):
+                self.sent = []
+                self.documents = []
+
+            async def send(self, chat_id, content, metadata=None, **kwargs):
+                self.sent.append(content)
+
+            async def send_image(self, **kwargs):
+                raise AssertionError("unexpected image URL delivery")
+
+            async def send_voice(self, **kwargs):
+                raise AssertionError("unexpected voice delivery")
+
+            async def send_video(self, **kwargs):
+                raise AssertionError("unexpected video delivery")
+
+            async def send_image_file(self, **kwargs):
+                raise AssertionError("unexpected image file delivery")
+
+            async def send_document(self, chat_id, file_path, metadata=None, **kwargs):
+                self.documents.append(file_path)
+
+        async def run_inline(fn):
+            return fn()
+
+        adapter = Adapter()
+        source = SessionSource(platform=Platform.DISCORD, chat_id="chat", chat_type="dm", user_id="user")
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.adapters = {Platform.DISCORD: adapter}
+        runner._provider_routing = {}
+        runner._fallback_model = None
+        runner._service_tier = None
+        runner._session_db = None
+        runner._thread_metadata_for_source = lambda source, event_message_id=None: None
+        runner._resolve_session_agent_runtime = lambda **kwargs: ("model", {"api_key": "key"})
+        runner._resolve_session_reasoning_config = lambda **kwargs: None
+        runner._load_service_tier = lambda: None
+        runner._resolve_turn_agent_config = lambda prompt, model, runtime: {"model": model, "runtime": runtime}
+        runner._run_in_executor_with_context = run_inline
+        runner._cleanup_agent_resources = lambda agent: None
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"agent": {}})
+
+        await runner._run_background_task("send report", source, "task-1")
+
+        assert any(text.startswith("✅ Background task complete") for text in adapter.sent)
+        assert adapter.documents == [str(media_path)]
 
     def test_send_file_ignores_subdirectory_context_media_hints(self):
         from gateway.run import _collect_auto_append_media_tags
