@@ -40,6 +40,13 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+    # When true, tool-progress for code-bearing tools (terminal, execute_code)
+    # never echoes the raw command/code to the channel — it shows only a
+    # sanitized friendly label (tool_display / tool_display_rewrite) or a
+    # generic "{name}…" line. Default OFF: CLI/personal platforms keep the
+    # full ```bash command block. Customer-facing channels (e.g. WhatsApp)
+    # should opt in so a model-authored command/secret can't leak to a user.
+    "hide_code_in_progress": False,
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
@@ -224,6 +231,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "hide_code_in_progress",
     }:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
