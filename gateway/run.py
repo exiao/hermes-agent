@@ -758,13 +758,26 @@ def _iter_tool_media_paths(content: str, tool_name: Optional[str] = None):
 
 def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
     media_paths: set = set()
+    tool_name_by_call_id: Dict[str, str] = {}
+    for msg in agent_history:
+        if msg.get("role") != "assistant":
+            continue
+        for call in msg.get("tool_calls") or []:
+            call_id = call.get("id") or call.get("call_id")
+            fn = call.get("function") or {}
+            name = str(fn.get("name") or call.get("name") or "")
+            if call_id and name:
+                tool_name_by_call_id[str(call_id)] = name
+
     for msg in agent_history:
         if msg.get("role") not in {"tool", "function"}:
             continue
         content = str(msg.get("content") or "")
         if "MEDIA:" not in content:
             continue
-        media_paths.update(_iter_tool_media_paths(content))
+        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+        tool_name = tool_name_by_call_id.get(call_id)
+        media_paths.update(_iter_tool_media_paths(content, tool_name=tool_name))
     return media_paths
 
 
@@ -832,6 +845,15 @@ def _collect_auto_append_media_tags(
     return media_tags, has_voice_directive
 
 
+def _iter_deliverable_reply_media_paths(content: str):
+    for line in content.splitlines():
+        match = _TOOL_MEDIA_LINE_RE.match(line)
+        if match:
+            path = _clean_tool_media_path(match.group(1))
+            if path:
+                yield path
+
+
 def _append_missing_auto_media_tags(
     final_response: str,
     messages: List[Dict[str, Any]],
@@ -846,7 +868,7 @@ def _append_missing_auto_media_tags(
     if not media_tags:
         return final_response
 
-    existing_paths = set(_iter_tool_media_paths(final_response))
+    existing_paths = set(_iter_deliverable_reply_media_paths(final_response))
     seen_paths = set(existing_paths)
     unique_tags = []
     for tag in media_tags:

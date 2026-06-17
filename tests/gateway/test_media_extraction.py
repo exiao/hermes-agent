@@ -136,6 +136,33 @@ caption
         assert tags == []
         assert voice is False
 
+    def test_gateway_auto_append_uses_deliverable_final_reply_tags_only(self):
+        from gateway.run import _append_missing_auto_media_tags
+
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_file", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "call_file", "content": "MEDIA:/tmp/report.md"},
+        ]
+        response = '{"file":"MEDIA:/tmp/report.md"}'
+
+        assert _append_missing_auto_media_tags(response, messages) == (
+            '{"file":"MEDIA:/tmp/report.md"}\nMEDIA:/tmp/report.md'
+        )
+
+    def test_history_scan_uses_send_file_standalone_tag_rules(self):
+        from gateway.run import _collect_history_media_paths
+
+        history = [
+            {"role": "assistant", "tool_calls": [{"id": "call_file", "function": {"name": "send_file"}}]},
+            {
+                "role": "tool",
+                "tool_call_id": "call_file",
+                "content": "Caption has MEDIA:/tmp/example.md\nMEDIA:/tmp/report.md",
+            },
+        ]
+
+        assert _collect_history_media_paths(history) == {"/tmp/report.md"}
+
     def test_gateway_auto_append_keeps_real_tts_media_tag(self):
         """TTS tool media tags are still auto-appended when the model omits them."""
         from gateway.run import _collect_auto_append_media_tags
