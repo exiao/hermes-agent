@@ -30,7 +30,7 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
-from toolsets import TOOLSETS
+from toolsets import TOOLSETS, get_toolset_names
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -128,6 +128,126 @@ _SUBAGENT_TOOLSETS = sorted(
     and not all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
 )
 _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
+
+# Map common wrong toolset names to their canonical registry keys. Without
+# this, _build_child_agent's intersection silently drops any name that isn't an
+# exact key, so a typo like "ShellExec" launches a child with no shell and the
+# failure only surfaces later as "subagent had file-only tools". The entries
+# below come from a session-history audit of names actually passed to
+# delegate_task (display names, mcp_-prefixed names, and plain typos).
+_TOOLSET_ALIASES: Dict[str, str] = {
+    # tool display-name / typo -> canonical toolset
+    "shellexec": "terminal",
+    "shell": "terminal",
+    "bash": "terminal",
+    "sessionsearch": "session_search",
+    "filesystem": "file",
+    "files": "file",
+    "code": "code_execution",
+    "codeexecution": "code_execution",
+    "web_search": "search",
+    "websearch": "search",
+    "image": "image_gen",
+    "images": "image_gen",
+}
+
+
+def _get_toolset_canonical_map() -> Dict[str, str]:
+    """Return case-folded toolset names/aliases mapped to canonical names.
+
+    ``TOOLSETS`` only contains built-in static toolsets. Plugin and MCP
+    toolsets are registered dynamically, so normalization must read the live
+    toolset registry as well. Registry aliases (for example an MCP server name
+    like ``MiniMax`` pointing at canonical ``mcp-MiniMax``) map to their
+    canonical target so later parent-toolset intersection sees the same key the
+    parent session carries.
+    """
+    canonical_by_lower: Dict[str, str] = {}
+
+    static_toolsets = {str(name).lower() for name in TOOLSETS}
+    for name in get_toolset_names():
+        canonical_by_lower[str(name).lower()] = str(name)
+    canonical_by_lower["all"] = "all"
+    canonical_by_lower["*"] = "all"
+
+    try:
+        from tools.registry import registry
+
+        for name in registry.get_registered_toolset_names():
+            name_lower = str(name).lower()
+            if name_lower not in static_toolsets:
+                canonical_by_lower[name_lower] = str(name)
+        for alias, canonical in registry.get_registered_toolset_aliases().items():
+            alias_lower = str(alias).lower()
+            if canonical and alias_lower not in static_toolsets:
+                canonical_by_lower[alias_lower] = str(canonical)
+    except Exception:
+        pass
+
+    return canonical_by_lower
+
+
+def _normalize_toolset_names(names):
+    """Normalize requested toolset names to canonical registry keys.
+
+    Accepts common wrong spellings instead of silently dropping them:
+    - explicit aliases in ``_TOOLSET_ALIASES`` (display names, typos),
+    - a leading ``mcp_`` prefix when the remainder is a valid toolset
+      (e.g. ``mcp_terminal`` -> ``terminal``),
+    - case-insensitive matches against canonical keys and aliases
+      (e.g. ``SessionSearch`` -> ``session_search``).
+
+    Unknown names that resolve to nothing are dropped with a WARNING (no
+    longer fully silent). Order is preserved and duplicates collapsed.
+    Returns ``None`` unchanged so callers can distinguish "no toolsets given"
+    from "empty list".
+    """
+    if names is None:
+        return None
+
+    valid = _get_toolset_canonical_map()
+    valid_display = ", ".join(f"'{n}'" for n in sorted(set(valid.values()), key=str.lower))
+    resolved: List[str] = []
+    seen: set = set()
+
+    for raw in names:
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip()
+        if not name:
+            continue
+        canonical = None
+        lowered = name.lower()
+        if lowered in {"web_search", "websearch"}:
+            canonical = _TOOLSET_ALIASES[lowered]
+        elif lowered in valid:
+            canonical = valid[lowered]
+        elif lowered in _TOOLSET_ALIASES:
+            canonical = _TOOLSET_ALIASES[lowered]
+        elif lowered.startswith("mcp_"):
+            unprefixed = lowered[4:]
+            dashed = f"mcp-{unprefixed}"
+            if unprefixed in valid:
+                canonical = valid[unprefixed]
+            elif dashed in valid:
+                canonical = valid[dashed]
+            elif unprefixed in _TOOLSET_ALIASES:
+                canonical = _TOOLSET_ALIASES[unprefixed]
+
+        if canonical is None:
+            logger.warning(
+                "delegate_task: unknown toolset %r ignored "
+                "(valid toolsets: %s)",
+                raw,
+                valid_display or _TOOLSET_LIST_STR,
+            )
+            continue
+        if canonical not in seen:
+            seen.add(canonical)
+            resolved.append(canonical)
+
+    return resolved
+
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
@@ -513,16 +633,23 @@ def _expand_parent_toolsets(parent_toolsets: set) -> set:
     the names of any individual toolsets whose tools are a *subset* of the
     parent's available tools.  The original parent toolset names are preserved.
     """
+    canonical = _get_toolset_canonical_map()
+    expanded = set(parent_toolsets)
+    expanded.update(
+        canonical[str(ts_name).lower()]
+        for ts_name in parent_toolsets
+        if str(ts_name).lower() in canonical
+    )
+
     parent_tool_names: set = set()
-    for ts_name in parent_toolsets:
+    for ts_name in expanded:
         ts_def = TOOLSETS.get(ts_name)
         if ts_def:
             parent_tool_names.update(ts_def.get("tools", []))
 
     if not parent_tool_names:
-        return set(parent_toolsets)
+        return expanded
 
-    expanded = set(parent_toolsets)
     for ts_name, ts_def in TOOLSETS.items():
         if ts_name in expanded:
             continue
@@ -536,10 +663,12 @@ def _preserve_parent_mcp_toolsets(
     child_toolsets: List[str], parent_toolsets: set[str]
 ) -> List[str]:
     """Append any parent MCP toolsets that are missing from a narrowed child."""
+    canonical = _get_toolset_canonical_map()
     preserved = list(child_toolsets)
     for toolset_name in sorted(parent_toolsets):
-        if _is_mcp_toolset_name(toolset_name) and toolset_name not in preserved:
-            preserved.append(toolset_name)
+        canonical_name = canonical.get(str(toolset_name).lower(), toolset_name)
+        if _is_mcp_toolset_name(canonical_name) and canonical_name not in preserved:
+            preserved.append(canonical_name)
     return preserved
 
 
@@ -976,17 +1105,24 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    explicit_toolsets = toolsets is not None
+    if explicit_toolsets:
+        # Map common wrong names (display names, mcp_ prefixes, typos) to
+        # canonical keys BEFORE intersecting, so a request like ["ShellExec"]
+        # resolves to ["terminal"] instead of being silently dropped.
+        toolsets = _normalize_toolset_names(toolsets) or []
+
+    if explicit_toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        child_toolsets = _strip_blocked_tools(child_toolsets)
+        if child_toolsets and _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
         child_toolsets = _strip_blocked_tools(parent_enabled)
     elif parent_toolsets:

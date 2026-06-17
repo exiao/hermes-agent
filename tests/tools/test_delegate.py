@@ -1632,6 +1632,225 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             ["web", "browser", "mcp-MiniMax"],
         )
 
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_normalizes_alias_toolset_names(self, mock_cfg):
+        # Regression: a wrong name like "ShellExec" must resolve to "terminal"
+        # instead of being silently dropped (which left the child shell-less).
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test alias normalization",
+                context=None,
+                toolsets=["mcp_terminal", "file"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            sorted(MockAgent.call_args[1]["enabled_toolsets"]),
+            ["file", "terminal"],
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_accepts_dynamic_registry_toolsets(self, mock_cfg):
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="minimax_generate",
+            toolset="mcp-MiniMax",
+            schema={"description": "Generate via MiniMax"},
+            handler=lambda _args: "{}",
+        )
+        reg.register_toolset_alias("MiniMax", "mcp-MiniMax")
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["mcp-MiniMax", "terminal"]
+
+        with patch("tools.registry.registry", reg), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test dynamic toolset normalization",
+                context=None,
+                toolsets=["mcp-minimax"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            MockAgent.call_args[1]["enabled_toolsets"],
+            ["mcp-MiniMax"],
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_intersects_mcp_alias_with_parent_alias(self, mock_cfg):
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="github_search",
+            toolset="mcp-github",
+            schema={"description": "Search GitHub"},
+            handler=lambda _args: "{}",
+        )
+        reg.register_toolset_alias("github", "mcp-github")
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["github", "terminal"]
+
+        with patch("tools.registry.registry", reg), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test MCP parent alias intersection",
+                context=None,
+                toolsets=["mcp-github"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["mcp-github"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_maps_web_search_to_search_when_parent_search_only(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["search"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test web_search alias",
+                context=None,
+                toolsets=["web_search"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["search"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_prefers_exact_registry_toolset_over_typo_alias(self, mock_cfg):
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="mcp_code_tool",
+            toolset="code",
+            schema={"description": "MCP code server"},
+            handler=lambda _args: "{}",
+        )
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["code"]
+
+        with patch("tools.registry.registry", reg), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test exact registry match",
+                context=None,
+                toolsets=["code"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["code"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_keeps_builtin_toolset_when_mcp_alias_shadows_it(self, mock_cfg):
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="mcp_web_tool",
+            toolset="mcp-web",
+            schema={"description": "MCP web server"},
+            handler=lambda _args: "{}",
+        )
+        reg.register_toolset_alias("web", "mcp-web")
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["web"]
+
+        with patch("tools.registry.registry", reg), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test built-in shadowing",
+                context=None,
+                toolsets=["web"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["web"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_preserves_all_toolset_request(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["all"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test all toolsets",
+                context=None,
+                toolsets=["all"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["all"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_preserves_explicit_unresolvable_toolsets_as_empty(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file", "web"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test unknown toolset narrowing",
+                context=None,
+                toolsets=["totally_bogus"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], [])
+
     @patch(
         "tools.delegate_tool._load_config",
         return_value={"inherit_mcp_toolsets": False},
