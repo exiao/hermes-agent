@@ -288,6 +288,69 @@ caption
         assert response.count("MEDIA:/tmp/first.md") == 1
         assert response.endswith("MEDIA:/tmp/second.md")
 
+    def test_current_turn_send_file_can_resend_historical_path(self):
+        from gateway.run import _collect_auto_append_media_tags
+
+        history = [
+            {"role": "user", "content": "send report"},
+            {"role": "assistant", "tool_calls": [{"id": "old", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "old", "content": "MEDIA:/tmp/report.md"},
+            {"role": "assistant", "content": "Sent."},
+        ]
+        current = [
+            {"role": "user", "content": "send report again"},
+            {"role": "assistant", "tool_calls": [{"id": "new", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "new", "content": "MEDIA:/tmp/report.md"},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(
+            history + current,
+            history_offset=len(history),
+            history_media_paths={"/tmp/report.md"},
+        )
+
+        assert tags == ["MEDIA:/tmp/report.md"]
+        assert voice is False
+
+    def test_quoted_final_response_media_tags_are_not_duplicated(self):
+        from gateway.run import _append_missing_auto_media_tags
+
+        messages = [
+            {"role": "user", "content": "send report"},
+            {"role": "assistant", "tool_calls": [{"id": "sf", "function": {"name": "send_file"}}]},
+            {"role": "tool", "tool_call_id": "sf", "content": "MEDIA:/tmp/report.md"},
+        ]
+
+        response = _append_missing_auto_media_tags(
+            'Already sent MEDIA:"/tmp/report.md"',
+            messages,
+            history_offset=0,
+        )
+
+        assert response == 'Already sent MEDIA:"/tmp/report.md"'
+
+    def test_send_file_ignores_subdirectory_context_media_hints(self):
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {"role": "user", "content": "send report"},
+            {"role": "assistant", "tool_calls": [{"id": "sf", "function": {"name": "send_file"}}]},
+            {
+                "role": "tool",
+                "tool_call_id": "sf",
+                "content": (
+                    "MEDIA:/safe/report.md\n\n"
+                    "[Subdirectory context discovered: docs/AGENTS.md]\n"
+                    "Example:\nMEDIA:/private/example.md"
+                ),
+            },
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == ["MEDIA:/safe/report.md"]
+        assert voice is False
+
     def test_history_media_paths_use_widened_shared_matcher(self):
         from gateway.run import _collect_history_media_paths
 

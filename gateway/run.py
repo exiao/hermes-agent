@@ -722,24 +722,25 @@ _TOOL_MEDIA_PATH_PATTERN = (
     + r')'
 )
 _TOOL_MEDIA_RE = re.compile(
-    r'MEDIA:\s*(' + _TOOL_MEDIA_PATH_PATTERN + r')(?=[\s`"\',;:)\]}]|$)',
+    r"MEDIA:\s*[`\"']?(" + _TOOL_MEDIA_PATH_PATTERN + r")[`\"']?(?=[\s`\"',;:)\]}]|$)",
     re.IGNORECASE,
 )
 _TOOL_MEDIA_LINE_RE = re.compile(
-    r'^\s*MEDIA:\s*(' + _TOOL_MEDIA_PATH_PATTERN + r')\s*$',
+    r"^\s*MEDIA:\s*[`\"']?(" + _TOOL_MEDIA_PATH_PATTERN + r")[`\"']?\s*$",
     re.IGNORECASE,
 )
 
 
 def _clean_tool_media_path(path: str) -> str:
-    return path.strip().rstrip('\",}')
+    return path.strip().strip('`\"\'').rstrip(",}")
 
 
 def _iter_tool_media_paths(content: str, tool_name: Optional[str] = None):
     if tool_name == "send_file":
         # send_file returns ``<optional caption>\nMEDIA:<validated path>``.
-        # Captions are user/model-controlled text and can contain MEDIA examples,
-        # so only trust the final standalone MEDIA line returned by the tool.
+        # Captions and appended subdirectory hints can contain MEDIA examples,
+        # so only trust the final standalone MEDIA line in the actual tool result.
+        content = content.split("\n[Subdirectory context discovered:", 1)[0]
         for line in reversed(content.splitlines()):
             match = _TOOL_MEDIA_LINE_RE.match(line)
             if match:
@@ -793,6 +794,7 @@ def _collect_auto_append_media_tags(
     history_media_paths = history_media_paths or set()
     # Only trust the slice boundary when the message list still contains the
     # full history prefix. Otherwise scan everything (compression-safe fallback).
+    use_history_dedup = not (history_offset and len(messages) >= history_offset)
     if history_offset and len(messages) >= history_offset:
         new_messages = messages[history_offset:]
     else:
@@ -822,7 +824,7 @@ def _collect_auto_append_media_tags(
             continue
         tool_name = tool_name_by_call_id.get(call_id)
         for path in _iter_tool_media_paths(content, tool_name=tool_name):
-            if path not in history_media_paths:
+            if not use_history_dedup or path not in history_media_paths:
                 media_tags.append(f"MEDIA:{path}")
         if "[[audio_as_voice]]" in content:
             has_voice_directive = True
@@ -15137,10 +15139,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # list) can never leak onto a later text-only reply. (Fixes #34608)
             #
             # Path-based deduplication against _history_media_paths (collected
-            # before run_conversation) is retained as a secondary guard. It is
-            # also the sole guard on the fallback branch taken when mid-run
-            # context compression shrinks the message list below the original
-            # history length, preserving the compression-safe behaviour of #160.
+            # before run_conversation) is used only on the fallback branch taken
+            # when mid-run context compression shrinks the message list below
+            # the original history length. When the current-turn slice is intact,
+            # a repeated send_file of the same path should be delivered again.
             final_response = _append_missing_auto_media_tags(
                 final_response,
                 result.get("messages", []),
