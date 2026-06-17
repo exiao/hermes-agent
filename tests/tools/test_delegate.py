@@ -1694,6 +1694,59 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         )
 
     @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_intersects_mcp_alias_with_parent_alias(self, mock_cfg):
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="github_search",
+            toolset="mcp-github",
+            schema={"description": "Search GitHub"},
+            handler=lambda _args: "{}",
+        )
+        reg.register_toolset_alias("github", "mcp-github")
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["github", "terminal"]
+
+        with patch("tools.registry.registry", reg), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test MCP parent alias intersection",
+                context=None,
+                toolsets=["mcp-github"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["mcp-github"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_maps_web_search_to_search_when_parent_search_only(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["search"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test web_search alias",
+                context=None,
+                toolsets=["web_search"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["search"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
     def test_build_child_agent_preserves_explicit_unresolvable_toolsets_as_empty(self, mock_cfg):
         parent = _make_mock_parent()
         parent.enabled_toolsets = ["terminal", "file", "web"]

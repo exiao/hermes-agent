@@ -145,8 +145,8 @@ _TOOLSET_ALIASES: Dict[str, str] = {
     "files": "file",
     "code": "code_execution",
     "codeexecution": "code_execution",
-    "web_search": "web",
-    "websearch": "web",
+    "web_search": "search",
+    "websearch": "search",
     "image": "image_gen",
     "images": "image_gen",
 }
@@ -212,10 +212,10 @@ def _normalize_toolset_names(names):
             continue
         canonical = None
         lowered = name.lower()
-        if lowered in valid:
-            canonical = valid[lowered]
-        elif lowered in _TOOLSET_ALIASES:
+        if lowered in _TOOLSET_ALIASES:
             canonical = _TOOLSET_ALIASES[lowered]
+        elif lowered in valid:
+            canonical = valid[lowered]
         elif lowered.startswith("mcp_"):
             unprefixed = lowered[4:]
             dashed = f"mcp-{unprefixed}"
@@ -625,16 +625,23 @@ def _expand_parent_toolsets(parent_toolsets: set) -> set:
     the names of any individual toolsets whose tools are a *subset* of the
     parent's available tools.  The original parent toolset names are preserved.
     """
+    canonical = _get_toolset_canonical_map()
+    expanded = set(parent_toolsets)
+    expanded.update(
+        canonical[str(ts_name).lower()]
+        for ts_name in parent_toolsets
+        if str(ts_name).lower() in canonical
+    )
+
     parent_tool_names: set = set()
-    for ts_name in parent_toolsets:
+    for ts_name in expanded:
         ts_def = TOOLSETS.get(ts_name)
         if ts_def:
             parent_tool_names.update(ts_def.get("tools", []))
 
     if not parent_tool_names:
-        return set(parent_toolsets)
+        return expanded
 
-    expanded = set(parent_toolsets)
     for ts_name, ts_def in TOOLSETS.items():
         if ts_name in expanded:
             continue
@@ -648,10 +655,12 @@ def _preserve_parent_mcp_toolsets(
     child_toolsets: List[str], parent_toolsets: set[str]
 ) -> List[str]:
     """Append any parent MCP toolsets that are missing from a narrowed child."""
+    canonical = _get_toolset_canonical_map()
     preserved = list(child_toolsets)
     for toolset_name in sorted(parent_toolsets):
-        if _is_mcp_toolset_name(toolset_name) and toolset_name not in preserved:
-            preserved.append(toolset_name)
+        canonical_name = canonical.get(str(toolset_name).lower(), toolset_name)
+        if _is_mcp_toolset_name(canonical_name) and canonical_name not in preserved:
+            preserved.append(canonical_name)
     return preserved
 
 

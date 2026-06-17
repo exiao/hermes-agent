@@ -28,6 +28,8 @@ class TestToolsetAliasNormalization(unittest.TestCase):
             "mcp_memory": "memory",
             "code": "code_execution",
             "filesystem": "file",
+            "web_search": "search",
+            "websearch": "search",
         }
         for wrong, canonical in cases.items():
             self.assertEqual(
