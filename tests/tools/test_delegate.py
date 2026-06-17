@@ -1747,6 +1747,90 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["search"])
 
     @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_prefers_exact_registry_toolset_over_typo_alias(self, mock_cfg):
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="mcp_code_tool",
+            toolset="code",
+            schema={"description": "MCP code server"},
+            handler=lambda _args: "{}",
+        )
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["code"]
+
+        with patch("tools.registry.registry", reg), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test exact registry match",
+                context=None,
+                toolsets=["code"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["code"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_keeps_builtin_toolset_when_mcp_alias_shadows_it(self, mock_cfg):
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="mcp_web_tool",
+            toolset="mcp-web",
+            schema={"description": "MCP web server"},
+            handler=lambda _args: "{}",
+        )
+        reg.register_toolset_alias("web", "mcp-web")
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["web"]
+
+        with patch("tools.registry.registry", reg), patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test built-in shadowing",
+                context=None,
+                toolsets=["web"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["web"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_preserves_all_toolset_request(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["all"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test all toolsets",
+                context=None,
+                toolsets=["all"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["all"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
     def test_build_child_agent_preserves_explicit_unresolvable_toolsets_as_empty(self, mock_cfg):
         parent = _make_mock_parent()
         parent.enabled_toolsets = ["terminal", "file", "web"]
