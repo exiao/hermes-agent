@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
-from utils import base_url_host_matches, normalize_proxy_env_vars
+from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
 # ~220 ms of imports (anthropic.types, anthropic.lib.tools._beta_runner, etc.)
@@ -655,8 +655,8 @@ def _common_betas_for_base_url(
     return betas
 
 
-def _apply_proxy_api_key_header(kwargs: dict) -> dict:
-    """Attach the ``x-proxy-api-key`` inbound header when ``PROXY_API_KEY`` is set.
+def _apply_proxy_api_key_header(kwargs: dict, base_url: str | None) -> dict:
+    """Attach the ``x-proxy-api-key`` inbound header for a key-gated billing proxy.
 
     A billing proxy fronted by a public hostname (e.g. behind a Cloudflare
     tunnel) gates non-local callers on an inbound key. Anthropic agent requests
@@ -668,12 +668,22 @@ def _apply_proxy_api_key_header(kwargs: dict) -> dict:
     Anthropic agent call to a key-gated proxy is rejected and silently falls
     through to the fallback provider.
 
-    Local ``127.0.0.1``/``localhost`` proxies ignore the header, so attaching it
-    whenever the env var is present is harmless. Merges onto any existing
-    ``default_headers`` (e.g. ``anthropic-beta``) rather than replacing them.
+    The header is a proxy-admission secret, so it must only be sent to the proxy
+    itself. It attaches only when ``PROXY_API_KEY`` is set AND the client's
+    target host matches the configured proxy host (``ANTHROPIC_BASE_URL``). When
+    the client targets the native Anthropic API (no ``base_url``) or any
+    unrelated Anthropic-compatible provider, the header is omitted so the secret
+    never leaks to a third party. Merges onto any existing ``default_headers``
+    (e.g. ``anthropic-beta``) rather than replacing them.
     """
     proxy_api_key = os.environ.get("PROXY_API_KEY")
     if not proxy_api_key:
+        return kwargs
+    proxy_host = base_url_hostname(os.environ.get("ANTHROPIC_BASE_URL") or "")
+    if not proxy_host:
+        return kwargs
+    target_host = base_url_hostname(base_url or "")
+    if target_host != proxy_host:
         return kwargs
     headers = dict(kwargs.get("default_headers") or {})
     headers["x-proxy-api-key"] = proxy_api_key
@@ -751,7 +761,7 @@ def _build_anthropic_client_with_bearer_hook(
     if common_betas:
         kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
-    kwargs = _apply_proxy_api_key_header(kwargs)
+    kwargs = _apply_proxy_api_key_header(kwargs, normalized_base_url)
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
@@ -875,7 +885,7 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
-    kwargs = _apply_proxy_api_key_header(kwargs)
+    kwargs = _apply_proxy_api_key_header(kwargs, normalized_base_url)
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
