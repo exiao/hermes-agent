@@ -655,6 +655,32 @@ def _common_betas_for_base_url(
     return betas
 
 
+def _apply_proxy_api_key_header(kwargs: dict) -> dict:
+    """Attach the ``x-proxy-api-key`` inbound header when ``PROXY_API_KEY`` is set.
+
+    A billing proxy fronted by a public hostname (e.g. behind a Cloudflare
+    tunnel) gates non-local callers on an inbound key. Anthropic agent requests
+    carry their auth in ``x-api-key``/``Authorization`` for the upstream model,
+    which the proxy passes through; the proxy's own admission check reads a
+    separate ``x-proxy-api-key``. The OpenAI-wire client path sets this via
+    ``model.default_headers`` config, but the Anthropic SDK client is built
+    here, so the env-driven header must be merged in at construction or every
+    Anthropic agent call to a key-gated proxy is rejected and silently falls
+    through to the fallback provider.
+
+    Local ``127.0.0.1``/``localhost`` proxies ignore the header, so attaching it
+    whenever the env var is present is harmless. Merges onto any existing
+    ``default_headers`` (e.g. ``anthropic-beta``) rather than replacing them.
+    """
+    proxy_api_key = os.environ.get("PROXY_API_KEY")
+    if not proxy_api_key:
+        return kwargs
+    headers = dict(kwargs.get("default_headers") or {})
+    headers["x-proxy-api-key"] = proxy_api_key
+    kwargs["default_headers"] = headers
+    return kwargs
+
+
 def _build_anthropic_client_with_bearer_hook(
     token_provider,
     base_url: str = None,
@@ -725,6 +751,7 @@ def _build_anthropic_client_with_bearer_hook(
     if common_betas:
         kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
+    kwargs = _apply_proxy_api_key_header(kwargs)
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
@@ -848,6 +875,7 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
+    kwargs = _apply_proxy_api_key_header(kwargs)
     return _anthropic_sdk.Anthropic(**kwargs)
 
 

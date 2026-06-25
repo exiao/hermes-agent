@@ -201,6 +201,38 @@ class TestBuildAnthropicClient:
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
 
+    def test_proxy_api_key_header_attached_when_env_set(self, monkeypatch):
+        """PROXY_API_KEY is sent as x-proxy-api-key, merged onto anthropic-beta.
+
+        Regression for the CPE Modal proxy: the main pipeline agents build the
+        Anthropic client here (not config.anthropic_client()), so without this
+        the env-driven inbound key never reaches a key-gated public proxy and
+        every Anthropic agent call 401s into the fallback provider.
+        """
+        monkeypatch.setenv("PROXY_API_KEY", "inbound-secret")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-api03-something")
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["default_headers"]["x-proxy-api-key"] == "inbound-secret"
+            # Must not clobber the beta header it merges onto.
+            assert "anthropic-beta" in kwargs["default_headers"]
+
+    def test_proxy_api_key_header_absent_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("PROXY_API_KEY", raising=False)
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-api03-something")
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert "x-proxy-api-key" not in (kwargs.get("default_headers") or {})
+
+    def test_proxy_api_key_header_attached_on_oauth_path(self, monkeypatch):
+        """The OAuth/Bearer auth branch also carries the inbound proxy key."""
+        monkeypatch.setenv("PROXY_API_KEY", "inbound-secret")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-oat01-" + "x" * 60)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["default_headers"]["x-proxy-api-key"] == "inbound-secret"
+            assert "auth_token" in kwargs
+
 
 class TestReadClaudeCodeCredentials:
     @pytest.fixture(autouse=True)
