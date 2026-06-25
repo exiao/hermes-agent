@@ -670,8 +670,11 @@ def _apply_proxy_api_key_header(kwargs: dict, base_url: str | None) -> dict:
 
     The header is a proxy-admission secret, so it must only be sent to the proxy
     itself. It attaches only when ``PROXY_API_KEY`` is set AND the client's
-    target host matches the configured proxy host (``ANTHROPIC_BASE_URL``). When
-    the client targets the native Anthropic API (no ``base_url``) or any
+    effective target host matches the configured proxy host
+    (``ANTHROPIC_BASE_URL``). When ``base_url`` is omitted the Anthropic SDK
+    routes the request to ``ANTHROPIC_BASE_URL`` itself, so the effective target
+    is the proxy and the header attaches. When the client targets the native
+    Anthropic API (an explicit ``api.anthropic.com`` ``base_url``) or any
     unrelated Anthropic-compatible provider, the header is omitted so the secret
     never leaks to a third party. Merges onto any existing ``default_headers``
     (e.g. ``anthropic-beta``) rather than replacing them.
@@ -679,10 +682,13 @@ def _apply_proxy_api_key_header(kwargs: dict, base_url: str | None) -> dict:
     proxy_api_key = os.environ.get("PROXY_API_KEY")
     if not proxy_api_key:
         return kwargs
-    proxy_host = base_url_hostname(os.environ.get("ANTHROPIC_BASE_URL") or "")
+    proxy_base_url = os.environ.get("ANTHROPIC_BASE_URL") or ""
+    proxy_host = base_url_hostname(proxy_base_url)
     if not proxy_host:
         return kwargs
-    target_host = base_url_hostname(base_url or "")
+    # When base_url is omitted, the Anthropic SDK falls back to ANTHROPIC_BASE_URL,
+    # so the request's real destination is the proxy host, not native Anthropic.
+    target_host = base_url_hostname(base_url or proxy_base_url)
     if target_host != proxy_host:
         return kwargs
     headers = dict(kwargs.get("default_headers") or {})
