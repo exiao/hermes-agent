@@ -81,6 +81,11 @@ def _resolve_default_notify_targets(
     except Exception:
         return []
     kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(kcfg, dict):
+        # A malformed live edit (e.g. ``kanban: false`` or a YAML list) must
+        # not raise out of the notifier loop — that would skip ALL per-task
+        # delivery every tick. Fail safe to "no default targets".
+        return []
     raw = kcfg.get("default_notify") or []
     if not isinstance(raw, (list, tuple)):
         return []

@@ -112,6 +112,14 @@ def test_non_dict_config_fails_safe():
     assert _resolve_default_notify_targets(lambda: ["not", "a", "dict"]) == []
 
 
+def test_malformed_kanban_section_fails_safe():
+    # A live edit that leaves ``kanban`` as a non-dict (e.g. ``kanban: false``
+    # or a YAML list) must not raise — it would break ALL per-task delivery.
+    assert _resolve_default_notify_targets(lambda: {"kanban": False}) == []
+    assert _resolve_default_notify_targets(lambda: {"kanban": ["a", "b"]}) == []
+    assert _resolve_default_notify_targets(lambda: {"kanban": "nope"}) == []
+
+
 def test_config_read_error_fails_safe_empty():
     def _boom():
         raise RuntimeError("config read failed")
