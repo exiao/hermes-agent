@@ -74,6 +74,11 @@
   --theme-font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo,
     Consolas, monospace;
   --theme-font-display: var(--theme-font-sans);
+  /* Brand-chrome display font for page titles + the DS `.font-expanded`
+     utility. Defaults to the DS Rules Expanded face (so default/preset themes
+     keep their canonical chrome before ThemeProvider runs); themes that ship
+     an explicit `fontDisplay` override it via the ThemeProvider. */
+  --theme-font-chrome: var(--font-rules-expanded);
   --theme-base-size: 15px;
   --theme-line-height: 1.55;
   --theme-letter-spacing: 0;
@@ -116,6 +121,28 @@ body {
 
 code, kbd, pre, samp, .font-mono, .font-mono-ui {
   font-family: var(--theme-font-mono);
+}
+
+/* Headings honor the theme's display font. `--theme-font-display` is set
+   from `typography.fontDisplay` (falling back to `--theme-font-sans` when a
+   theme omits it), so a theme that ships a distinct display face — e.g. a
+   serif for editorial headings over a sans body — actually renders it.
+   Without this rule the variable is computed but never consumed, and every
+   theme's `fontDisplay` is silently inert. */
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--theme-font-display);
+}
+
+/* The DS `.font-expanded` utility (page titles via PageHeaderProvider, card
+   titles, and plugin chrome like the Kanban lane names) hardcodes the Rules
+   Expanded face inside `@nous-research/ui`, winning on cascade over any theme
+   variable. Re-point it at `--theme-font-chrome` so themes can drive it: the
+   var defaults to Rules Expanded (preserving the default look) but a theme
+   with an explicit `fontDisplay` overrides it. This is a plain rule (not an
+   `@utility`/`@layer` rule), so it outranks the DS utility without
+   `!important`. */
+.font-expanded {
+  font-family: var(--theme-font-chrome);
 }
 
 /* Density: scale the shadcn spacing utilities via a multiplier. The DS
