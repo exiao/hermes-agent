@@ -100,6 +100,117 @@ def _resolve_default_notify_targets(
     return targets
 
 
+# --------------------------------------------------------------------------
+# On-completion adversarial review (constitution rule 2).
+# --------------------------------------------------------------------------
+#
+# Write-lane assignees that produce a reviewable deliverable. A completion on
+# one of these lanes should auto-spawn a review card (the constitution's
+# "adversarial verification (default)" rule). Read-only lanes (researcher,
+# reviewer) and the review/follow-up cards we ourselves spawn are excluded so
+# we never review-a-review (the infinite-loop guard). Assignees are stored
+# canonicalised (lowercased via ``_canonical_assignee``), so compare lowercase.
+_WRITE_LANE_ASSIGNEES = frozenset({
+    "cpe-dev",
+    "bloom-dev",
+    "infra-ops",
+    "pr-babysitter",
+    "verifier",
+    "content-creator",
+    "ads-optimizer",
+})
+
+# Lanes whose completion must NEVER trigger a reaction: read-only producers
+# (nothing to ship-review) and the review lane itself (a reviewer's verdict is
+# not a new deliverable to re-review — that is the loop). ``pr-babysitter`` is
+# a write lane but is also the canonical follow-up we route a passing PR to;
+# we still allow reviewing a pr-babysitter deliverable, but the marker stamp
+# below is what actually stops the chain, not the assignee.
+_NON_TRIGGER_ASSIGNEES = frozenset({
+    "researcher",
+    "reviewer",
+})
+
+# Marker stamped (in the card body) on every card THIS automation spawns so a
+# spawned review/follow-up card's own completion does not spawn another review.
+# Detecting the marker — not the assignee — is the authoritative loop guard,
+# because a review card can be assigned to a write lane (e.g. ``verifier``).
+_AUTO_REACTION_MARKER = "<!-- kanban:auto-on-complete-reaction -->"
+
+
+def _resolve_on_complete_review_config(
+    load_config: Callable[[], Any],
+) -> "Optional[dict]":
+    """Resolve the live ``kanban.on_complete_review`` config block.
+
+    Shape in ``config.yaml``::
+
+        kanban:
+          on_complete_review:
+            enabled: true
+            # Where verdict + progress messages go (the "Kanban Master" group).
+            notify:
+              platform: signal
+              chat_id: "group:..."
+              thread_id: ""   # optional
+
+    Returns ``None`` when the feature is disabled or misconfigured (no
+    ``enabled: true``), so the caller treats a missing/garbled block as OFF.
+    On a valid+enabled block, returns a normalised dict::
+
+        {"notify": {"platform", "chat_id", "thread_id"}}  # notify may be None
+
+    Read fresh on every notifier tick (like the other resolvers here) so
+    flipping ``enabled`` takes effect on the next tick with no gateway
+    restart. Fails **safe**: any read/parse error returns ``None``.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return None
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    raw = kcfg.get("on_complete_review")
+    if not isinstance(raw, dict):
+        return None
+    if not bool(raw.get("enabled", False)):
+        return None
+    notify = None
+    n = raw.get("notify")
+    if isinstance(n, dict):
+        platform = str(n.get("platform") or "").strip().lower()
+        chat_id = str(n.get("chat_id") or "").strip()
+        if platform and chat_id:
+            notify = {
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": str(n.get("thread_id") or "").strip(),
+            }
+    return {"notify": notify}
+
+
+def _select_reviewer_for(task) -> str:
+    """Pick the reviewer lane for a completed write-lane deliverable.
+
+    Constitution rule 2: route by deliverable type. Code/PR deliverables get a
+    static-diff ``reviewer``; content/ads get a *second* worker of the same
+    producing lane briefed to critique against a rubric (never the same worker
+    that produced it — self-review bias is the #1 multi-agent failure).
+    Runtime-proof features would route to ``verifier``, but the trigger cannot
+    tell "needs a boot" from "static diff is enough" structurally, so it
+    defaults code to ``reviewer`` and leaves the runtime-proof escalation to a
+    body cue or to the orchestrator layer. Keep the decision tree shallow and
+    delegate judgement to the reviewer LLM (per the task's "delegate judgment"
+    constraint).
+    """
+    assignee = (getattr(task, "assignee", None) or "").lower()
+    if assignee == "content-creator":
+        return "content-creator"
+    if assignee == "ads-optimizer":
+        return "ads-optimizer"
+    # All code/infra/PR lanes -> static-diff reviewer by default.
+    return "reviewer"
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -241,6 +352,9 @@ class GatewayKanbanWatchersMixin:
                 # adding/removing a `kanban.default_notify` entry takes effect
                 # on the next tick (no gateway restart). Fails safe to [].
                 default_notify_targets = _resolve_default_notify_targets(_load_config)
+                # Resolve the on-completion review reaction config fresh each
+                # tick (None = feature off). Same live-reload semantics.
+                on_complete_review_cfg = _resolve_on_complete_review_config(_load_config)
 
                 def _collect():
                     deliveries: list[dict] = []
@@ -510,6 +624,30 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                                # On-completion reaction (constitution rule 2):
+                                # spawn an adversarial review parented to the
+                                # just-completed write-lane task and post
+                                # progress to the configured chat. Gated by
+                                # `kanban.on_complete_review.enabled`. Fires
+                                # inside the `completed` branch so it only ever
+                                # runs on a real completion; idempotent on the
+                                # task id so the per-chat fan-out of the same
+                                # completed event spawns at most ONE review.
+                                if on_complete_review_cfg is not None:
+                                    try:
+                                        await self._maybe_react_on_complete(
+                                            adapter=adapter,
+                                            task=task,
+                                            board=board_slug,
+                                            notifier_profile=notifier_profile,
+                                            review_cfg=on_complete_review_cfg,
+                                        )
+                                    except Exception as react_exc:
+                                        logger.warning(
+                                            "kanban on-complete-review: reaction "
+                                            "for %s failed: %s",
+                                            sub["task_id"], react_exc,
+                                        )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -735,6 +873,210 @@ class GatewayKanbanWatchersMixin:
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+
+    def _qualifies_for_on_complete_review(self, task) -> "tuple[bool, str]":
+        """Decide whether a completed task should trigger the review reaction.
+
+        Returns ``(qualifies, reason)``; ``reason`` names the gate that fired
+        for log legibility. This is the spam-prevention line (the task's
+        "Scope" section) and the infinite-loop guard (rule 2):
+
+          * Only WRITE-LANE deliverables qualify (``_WRITE_LANE_ASSIGNEES``).
+          * Read-only lanes (researcher, reviewer) never qualify.
+          * A card THIS automation spawned (stamped with
+            ``_AUTO_REACTION_MARKER`` in its body) never qualifies — a review
+            of a review is the loop we must not create.
+
+        The marker check is the authoritative loop guard; the assignee check
+        is the scope filter. Both must pass.
+        """
+        if task is None:
+            return False, "no-task"
+        assignee = (getattr(task, "assignee", None) or "").lower()
+        body = getattr(task, "body", None) or ""
+        # Loop guard FIRST: never react to a card we spawned, regardless of
+        # which lane it was assigned to (a verifier review card is write-lane).
+        if _AUTO_REACTION_MARKER in body:
+            return False, "auto-spawned-card (loop-guard)"
+        if assignee in _NON_TRIGGER_ASSIGNEES:
+            return False, f"non-trigger-lane:{assignee or '<none>'}"
+        if assignee not in _WRITE_LANE_ASSIGNEES:
+            return False, f"not-write-lane:{assignee or '<none>'}"
+        return True, f"write-lane:{assignee}"
+
+    async def _maybe_react_on_complete(
+        self,
+        *,
+        adapter,
+        task,
+        board: Optional[str],
+        notifier_profile: Optional[str],
+        review_cfg: dict,
+    ) -> None:
+        """On a qualifying ``completed`` event: spawn an adversarial review
+        card parented to the task and post verdict-loop progress to the
+        configured Signal chat (the "Kanban Master" group).
+
+        This AUTOMATES the trigger for constitution rule 2 — it does not
+        reinvent routing. The spawned reviewer (a separate context window with
+        a rubric) posts the actual ship/needs-rework verdict to the chat and,
+        on a pass, routes the follow-up (e.g. a completed PR -> pr-babysitter)
+        via its own kanban tools. The trigger's job is: fire once, parent the
+        review, and report that the loop moved.
+
+        Idempotency: the review card is created with an ``idempotency_key``
+        derived from the completed task id, so re-delivery of the completed
+        event (retries, multi-tick) never spawns a duplicate review. The
+        spawned card carries ``_AUTO_REACTION_MARKER`` so its own completion
+        is skipped by ``_qualifies_for_on_complete_review`` (no loop).
+        """
+        from hermes_cli import kanban_db as _kb
+        from gateway.config import Platform as _Platform
+
+        qualifies, reason = self._qualifies_for_on_complete_review(task)
+        if not qualifies:
+            logger.debug(
+                "kanban on-complete-review: skipping %s (%s)",
+                getattr(task, "id", "<?>"), reason,
+            )
+            return
+
+        task_id = task.id
+        reviewer = _select_reviewer_for(task)
+        notify = review_cfg.get("notify") or {}
+
+        def _spawn_review():
+            """Create the parented review card (idempotent). Runs in a thread."""
+            conn = _kb.connect(board=board)
+            try:
+                # Hard idempotency: never double-spawn a review for the same
+                # completed task even across ticks / event redelivery.
+                idem = f"on-complete-review:{task_id}"
+                existing = None
+                try:
+                    for child_id in _kb.child_ids(conn, task_id):
+                        child = _kb.get_task(conn, child_id)
+                        if child and _AUTO_REACTION_MARKER in (child.body or ""):
+                            existing = child_id
+                            break
+                except Exception:
+                    pass
+                if existing:
+                    return None, existing
+
+                title = f"Review: {(task.title or task_id)[:100]}"
+                who = (task.assignee or "?")
+                body = (
+                    f"{_AUTO_REACTION_MARKER}\n"
+                    f"# Adversarial review of {task_id} ({who})\n\n"
+                    "Auto-spawned by the on-completion reaction (constitution "
+                    "rule 2). Review the deliverable from the parent task and "
+                    "post a verdict to the **Kanban Master** Signal group.\n\n"
+                    "## What to do\n"
+                    "1. Read the parent task's completion handoff (summary + "
+                    "metadata + any PR url) and the diff/deliverable it points "
+                    "at.\n"
+                    "2. Judge it against the rubric for its type (code: "
+                    "correctness, tests, regressions, scope; content/ads: "
+                    "against the brief). You are a SEPARATE reviewer — do not "
+                    "rubber-stamp.\n"
+                    "3. Post your verdict (SHIP / NEEDS-REWORK + the why) to "
+                    "the Kanban Master Signal group, and also via "
+                    "`kanban_comment` on this card.\n"
+                    "4. On a PASS for a completed PR, spawn a `pr-babysitter` "
+                    "follow-up parented to the PARENT task (watch CI / address "
+                    "review threads). A verified feature needs nothing further "
+                    "unless the parent body asks.\n\n"
+                    "Do NOT merge or publish. Reviewer/verifier lanes report; "
+                    "Eric merges.\n"
+                )
+                new_id = _kb.create_task(
+                    conn,
+                    title=title,
+                    body=body,
+                    assignee=reviewer,
+                    parents=[task_id],
+                    created_by="kanban-on-complete-reaction",
+                    workspace_kind=(
+                        "scratch" if reviewer == "reviewer" else "dir"
+                    ),
+                    priority=getattr(task, "priority", 0) or 0,
+                    idempotency_key=idem,
+                    goal_mode=True,
+                    goal_max_turns=20,
+                    max_runtime_seconds=1800,
+                    board=board,
+                )
+                return new_id, None
+            finally:
+                conn.close()
+
+        try:
+            new_id, existing = await asyncio.to_thread(_spawn_review)
+        except Exception as exc:
+            logger.warning(
+                "kanban on-complete-review: failed to spawn review for %s: %s",
+                task_id, exc,
+            )
+            return
+
+        if existing:
+            logger.debug(
+                "kanban on-complete-review: review %s already exists for %s; "
+                "no progress message (idempotent)",
+                existing, task_id,
+            )
+            return
+
+        logger.info(
+            "kanban on-complete-review: spawned review %s (%s) parented to %s",
+            new_id, reviewer, task_id,
+        )
+
+        # Report progress to the Kanban Master chat so Eric sees the loop move
+        # without opening the dashboard. Best-effort: a send failure here must
+        # not undo the (already-created) review card.
+        if not notify:
+            logger.debug(
+                "kanban on-complete-review: no notify target configured; "
+                "review %s spawned silently", new_id,
+            )
+            return
+        try:
+            plat = _Platform(notify["platform"])
+        except ValueError:
+            logger.debug(
+                "kanban on-complete-review: unknown notify platform %s",
+                notify.get("platform"),
+            )
+            return
+        progress_adapter = self.adapters.get(plat)
+        if progress_adapter is None:
+            logger.debug(
+                "kanban on-complete-review: notify adapter %s not connected",
+                notify["platform"],
+            )
+            return
+        meta: dict[str, Any] = {}
+        if notify.get("thread_id"):
+            meta["thread_id"] = notify["thread_id"]
+        msg = (
+            f"🔎 Review routed for {task_id} (@{task.assignee}) — "
+            f"{(task.title or '')[:80]}\n"
+            f"Spawned {new_id} → @{reviewer}. Verdict + any follow-up will "
+            f"land here."
+        )
+        try:
+            await progress_adapter.send(notify["chat_id"], msg, metadata=meta)
+            logger.debug(
+                "kanban on-complete-review: progress posted for %s to %s/%s",
+                task_id, notify["platform"], notify["chat_id"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "kanban on-complete-review: progress send failed for %s: %s",
+                task_id, exc,
+            )
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
