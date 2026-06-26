@@ -288,3 +288,31 @@ def test_default_notify_does_not_disturb_existing_per_task_sub(tmp_path, monkeyp
     assert chats == sorted([default_chat, manual_chat]), (
         f"both the manual and default targets should receive the completion; got {chats}"
     )
+
+
+def test_add_default_notify_subs_bulk_active_only(tmp_path, monkeypatch):
+    """The bulk helper subscribes every active task and skips final ones in a
+    single transaction, and is idempotent on re-run (no duplicate rows)."""
+    db_path = tmp_path / "bulk.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    chat = "group:bulk-target="
+    conn = kb.connect()
+    try:
+        active1 = kb.create_task(conn, title="a1", assignee="researcher")
+        active2 = kb.create_task(conn, title="a2", assignee="researcher")
+        done = kb.create_task(conn, title="d", assignee="researcher")
+        kb.complete_task(conn, done, summary="ok")
+
+        kb.add_default_notify_subs(conn, platform="signal", chat_id=chat)
+        subscribed = {s["task_id"] for s in kb.list_notify_subs(conn)}
+        assert subscribed == {active1, active2}, (
+            f"only active tasks should be subscribed; got {subscribed}"
+        )
+
+        # Idempotent: a second call adds no duplicate rows.
+        kb.add_default_notify_subs(conn, platform="signal", chat_id=chat)
+        assert len(kb.list_notify_subs(conn)) == 2
+    finally:
+        conn.close()

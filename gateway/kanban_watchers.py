@@ -315,35 +315,28 @@ class GatewayKanbanWatchersMixin:
                             # adapter is currently connected, mirroring the
                             # delivery gate below.
                             if default_notify_targets:
-                                try:
-                                    active_tasks = _kb.list_tasks(conn)
-                                except Exception as exc:
-                                    active_tasks = []
-                                    logger.debug(
-                                        "kanban notifier: cannot list tasks on board %s for default-notify: %s",
-                                        slug, exc,
-                                    )
-                                FINAL_STATUSES = {"done", "archived"}
-                                for t in active_tasks:
-                                    if getattr(t, "status", None) in FINAL_STATUSES:
+                                # One bulk INSERT-OR-IGNORE per connected target
+                                # instead of a per-task write txn each tick: the
+                                # SELECT picks every active (non-final) task in a
+                                # single transaction. Idempotent on the PK, so an
+                                # existing per-task subscription (cursor /
+                                # fail-count) is never disturbed.
+                                for tgt in default_notify_targets:
+                                    if tgt["platform"] not in active_platforms:
                                         continue
-                                    for tgt in default_notify_targets:
-                                        if tgt["platform"] not in active_platforms:
-                                            continue
-                                        try:
-                                            _kb.add_notify_sub(
-                                                conn,
-                                                task_id=t.id,
-                                                platform=tgt["platform"],
-                                                chat_id=tgt["chat_id"],
-                                                thread_id=tgt["thread_id"],
-                                                notifier_profile=notifier_profile,
-                                            )
-                                        except Exception as exc:
-                                            logger.debug(
-                                                "kanban notifier: default-notify subscribe failed for %s on %s: %s",
-                                                t.id, tgt["platform"], exc,
-                                            )
+                                    try:
+                                        _kb.add_default_notify_subs(
+                                            conn,
+                                            platform=tgt["platform"],
+                                            chat_id=tgt["chat_id"],
+                                            thread_id=tgt["thread_id"],
+                                            notifier_profile=notifier_profile,
+                                        )
+                                    except Exception as exc:
+                                        logger.debug(
+                                            "kanban notifier: default-notify subscribe failed for %s on %s: %s",
+                                            tgt["chat_id"], tgt["platform"], exc,
+                                        )
 
                             subs = _kb.list_notify_subs(conn)
                             if not subs:
