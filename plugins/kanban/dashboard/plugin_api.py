@@ -119,19 +119,25 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
 def _conn(board: Optional[str] = None):
     """Open a kanban_db connection, creating the schema on first use.
 
-    Every handler that mutates the DB goes through this so the plugin
-    self-heals on a fresh install (no user-visible "no such table"
-    error if somebody hits POST /tasks before GET /board).
-    ``init_db`` is idempotent.
+    Every handler goes through this so the plugin self-heals on a fresh
+    install (no user-visible "no such table" error if somebody hits
+    POST /tasks before GET /board).
+
+    ``connect()`` already auto-runs the schema + migration pass the
+    first time this process opens a given board, then caches that per
+    path. Calling ``init_db()`` here instead forced a full
+    re-migration (cross-process init flock + header validation +
+    ``PRAGMA integrity_check``) on *every* request — and the dashboard
+    runs in a separate process from the gateway dispatcher, so each
+    board load contended that lock against live worker writes under the
+    120s busy timeout, turning a 4ms read into multi-second stalls. The
+    one-time auto-init in ``connect()`` covers the fresh-install case
+    without paying that cost per request.
 
     ``board`` is the query-param slug (already normalised by
     :func:`_resolve_board`). When ``None`` the active board is used
     via the resolution chain (env var → ``current`` file → ``default``).
     """
-    try:
-        kanban_db.init_db(board=board)
-    except Exception as exc:
-        log.warning("kanban init_db failed: %s", exc)
     return kanban_db.connect(board=board)
 
 

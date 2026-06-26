@@ -80,6 +80,42 @@ def test_board_empty(client):
 
 
 # ---------------------------------------------------------------------------
+# Read requests must not force a DB re-migration on every call
+# ---------------------------------------------------------------------------
+
+
+def test_board_read_does_not_force_remigration(client, monkeypatch):
+    """GET /board is a read; it must not call init_db().
+
+    init_db() discards the per-process init cache and forces connect()
+    down the slow path (cross-process init flock + header validation +
+    PRAGMA integrity_check). Doing that per request made the dashboard
+    contend the init lock against the live gateway dispatcher under the
+    120s busy timeout, turning a millisecond read into multi-second
+    stalls. Reads go through the cached connect() instead.
+    """
+    calls = {"init_db": 0}
+    real_init_db = kb.init_db
+
+    def _counting_init_db(*args, **kwargs):
+        calls["init_db"] += 1
+        return real_init_db(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "init_db", _counting_init_db)
+
+    # Warm any first-open auto-init via connect(), then assert the read
+    # path itself triggers zero forced re-migrations.
+    for _ in range(3):
+        r = client.get("/api/plugins/kanban/board")
+        assert r.status_code == 200, r.text
+
+    assert calls["init_db"] == 0, (
+        f"board read forced {calls['init_db']} init_db re-migration(s); "
+        "read handlers must use the cached connect() path"
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
 
