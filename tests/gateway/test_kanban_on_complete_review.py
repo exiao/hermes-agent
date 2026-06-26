@@ -25,6 +25,7 @@ from gateway.config import Platform
 from gateway.kanban_watchers import (
     _AUTO_REACTION_MARKER,
     _orchestrator_assignee,
+    _qualifies_for_on_complete_review,
     _resolve_on_complete_review_config,
 )
 from gateway.run import GatewayRunner
@@ -130,22 +131,13 @@ def test_orchestrator_assignee_fails_safe():
 # --------------------------------------------------------------------------
 
 
-def _runner():
-    r = GatewayRunner.__new__(GatewayRunner)
-    r._running = True
-    r.adapters = {}
-    r._kanban_sub_fail_counts = {}
-    return r
-
-
 def test_gate_every_completed_task_qualifies():
     """The new contract: any lane's completion qualifies. The orchestrator,
     not this gate, decides whether a follow-up is warranted."""
-    r = _runner()
     for lane in ("cpe-dev", "bloom-dev", "infra-ops", "verifier",
                  "content-creator", "researcher", "reviewer", "random-lane"):
         task = SimpleNamespace(id="t1", assignee=lane, body="some deliverable")
-        ok, _reason = r._qualifies_for_on_complete_review(task)
+        ok, _reason = _qualifies_for_on_complete_review(task)
         assert ok, lane
 
 
@@ -153,10 +145,9 @@ def test_gate_auto_spawned_card_never_qualifies():
     """The loop guard: a decision card stamped with the marker — regardless of
     lane — must never trigger another reaction. This is the structural fix that
     stops review-of-a-review."""
-    r = _runner()
     body = f"{_AUTO_REACTION_MARKER}\n# review of t_parent"
     task = SimpleNamespace(id="t_review", assignee="verifier", body=body)
-    ok, reason = r._qualifies_for_on_complete_review(task)
+    ok, reason = _qualifies_for_on_complete_review(task)
     assert not ok
     assert "loop-guard" in reason
 

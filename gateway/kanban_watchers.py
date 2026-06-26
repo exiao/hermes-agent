@@ -186,6 +186,27 @@ def _orchestrator_assignee(load_config: Callable[[], Any]) -> str:
         return "orchestrator"
 
 
+def _qualifies_for_on_complete_review(task) -> "tuple[bool, str]":
+    """Decide whether a completed task should trigger the orchestrator hand-off.
+
+    Returns ``(qualifies, reason)``; ``reason`` names the gate that fired for
+    log legibility. Every completion qualifies EXCEPT a card this automation
+    itself spawned — reacting to our own decision card would loop forever. The
+    marker (stamped in the body of every spawned card) is the only gate: no
+    assignee allowlist, so a brand-new lane is covered with zero code change,
+    and the orchestrator decides per-task what (if anything) to do next.
+
+    Standalone (no instance state) so it unit-tests directly and can't raise
+    AttributeError under a mocked runner.
+    """
+    if task is None:
+        return False, "no-task"
+    body = getattr(task, "body", None) or ""
+    if _AUTO_REACTION_MARKER in body:
+        return False, "auto-spawned-card (loop-guard)"
+    return True, "completed"
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -610,13 +631,15 @@ class GatewayKanbanWatchersMixin:
                                 # completed event spawns at most ONE review.
                                 if on_complete_review_cfg is not None:
                                     try:
-                                        await self._maybe_react_on_complete(
-                                            adapter=adapter,
-                                            task=task,
-                                            board=board_slug,
-                                            notifier_profile=notifier_profile,
-                                            review_cfg=on_complete_review_cfg,
+                                        react_fn = getattr(
+                                            self, "_maybe_react_on_complete", None
                                         )
+                                        if react_fn is not None:
+                                            await react_fn(
+                                                task=task,
+                                                board=board_slug,
+                                                review_cfg=on_complete_review_cfg,
+                                            )
                                     except Exception as react_exc:
                                         logger.warning(
                                             "kanban on-complete-review: reaction "
@@ -849,31 +872,11 @@ class GatewayKanbanWatchersMixin:
                     path, exc,
                 )
 
-    def _qualifies_for_on_complete_review(self, task) -> "tuple[bool, str]":
-        """Decide whether a completed task should trigger the orchestrator hand-off.
-
-        Returns ``(qualifies, reason)``; ``reason`` names the gate that fired
-        for log legibility. Every completion qualifies EXCEPT a card this
-        automation itself spawned — reacting to our own decision card would
-        loop forever. The marker (stamped in the body of every spawned card) is
-        the only gate: no assignee allowlist, so a brand-new lane is covered
-        with zero code change, and the orchestrator decides per-task what (if
-        anything) to do next.
-        """
-        if task is None:
-            return False, "no-task"
-        body = getattr(task, "body", None) or ""
-        if _AUTO_REACTION_MARKER in body:
-            return False, "auto-spawned-card (loop-guard)"
-        return True, "completed"
-
     async def _maybe_react_on_complete(
         self,
         *,
-        adapter,
         task,
         board: Optional[str],
-        notifier_profile: Optional[str],
         review_cfg: dict,
     ) -> None:
         """On a qualifying ``completed`` event: spawn ONE orchestrator decision
@@ -896,7 +899,7 @@ class GatewayKanbanWatchersMixin:
         from gateway.config import Platform as _Platform
         from hermes_cli.config import load_config as _load_config
 
-        qualifies, reason = self._qualifies_for_on_complete_review(task)
+        qualifies, reason = _qualifies_for_on_complete_review(task)
         if not qualifies:
             logger.debug(
                 "kanban on-complete-review: skipping %s (%s)",
