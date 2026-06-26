@@ -1026,8 +1026,9 @@ class GatewayKanbanWatchersMixin:
         meta: dict[str, Any] = {}
         if notify.get("thread_id"):
             meta["thread_id"] = notify["thread_id"]
+        who_str = f" (@{task.assignee})" if task.assignee else ""
         msg = (
-            f"✅ {task_id} completed (@{task.assignee}) — "
+            f"✅ {task_id} completed{who_str} — "
             f"{(task.title or '')[:80]}\n"
             f"Spawned {new_id} → @{orchestrator} to decide the next step. "
             f"Any follow-up will land here."
