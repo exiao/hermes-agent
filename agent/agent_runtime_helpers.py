@@ -1980,6 +1980,17 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     if normalized in agent.valid_tool_names:
         return normalized
 
+    # Strip a leading ``mcp_`` / ``mcp-`` prefix that Claude-style models tack
+    # on because tools are commonly exposed over MCP (e.g. ``mcp_read_file`` ->
+    # ``read_file``). Deterministic strip before the fuzzy fallback so short
+    # names can't mis-resolve via difflib. Mirrors the same handling in
+    # tools/delegate_tool.py. See #14784 for the class of name-mangling repairs.
+    for _mcp_prefix in ("mcp_", "mcp-"):
+        if normalized.startswith(_mcp_prefix):
+            unprefixed = normalized[len(_mcp_prefix):]
+            if unprefixed in agent.valid_tool_names:
+                return unprefixed
+
     # Build the full candidate set for class-like emissions.
     cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
     # Strip trailing tool-suffix up to twice — TodoTool_tool needs it.

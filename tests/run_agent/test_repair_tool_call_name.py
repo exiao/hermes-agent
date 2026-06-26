@@ -186,3 +186,33 @@ class TestVolcEngineXmlPollution:
         # rest of the pipeline (fuzzy match at 0.7 cutoff) can still
         # recover the obvious target.
         assert repair('"terminal"') == "terminal"
+
+
+class TestMcpPrefixStrip:
+    """Claude-style models prefix tool calls with ``mcp_`` because tools are
+    commonly exposed over MCP. The repair routine must strip it deterministically
+    (before the fuzzy fallback) so short names can't mis-resolve via difflib."""
+
+    def test_mcp_underscore_prefix_stripped(self, repair):
+        assert repair("mcp_read_file") == "read_file"
+
+    def test_mcp_dash_prefix_stripped(self, repair):
+        assert repair("mcp-read_file") == "read_file"
+
+    def test_mcp_prefix_on_short_name(self, repair):
+        # Short names are exactly where the fuzzy fallback was unreliable.
+        assert repair("mcp_terminal") == "terminal"
+
+    def test_mcp_prefix_uppercase(self, repair):
+        assert repair("MCP_Terminal") == "terminal"
+
+    def test_mcp_prefix_short_name_fuzzy_would_miss(self, repair):
+        # The load-bearing case: ``mcp_todo`` is too short for the 0.7
+        # fuzzy cutoff (difflib returns nothing), so before the explicit
+        # strip this returned None -> "Unknown tool" and the call failed.
+        # The deterministic mcp_ strip rescues it.
+        assert repair("mcp_todo") == "todo"
+
+    def test_mcp_prefix_with_unknown_remainder_still_fails(self, repair):
+        # Stripping must not launder an unknown tool into a valid one.
+        assert repair("mcp_no_such_tool") is None
