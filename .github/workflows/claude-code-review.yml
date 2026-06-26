@@ -1,0 +1,125 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: claude-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  # Skip when the latest commit was authored by a bot (exact noreply-email match)
+  # to prevent re-trigger loops from automated commits on the PR branch.
+  check-author:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+      - id: check
+        run: |
+          AUTHOR_EMAIL=$(git log -1 --format='%ae' HEAD)
+          echo "Last commit author email: $AUTHOR_EMAIL"
+          if [[ "$AUTHOR_EMAIL" == "claude[bot]@users.noreply.github.com" ]] || \
+             [[ "$AUTHOR_EMAIL" == "github-actions[bot]@users.noreply.github.com" ]] || \
+             [[ "$AUTHOR_EMAIL" == *"[bot]@users.noreply.github.com" ]]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  claude-review:
+    needs: check-author
+    if: |
+      needs.check-author.outputs.should_run == 'true' &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    # Review-only: the reviewer reads code and posts a formal review + sticky
+    # comment. It does NOT commit auto-fixes. hermes-agent is a framework with
+    # strict, subtle invariants (per-conversation prompt caching, message-role
+    # alternation, narrow-waist tool footprint) where an "obvious" fix can
+    # silently break a load-bearing invariant, so every change stays in front of
+    # a human. contents:read is therefore intentional.
+    permissions:
+      contents: read
+      pull-requests: write  # Required for use_sticky_comment and gh pr review/comment
+      issues: read
+      id-token: write
+      actions: read  # Required for the github_ci MCP server
+
+    steps:
+      - name: Checkout repository
+        timeout-minutes: 60
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Detect Claude workflow self-change
+        id: workflow_self_change
+        run: |
+          BASE_SHA=$(git merge-base "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")
+          if git diff --name-only "$BASE_SHA" "${{ github.event.pull_request.head.sha }}" | grep -Eq '^\.github/workflows/claude-code-review\.yml$'; then
+            echo "skip_review=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping Claude Code Review because this PR changes the workflow that authorizes the Anthropic app token."
+          else
+            echo "skip_review=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Claude Code Review
+        id: claude-review
+        if: steps.workflow_self_change.outputs.skip_review != 'true'
+        timeout-minutes: 60
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          use_sticky_comment: true
+          track_progress: true
+          allowed_bots: 'claude,claude[bot]'
+          additional_permissions: |
+            actions: read
+          prompt: |
+            Review pull request #${{ github.event.pull_request.number }}. This is hermes-agent: a personal AI-agent framework (one agent core across a CLI, a messaging gateway for ~20 platforms, a TUI, and an Electron desktop app). Two properties from AGENTS.md shape almost every review decision — read changes through this lens, in priority order.
+
+            FOCUS ON (high to low priority):
+            1. Prompt-cache safety — the #1 invariant. Per-conversation prompt caching is "sacred": a long-lived conversation reuses a cached prefix every turn. FLAG anything that mutates past context mid-conversation, swaps toolsets mid-conversation, reloads memories or rebuilds the system prompt mid-conversation, or otherwise makes the system prompt non-byte-stable for the life of a conversation. The ONLY sanctioned exception is context compression.
+            2. Message-role alternation — never two same-role messages in a row, and never a synthetic user message injected mid-loop. FLAG any change that breaks strict role alternation or fabricates a mid-conversation user turn.
+            3. Narrow-waist / footprint — every model tool ships on EVERY API call, so a NEW core tool is the expensive exception. FLAG a new core model tool when the capability is reachable via the Footprint Ladder's higher rungs instead: extend existing code > CLI command + skill > service-gated tool (check_fn) > plugin > MCP server in the catalog > new core tool (last resort). A new core tool is only justified when it is fundamental, broadly useful, and unreachable via terminal + file (or an MCP server).
+            4. No new HERMES_* env vars for non-secret config — .env is for SECRETS ONLY (API keys, tokens, passwords). All behavioral settings (timeouts, thresholds, feature flags, display prefs) belong in config.yaml. FLAG any PR that tells users to "set X in your .env" unless X is a credential, or that adds a HERMES_* env var for non-secret config instead of a config.yaml key.
+            5. Real bugs, well — reproduce the symptom on the PR's code, cite the EXACT line where it manifests, and fix the whole bug class: check sibling call paths for the same flaw, not just the one reported site.
+            6. For every deleted function call or side effect, grep to find what depended on it. A removed side effect with no replacement is a bug.
+            7. Tests are behavior contracts, not snapshots — FLAG change-detector tests that freeze data expected to change (model catalogs, config version literals, enumeration counts, hardcoded provider-model lists). Prefer assertions about how two pieces of data must relate (invariants).
+            8. E2E validation over green mocks — for anything touching resolution chains, config propagation, security boundaries, remote backends, or file/network I/O, the change should exercise the real path against a temp HERMES_HOME, not just pass mocked unit tests. FLAG dead code wired into a live path without E2E proof.
+            9. Profile-safety — code reading/writing HERMES_HOME paths must use get_hermes_home() / display_hermes_home(), never hardcode ~/.hermes or Path.home()/".hermes" (that breaks profiles).
+            10. Correctness, security, reliability (crashes/failures), and genuine performance problems in the changed code.
+
+            DO NOT flag:
+            - Style, naming, or structural preferences
+            - Pre-existing issues on lines the PR did not modify
+            - Suggestions that amount to "this could be slightly better"
+            - Premature optimizations
+            - Linting, formatting, or type-annotation nits
+            - Missing error handling for scenarios that require multiple unlikely conditions
+
+            Before calling something a bug, verify the PREMISE against how the code actually works: a limitation that looks like an oversight is often intentional design (e.g. profiles are isolated islands on purpose). If you cannot point to the exact line where the bug manifests AND show your concern changes that line's behavior, do not flag it. When in doubt about intent, say so rather than asserting a bug.
+
+            This is a REVIEW-ONLY workflow: do NOT edit, commit, or push code. Read the diff and the surrounding code, then report. For each issue, recommend the fix in your comment instead of applying it.
+
+            When you flag something, keep it to 1-2 sentences: state the problem, the fix, and where it is located. Use the full 40-char git SHA when linking to code (e.g., https://github.com/${{ github.repository }}/blob/FULL_SHA/path/file.py#L10-L15). End your review with a one-line severity tally (e.g. "2 blocking, 1 minor"). If the PR has no issues worth flagging, just say "LGTM" and one sentence of what you reviewed.
+
+            REVIEW SUBMISSION:
+            After completing your review, submit a formal GitHub review using gh pr review:
+            - If you found issues: `gh pr review ${{ github.event.pull_request.number }} --request-changes --body "Summary of issues found"`
+            - If LGTM: `gh pr review ${{ github.event.pull_request.number }} --approve --body "LGTM - brief summary"`
+            If gh pr review fails (e.g. permissions), fall back to posting a comment with `gh pr comment` instead.
+
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+          claude_args: |
+            --model claude-opus-4-8
+            --fallback-model claude-sonnet-4-6
+            --allowed-tools "Read,Glob,Grep,Bash(gh pr view *),Bash(gh pr diff *),Bash(gh pr comment *),Bash(gh pr review *),Bash(git diff *),Bash(git log *),Bash(git show *),WebSearch,WebFetch"
