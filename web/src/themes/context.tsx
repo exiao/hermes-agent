@@ -98,6 +98,12 @@ function typographyVars(typo: ThemeTypography): Record<string, string> {
     "--theme-font-sans": typo.fontSans,
     "--theme-font-mono": typo.fontMono,
     "--theme-font-display": typo.fontDisplay ?? typo.fontSans,
+    // Brand-chrome display font (page titles, the DS `.font-expanded` utility).
+    // Defaults to the DS Rules Expanded face so the default theme and presets
+    // that omit `fontDisplay` keep their canonical chrome; a theme that ships
+    // an explicit `fontDisplay` (e.g. an editorial serif) overrides it here so
+    // `.font-expanded` honors the theme without a per-theme `!important` hack.
+    "--theme-font-chrome": typo.fontDisplay ?? "var(--font-rules-expanded)",
     "--theme-base-size": typo.baseSize,
     "--theme-line-height": typo.lineHeight,
     "--theme-letter-spacing": typo.letterSpacing,
