@@ -55,6 +55,56 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _resolve_default_notify_targets(
+    load_config: Callable[[], Any],
+) -> "list[dict]":
+    """Resolve the live board-wide ``kanban.default_notify`` target list.
+
+    Each entry fans every ticket's terminal events out to a chat with zero
+    manual ``notify-subscribe``. Shape in ``config.yaml``::
+
+        kanban:
+          default_notify:
+            - platform: signal
+              chat_id: "group:..."
+              thread_id: ""   # optional
+
+    Read fresh on every notifier tick (like ``_resolve_auto_decompose_settings``)
+    so adding/removing a target takes effect on the next tick instead of
+    requiring a gateway restart. Fails **safe**: any read/parse error returns
+    ``[]`` (no auto-subscribe) rather than raising out of the notifier loop.
+    Entries missing ``platform`` or ``chat_id`` are dropped. ``thread_id``
+    defaults to ``""`` to match the subscription primary key.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return []
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(kcfg, dict):
+        # A malformed live edit (e.g. ``kanban: false`` or a YAML list) must
+        # not raise out of the notifier loop — that would skip ALL per-task
+        # delivery every tick. Fail safe to "no default targets".
+        return []
+    raw = kcfg.get("default_notify") or []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    targets: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        platform = str(entry.get("platform") or "").strip().lower()
+        chat_id = str(entry.get("chat_id") or "").strip()
+        if not platform or not chat_id:
+            continue
+        targets.append({
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": str(entry.get("thread_id") or "").strip(),
+        })
+    return targets
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -192,6 +242,11 @@ class GatewayKanbanWatchersMixin:
 
         while self._running:
             try:
+                # Resolve board-wide auto-subscribe targets fresh each tick so
+                # adding/removing a `kanban.default_notify` entry takes effect
+                # on the next tick (no gateway restart). Fails safe to [].
+                default_notify_targets = _resolve_default_notify_targets(_load_config)
+
                 def _collect():
                     deliveries: list[dict] = []
                     active_platforms = {
@@ -244,6 +299,45 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+                            #
+                            # Board-wide auto-subscribe: before reading the
+                            # subscription table, ensure every config-listed
+                            # `kanban.default_notify` target is subscribed to
+                            # every active (non-final) task on this board. This
+                            # is what makes terminal events fan out to e.g. the
+                            # "Kanban Workers" Signal group with zero manual
+                            # `notify-subscribe`. `add_notify_sub` is
+                            # INSERT-OR-IGNORE on the (task, platform, chat,
+                            # thread) PK, so this is idempotent and never
+                            # disturbs an existing per-task subscription (the
+                            # cursor / fail-count state is keyed the same way).
+                            # We only auto-subscribe targets whose platform
+                            # adapter is currently connected, mirroring the
+                            # delivery gate below.
+                            if default_notify_targets:
+                                # One bulk INSERT-OR-IGNORE per connected target
+                                # instead of a per-task write txn each tick: the
+                                # SELECT picks every active (non-final) task in a
+                                # single transaction. Idempotent on the PK, so an
+                                # existing per-task subscription (cursor /
+                                # fail-count) is never disturbed.
+                                for tgt in default_notify_targets:
+                                    if tgt["platform"] not in active_platforms:
+                                        continue
+                                    try:
+                                        _kb.add_default_notify_subs(
+                                            conn,
+                                            platform=tgt["platform"],
+                                            chat_id=tgt["chat_id"],
+                                            thread_id=tgt["thread_id"],
+                                            notifier_profile=notifier_profile,
+                                        )
+                                    except Exception as exc:
+                                        logger.debug(
+                                            "kanban notifier: default-notify subscribe failed for %s on %s: %s",
+                                            tgt["chat_id"], tgt["platform"], exc,
+                                        )
+
                             subs = _kb.list_notify_subs(conn)
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)

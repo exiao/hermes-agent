@@ -7878,6 +7878,41 @@ def list_notify_subs(
     return [dict(r) for r in rows]
 
 
+def add_default_notify_subs(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    final_statuses: Iterable[str] = ("done", "archived"),
+) -> None:
+    """Subscribe one board-wide target to every active (non-final) task in a
+    single write transaction.
+
+    Equivalent to calling :func:`add_notify_sub` once per active task, but
+    issues one ``INSERT OR IGNORE ... SELECT`` instead of N IMMEDIATE write
+    transactions per notifier tick — the per-task loop opened a write txn for
+    every active task every 5s even when the rows already existed. Idempotent
+    on the (task, platform, chat, thread) PK, so existing per-task or default
+    subscriptions (and their cursors) are never disturbed.
+    """
+    finals = tuple(final_statuses)
+    placeholders = ",".join("?" for _ in finals)
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, notifier_profile, created_at)
+            SELECT id, ?, ?, ?, ?, ?
+              FROM tasks
+             WHERE status NOT IN ({placeholders})
+            """,
+            (platform, chat_id, thread_id or "", notifier_profile, now, *finals),
+        )
+
+
 def remove_notify_sub(
     conn: sqlite3.Connection,
     *,
