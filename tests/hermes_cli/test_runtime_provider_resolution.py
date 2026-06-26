@@ -107,6 +107,80 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
     assert resolved["base_url"] == "https://proxy.example.com/anthropic"
 
 
+def test_resolve_runtime_provider_anthropic_falls_back_to_env_base_url(monkeypatch):
+    """Env-only proxy deployment (no config base_url, ANTHROPIC_BASE_URL set):
+    the resolved base_url must be the env proxy URL, not native Anthropic, so the
+    adapter's x-proxy-api-key host gate matches and the key-gated proxy is reached.
+
+    This is the CPE Modal shape: AIAgent(model, provider) with Anthropic auth via
+    ANTHROPIC_TOKEN/ANTHROPIC_BASE_URL + PROXY_API_KEY, no base_url passed.
+    """
+    class _Entry:
+        access_token = "pool-token"
+        source = "manual"
+        base_url = None  # realistic: env-driven anthropic pool entries carry no base_url
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.com/anthropic")
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "anthropic",
+                "default": "claude-opus-4-6",
+            },
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
+
+
+def test_resolve_runtime_provider_anthropic_config_base_url_wins_over_env(monkeypatch):
+    """A config base_url takes precedence over ANTHROPIC_BASE_URL (env is only the
+    fallback when config omits the URL)."""
+    class _Entry:
+        access_token = "pool-token"
+        source = "manual"
+        base_url = None  # realistic: env-driven anthropic pool entries carry no base_url
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://env.example.com/anthropic")
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "model": {"provider": "anthropic", "default": "claude-opus-4-6"},
+            "providers": {
+                "anthropic": {"base_url": "https://config.example.com/anthropic"}
+            },
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved["base_url"] == "https://config.example.com/anthropic"
+
+
 def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
     def _unexpected_pool(provider):
         raise AssertionError(f"load_pool should not be called for {provider}")

@@ -201,6 +201,97 @@ class TestBuildAnthropicClient:
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
 
+    def test_proxy_api_key_header_attached_for_proxy_host(self, monkeypatch):
+        """PROXY_API_KEY is sent as x-proxy-api-key only to the proxy host.
+
+        Regression for the CPE Modal proxy: the main pipeline agents build the
+        Anthropic client here (not config.anthropic_client()), so without this
+        the env-driven inbound key never reaches a key-gated public proxy and
+        every Anthropic agent call 401s into the fallback provider. The header
+        is a proxy-admission secret, so it attaches only when the client targets
+        the configured proxy host (ANTHROPIC_BASE_URL).
+        """
+        monkeypatch.setenv("PROXY_API_KEY", "inbound-secret")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.com/anthropic")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "sk-ant-api03-something",
+                base_url="https://proxy.example.com/anthropic",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["default_headers"]["x-proxy-api-key"] == "inbound-secret"
+            # Must not clobber the beta header it merges onto.
+            assert "anthropic-beta" in kwargs["default_headers"]
+
+    def test_proxy_api_key_header_attached_when_base_url_omitted(self, monkeypatch):
+        """Omitted base_url routes to ANTHROPIC_BASE_URL, so the header attaches.
+
+        Regression for the env-only proxy deployment (CPE): callers authenticate
+        via ANTHROPIC_TOKEN/ANTHROPIC_BASE_URL and don't pass base_url, in which
+        case the Anthropic SDK routes the request to ANTHROPIC_BASE_URL itself.
+        The effective target is the proxy, so the admission header must attach or
+        every call 401s into the fallback.
+        """
+        monkeypatch.setenv("PROXY_API_KEY", "inbound-secret")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.com/anthropic")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-api03-something")
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["default_headers"]["x-proxy-api-key"] == "inbound-secret"
+
+    def test_proxy_api_key_header_absent_for_explicit_native_anthropic(self, monkeypatch):
+        """The proxy-admission secret never leaks to an explicit native Anthropic URL.
+
+        When the client explicitly targets api.anthropic.com (not the proxy), the
+        header must be omitted so the secret isn't sent to a host that has no
+        business receiving it.
+        """
+        monkeypatch.setenv("PROXY_API_KEY", "inbound-secret")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.com/anthropic")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "sk-ant-api03-something",
+                base_url="https://api.anthropic.com",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert "x-proxy-api-key" not in (kwargs.get("default_headers") or {})
+
+    def test_proxy_api_key_header_absent_for_unrelated_third_party(self, monkeypatch):
+        """The secret is not sent to an unrelated Anthropic-compatible provider."""
+        monkeypatch.setenv("PROXY_API_KEY", "inbound-secret")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.com/anthropic")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "third-party-secret",
+                base_url="https://api.minimax.io/anthropic",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert "x-proxy-api-key" not in (kwargs.get("default_headers") or {})
+
+    def test_proxy_api_key_header_absent_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("PROXY_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.com/anthropic")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "sk-ant-api03-something",
+                base_url="https://proxy.example.com/anthropic",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert "x-proxy-api-key" not in (kwargs.get("default_headers") or {})
+
+    def test_proxy_api_key_header_merges_without_clobbering_betas(self, monkeypatch):
+        """Attaching the proxy key preserves the existing anthropic-beta header."""
+        monkeypatch.setenv("PROXY_API_KEY", "inbound-secret")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.com/anthropic")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "proxy-routed-key",
+                base_url="https://proxy.example.com/anthropic",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["default_headers"]["x-proxy-api-key"] == "inbound-secret"
+            assert "anthropic-beta" in kwargs["default_headers"]
+
 
 class TestReadClaudeCodeCredentials:
     @pytest.fixture(autouse=True)
