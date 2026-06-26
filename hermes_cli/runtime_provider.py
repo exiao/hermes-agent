@@ -380,7 +380,14 @@ def _resolve_runtime_from_pool_entry(
         cfg_base_url = ""
         if cfg_provider == "anthropic":
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
-        base_url = cfg_base_url or base_url or "https://api.anthropic.com"
+        # Honor ANTHROPIC_BASE_URL (the Anthropic SDK's own env fallback) when
+        # neither config nor a pool entry supplies a base_url. Env-only proxy
+        # deployments (CPE Modal: ANTHROPIC_TOKEN + ANTHROPIC_BASE_URL +
+        # PROXY_API_KEY, no config/base_url) would otherwise resolve to
+        # api.anthropic.com, so the adapter's x-proxy-api-key host gate never
+        # matches the proxy and the key-gated proxy 401s.
+        env_base_url = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
+        base_url = cfg_base_url or base_url or env_base_url or "https://api.anthropic.com"
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
     elif provider == "xai":
@@ -1686,7 +1693,15 @@ def resolve_runtime_provider(
         cfg_base_url = ""
         if cfg_provider == "anthropic":
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
-        base_url = cfg_base_url or "https://api.anthropic.com"
+        # When config omits a base_url, honor ANTHROPIC_BASE_URL (the Anthropic
+        # SDK's own env fallback) before defaulting to native. Env-only proxy
+        # deployments (e.g. the CPE Modal pipeline: ANTHROPIC_TOKEN +
+        # ANTHROPIC_BASE_URL + PROXY_API_KEY, no config base_url) route through
+        # here; without this the resolved base_url is forced to api.anthropic.com,
+        # so the adapter's x-proxy-api-key host gate never matches the proxy and
+        # the key-gated proxy 401s.
+        env_base_url = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
+        base_url = cfg_base_url or env_base_url or "https://api.anthropic.com"
 
         # For Microsoft Foundry endpoints, use ANTHROPIC_API_KEY directly —
         # Claude Code OAuth tokens (sk-ant-oat01) are not accepted by Azure.
