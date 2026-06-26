@@ -2455,23 +2455,22 @@ DEFAULT_CONFIG = {
         # the adapter's send-format id (e.g. Signal group: "group:<base64>").
         # Empty list = feature off (default).
         "default_notify": [],
-        # On-completion adversarial review (constitution rule 2). When
-        # ``enabled: true``, a completion on a WRITE-LANE task (cpe-dev,
-        # bloom-dev, infra-ops, pr-babysitter, verifier, content-creator,
-        # ads-optimizer) auto-spawns a review card parented to it (a separate
-        # reviewer / second-producer context, never self-review) and posts a
-        # short progress line to ``notify`` (the "Kanban Master" chat). The
-        # spawned reviewer posts its ship/needs-rework verdict and routes any
-        # follow-up (e.g. completed PR -> pr-babysitter) via its own kanban
-        # tools. Read-only lanes (researcher, reviewer) and the auto-spawned
-        # review cards themselves never trigger — no review-of-a-review loop.
-        # Read fresh each tick — editing this takes effect on the next tick,
-        # no restart. ``enabled: false`` (default) = feature off.
+        # On-completion reaction. When ``enabled: true``, EVERY task that
+        # completes auto-spawns one decision card parented to it, assigned to
+        # the orchestrator lane (``kanban.orchestrator_profile``, default
+        # ``orchestrator``), and posts a short progress line to ``notify`` (the
+        # "Kanban Master" chat). The orchestrator reads the completion handoff
+        # and ~/.hermes/constitution.md and decides the follow-up (review,
+        # babysit a PR, verify a feature, or nothing) — routing policy lives in
+        # the constitution, not here. The only completion that does NOT trigger
+        # is a decision card this automation itself spawned (marker in body) —
+        # the loop guard. Read fresh each tick — editing this takes effect on
+        # the next tick, no restart. ``enabled: false`` (default) = feature off.
         "on_complete_review": {
             "enabled": False,
-            # Where verdict + progress messages go. ``chat_id`` is the
-            # adapter's send-format id (Signal: "group:<base64>"). Leave
-            # platform/chat_id blank to spawn reviews silently (board only).
+            # Where the progress line goes. ``chat_id`` is the adapter's
+            # send-format id (Signal: "group:<base64>"). Leave platform/chat_id
+            # blank to spawn decision cards silently (board only).
             "notify": {
                 "platform": "",
                 "chat_id": "",

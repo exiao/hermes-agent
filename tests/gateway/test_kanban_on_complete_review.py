@@ -24,8 +24,8 @@ import gateway.kanban_watchers as kw
 from gateway.config import Platform
 from gateway.kanban_watchers import (
     _AUTO_REACTION_MARKER,
+    _orchestrator_assignee,
     _resolve_on_complete_review_config,
-    _select_reviewer_for,
 )
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
@@ -103,23 +103,30 @@ def test_resolver_non_dict_config_fails_safe():
 
 
 # --------------------------------------------------------------------------
-# Reviewer selection (route by deliverable type)
+# Orchestrator assignee resolution
 # --------------------------------------------------------------------------
 
 
-def test_select_reviewer_code_lanes_go_to_reviewer():
-    for lane in ("cpe-dev", "bloom-dev", "infra-ops", "pr-babysitter", "verifier"):
-        task = SimpleNamespace(assignee=lane)
-        assert _select_reviewer_for(task) == "reviewer", lane
+def test_orchestrator_assignee_defaults_when_unset():
+    assert _orchestrator_assignee(lambda: {}) == "orchestrator"
+    assert _orchestrator_assignee(lambda: {"kanban": {}}) == "orchestrator"
+    assert _orchestrator_assignee(lambda: {"kanban": {"orchestrator_profile": ""}}) == "orchestrator"
 
 
-def test_select_reviewer_content_and_ads_get_second_producer():
-    assert _select_reviewer_for(SimpleNamespace(assignee="content-creator")) == "content-creator"
-    assert _select_reviewer_for(SimpleNamespace(assignee="ads-optimizer")) == "ads-optimizer"
+def test_orchestrator_assignee_honours_config():
+    assert _orchestrator_assignee(
+        lambda: {"kanban": {"orchestrator_profile": "router"}}
+    ) == "router"
+
+
+def test_orchestrator_assignee_fails_safe():
+    def _boom():
+        raise RuntimeError("nope")
+    assert _orchestrator_assignee(_boom) == "orchestrator"
 
 
 # --------------------------------------------------------------------------
-# Lane gating: _qualifies_for_on_complete_review (the spam + loop guard)
+# Gating: _qualifies_for_on_complete_review (the loop guard)
 # --------------------------------------------------------------------------
 
 
@@ -131,35 +138,21 @@ def _runner():
     return r
 
 
-def test_gate_write_lane_qualifies():
+def test_gate_every_completed_task_qualifies():
+    """The new contract: any lane's completion qualifies. The orchestrator,
+    not this gate, decides whether a follow-up is warranted."""
     r = _runner()
-    for lane in ("cpe-dev", "bloom-dev", "infra-ops", "verifier", "content-creator"):
-        task = SimpleNamespace(id="t1", assignee=lane, body="some PR")
+    for lane in ("cpe-dev", "bloom-dev", "infra-ops", "verifier",
+                 "content-creator", "researcher", "reviewer", "random-lane"):
+        task = SimpleNamespace(id="t1", assignee=lane, body="some deliverable")
         ok, _reason = r._qualifies_for_on_complete_review(task)
         assert ok, lane
 
 
-def test_gate_read_only_lanes_do_not_qualify():
-    r = _runner()
-    for lane in ("researcher", "reviewer"):
-        task = SimpleNamespace(id="t1", assignee=lane, body="report")
-        ok, reason = r._qualifies_for_on_complete_review(task)
-        assert not ok, lane
-        assert "non-trigger-lane" in reason or "not-write-lane" in reason
-
-
-def test_gate_unknown_lane_does_not_qualify():
-    r = _runner()
-    task = SimpleNamespace(id="t1", assignee="random-lane", body="x")
-    ok, reason = r._qualifies_for_on_complete_review(task)
-    assert not ok
-    assert "not-write-lane" in reason
-
-
-def test_gate_auto_spawned_card_never_qualifies_even_on_write_lane():
-    """The loop guard: a review card stamped with the marker — assigned to a
-    WRITE lane (e.g. verifier) — must NOT re-trigger. This is the structural
-    fix that stops review-of-a-review."""
+def test_gate_auto_spawned_card_never_qualifies():
+    """The loop guard: a decision card stamped with the marker — regardless of
+    lane — must never trigger another reaction. This is the structural fix that
+    stops review-of-a-review."""
     r = _runner()
     body = f"{_AUTO_REACTION_MARKER}\n# review of t_parent"
     task = SimpleNamespace(id="t_review", assignee="verifier", body=body)
@@ -263,39 +256,43 @@ def _drive_two_ticks(monkeypatch, tmp_path, db_name, assignee, body, *, enabled=
     return tid, adapter, children
 
 
-def test_write_lane_completion_spawns_parented_review_and_posts_progress(tmp_path, monkeypatch):
+def test_completion_spawns_parented_orchestrator_card_and_posts_progress(tmp_path, monkeypatch):
     tid, adapter, children = _drive_two_ticks(
         monkeypatch, tmp_path, "react.db", assignee="infra-ops", body="opened PR #99",
     )
-    # A review card was spawned and parented to the completed task.
-    review_cards = [c for c in children if c and _AUTO_REACTION_MARKER in (c.body or "")]
-    assert len(review_cards) == 1, f"expected one review card, got {children}"
-    review = review_cards[0]
-    assert review.assignee == "reviewer"  # infra-ops -> static-diff reviewer
-    assert tid in (review.body or "")
+    # One orchestrator decision card was spawned and parented to the task.
+    decision_cards = [c for c in children if c and _AUTO_REACTION_MARKER in (c.body or "")]
+    assert len(decision_cards) == 1, f"expected one decision card, got {children}"
+    decision = decision_cards[0]
+    assert decision.assignee == "orchestrator"
+    assert tid in (decision.body or "")
 
-    # Progress + completion both landed in the Kanban Master chat.
+    # Progress landed in the Kanban Master chat.
     texts = [s["text"] for s in adapter.sent if s["chat_id"] == KM_CHAT]
-    assert any("Review routed" in t for t in texts), texts
-    assert any(review.id in t for t in texts), texts
+    assert any("completed" in t for t in texts), texts
+    assert any(decision.id in t for t in texts), texts
 
 
-def test_content_lane_routes_to_second_content_creator(tmp_path, monkeypatch):
+def test_content_lane_completion_also_routes_to_orchestrator(tmp_path, monkeypatch):
     _tid, _adapter, children = _drive_two_ticks(
         monkeypatch, tmp_path, "content.db", assignee="content-creator", body="draft copy",
     )
-    review_cards = [c for c in children if c and _AUTO_REACTION_MARKER in (c.body or "")]
-    assert len(review_cards) == 1
-    assert review_cards[0].assignee == "content-creator"  # never self... a SECOND card
+    decision_cards = [c for c in children if c and _AUTO_REACTION_MARKER in (c.body or "")]
+    assert len(decision_cards) == 1
+    # Every lane routes to the orchestrator; it decides the second-producer critique.
+    assert decision_cards[0].assignee == "orchestrator"
 
 
-def test_read_only_researcher_completion_does_not_react(tmp_path, monkeypatch):
+def test_read_only_researcher_completion_also_routes_to_orchestrator(tmp_path, monkeypatch):
+    """Under the new contract every completion hands to the orchestrator, which
+    then decides a researcher report needs no follow-up. The gate no longer
+    filters by lane."""
     _tid, adapter, children = _drive_two_ticks(
         monkeypatch, tmp_path, "researcher.db", assignee="researcher", body="findings",
     )
-    review_cards = [c for c in children if c and _AUTO_REACTION_MARKER in (c.body or "")]
-    assert review_cards == [], "read-only researcher must not spawn a review"
-    assert not any("Review routed" in s["text"] for s in adapter.sent)
+    decision_cards = [c for c in children if c and _AUTO_REACTION_MARKER in (c.body or "")]
+    assert len(decision_cards) == 1
+    assert decision_cards[0].assignee == "orchestrator"
 
 
 def test_auto_spawned_review_card_completion_does_not_loop(tmp_path, monkeypatch):
@@ -344,8 +341,8 @@ def test_reaction_is_idempotent_across_a_third_tick(tmp_path, monkeypatch):
     finally:
         conn.close()
     review_cards = [c for c in children if c and _AUTO_REACTION_MARKER in (c.body or "")]
-    assert len(review_cards) == 1, f"idempotent: exactly one review, got {len(review_cards)}"
-    routed = [s for s in adapter.sent if "Review routed" in s["text"]]
+    assert len(review_cards) == 1, f"idempotent: exactly one decision card, got {len(review_cards)}"
+    routed = [s for s in adapter.sent if "completed" in s["text"]]
     assert len(routed) == 1, f"exactly one progress message, got {len(routed)}"
 
 
