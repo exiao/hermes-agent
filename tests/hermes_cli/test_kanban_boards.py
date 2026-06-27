@@ -510,6 +510,11 @@ class TestCLI:
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
+        # kanban create validates the assignee against list_profiles_on_disk();
+        # seed the `dev` profile these tasks route to so the creates succeed.
+        dev_dir = tmp_path / "profiles" / "dev"
+        dev_dir.mkdir(parents=True, exist_ok=True)
+        (dev_dir / "config.yaml").write_text("model: {}\n")
         assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
         assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
 
