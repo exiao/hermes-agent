@@ -1,6 +1,7 @@
 import importlib
 import os
 import sys
+from pathlib import Path
 
 from hermes_cli.env_loader import load_hermes_dotenv
 
@@ -103,3 +104,67 @@ def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
 
     assert os.getenv("OPENAI_BASE_URL") == "https://new.example/v1"
     assert os.getenv("HERMES_INFERENCE_PROVIDER") == "custom"
+
+
+def test_profile_inherits_root_env_secret(tmp_path, monkeypatch):
+    """A profile home pulls shared secrets from the root ~/.hermes/.env.
+
+    The root .env is the single source of truth; the per-profile .env need not
+    (and should not) duplicate shared secrets. Validates the durable
+    "one .env, every profile references it" fix.
+    """
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / ".env").write_text("CPE_GITHUB_TOKEN=tok-from-root\n", encoding="utf-8")
+
+    profile = root / "profiles" / "code-reviewer"
+    profile.mkdir(parents=True)
+    # Profile .env is intentionally secret-free.
+    (profile / ".env").write_text("# no secrets here\n", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.delenv("CPE_GITHUB_TOKEN", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=profile)
+
+    assert (root / ".env") in loaded
+    assert (profile / ".env") in loaded
+    # Root .env loads first as the base layer, profile .env on top.
+    assert loaded.index(root / ".env") < loaded.index(profile / ".env")
+    assert os.getenv("CPE_GITHUB_TOKEN") == "tok-from-root"
+
+
+def test_profile_env_overrides_root_env(tmp_path, monkeypatch):
+    """A profile may override a root value in its own .env (profile wins)."""
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / ".env").write_text("OPENAI_BASE_URL=https://root.example/v1\n", encoding="utf-8")
+
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("OPENAI_BASE_URL=https://profile.example/v1\n", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    load_hermes_dotenv(hermes_home=profile)
+
+    assert os.getenv("OPENAI_BASE_URL") == "https://profile.example/v1"
+
+
+def test_root_home_does_not_double_load_its_own_env(tmp_path, monkeypatch):
+    """The default/root home loads its .env exactly once (no duplicate pass)."""
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / ".env").write_text("OPENAI_API_KEY=sk-root\n", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=root)
+
+    assert loaded == [root / ".env"]
+    assert os.getenv("OPENAI_API_KEY") == "sk-root"
