@@ -241,6 +241,60 @@ def test_workspace_kind_validation(kanban_home):
         kb.create_task(conn, title="bad ws", workspace_kind="cloud")
 
 
+def test_create_strips_worktree_scheme_from_workspace_path(kanban_home):
+    """A 'worktree:<path>' value jammed into workspace_path must split into
+    workspace_kind='worktree' + a BARE absolute workspace_path (regression for
+    the scheme prefix that tripped the dispatcher circuit breaker)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="scheme in path",
+            workspace_path="worktree:/Users/testuser/projects/CPE-research/research-agent",
+        )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == "/Users/testuser/projects/CPE-research/research-agent"
+    assert not task.workspace_path.startswith("worktree:")
+
+
+def test_create_strips_dir_scheme_from_workspace_path(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="dir scheme", workspace_path="dir:/abs/work/dir"
+        )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == "/abs/work/dir"
+
+
+def test_create_explicit_kind_not_overridden_by_stray_prefix(kanban_home):
+    """An explicit non-default workspace_kind wins; only the prefix is stripped."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="explicit dir",
+            workspace_kind="dir",
+            workspace_path="dir:/abs/keep",
+        )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == "/abs/keep"
+
+
+def test_create_bare_path_unchanged(kanban_home):
+    """A healthy bare absolute path must pass through untouched."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="bare path",
+            workspace_kind="worktree",
+            workspace_path="/Users/testuser/projects/CPE-research/research-agent",
+        )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == "/Users/testuser/projects/CPE-research/research-agent"
+
+
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     with kb.connect() as conn:

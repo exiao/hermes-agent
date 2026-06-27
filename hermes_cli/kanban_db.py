@@ -84,7 +84,7 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -134,6 +134,43 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+
+# A ``--workspace`` value can carry a scheme prefix (``worktree:<path>`` /
+# ``dir:<path>``) that the CLI parser splits into (kind, path). Callers that
+# bypass that parser — the kanban tool, the dashboard, a hand-written create —
+# can accidentally jam the whole ``worktree:<path>`` string into
+# ``workspace_path`` while leaving ``workspace_kind`` at its default. The stored
+# path then starts with ``worktree:`` / ``dir:`` / ``scratch:``, the spawn-time
+# path validator judges it non-absolute, the spawn fails, and after two
+# consecutive spawn_failed the dispatcher circuit breaker blocks the task. This
+# regex strips such a leading scheme so the path self-heals to a bare value.
+_WORKSPACE_SCHEME_RE = re.compile(r"^(scratch|worktree|dir):(?P<path>.*)$", re.DOTALL)
+
+
+def _strip_workspace_scheme(
+    workspace_kind: Optional[str], workspace_path: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Split a ``<scheme>:<path>`` prefix out of ``workspace_path``.
+
+    Returns ``(kind, path)``. The scheme prefix (``worktree:`` / ``dir:`` /
+    ``scratch:``) must never reach ``workspace_path``. When a scheme is present
+    and ``workspace_kind`` is unset or the default ``scratch``, the scheme's
+    kind wins (an agent passing ``workspace_path='worktree:/abs'`` without a
+    separate kind clearly meant a worktree). When the caller passed an explicit
+    non-default ``workspace_kind`` we keep it and only strip the prefix, so an
+    explicit kind is never silently overridden by a stray prefix.
+    """
+    if not isinstance(workspace_path, str):
+        return workspace_kind, workspace_path
+    m = _WORKSPACE_SCHEME_RE.match(workspace_path.strip())
+    if not m:
+        return workspace_kind, workspace_path
+    scheme = workspace_path.strip().split(":", 1)[0]
+    bare = m.group("path").strip()
+    # Promote the kind only when the caller didn't make an explicit choice.
+    if not workspace_kind or workspace_kind == "scratch":
+        workspace_kind = scheme
+    return workspace_kind, (bare or None)
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -2370,6 +2407,16 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    # Self-heal a ``<scheme>:<path>`` value that leaked into workspace_path
+    # (e.g. a caller that bypassed the CLI's --workspace parser and jammed
+    # 'worktree:/abs/path' into workspace_path). The scheme prefix must never
+    # be persisted; strip it and promote the kind when the caller left it at
+    # the default. This keeps the stored path a bare absolute value so the
+    # spawn-time validator doesn't reject it and trip the circuit breaker.
+    workspace_kind, workspace_path = _strip_workspace_scheme(
+        workspace_kind, workspace_path
+    )
+    workspace_kind = workspace_kind or "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -5462,6 +5509,15 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     so subsequent runs reuse the same directory.
     """
     kind = task.workspace_kind or "scratch"
+    # Spawn-time self-heal: an already-persisted malformed value (a stored
+    # workspace_path that still carries a 'worktree:'/'dir:'/'scratch:' scheme
+    # prefix from before the create-path guard, or written by a third-party tool)
+    # would otherwise fail the absolute-path check below and trip the dispatcher
+    # circuit breaker. Strip the scheme so the task recovers instead of blocking.
+    _healed_kind, _healed_path = _strip_workspace_scheme(kind, task.workspace_path)
+    kind = _healed_kind or "scratch"
+    if _healed_path != task.workspace_path:
+        task = replace(task, workspace_kind=kind, workspace_path=_healed_path)
     if kind == "scratch":
         if task.workspace_path:
             # Legacy scratch tasks that were set to an explicit path get the
