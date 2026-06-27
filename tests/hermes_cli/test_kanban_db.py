@@ -1834,6 +1834,43 @@ def test_dispatch_self_heals_persisted_scheme_prefix(
     assert healed.workspace_path == str(target)
 
 
+def test_dispatch_review_self_heals_persisted_scheme_prefix(
+    kanban_home, all_assignees_spawnable, tmp_path
+):
+    """The review-queue claim path must self-heal a persisted scheme prefix the
+    same way the ready-queue path does. Regression for the Codex P2: a legacy
+    task already in status='review' with workspace_path='<scheme>:<abs>' bypassed
+    the heal, branched on the unpromoted workspace_kind, and could trip the
+    spawn-failure circuit breaker."""
+    target = tmp_path / "healed-dir"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append((task.workspace_kind, task.workspace_path, workspace))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review-heal", assignee="alice")
+        _set_task_status(conn, tid, "review")
+        # Malformed persisted value on a review-status task: 'dir:<abs>'
+        # jammed into workspace_path with the default scratch kind.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? "
+                "WHERE id = ?",
+                (f"dir:{target}", tid),
+            )
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        healed = kb.get_task(conn, tid)
+
+    # The spawned task object carries the healed (promoted) values...
+    assert spawned and spawned[0][0] == "dir"
+    assert spawned[0][1] == str(target)
+    # ...and the correction is persisted to the DB, not just a local copy.
+    assert healed is not None
+    assert healed.workspace_kind == "dir"
+    assert healed.workspace_path == str(target)
+
+
 def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawnable):
     def boom(task, workspace):
         raise RuntimeError("spawn failed")

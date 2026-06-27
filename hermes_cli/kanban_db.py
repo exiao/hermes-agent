@@ -173,6 +173,39 @@ def _strip_workspace_scheme(
     return workspace_kind, (bare or None)
 
 
+def _heal_claimed_workspace(conn: Any, claimed: "Task") -> "Task":
+    """Strip a leaked ``<scheme>:<path>`` prefix off a just-claimed task and
+    PERSIST the correction before the dispatcher branches on
+    ``workspace_kind``.
+
+    A task created by a surface that bypassed the CLI ``--workspace`` parser can
+    land in the DB with a ``worktree:``/``dir:``/``scratch:`` prefix still inside
+    ``workspace_path`` (and ``workspace_kind`` left at the default). Both the
+    ready-queue and the review-queue claim paths branch on
+    ``claimed.workspace_kind`` right after claiming, so the heal has to run — and
+    be written back — in both. ``resolve_workspace`` also heals, but only on a
+    local copy, so without this the DB keeps the wrong kind and the worktree
+    branch is never taken. Returns the (possibly corrected) ``claimed`` task.
+    """
+    healed_kind, healed_path = _strip_workspace_scheme(
+        claimed.workspace_kind, claimed.workspace_path
+    )
+    healed_kind = healed_kind or "scratch"
+    if (
+        healed_kind != claimed.workspace_kind
+        or healed_path != claimed.workspace_path
+    ):
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = ?, workspace_path = ? WHERE id = ?",
+                (healed_kind, healed_path, claimed.id),
+            )
+        claimed = replace(
+            claimed, workspace_kind=healed_kind, workspace_path=healed_path
+        )
+    return claimed
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
 
@@ -7256,22 +7289,7 @@ def _dispatch_once_locked(
         # heals defensively, but it only mutates a local copy — without this
         # the DB keeps workspace_kind='scratch', so the worktree branch is
         # never set and _maybe_emit_scratch_tip emits the wrong tip.
-        _healed_kind, _healed_path = _strip_workspace_scheme(
-            claimed.workspace_kind, claimed.workspace_path
-        )
-        _healed_kind = _healed_kind or "scratch"
-        if (
-            _healed_kind != claimed.workspace_kind
-            or _healed_path != claimed.workspace_path
-        ):
-            with write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET workspace_kind = ?, workspace_path = ? WHERE id = ?",
-                    (_healed_kind, _healed_path, claimed.id),
-                )
-            claimed = replace(
-                claimed, workspace_kind=_healed_kind, workspace_path=_healed_path
-            )
+        claimed = _heal_claimed_workspace(conn, claimed)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -7364,6 +7382,12 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Same self-heal as the ready-queue path above: a legacy review-status
+        # task whose workspace_path still carries a 'worktree:'/'dir:'/'scratch:'
+        # scheme prefix must be normalized (and persisted) before we branch on
+        # workspace_kind, or it bypasses the heal, fails the absolute-path check
+        # in _resolve_worktree_workspace, and trips the spawn-failure breaker.
+        claimed = _heal_claimed_workspace(conn, claimed)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
