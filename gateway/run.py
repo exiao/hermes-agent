@@ -5596,7 +5596,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "import json, sys\n"
                 "from datetime import datetime, timezone\n"
                 "try:\n"
-                f"    d = json.load(open({state_file!r}))\n"
+                f"    d = json.load(open({state_file!r}, encoding='utf-8'))\n"
                 "    s = d.get('gateway_state', '')\n"
                 "    if s in ('startup_failed', 'stopped'):\n"
                 "        sys.exit(1)\n"
