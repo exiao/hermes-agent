@@ -217,6 +217,14 @@ def load_hermes_dotenv(
     """Load Hermes environment files with user config taking precedence.
 
     Behavior:
+    - The root ``~/.hermes/.env`` is the single source of truth for shared
+      secrets. When ``hermes_home`` is a *profile* home
+      (``<root>/profiles/<name>``) the root ``.env`` is loaded FIRST as a base
+      layer, then the profile's own ``.env`` is loaded on top with override — so
+      every profile inherits the root secrets (e.g. ``CPE_GITHUB_TOKEN``)
+      without duplicating them, while a profile may still override any value in
+      its own ``.env``. The root/default home loads its ``.env`` directly (no
+      duplicate pass).
     - `~/.hermes/.env` overrides stale shell-exported values when present.
     - project `.env` acts as a dev fallback and only fills missing values when
       the user env exists.
@@ -228,13 +236,36 @@ def load_hermes_dotenv(
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
+    # When running under a named profile, the root ~/.hermes/.env is the shared
+    # secret store. Load it as a base layer BEFORE the profile .env so secrets
+    # live in exactly one file yet reach every profile; the profile .env then
+    # overrides on top. Resolve via get_default_hermes_root() (handles standard
+    # and Docker profile layouts) and only when it differs from the profile home.
+    root_env: Path | None = None
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root_home = get_default_hermes_root()
+        candidate = root_home / ".env"
+        if candidate.resolve() != user_env.resolve():
+            root_env = candidate
+    except Exception:  # noqa: BLE001 — never block startup on root-env resolution
+        root_env = None
+
     # Fix corrupted .env files before python-dotenv parses them (#8908).
+    if root_env and root_env.exists():
+        _sanitize_env_file_if_needed(root_env)
     if user_env.exists():
         _sanitize_env_file_if_needed(user_env)
     if project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
 
+    if root_env and root_env.exists():
+        _load_dotenv_with_fallback(root_env, override=True)
+        loaded.append(root_env)
+
     if user_env.exists():
+        # Profile .env wins over the shared root base layer.
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
 
