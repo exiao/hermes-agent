@@ -1325,6 +1325,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Reject an assignee that names a lane that doesn't exist. The dispatcher
+    # only spawns ready tasks whose assignee is a real profile on disk; a
+    # hand-typed `--assignee foo` typo would otherwise be accepted onto the
+    # board and silently never run. Shared validator with the create tool so
+    # the two surfaces can't drift.
+    assignee_error = kb.validate_assignee(args.assignee)
+    if assignee_error:
+        print(f"kanban: {assignee_error}", file=sys.stderr)
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,

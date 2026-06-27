@@ -8648,6 +8648,51 @@ def list_profiles_on_disk() -> list[str]:
     return sorted(names)
 
 
+# Assignee values that mean "intentionally unassigned" rather than naming a
+# profile. Mirrors the tool surface's ``_normalize_profile`` (none/-/null) so a
+# deliberately-unassigned or triage card stays legal. Matched case-folded.
+_UNASSIGNED_SENTINELS = frozenset({"none", "-", "null"})
+
+
+def validate_assignee(assignee: Optional[str]) -> Optional[str]:
+    """Validate a create-time assignee against the known profile set.
+
+    Returns an error string when ``assignee`` names a lane that does not
+    exist (a typo'd or never-built profile), or ``None`` when it is valid.
+
+    The dispatcher only spawns a ready task whose assignee is a real profile
+    on disk; an unknown assignee is accepted onto the board and then silently
+    never spawns. Validating here makes a bad route fail loud at create time
+    so nobody has to pre-probe the profile list.
+
+    "Unassigned" is valid: ``None``, empty, and the ``none``/``-``/``null``
+    sentinels all mean "no owner yet" (a triage/unassigned card) and pass.
+    Only a *named* assignee that is neither a known profile nor a sentinel
+    is rejected. Reuses :func:`list_profiles_on_disk` — no new enumeration.
+    """
+    if assignee is None:
+        return None
+    text = str(assignee).strip()
+    if not text or text.casefold() in _UNASSIGNED_SENTINELS:
+        return None
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        canon = normalize_profile_name(text)
+    except Exception:
+        canon = text
+    known = set(list_profiles_on_disk())
+    if canon in known:
+        return None
+    valid = ", ".join(sorted(known)) if known else "(none found on disk)"
+    return (
+        f"assignee {assignee!r} is not a known profile — the dispatcher only "
+        f"spawns tasks whose assignee names a profile under "
+        f"~/.hermes/profiles/, so this card would be accepted but never run. "
+        f"Valid profiles: {valid}. (Use 'none' to create an unassigned card.)"
+    )
+
+
 def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     """Return every assignee name known to the board or on disk.
 
