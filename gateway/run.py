@@ -12917,8 +12917,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "preserving original transcript instead of "
                             "overwriting it (#44794)."
                         )
-                    # in-place: archive_and_compact already persisted durably;
-                    # do not call the destructive rewrite_transcript.
+                    elif partial and tail:
+                        # In-place compaction archived + inserted only the
+                        # compressed HEAD; the verbatim tail we rejoined above
+                        # ("/compress here" keeps the recent exchanges) is not
+                        # yet in the live (active=1) set, so the next turn would
+                        # reload head-only and silently drop those kept turns.
+                        # Re-persist the rejoined head+tail through the SAME
+                        # non-destructive path (archive_and_compact) so the tail
+                        # lands in the active set without deleting the archived
+                        # pre-compression history.
+                        _db = getattr(tmp_agent, "_session_db", None) or self._session_db
+                        if _db is not None:
+                            _db.archive_and_compact(new_session_id, compressed)
+                    # else (full in-place): archive_and_compact already persisted
+                    # the complete compacted set; no further write needed.
                 # Reset stored token count — transcript changed, old value is stale
                 self.session_store.update_session(
                     session_entry.session_key, last_prompt_tokens=0

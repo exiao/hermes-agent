@@ -400,3 +400,56 @@ async def test_compress_command_skips_rewrite_after_in_place_compaction():
 
     # archive_and_compact already persisted durably; no destructive rewrite.
     runner.session_store.rewrite_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_compress_here_in_place_persists_rejoined_tail():
+    """`/compress here` (partial) under in-place compaction: _compress_context
+    archives + inserts only the compressed HEAD, then the handler rejoins the
+    verbatim tail. The handler must re-persist the rejoined head+tail via the
+    non-destructive archive_and_compact so the kept recent exchanges land in
+    the live (active=1) set — otherwise the next turn reloads head-only and
+    silently drops them."""
+    history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+        {"role": "user", "content": "five"},
+        {"role": "assistant", "content": "six"},
+    ]
+    head_compressed = [{"role": "assistant", "content": "summary of head"}]
+    runner = _make_runner(history)
+    fake_db = MagicMock()
+    runner._session_db = fake_db
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance._session_db = fake_db
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.compression_in_place = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._last_compaction_in_place = True
+    agent_instance._compress_context.return_value = (head_compressed, "")
+
+    def _estimate(messages, **_kwargs):
+        return 100
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        await runner._handle_compress_command(_make_event("/compress here 2"))
+
+    # The rejoined head+tail must be re-persisted non-destructively, and the
+    # destructive rewrite path must NOT be used.
+    fake_db.archive_and_compact.assert_called_once()
+    persisted = fake_db.archive_and_compact.call_args.args[1]
+    # Tail (the last kept exchanges) must be present in the persisted set.
+    assert {"role": "user", "content": "five"} in persisted
+    assert {"role": "assistant", "content": "six"} in persisted
+    runner.session_store.rewrite_transcript.assert_not_called()
