@@ -1342,6 +1342,30 @@ Five real sources of local-vs-CI drift the script closes:
 invocation (including IDE integrations) gets hermetic behavior — but the wrapper
 is belt-and-suspenders.
 
+**Concrete failure mode this prevents.** Running the venv pytest directly
+against a live developer env produces a cluster of bogus failures that have
+nothing to do with your change:
+
+- `HERMES_ALLOW_PRIVATE_URLS=true` in your shell → all of
+  `tests/tools/test_url_safety.py` + the vision SSRF tests fail, because
+  private-IP blocking is disabled, so `is_safe_url("http://localhost")`
+  returns `True` where the test asserts `False`. The wrapper unsets it.
+- Your real `~/.hermes/` / `$HOME` → file-tool sensitive-path and
+  cross-profile guard tests assert against your actual config paths. The
+  wrapper's temp HOME fixes this.
+
+On macOS specifically, two more fail even with a clean env (these are
+platform, not wrapper, issues — skip or run on Linux/CI):
+
+- `tests/tools/test_voice_mode.py` PulseSocket tests → `OSError: AF_UNIX path
+  too long` (macOS caps `sun_path` at 104 chars; pytest's tmp path overflows).
+- file-tool tests using `tmp_path` → macOS puts it under `/var/folders/...`,
+  which the sensitive-path guard correctly blocks. `TMPDIR=/tmp` works around
+  it locally.
+
+Bottom line: a wall of red from those files almost always means "ran pytest
+directly with a live env," not a real regression. Use the wrapper.
+
 ### Running without the wrapper (only if you must)
 
 If you can't use the wrapper (e.g. inside an IDE that shells pytest directly),
