@@ -12884,36 +12884,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if partial and tail:
                     compressed = rejoin_compressed_head_and_tail(compressed, tail)
 
-                # _compress_context either rotated (ended the old session,
-                # created a continuation id — write compressed messages into the
-                # NEW session so the original stays searchable) or compacted in
-                # place (same id, transcript replaced with the compacted set).
+                # With session_db passed, _compress_context itself durably
+                # persists the result, and how it persisted dictates whether we
+                # may write here:
+                #   - rotated: it ended the old session and created an EMPTY
+                #     continuation row. We must write the compressed transcript
+                #     into that new id so the continuation has content.
+                #   - in-place: it called the NON-destructive archive_and_compact
+                #     on the same id (old turns kept active=0 + FTS-searchable,
+                #     compressed set inserted active=1). Writing here would route
+                #     to the DESTRUCTIVE replace_messages, DELETE every row for
+                #     the id, and wipe the archived pre-compression history.
+                #   - abort (neither): session_id rolled back unchanged for a
+                #     FAILURE reason; writing would overwrite the original
+                #     transcript with only the summary (#44794).
+                # So rewrite ONLY on rotation; in-place and abort are left alone.
                 new_session_id = tmp_agent.session_id
                 rotated = new_session_id != session_entry.session_id
-                _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
                 if rotated:
                     session_entry.session_id = new_session_id
                     self.session_store._save()
                     self._sync_telegram_topic_binding(
                         source, session_entry, reason="compress-command",
                     )
-
-                # Rewrite only when rotation produced a new id OR in-place
-                # compaction succeeded. Guard the THIRD case: _compress_context
-                # could NOT rotate AND was not in-place (e.g. the DB split
-                # raised), leaving session_id unchanged for a FAILURE reason —
-                # rewriting there would DELETE the original transcript and
-                # replace it with only the compressed summary (permanent data
-                # loss #44794). Mirrors gateway/slash_commands.py.
-                if rotated or _in_place:
                     self.session_store.rewrite_transcript(new_session_id, compressed)
                 else:
-                    logger.warning(
-                        "Manual /compress: session rotation did not occur "
-                        "(session_id unchanged) and in-place mode is off — "
-                        "preserving original transcript instead of overwriting "
-                        "it (#44794)."
-                    )
+                    _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
+                    if not _in_place:
+                        logger.warning(
+                            "Manual /compress: session rotation did not occur "
+                            "(session_id unchanged) and in-place mode is off — "
+                            "preserving original transcript instead of "
+                            "overwriting it (#44794)."
+                        )
+                    # in-place: archive_and_compact already persisted durably;
+                    # do not call the destructive rewrite_transcript.
                 # Reset stored token count — transcript changed, old value is stale
                 self.session_store.update_session(
                     session_entry.session_key, last_prompt_tokens=0

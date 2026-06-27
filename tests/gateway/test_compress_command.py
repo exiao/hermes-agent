@@ -358,3 +358,45 @@ async def test_compress_command_preserves_transcript_when_rotation_aborts():
 
     # The original transcript must be preserved — no destructive rewrite.
     runner.session_store.rewrite_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_compress_command_skips_rewrite_after_in_place_compaction():
+    """In-place compaction (compression.in_place, the default) persists via
+    the NON-destructive SessionDB.archive_and_compact under the SAME id —
+    old turns kept active=0 and FTS-searchable. The handler must NOT then call
+    rewrite_transcript, which routes to the DESTRUCTIVE replace_messages and
+    would DELETE every row for the id, wiping the archived history."""
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+    runner._session_db = object()
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.compression_in_place = True
+    # In-place: same id, _last_compaction_in_place True.
+    agent_instance.session_id = "sess-1"
+    agent_instance._last_compaction_in_place = True
+    agent_instance._compress_context.return_value = (compressed, "")
+
+    def _estimate(messages, **_kwargs):
+        return 100 if messages == history else 60
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    # archive_and_compact already persisted durably; no destructive rewrite.
+    runner.session_store.rewrite_transcript.assert_not_called()
