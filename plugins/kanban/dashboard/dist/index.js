@@ -412,6 +412,7 @@
       let proxy = null;
       let lastTarget = null;
       let dragging = false;
+      let decided = false;
 
       function startDrag(ev) {
         dragging = true;
@@ -429,12 +430,25 @@
 
       function move(ev) {
         if (!dragging) {
+          const dx = Math.abs(ev.clientX - startX);
+          const dy = Math.abs(ev.clientY - startY);
           // Still in the dead zone: wait for the finger to clear the
           // threshold before claiming the gesture, so vertical scrolling
           // and taps still reach the browser.
-          if (Math.abs(ev.clientX - startX) < TOUCH_DRAG_THRESHOLD &&
-              Math.abs(ev.clientY - startY) < TOUCH_DRAG_THRESHOLD) {
+          if (dx < TOUCH_DRAG_THRESHOLD && dy < TOUCH_DRAG_THRESHOLD) {
             return;
+          }
+          // Threshold cleared. Decide intent once: a vertical-dominant flick
+          // is the column scrolling, so bow out and hand the gesture back to
+          // the browser. Only a horizontal-dominant drag becomes a card drag.
+          if (!decided) {
+            decided = true;
+            if (dy > dx) {
+              document.removeEventListener("pointermove", move);
+              document.removeEventListener("pointerup", up);
+              document.removeEventListener("pointercancel", up);
+              return;
+            }
           }
           startDrag(ev);
         }
@@ -460,12 +474,19 @@
         document.removeEventListener("pointercancel", up);
         if (!dragging) return; // Was a tap/scroll — let the click through.
         // A real drag happened: swallow the synthetic click so the card's
-        // onClick doesn't open the task modal on release.
-        el.addEventListener("click", function suppressClick(ce) {
+        // onClick doesn't open the task modal on release. The synthetic click
+        // only fires when the gesture ends over the card; if the drag ends
+        // elsewhere no click comes, so schedule a next-tick cleanup to avoid
+        // leaving a dangling listener that would eat the next genuine tap.
+        function suppressClick(ce) {
           ce.stopPropagation();
           ce.preventDefault();
           el.removeEventListener("click", suppressClick, true);
-        }, true);
+        }
+        el.addEventListener("click", suppressClick, true);
+        setTimeout(function () {
+          el.removeEventListener("click", suppressClick, true);
+        }, 0);
         if (lastTarget) {
           lastTarget.classList.remove("hermes-kanban-column--drop");
           const status = lastTarget.getAttribute("data-kanban-column");
