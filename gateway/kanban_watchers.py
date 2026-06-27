@@ -154,6 +154,49 @@ def _clip_notify_detail(text: str, limit: int = _NOTIFY_DETAIL_MAX) -> str:
     return text[:limit] + f"… ({len(text) - limit} more chars; see board)"
 
 
+# Self-labeling block notifications. A worker's block carries a typed ``kind``
+# (kanban_db.VALID_BLOCK_KINDS); the push leads with a header that says — at a
+# glance, before any reason text — whether the reader must ACT:
+#
+#   needs_input → 🔴 ERIC DECISION   (the only kind that asks Eric to decide)
+#   capability  → 🟠 ROUTING         (a wall for the orchestrator, not Eric)
+#   transient   → 🟡 RETRY           (flaky; may clear on its own)
+#   None/legacy → ⏸ … blocked        (unchanged, back-compat)
+#
+# The full reason still rides in the body so nothing is lost — it's just below
+# the headline instead of being the whole message. This is the half that turns
+# "a wall of identical ⏸ blocked paragraphs" into a triage-at-a-glance feed.
+_BLOCK_KIND_NOTIFY = {
+    "needs_input": "🔴 ERIC DECISION",
+    "capability": "🟠 ROUTING",
+    "transient": "🟡 RETRY",
+}
+
+
+def _format_block_notification(
+    block_kind: Optional[str],
+    task_id: str,
+    title: str,
+    reason_detail: str,
+    tag: str = "",
+) -> str:
+    """Build the blocked-event push text.
+
+    ``reason_detail`` is the already-clipped reason (may be ""). ``tag`` is the
+    ``@assignee `` attribution prefix. For a typed block the first line is a
+    self-labeling header (``🔴 ERIC DECISION — <id>: <title>``) and the reason
+    follows on its own line; for an un-typed/legacy block the historical
+    ``⏸ … blocked: <reason>`` shape is preserved so existing consumers (and the
+    notify-untruncate regression tests) keep working.
+    """
+    header = _BLOCK_KIND_NOTIFY.get(block_kind or "")
+    if header:
+        head = f"{header} — {tag}{task_id}: {title}"
+        return f"{head}\n{reason_detail}" if reason_detail else head
+    suffix = f": {reason_detail}" if reason_detail else ""
+    return f"⏸ {tag}{task_id} blocked{suffix}"
+
+
 def _resolve_on_complete_review_config(
     load_config: Callable[[], Any],
 ) -> "Optional[dict]":
@@ -587,10 +630,23 @@ class GatewayKanbanWatchersMixin:
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
-                            reason = ""
+                            reason_detail = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {_clip_notify_detail(str(ev.payload['reason']))}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                                reason_detail = _clip_notify_detail(
+                                    str(ev.payload["reason"])
+                                )
+                            # The block's typed kind (needs_input / capability /
+                            # transient / None) drives the self-labeling header.
+                            block_kind = (
+                                ev.payload.get("kind") if ev.payload else None
+                            )
+                            msg = _format_block_notification(
+                                block_kind,
+                                sub["task_id"],
+                                title,
+                                reason_detail,
+                                tag=tag,
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):

@@ -610,7 +610,7 @@ def test_complete_retry_with_corrected_created_cards_succeeds(worker_env):
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({"reason": "need clarification", "kind": "needs_input"})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
@@ -624,8 +624,57 @@ def test_block_happy_path(worker_env):
 def test_block_rejects_empty_reason(worker_env):
     from tools import kanban_tools as kt
     for bad in ["", "   ", None]:
-        out = kt._handle_block({"reason": bad})
+        out = kt._handle_block({"reason": bad, "kind": "needs_input"})
         assert json.loads(out).get("error")
+
+
+def test_block_requires_kind(worker_env):
+    """A worker block with no kind is rejected, never silently stored generic."""
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "need clarification"})
+    err = json.loads(out).get("error", "")
+    assert "kind is required" in err
+    # The task must NOT have been blocked.
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status != "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_redirects_merge_ready_to_complete(worker_env):
+    """Merge-ready / awaiting-merge is not a block — steer to kanban_complete."""
+    from tools import kanban_tools as kt
+    for reason in (
+        "DONE-PENDING-MERGE: PR #47 ready for Eric to merge",
+        "merge-ready, awaiting Eric's merge",
+        "the fix is staged and ready to merge",
+    ):
+        out = kt._handle_block({"reason": reason, "kind": "needs_input"})
+        err = json.loads(out).get("error", "")
+        assert "kanban_complete" in err
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status != "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_typed_reason_is_headed(worker_env):
+    """The stored reason for a typed block leads with the header tag."""
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "which prod region?", "kind": "needs_input"})
+    assert json.loads(out)["ok"] is True
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        events = [e for e in kb.list_events(conn, worker_env) if e.kind == "blocked"]
+        assert events
+        assert (events[-1].payload or {}).get("reason", "").startswith("ERIC DECISION:")
+    finally:
+        conn.close()
 
 
 def test_heartbeat_happy_path(worker_env):
@@ -1700,6 +1749,7 @@ def test_board_param_routes_block_to_alt_board(multi_board_env):
     out = kt._handle_block({
         "task_id": alt_seed,
         "reason": "need input on alt board",
+        "kind": "needs_input",
         "board": "alt",
     })
     d = json.loads(out)

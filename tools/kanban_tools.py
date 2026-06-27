@@ -625,12 +625,51 @@ def _handle_block(args: dict, **kw) -> str:
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
     board = args.get("board")
+    # Force every WORKER block to be typed. An un-typed block lands in the
+    # undifferentiated `blocked` bucket and the Signal push can't say whether
+    # Eric must act, which is exactly the "wall of identical alerts" complaint.
+    # Reject here (the CLI/operator path stays permissive) so a worker must
+    # name WHY it's stuck — which also picks the right header tag downstream.
+    if kind is None or not str(kind).strip():
+        return tool_error(
+            "kind is required: 'needs_input' (you need an Eric decision), "
+            "'capability' (a hard wall — no creds/access/wrong lane, a routing "
+            "bug for the orchestrator), 'transient' (flaky, may clear on "
+            "retry), or 'dependency' (waiting on another task — routes to todo "
+            "and auto-resumes). Pick the one that matches why you stopped."
+        )
+    # Merge-ready work is NOT a block. Per constitution rule 2a, a task that is
+    # done-but-awaiting-Eric's-merge goes to `done` (with a review-required
+    # note), not `blocked` — otherwise it clogs the human-action queue looking
+    # like something Eric must decide. Redirect that case to kanban_complete
+    # instead of silently parking it in blocked.
+    _reason_low = str(reason).lower()
+    _MERGE_READY_MARKERS = (
+        "done-pending-merge",
+        "done pending merge",
+        "merge-ready",
+        "merge ready",
+        "ready to merge",
+        "ready for merge",
+        "awaiting merge",
+        "awaiting eric's merge",
+        "pending merge",
+    )
+    if any(m in _reason_low for m in _MERGE_READY_MARKERS):
+        return tool_error(
+            "this reads as merge-ready / awaiting-merge, which is not a block. "
+            "Per constitution rule 2a, merge-ready work goes to DONE, not "
+            "blocked. Call kanban_complete(summary=...) and put the "
+            "review-required / PR-merge note in the summary or a "
+            "kanban_comment, so it lands in the review queue instead of the "
+            "human-decision queue."
+        )
     try:
         kb, conn = _connect(board=board)
-        if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
+        if kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
-                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
+                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)}"
             )
         try:
             ok = kb.block_task(
@@ -1219,15 +1258,19 @@ KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
         "Stop work on this task and route it according to WHY you're stuck. "
-        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
-        "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
-        "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
-        "block on things you can resolve yourself."
+        "``kind`` is REQUIRED — it decides routing AND the header tag the human "
+        "sees: 'dependency' (waiting on another task — goes to todo and "
+        "auto-resumes when that task finishes, no human needed), 'needs_input' "
+        "(you need an Eric decision/answer → shows as 'ERIC DECISION'), "
+        "'capability' (a hard wall: no access, missing credentials, wrong lane, "
+        "an action no agent can do → shows as 'ROUTING', for the orchestrator, "
+        "NOT an Eric decision), or 'transient' (a flaky failure that may clear "
+        "→ shows as 'RETRY'). ``reason`` is shown to the human on the board. "
+        "Do NOT block for merge-ready / awaiting-merge work — that goes to "
+        "kanban_complete (done), not blocked. If a task keeps getting unblocked "
+        "and re-blocked for the same reason it is auto-escalated to triage. Use "
+        "for genuine blockers only — don't block on things you can resolve "
+        "yourself."
     ),
     "parameters": {
         "type": "object",
@@ -1241,21 +1284,25 @@ KANBAN_BLOCK_SCHEMA = {
                 "description": (
                     "What you need answered or what stopped you, in one or "
                     "two sentences. Don't paste the whole conversation; the "
-                    "human has the board and can ask follow-ups via comments."
+                    "human has the board and can ask follow-ups via comments. "
+                    "A header tag matching ``kind`` (ERIC DECISION / ROUTING / "
+                    "RETRY) is added automatically, so just write the reason."
                 ),
             },
             "kind": {
                 "type": "string",
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
-                    "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
-                    "Omit only if none apply."
+                    "REQUIRED. Why you're blocked. 'dependency' waits in todo "
+                    "and resumes automatically; 'needs_input' → ERIC DECISION "
+                    "(only kind that asks Eric to decide); 'capability' → "
+                    "ROUTING (a wall for the orchestrator, not Eric); "
+                    "'transient' → RETRY."
                 ),
             },
             "board": _board_schema_prop(),
         },
-        "required": ["reason"],
+        "required": ["reason", "kind"],
     },
 }
 
