@@ -60,22 +60,34 @@ def _blocked_subscription(reason):
 
 
 def _gave_up_subscription(error):
+    """Trip the real retry breaker so the gave_up event payload is built by
+    the production path (`_record_task_failure`), not hand-written. With
+    ``failure_limit=1`` a single failure crosses the threshold and emits the
+    ``gave_up`` event the notifier reads."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="gaveup notify", assignee="dev")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-        kb._append_event(conn, tid, kind="gave_up", payload={"error": error})
+        kb.claim_task(conn, tid)
+        kb._record_task_failure(
+            conn, tid, error=error,
+            outcome="spawn_failed", release_claim=True, end_run=True,
+            failure_limit=1,
+        )
         return tid
     finally:
         conn.close()
 
 
 def _completed_subscription(summary):
+    """Complete via the real `complete_task` producer so the event payload is
+    built (and capped) exactly as production does, not hand-written."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="done notify", assignee="dev")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-        kb._append_event(conn, tid, kind="completed", payload={"summary": summary})
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary=summary)
         return tid
     finally:
         conn.close()
@@ -109,7 +121,12 @@ def test_blocked_reason_is_not_clipped_at_160(tmp_path, monkeypatch):
     assert "split the feature into its own card." in text
 
 
-def test_gave_up_error_is_not_clipped_at_200(tmp_path, monkeypatch):
+def test_gave_up_error_survives_producer_and_notifier(tmp_path, monkeypatch):
+    """A long gave_up error must survive BOTH the producer
+    (`_record_task_failure`, which used to slice the event payload at 500) and
+    the notifier (which used to slice at 200). Uses a >500-char error driven
+    through the real breaker so it regression-guards the producer pre-truncation
+    Codex flagged, not just the notifier slice."""
     db_path = tmp_path / "gaveup-untruncate.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -118,9 +135,9 @@ def test_gave_up_error_is_not_clipped_at_200(tmp_path, monkeypatch):
         "task t_48c55d21 worktree path '/Users/x/projects/cpe-research' is not "
         "inside a git repo and does not point at a git repo root. The dispatcher "
         "walked up looking for a repo root, found none, and could not materialize "
-        "a linked worktree, so the worker never spawned across all retry attempts."
-    )
-    assert len(error) > 200
+        "a linked worktree, so the worker never spawned. "
+    ) * 3  # >500 chars: exceeds the old producer cap, not just the notifier cap
+    assert len(error) > 500
 
     tid = _gave_up_subscription(error)
     adapter = RecordingAdapter()
@@ -129,7 +146,40 @@ def test_gave_up_error_is_not_clipped_at_200(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     text = adapter.sent[0]["text"]
     assert "gave up" in text
-    assert error in text
+    # Full error survives end to end — the tail past 500 chars (which the
+    # producer used to drop before the notifier ever saw it) is present.
+    assert error.strip() in text
+
+
+def test_completed_long_summary_survives_producer_400_cap(tmp_path, monkeypatch):
+    """A completed summary whose first line exceeds 400 chars must survive the
+    real `complete_task` producer (which used to slice the event payload first
+    line at 400) and reach the notifier intact. Guards the completed-path
+    pre-truncation Codex flagged: the notifier fix alone couldn't help because
+    the producer dropped the tail before the notifier saw it."""
+    db_path = tmp_path / "done-long.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    # Single line, >400 chars, well under the notifier's 3500 visible cap.
+    summary = (
+        "Landed the security hotfix and verified it end to end: "
+        + "escaped every leaderboard field, added a clamp helper, re-synced "
+        "200.html byte-equal, ran the targeted suite green, and confirmed the "
+        "stored-XSS payload no longer executes in the rendered leaderboard. "
+        * 3
+    ).replace("\n", " ")
+    assert len(summary) > 400 and len(summary) < 3500
+
+    tid = _completed_subscription(summary)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "done" in text
+    # The tail past 400 chars (which the producer used to drop) is present.
+    assert summary.strip() in text
 
 
 def test_pathological_reason_is_bounded_with_visible_suffix(tmp_path, monkeypatch):

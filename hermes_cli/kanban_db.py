@@ -253,6 +253,17 @@ _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 
+# Cap for the human-facing handoff text carried in a terminal-state EVENT
+# payload (completed `summary`, gave_up `error`). The gateway notifier
+# (gateway/kanban_watchers.py) re-clips this to its own visible bound
+# (`_NOTIFY_DETAIL_MAX`, currently 3500) and appends a "see board" suffix when
+# it truncates. This cap MUST stay above that notify cap so the notifier is the
+# single place truncation happens visibly — if the payload were pre-sliced
+# shorter, a long handoff would be cut here silently and the notifier could
+# never advertise that there's more on the board. The full text always remains
+# on the run row regardless.
+_EVENT_PAYLOAD_DETAIL_MAX = 4000
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -3884,10 +3895,13 @@ def complete_task(
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
-        # second SQL round-trip. First line only, 400 char cap — the
-        # full summary stays on the run row.
+        # second SQL round-trip. First line only; capped at
+        # _EVENT_PAYLOAD_DETAIL_MAX (above the notifier's own visible cap)
+        # so the notifier, not this site, is where any truncation shows.
+        # The full summary stays on the run row.
         ev_summary = (summary if summary is not None else result) or ""
-        ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
+        ev_lines = ev_summary.strip().splitlines()
+        ev_summary = ev_lines[0][:_EVENT_PAYLOAD_DETAIL_MAX] if ev_lines else ""
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
@@ -4304,10 +4318,8 @@ def edit_completed_task_result(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
                     (json.dumps(metadata, ensure_ascii=False), run_id),
                 )
-        ev_summary = (
-            handoff_summary.strip().splitlines()[0][:400]
-            if handoff_summary else ""
-        )
+        ev_lines = handoff_summary.strip().splitlines() if handoff_summary else []
+        ev_summary = ev_lines[0][:_EVENT_PAYLOAD_DETAIL_MAX] if ev_lines else ""
         _append_event(
             conn, task_id, "edited",
             {
@@ -6273,7 +6285,9 @@ def _record_task_failure(
                 "failures": failures,
                 "effective_limit": effective_limit,
                 "limit_source": limit_source,
-                "error": error[:500],
+                # Above the notifier's visible cap so truncation shows there,
+                # not silently here. Full error stays on the run row.
+                "error": error[:_EVENT_PAYLOAD_DETAIL_MAX],
                 "trigger_outcome": outcome,
             }
             if event_payload_extra:
@@ -6311,7 +6325,7 @@ def _record_task_failure(
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    {"error": error[:_EVENT_PAYLOAD_DETAIL_MAX], "failures": failures},
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
