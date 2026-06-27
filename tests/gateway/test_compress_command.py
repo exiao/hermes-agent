@@ -305,3 +305,9 @@ async def test_compress_command_passes_session_db_and_persists_rotated_session()
     )
     agent_instance.shutdown_memory_provider.assert_called_once()
     agent_instance.close.assert_called_once()
+    # The temp agent rotates session_id to the continuation session, which the
+    # gateway entry now points at. close() must NOT end that live session, so
+    # the handler must set _end_session_on_close = False before cleanup. Without
+    # it, passing session_db makes AIAgent.close() mark the rotated session
+    # ended with agent_close, breaking persistence/search for compressed chats.
+    assert agent_instance._end_session_on_close is False

@@ -12841,7 +12841,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
-
+                # Prevent close() from ending the newly rotated continuation
+                # session — _compress_context rotates session_id and the gateway
+                # session entry now points at the new id, which must remain open
+                # for the next user turn. Without this, _cleanup_agent_resources
+                # -> AIAgent.close() marks the live session ended with
+                # agent_close (matches the parallel handler in slash_commands.py).
+                tmp_agent._end_session_on_close = False
                 # Estimate with system prompt + tool schemas included so the
                 # figure reflects real request pressure, not a transcript-only
                 # underestimate (#6217). Must be computed after tmp_agent is
