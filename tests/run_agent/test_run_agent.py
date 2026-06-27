@@ -4387,6 +4387,11 @@ class TestRunConversation:
         agent.provider = "openrouter"
         agent.model = "some/unknown-model"
         agent.base_url = "https://openrouter.ai/api/v1"
+        # Pin the compressor's model to the agent's so build_turn_context does
+        # not treat this as a model change and re-probe the window (which would
+        # reset the configured 200K to the unknown-model default). This test is
+        # specifically about the OVERFLOW path keeping the configured window.
+        agent.context_compressor.model = "some/unknown-model"
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = int(
             agent.context_compressor.context_length * agent.context_compressor.threshold_percent
