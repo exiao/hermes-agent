@@ -5732,6 +5732,18 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern matching a BARE PR reference in a task's title/body — the way
+# babysit/review/re-verify tasks name the PR they are anchored to (e.g.
+# "Babysit PR #48", "Re-verify PR #46", "cpe-research/research-agent#801").
+# Used to detect that a task is about a PRE-EXISTING PR (so the active_pr
+# comment guard must NOT strand it), distinct from an implementation task
+# that risks opening a duplicate PR. Requires the "PR" keyword or an
+# owner/repo prefix so a plain "#42" issue mention doesn't trip it.
+_RESPAWN_GUARD_PR_REF_RE = re.compile(
+    r"(?:\bPR\s*#\d+|[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#\d+)",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class DispatchResult:
@@ -6854,7 +6866,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, title, body FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -6913,13 +6925,31 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    #    EXCEPT when the task is itself anchored to a pre-existing PR (a
+    #    babysit / review / re-verify task whose whole job is to operate on a
+    #    PR that already exists). Such a task legitimately posts that PR's URL
+    #    in its own comments AND must re-spawn to keep working the PR; the
+    #    active_pr guard would otherwise strand it for the full 24h PR window.
+    #    The discriminator: an implementation task at risk of opening a
+    #    DUPLICATE PR has the URL only in its comments (its own output), while
+    #    a babysit task references the PR up front in its title/body. So if a
+    #    PR reference appears in title/body, this task is about an existing PR,
+    #    not at risk of duplicating one — skip the comment-based guard.
+    anchored_to_pr = any(
+        field and (
+            _RESPAWN_GUARD_PR_URL_RE.search(field)
+            or _RESPAWN_GUARD_PR_REF_RE.search(field)
+        )
+        for field in (row["title"], row["body"])
+    )
+    if not anchored_to_pr:
+        pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                return "active_pr"
 
     return None
 
