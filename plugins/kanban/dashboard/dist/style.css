@@ -226,6 +226,13 @@
 .hermes-kanban-card {
   cursor: grab;
   transition: transform 100ms ease, box-shadow 100ms ease;
+  /* Declare touch intent up front: the browser keeps vertical column
+     scrolling (pan-y), but horizontal drag-intent gestures are handed to
+     attachTouchDrag() instead of being pan-claimed and cancelled mid-drag.
+     Without this, pointer-event touch browsers (Android Chrome/Edge) can
+     take over a horizontal gesture and fire pointercancel before the
+     handler's first preventDefault() owns the drag. */
+  touch-action: pan-y;
 }
 .hermes-kanban-card:hover {
   box-shadow: 0 1px 0 0 var(--color-ring) inset, 0 0 0 1px var(--color-ring) inset;
