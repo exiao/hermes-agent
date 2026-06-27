@@ -165,7 +165,7 @@ def _strip_workspace_scheme(
     m = _WORKSPACE_SCHEME_RE.match(workspace_path.strip())
     if not m:
         return workspace_kind, workspace_path
-    scheme = workspace_path.strip().split(":", 1)[0]
+    scheme = m.group(1)
     bare = m.group("path").strip()
     # Promote the kind only when the caller didn't make an explicit choice.
     if not workspace_kind or workspace_kind == "scratch":
@@ -2413,10 +2413,10 @@ def create_task(
     # be persisted; strip it and promote the kind when the caller left it at
     # the default. This keeps the stored path a bare absolute value so the
     # spawn-time validator doesn't reject it and trip the circuit breaker.
-    workspace_kind, workspace_path = _strip_workspace_scheme(
+    _healed_kind, workspace_path = _strip_workspace_scheme(
         workspace_kind, workspace_path
     )
-    workspace_kind = workspace_kind or "scratch"
+    workspace_kind = _healed_kind or "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -7249,6 +7249,29 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Self-heal an already-persisted malformed workspace_path (a stored
+        # 'worktree:'/'dir:'/'scratch:' scheme prefix written by a create
+        # surface that bypassed the CLI parser) and PERSIST the correction
+        # before branching on workspace_kind below. resolve_workspace also
+        # heals defensively, but it only mutates a local copy — without this
+        # the DB keeps workspace_kind='scratch', so the worktree branch is
+        # never set and _maybe_emit_scratch_tip emits the wrong tip.
+        _healed_kind, _healed_path = _strip_workspace_scheme(
+            claimed.workspace_kind, claimed.workspace_path
+        )
+        _healed_kind = _healed_kind or "scratch"
+        if (
+            _healed_kind != claimed.workspace_kind
+            or _healed_path != claimed.workspace_path
+        ):
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET workspace_kind = ?, workspace_path = ? WHERE id = ?",
+                    (_healed_kind, _healed_path, claimed.id),
+                )
+            claimed = replace(
+                claimed, workspace_kind=_healed_kind, workspace_path=_healed_path
+            )
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":

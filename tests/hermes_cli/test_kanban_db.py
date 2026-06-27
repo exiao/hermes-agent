@@ -291,6 +291,7 @@ def test_create_bare_path_unchanged(kanban_home):
             workspace_path="/Users/testuser/projects/CPE-research/research-agent",
         )
         task = kb.get_task(conn, tid)
+    assert task is not None
     assert task.workspace_kind == "worktree"
     assert task.workspace_path == "/Users/testuser/projects/CPE-research/research-agent"
 
@@ -1782,6 +1783,44 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
     # c is now running
     with kb.connect() as conn:
         assert kb.get_task(conn, c).status == "running"
+
+
+def test_dispatch_self_heals_persisted_scheme_prefix(
+    kanban_home, all_assignees_spawnable, tmp_path
+):
+    """A task already persisted with a scheme prefix in workspace_path (written
+    by a create surface that bypassed the guard) must be self-healed AND the
+    correction persisted at claim time, so the spawned task and the DB both
+    carry the promoted workspace_kind. Regression for the Gemini HIGH finding:
+    healing only a local copy in resolve_workspace left workspace_kind='scratch'
+    in the DB, breaking branch wiring and scratch-tip emission."""
+    target = tmp_path / "healed-dir"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append((task.workspace_kind, task.workspace_path, workspace))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="healme", assignee="alice")
+        # Simulate a malformed persisted value: jam 'dir:<abs>' into
+        # workspace_path with the default scratch kind, bypassing create_task's
+        # guard (direct UPDATE, as a third-party create surface would).
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? "
+                "WHERE id = ?",
+                (f"dir:{target}", tid),
+            )
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        healed = kb.get_task(conn, tid)
+
+    # The spawned task object carries the healed values...
+    assert spawned and spawned[0][0] == "dir"
+    assert spawned[0][1] == str(target)
+    # ...and the correction is persisted to the DB (not just a local copy).
+    assert healed is not None
+    assert healed.workspace_kind == "dir"
+    assert healed.workspace_path == str(target)
 
 
 def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawnable):
