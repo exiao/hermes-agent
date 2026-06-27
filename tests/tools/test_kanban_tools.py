@@ -158,6 +158,18 @@ def worker_env(monkeypatch, tmp_path):
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
+    # Seed the profile dirs that create-path tests route to. ``kanban_create``
+    # now validates the assignee against ``list_profiles_on_disk()`` (rejecting
+    # a lane that doesn't exist), so the fake assignees these tests use must be
+    # real profiles on disk for their happy paths to succeed.
+    profiles_root = home / "profiles"
+    for _name in (
+        "test-worker", "peer", "factory", "qa", "worker", "linguist", "a", "x",
+    ):
+        _pdir = profiles_root / _name
+        _pdir.mkdir(parents=True, exist_ok=True)
+        (_pdir / "config.yaml").write_text("model: {}\n")
+
     from hermes_cli import kanban_db as kb
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
@@ -1513,6 +1525,13 @@ def multi_board_env(monkeypatch, tmp_path):
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
+    # kanban_create validates the assignee against list_profiles_on_disk();
+    # seed the profiles these board-routing create tests assign to.
+    for _name in ("worker", "linguist"):
+        _pdir = home / "profiles" / _name
+        _pdir.mkdir(parents=True, exist_ok=True)
+        (_pdir / "config.yaml").write_text("model: {}\n")
+
     from hermes_cli import kanban_db as kb
     kb._INITIALIZED_PATHS.clear()
     # Default board — implicit
@@ -1952,6 +1971,11 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     (home / "config.yaml").write_text(
         "kanban:\n  auto_subscribe_on_create: false\n"
     )
+    # kanban_create validates the assignee against the profiles under this
+    # (fresh) home's default root; seed `peer` so the create still routes.
+    _pp = home / "profiles" / "peer"
+    _pp.mkdir(parents=True)
+    (_pp / "config.yaml").write_text("model: {}\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")

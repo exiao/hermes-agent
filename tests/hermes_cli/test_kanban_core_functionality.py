@@ -47,6 +47,13 @@ def kanban_home(tmp_path, monkeypatch):
     # written against. The grace-period itself is covered by dedicated
     # tests in tests/hermes_cli/test_kanban_db.py.
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    # Seed the profile dirs that CLI create tests route to. `hermes kanban
+    # create` now validates --assignee against list_profiles_on_disk(), so the
+    # fake assignees these tests use must exist as profiles on disk.
+    for _name in ("linguist", "x"):
+        _pdir = home / "profiles" / _name
+        _pdir.mkdir(parents=True, exist_ok=True)
+        (_pdir / "config.yaml").write_text("model: {}\n")
     kb.init_db()
     return home
 
@@ -2199,6 +2206,11 @@ def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # kanban create now validates --assignee against the profiles on disk;
+    # seed the `worker` profile so this auto-init smoke test still routes.
+    _wp = home / "profiles" / "worker"
+    _wp.mkdir(parents=True)
+    (_wp / "config.yaml").write_text("model: {}\n")
     # Sanity: kanban.db does NOT exist yet.
     import subprocess as _sp
     import sys as _sys
@@ -3424,7 +3436,7 @@ def test_check_dispatcher_presence_silent_on_probe_error(monkeypatch):
 def _make_create_ns(**overrides):
     """Build a Namespace suitable for kb_cli._cmd_create()."""
     ns = argparse.Namespace(
-        title="x", body=None, assignee="worker",
+        title="x", body=None, assignee="linguist",
         created_by="user", workspace="scratch", tenant=None,
         priority=0, parent=None, triage=False,
         idempotency_key=None, max_runtime=None, skills=None,
@@ -3443,7 +3455,7 @@ def test_cli_create_warns_when_no_gateway(kanban_home, monkeypatch, capsys):
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
     )
-    ns = _make_create_ns(title="warn-me", assignee="worker")
+    ns = _make_create_ns(title="warn-me", assignee="linguist")
     assert kb_cli._cmd_create(ns) == 0
     captured = capsys.readouterr()
     # Stderr has the warning prefix + guidance.
@@ -3458,7 +3470,7 @@ def test_cli_create_silent_when_gateway_up(kanban_home, monkeypatch, capsys):
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
     )
-    ns = _make_create_ns(title="silent", assignee="worker")
+    ns = _make_create_ns(title="silent", assignee="linguist")
     assert kb_cli._cmd_create(ns) == 0
     captured = capsys.readouterr()
     assert "hermes gateway start" not in captured.err

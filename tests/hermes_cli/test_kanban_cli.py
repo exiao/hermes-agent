@@ -20,6 +20,13 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Seed the profile dirs that CLI create tests route to. `hermes kanban
+    # create` now validates --assignee against list_profiles_on_disk(), so the
+    # fake assignees these tests use must exist as profiles on disk.
+    for _name in ("alice", "bob", "broken-model", "orig", "x"):
+        _pdir = home / "profiles" / _name
+        _pdir.mkdir(parents=True, exist_ok=True)
+        (_pdir / "config.yaml").write_text("model: {}\n")
     kb.init_db()
     return home
 

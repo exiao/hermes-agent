@@ -766,6 +766,17 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # Reject an assignee that names a lane that doesn't exist. The dispatcher
+    # only spawns ready tasks whose assignee is a real profile on disk; an
+    # unknown assignee is accepted onto the board and then silently never
+    # spawns. Fail loud here so the model self-corrects instead of filing a
+    # card that sits forever. Shared with the CLI create path so the two
+    # surfaces can't drift.
+    from hermes_cli import kanban_db as _kb_validate
+
+    assignee_error = _kb_validate.validate_assignee(assignee)
+    if assignee_error:
+        return tool_error(assignee_error)
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
