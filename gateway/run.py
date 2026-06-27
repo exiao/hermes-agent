@@ -5591,7 +5591,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             tempfile.gettempdir(),
             f"hermes-watchdog-health-{current_pid}.py",
         )
-        with open(health_script, "w") as f:
+        with open(health_script, "w", encoding="utf-8") as f:
             f.write(
                 "import json, sys\n"
                 "from datetime import datetime, timezone\n"
