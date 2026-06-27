@@ -130,7 +130,15 @@ _AUTO_REACTION_MARKER = "<!-- kanban:auto-on-complete-reaction -->"
 # the cap is generous. It is still bounded (not unlimited) so a pathological
 # multi-KB summary can't flood the channel — past the cap we append a visible
 # pointer back to the board.
-_NOTIFY_DETAIL_MAX = 4000
+#
+# The cap is held a few hundred chars under the tightest common adapter limit
+# (WeCom hard-truncates at 4000, Telegram chunks at 4096) so the envelope the
+# caller wraps around this detail — emoji + "@<assignee> Kanban <id> done — " +
+# title[:120] + "\n" (worst case ~180 chars) — plus our own visible "see board"
+# suffix still fits without the adapter silently re-clipping the advertised
+# truncation off the tail. Reserving the envelope is what keeps the truncation
+# *visible* rather than silently lost on capped platforms.
+_NOTIFY_DETAIL_MAX = 3500
 
 
 def _clip_notify_detail(text: str, limit: int = _NOTIFY_DETAIL_MAX) -> str:
@@ -567,11 +575,13 @@ class GatewayKanbanWatchersMixin:
                             if payload_summary:
                                 lines = payload_summary.strip().splitlines()
                                 first = lines[0] if lines else payload_summary
-                                handoff = f"\n{_clip_notify_detail(first)}"
+                                detail = _clip_notify_detail(first)
+                                handoff = f"\n{detail}" if detail else ""
                             elif task and task.result:
                                 lines = task.result.strip().splitlines()
                                 first = lines[0] if lines else task.result
-                                handoff = f"\n{_clip_notify_detail(first)}"
+                                detail = _clip_notify_detail(first)
+                                handoff = f"\n{detail}" if detail else ""
                             msg = (
                                 f"✔ {tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"

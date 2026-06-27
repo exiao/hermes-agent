@@ -70,6 +70,17 @@ def _gave_up_subscription(error):
         conn.close()
 
 
+def _completed_subscription(summary):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="done notify", assignee="dev")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="completed", payload={"summary": summary})
+        return tid
+    finally:
+        conn.close()
+
+
 def test_blocked_reason_is_not_clipped_at_160(tmp_path, monkeypatch):
     db_path = tmp_path / "blocked-untruncate.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -137,3 +148,50 @@ def test_pathological_reason_is_bounded_with_visible_suffix(tmp_path, monkeypatc
     assert reason not in text
     # And the truncation is advertised, not silent.
     assert "more chars; see board" in text
+
+
+def test_completed_whitespace_only_summary_has_no_trailing_newline(tmp_path, monkeypatch):
+    """A whitespace-only summary must not leave a dangling ``\\n`` on the headline.
+
+    ``_clip_notify_detail`` strips its input, so a whitespace-only summary clips
+    to ``""``; prepending ``\\n`` unconditionally would emit ``"... done — title\\n"``.
+    The handoff must be omitted entirely when the clipped detail is empty.
+    """
+    db_path = tmp_path / "done-whitespace.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _completed_subscription("   \n  \t ")
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "done" in text
+    # No empty handoff line tacked on the end.
+    assert not text.endswith("\n")
+    assert "\n" not in text
+
+
+def test_capped_handoff_plus_envelope_fits_under_4000_char_adapter(tmp_path, monkeypatch):
+    """The whole notification (envelope + clipped detail + suffix) must stay under
+    the tightest common adapter cap (4000, e.g. WeCom) so the advertised "see
+    board" suffix is never silently re-clipped off the tail on capped platforms.
+    """
+    db_path = tmp_path / "done-capped.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    # A summary well past the inline cap forces the visible-suffix path.
+    summary = "x" * (_NOTIFY_DETAIL_MAX + 1000)
+    tid = _completed_subscription(summary)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    # The advertised suffix is present...
+    assert "more chars; see board" in text
+    # ...and the full message — envelope included — fits under a 4000-char
+    # adapter, so ``content[:4000]`` would not chop the suffix off.
+    assert len(text) <= 4000
