@@ -200,6 +200,44 @@ def test_pathological_reason_is_bounded_with_visible_suffix(tmp_path, monkeypatc
     assert "more chars; see board" in text
 
 
+def test_gave_up_run_row_stores_full_error_for_retry(tmp_path, monkeypatch):
+    """The durable attempt record (`task_runs.error`) must keep the full error,
+    not a 500-char stub. `build_worker_context` feeds prior-attempt errors to
+    the NEXT retry (capped at 4KB there), so slicing to 500 in `_end_run` would
+    hand a retrying worker a truncated prior failure — while the completed path
+    stores its summary in full. This guards that asymmetry."""
+    db_path = tmp_path / "gaveup-runrow.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    error = (
+        "spawn failed: worktree path is not inside a git repo and does not point "
+        "at a git repo root; the dispatcher walked up, found no repo, and could "
+        "not materialize a linked worktree. "
+    ) * 4  # >500 chars
+    assert len(error) > 500
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="runrow", assignee="dev")
+        kb.claim_task(conn, tid)
+        kb._record_task_failure(
+            conn, tid, error=error,
+            outcome="spawn_failed", release_claim=True, end_run=True,
+            failure_limit=1,
+        )
+        runs = kb.list_runs(conn, tid, include_active=False)
+    finally:
+        conn.close()
+
+    assert runs, "a closed run should exist after gave_up"
+    run_error = runs[-1].error
+    assert run_error is not None
+    # The full error survives on the run row — the tail past 500 chars (which
+    # the old _end_run slice dropped before any retry could read it) is present.
+    assert error.strip() in run_error
+
+
 def test_completed_whitespace_only_summary_has_no_trailing_newline(tmp_path, monkeypatch):
     """A whitespace-only summary must not leave a dangling ``\\n`` on the headline.
 

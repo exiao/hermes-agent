@@ -6273,7 +6273,10 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
-                    error=error[:500],
+                    # Store generously (matches the completed-summary path and
+                    # the event payload) so a retry reads the full prior error
+                    # via build_worker_context, not a 500-char stub.
+                    error=error[:_EVENT_PAYLOAD_DETAIL_MAX],
                     metadata={
                         "failures": failures,
                         "trigger_outcome": outcome,
@@ -6320,7 +6323,7 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
-                    error=error[:500],
+                    error=error[:_EVENT_PAYLOAD_DETAIL_MAX],
                     metadata={"failures": failures},
                 )
                 _append_event(
