@@ -2113,6 +2113,63 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_babysit_task_not_stranded_by_own_pr_comment(kanban_home):
+    """A babysit/re-verify task anchored to a pre-existing PR is NOT guarded
+    by active_pr even when its own comments echo that PR's URL.
+
+    Regression: the active_pr guard exists to stop an IMPLEMENTATION task from
+    re-spawning and opening a DUPLICATE PR. A babysit task's whole job is to
+    keep working an EXISTING PR, so it posts the PR URL in its comments and
+    must re-spawn — the guard previously stranded it for the full 24h PR
+    window. The discriminator is a PR reference in the task title/body.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="Babysit PR #48 to merge-ready: ruff fix",
+            assignee="pr-babysitter",
+        )
+        kb.add_comment(
+            conn, t, "pr-babysitter",
+            "PR #48 head pushed: https://github.com/exiao/hermes-agent/pull/48",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_babysit_task_owner_repo_ref_not_stranded(kanban_home):
+    """An owner/repo#N anchor in the title (e.g. cpe-research/research-agent#801)
+    also exempts the task from the active_pr comment guard."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="Babysit cpe-research/research-agent#801 to CI-green",
+            assignee="pr-babysitter",
+        )
+        kb.add_comment(
+            conn, t, "pr-babysitter",
+            "head 67351a4e: https://github.com/cpe-research/research-agent/pull/801",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_impl_task_still_guarded_by_pr_comment(kanban_home):
+    """An IMPLEMENTATION task (no PR reference in title/body) is STILL guarded
+    by active_pr when a PR URL appears in its comments — the duplicate-PR
+    protection the guard was built for must remain intact."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="Implement rate limiter", assignee="alice",
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     kanban_home, all_assignees_spawnable
 ):
