@@ -296,6 +296,11 @@ async def test_compress_command_passes_session_db_and_persists_rotated_session()
     assert "Compressed:" in result
     mock_agent_cls.assert_called_once()
     assert mock_agent_cls.call_args.kwargs["session_db"] is runner._session_db
+    # The continuation row _compress_context creates must record the real
+    # gateway platform, not fall back to source='cli' (which hides post-
+    # compression messages from source-filtered SessionDB searches).
+    assert mock_agent_cls.call_args.kwargs["platform"] == "telegram"
+    assert mock_agent_cls.call_args.kwargs["chat_id"] == "c1"
     runner.session_store._save.assert_called_once()
     runner.session_store.rewrite_transcript.assert_called_once_with(
         "sess-2", compressed
@@ -311,3 +316,45 @@ async def test_compress_command_passes_session_db_and_persists_rotated_session()
     # it, passing session_db makes AIAgent.close() mark the rotated session
     # ended with agent_close, breaking persistence/search for compressed chats.
     assert agent_instance._end_session_on_close is False
+
+
+@pytest.mark.asyncio
+async def test_compress_command_preserves_transcript_when_rotation_aborts():
+    """If _compress_context can neither rotate the session nor compact in
+    place (e.g. the DB split raised and session_id rolled back unchanged),
+    the handler must NOT call rewrite_transcript — doing so would delete the
+    original searchable history and replace it with only the summary
+    (#44794)."""
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+    runner._session_db = object()
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.compression_in_place = False
+    # Rotation aborted: session_id stays at the original AND not in-place.
+    agent_instance.session_id = "sess-1"
+    agent_instance._last_compaction_in_place = False
+    agent_instance._compress_context.return_value = (compressed, "")
+
+    def _estimate(messages, **_kwargs):
+        return 100 if messages == history else 60
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    # The original transcript must be preserved — no destructive rewrite.
+    runner.session_store.rewrite_transcript.assert_not_called()
