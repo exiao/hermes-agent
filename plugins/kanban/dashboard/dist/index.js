@@ -397,17 +397,49 @@
   // standard `drop` event and our `hermes-kanban:drop` event.
   // -------------------------------------------------------------------------
 
+  // Minimum finger travel (px) before a touch becomes a drag. Below this we
+  // leave the gesture to the browser so the card list scrolls normally and a
+  // stationary touch stays a tap (opens the task). Without this gate every
+  // touch preventDefault'd native scroll and fell through to onClick.
+  const TOUCH_DRAG_THRESHOLD = 8;
+
   function attachTouchDrag(el, taskId) {
     if (!el) return;
     function onDown(e) {
       if (e.pointerType !== "touch") return;
-      e.preventDefault();
-      const proxy = el.cloneNode(true);
-      proxy.classList.add("hermes-kanban-touch-proxy");
-      document.body.appendChild(proxy);
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let proxy = null;
       let lastTarget = null;
+      let dragging = false;
+
+      function startDrag(ev) {
+        dragging = true;
+        proxy = el.cloneNode(true);
+        proxy.classList.add("hermes-kanban-touch-proxy");
+        proxy.style.position = "fixed";
+        proxy.style.pointerEvents = "none";
+        proxy.style.opacity = "0.85";
+        proxy.style.zIndex = "9999";
+        proxy.style.width = `${el.offsetWidth}px`;
+        proxy.style.left = `${ev.clientX - el.offsetWidth / 2}px`;
+        proxy.style.top = `${ev.clientY - 24}px`;
+        document.body.appendChild(proxy);
+      }
 
       function move(ev) {
+        if (!dragging) {
+          // Still in the dead zone: wait for the finger to clear the
+          // threshold before claiming the gesture, so vertical scrolling
+          // and taps still reach the browser.
+          if (Math.abs(ev.clientX - startX) < TOUCH_DRAG_THRESHOLD &&
+              Math.abs(ev.clientY - startY) < TOUCH_DRAG_THRESHOLD) {
+            return;
+          }
+          startDrag(ev);
+        }
+        // From here on we own the gesture; stop the page from scrolling.
+        ev.preventDefault();
         proxy.style.left = `${ev.clientX - proxy.offsetWidth / 2}px`;
         proxy.style.top = `${ev.clientY - 24}px`;
         proxy.style.display = "none";
@@ -426,6 +458,14 @@
         document.removeEventListener("pointermove", move);
         document.removeEventListener("pointerup", up);
         document.removeEventListener("pointercancel", up);
+        if (!dragging) return; // Was a tap/scroll — let the click through.
+        // A real drag happened: swallow the synthetic click so the card's
+        // onClick doesn't open the task modal on release.
+        el.addEventListener("click", function suppressClick(ce) {
+          ce.stopPropagation();
+          ce.preventDefault();
+          el.removeEventListener("click", suppressClick, true);
+        }, true);
         if (lastTarget) {
           lastTarget.classList.remove("hermes-kanban-column--drop");
           const status = lastTarget.getAttribute("data-kanban-column");
@@ -442,17 +482,9 @@
             }));
           }
         }
-        proxy.remove();
+        if (proxy) proxy.remove();
       }
-      // Kick off proxy at the pointer origin.
-      proxy.style.position = "fixed";
-      proxy.style.pointerEvents = "none";
-      proxy.style.opacity = "0.85";
-      proxy.style.zIndex = "9999";
-      proxy.style.width = `${el.offsetWidth}px`;
-      proxy.style.left = `${e.clientX - el.offsetWidth / 2}px`;
-      proxy.style.top = `${e.clientY - 24}px`;
-      document.addEventListener("pointermove", move);
+      document.addEventListener("pointermove", move, { passive: false });
       document.addEventListener("pointerup", up);
       document.addEventListener("pointercancel", up);
     }
