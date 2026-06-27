@@ -123,6 +123,36 @@ def _resolve_default_notify_targets(
 # guard, so a brand-new lane is covered with no code change.
 _AUTO_REACTION_MARKER = "<!-- kanban:auto-on-complete-reaction -->"
 
+# Max chars of a worker's terminal-state handoff (blocked reason / gave_up
+# error / completed summary) to inline into a delivered notification. The old
+# 160/200 slices clipped the worker's reasoning mid-sentence; these pings exist
+# precisely so Eric can read why a task stopped without opening the board, so
+# the cap is generous. It is still bounded (not unlimited) so a pathological
+# multi-KB summary can't flood the channel — past the cap we append a visible
+# pointer back to the board.
+#
+# The cap is held a few hundred chars under the tightest common adapter limit
+# (WeCom hard-truncates at 4000, Telegram chunks at 4096) so the envelope the
+# caller wraps around this detail — emoji + "@<assignee> Kanban <id> done — " +
+# title[:120] + "\n" (worst case ~180 chars) — plus our own visible "see board"
+# suffix still fits without the adapter silently re-clipping the advertised
+# truncation off the tail. Reserving the envelope is what keeps the truncation
+# *visible* rather than silently lost on capped platforms.
+_NOTIFY_DETAIL_MAX = 3500
+
+
+def _clip_notify_detail(text: str, limit: int = _NOTIFY_DETAIL_MAX) -> str:
+    """Bound a handoff string for a notification, with a visible suffix.
+
+    Unlike the bare ``[:N]`` slices this replaces, the truncation is
+    advertised so the reader knows there is more on the board rather than
+    silently losing the tail mid-sentence.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"… ({len(text) - limit} more chars; see board)"
+
 
 def _resolve_on_complete_review_config(
     load_config: Callable[[], Any],
@@ -535,19 +565,23 @@ class GatewayKanbanWatchersMixin:
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
                             # task.result for legacy rows written before
-                            # runs shipped.
+                            # runs shipped. A done ping is a headline, so
+                            # we keep it to the first line — but don't clip
+                            # that line off mid-sentence.
                             handoff = ""
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
                                 lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
+                                first = lines[0] if lines else payload_summary
+                                detail = _clip_notify_detail(first)
+                                handoff = f"\n{detail}" if detail else ""
                             elif task and task.result:
                                 lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
+                                first = lines[0] if lines else task.result
+                                detail = _clip_notify_detail(first)
+                                handoff = f"\n{detail}" if detail else ""
                             msg = (
                                 f"✔ {tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
@@ -555,12 +589,12 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
+                                reason = f": {_clip_notify_detail(str(ev.payload['reason']))}"
                             msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
+                                err = f"\n{_clip_notify_detail(str(ev.payload['error']))}"
                             msg = (
                                 f"✖ {tag}Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures{err}"
