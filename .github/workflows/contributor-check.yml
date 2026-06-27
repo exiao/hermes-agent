@@ -2,6 +2,11 @@ name: Contributor Attribution Check
 
 on:
   workflow_call:
+    inputs:
+      event_name:
+        description: The event name from the calling orchestrator (pull_request or push).
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -16,8 +21,17 @@ jobs:
 
       - name: Check for unmapped contributor emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Scope the check to commits this PR actually introduces. Compute the
+          # merge base against the PR's *target* branch, not a hard-coded
+          # origin/main — fork PRs target live-config, and merge-base with
+          # origin/main reaches the fork divergence and sweeps in unrelated
+          # historical author emails. For pushes there is no base ref, so fall
+          # back to the previous commit.
+          if [ "${{ inputs.event_name }}" = "pull_request" ]; then
+            MERGE_BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          else
+            MERGE_BASE=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
+          fi
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
