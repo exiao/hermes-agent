@@ -228,3 +228,54 @@ def test_decompose_per_child_workspace_override(kanban_home):
         inh = kb.get_task(conn, child_ids[1])
     assert over.workspace_path == "/other/repo"
     assert inh.workspace_path == proj
+
+
+def test_decompose_strips_scheme_prefix_from_child_override(kanban_home):
+    """A child workspace override carrying a '<scheme>:<path>' prefix must be
+    self-healed before the direct INSERT, just like create_task does. Codex P2:
+    decompose_triage_task bypassed the create-path guard, so a child passing
+    workspace_path='worktree:/repo' (or inheriting a prefixed legacy root)
+    landed as scratch + 'worktree:/repo' — a newly malformed row."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="root", assignee="worker", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[
+                {"title": "wt-prefix", "workspace_path": "worktree:/abs/repo"},
+                {"title": "dir-prefix", "workspace_path": "dir:/abs/dir"},
+            ],
+            author="decomposer",
+        )
+    assert child_ids is not None
+    with kb.connect() as conn:
+        wt = kb.get_task(conn, child_ids[0])
+        dr = kb.get_task(conn, child_ids[1])
+    # Scheme promoted to kind, path stored bare (no prefix).
+    assert wt.workspace_kind == "worktree"
+    assert wt.workspace_path == "/abs/repo"
+    assert dr.workspace_kind == "dir"
+    assert dr.workspace_path == "/abs/dir"
+
+
+def test_decompose_strips_prefix_from_inherited_legacy_root(kanban_home):
+    """When the root itself carries a legacy prefixed path, an inheriting child
+    (no explicit override) must not copy the malformed value verbatim."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="root", assignee="worker", triage=True)
+        # Force a malformed persisted root path (bypass create guard).
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'scratch', "
+                "workspace_path = ? WHERE id = ?",
+                ("worktree:/abs/legacy", tid),
+            )
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "inherit"}],
+            author="decomposer",
+        )
+    assert child_ids is not None
+    with kb.connect() as conn:
+        inh = kb.get_task(conn, child_ids[0])
+    assert inh.workspace_kind == "worktree"
+    assert inh.workspace_path == "/abs/legacy"

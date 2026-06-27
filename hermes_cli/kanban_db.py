@@ -84,7 +84,7 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -134,6 +134,76 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+
+# A ``--workspace`` value can carry a scheme prefix (``worktree:<path>`` /
+# ``dir:<path>``) that the CLI parser splits into (kind, path). Callers that
+# bypass that parser — the kanban tool, the dashboard, a hand-written create —
+# can accidentally jam the whole ``worktree:<path>`` string into
+# ``workspace_path`` while leaving ``workspace_kind`` at its default. The stored
+# path then starts with ``worktree:`` / ``dir:`` / ``scratch:``, the spawn-time
+# path validator judges it non-absolute, the spawn fails, and after two
+# consecutive spawn_failed the dispatcher circuit breaker blocks the task. This
+# regex strips such a leading scheme so the path self-heals to a bare value.
+_WORKSPACE_SCHEME_RE = re.compile(r"^(scratch|worktree|dir):(?P<path>.*)$", re.DOTALL)
+
+
+def _strip_workspace_scheme(
+    workspace_kind: Optional[str], workspace_path: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Split a ``<scheme>:<path>`` prefix out of ``workspace_path``.
+
+    Returns ``(kind, path)``. The scheme prefix (``worktree:`` / ``dir:`` /
+    ``scratch:``) must never reach ``workspace_path``. When a scheme is present
+    and ``workspace_kind`` is unset or the default ``scratch``, the scheme's
+    kind wins (an agent passing ``workspace_path='worktree:/abs'`` without a
+    separate kind clearly meant a worktree). When the caller passed an explicit
+    non-default ``workspace_kind`` we keep it and only strip the prefix, so an
+    explicit kind is never silently overridden by a stray prefix.
+    """
+    if not isinstance(workspace_path, str):
+        return workspace_kind, workspace_path
+    m = _WORKSPACE_SCHEME_RE.match(workspace_path.strip())
+    if not m:
+        return workspace_kind, workspace_path
+    scheme = m.group(1)
+    bare = m.group("path").strip()
+    # Promote the kind only when the caller didn't make an explicit choice.
+    if not workspace_kind or workspace_kind == "scratch":
+        workspace_kind = scheme
+    return workspace_kind, (bare or None)
+
+
+def _heal_claimed_workspace(conn: Any, claimed: "Task") -> "Task":
+    """Strip a leaked ``<scheme>:<path>`` prefix off a just-claimed task and
+    PERSIST the correction before the dispatcher branches on
+    ``workspace_kind``.
+
+    A task created by a surface that bypassed the CLI ``--workspace`` parser can
+    land in the DB with a ``worktree:``/``dir:``/``scratch:`` prefix still inside
+    ``workspace_path`` (and ``workspace_kind`` left at the default). Both the
+    ready-queue and the review-queue claim paths branch on
+    ``claimed.workspace_kind`` right after claiming, so the heal has to run — and
+    be written back — in both. ``resolve_workspace`` also heals, but only on a
+    local copy, so without this the DB keeps the wrong kind and the worktree
+    branch is never taken. Returns the (possibly corrected) ``claimed`` task.
+    """
+    healed_kind, healed_path = _strip_workspace_scheme(
+        claimed.workspace_kind, claimed.workspace_path
+    )
+    healed_kind = healed_kind or "scratch"
+    if (
+        healed_kind != claimed.workspace_kind
+        or healed_path != claimed.workspace_path
+    ):
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = ?, workspace_path = ? WHERE id = ?",
+                (healed_kind, healed_path, claimed.id),
+            )
+        claimed = replace(
+            claimed, workspace_kind=healed_kind, workspace_path=healed_path
+        )
+    return claimed
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -2370,6 +2440,16 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    # Self-heal a ``<scheme>:<path>`` value that leaked into workspace_path
+    # (e.g. a caller that bypassed the CLI's --workspace parser and jammed
+    # 'worktree:/abs/path' into workspace_path). The scheme prefix must never
+    # be persisted; strip it and promote the kind when the caller left it at
+    # the default. This keeps the stored path a bare absolute value so the
+    # spawn-time validator doesn't reject it and trip the circuit breaker.
+    _healed_kind, workspace_path = _strip_workspace_scheme(
+        workspace_kind, workspace_path
+    )
+    workspace_kind = _healed_kind or "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -5044,6 +5124,14 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # This direct INSERT bypasses create_task's guard, so a child (or
+            # an inherited legacy root) carrying a 'worktree:'/'dir:'/'scratch:'
+            # scheme prefix inside workspace_path would land malformed. Strip it
+            # here so the stored row is a bare absolute path with the right kind.
+            child_ws_kind, child_ws_path = _strip_workspace_scheme(
+                child_ws_kind, child_ws_path
+            )
+            child_ws_kind = child_ws_kind or "scratch"
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
@@ -5435,7 +5523,12 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
@@ -5462,6 +5555,27 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     so subsequent runs reuse the same directory.
     """
     kind = task.workspace_kind or "scratch"
+    # Spawn-time self-heal: an already-persisted malformed value (a stored
+    # workspace_path that still carries a 'worktree:'/'dir:'/'scratch:' scheme
+    # prefix from before the create-path guard, or written by a third-party tool)
+    # would otherwise fail the absolute-path check below and trip the dispatcher
+    # circuit breaker. Strip the scheme so the task recovers instead of blocking.
+    _healed_kind, _healed_path = _strip_workspace_scheme(kind, task.workspace_path)
+    kind = _healed_kind or "scratch"
+    if _healed_path != task.workspace_path or kind != (task.workspace_kind or "scratch"):
+        # Persist the correction when a connection is supplied so callers that
+        # only write back the resolved path (e.g. the manual ``hermes kanban
+        # claim`` path) don't leave a stale workspace_kind in the DB. The
+        # dispatcher already persists via _heal_claimed_workspace before it
+        # reaches here, so a redundant UPDATE there is harmless and idempotent.
+        if conn is not None:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET workspace_kind = ?, workspace_path = ? "
+                    "WHERE id = ?",
+                    (kind, _healed_path, task.id),
+                )
+        task = replace(task, workspace_kind=kind, workspace_path=_healed_path)
     if kind == "scratch":
         if task.workspace_path:
             # Legacy scratch tasks that were set to an explicit path get the
@@ -7193,6 +7307,14 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Self-heal an already-persisted malformed workspace_path (a stored
+        # 'worktree:'/'dir:'/'scratch:' scheme prefix written by a create
+        # surface that bypassed the CLI parser) and PERSIST the correction
+        # before branching on workspace_kind below. resolve_workspace also
+        # heals defensively, but it only mutates a local copy — without this
+        # the DB keeps workspace_kind='scratch', so the worktree branch is
+        # never set and _maybe_emit_scratch_tip emits the wrong tip.
+        claimed = _heal_claimed_workspace(conn, claimed)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -7285,6 +7407,12 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Same self-heal as the ready-queue path above: a legacy review-status
+        # task whose workspace_path still carries a 'worktree:'/'dir:'/'scratch:'
+        # scheme prefix must be normalized (and persisted) before we branch on
+        # workspace_kind, or it bypasses the heal, fails the absolute-path check
+        # in _resolve_worktree_workspace, and trips the spawn-failure breaker.
+        claimed = _heal_claimed_workspace(conn, claimed)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":

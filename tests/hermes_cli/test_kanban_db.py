@@ -241,6 +241,72 @@ def test_workspace_kind_validation(kanban_home):
         kb.create_task(conn, title="bad ws", workspace_kind="cloud")
 
 
+def test_create_strips_worktree_scheme_from_workspace_path(kanban_home):
+    """A 'worktree:<path>' value jammed into workspace_path must split into
+    workspace_kind='worktree' + a BARE absolute workspace_path (regression for
+    the scheme prefix that tripped the dispatcher circuit breaker)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="scheme in path",
+            workspace_path="worktree:/Users/testuser/projects/CPE-research/research-agent",
+        )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == "/Users/testuser/projects/CPE-research/research-agent"
+    assert not task.workspace_path.startswith("worktree:")
+
+
+def test_create_strips_dir_scheme_from_workspace_path(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="dir scheme", workspace_path="dir:/abs/work/dir"
+        )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == "/abs/work/dir"
+
+
+def test_create_explicit_kind_not_overridden_by_stray_prefix(kanban_home):
+    """An explicit non-default workspace_kind wins; only the prefix is stripped."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="explicit dir",
+            workspace_kind="dir",
+            workspace_path="dir:/abs/keep",
+        )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == "/abs/keep"
+
+
+def test_strip_scheme_worktree_kind_with_prefix_keeps_kind():
+    """A row already 'worktree' kind but carrying a 'worktree:' prefix in the
+    path (Codex P2: legacy worktree row) must strip the prefix and keep the
+    kind, so dispatch routes it through worktree materialization with a bare
+    absolute path instead of failing the absolute-path check."""
+    assert kb._strip_workspace_scheme("worktree", "worktree:/abs/repo") == (
+        "worktree",
+        "/abs/repo",
+    )
+
+
+def test_create_bare_path_unchanged(kanban_home):
+    """A healthy bare absolute path must pass through untouched."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="bare path",
+            workspace_kind="worktree",
+            workspace_path="/Users/testuser/projects/CPE-research/research-agent",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == "/Users/testuser/projects/CPE-research/research-agent"
+
+
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     with kb.connect() as conn:
@@ -1728,6 +1794,133 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
     # c is now running
     with kb.connect() as conn:
         assert kb.get_task(conn, c).status == "running"
+
+
+def test_dispatch_self_heals_persisted_scheme_prefix(
+    kanban_home, all_assignees_spawnable, tmp_path
+):
+    """A task already persisted with a scheme prefix in workspace_path (written
+    by a create surface that bypassed the guard) must be self-healed AND the
+    correction persisted at claim time, so the spawned task and the DB both
+    carry the promoted workspace_kind. Regression for the Gemini HIGH finding:
+    healing only a local copy in resolve_workspace left workspace_kind='scratch'
+    in the DB, breaking branch wiring and scratch-tip emission."""
+    target = tmp_path / "healed-dir"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append((task.workspace_kind, task.workspace_path, workspace))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="healme", assignee="alice")
+        # Simulate a malformed persisted value: jam 'dir:<abs>' into
+        # workspace_path with the default scratch kind, bypassing create_task's
+        # guard (direct UPDATE, as a third-party create surface would).
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? "
+                "WHERE id = ?",
+                (f"dir:{target}", tid),
+            )
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        healed = kb.get_task(conn, tid)
+
+    # The spawned task object carries the healed values...
+    assert spawned and spawned[0][0] == "dir"
+    assert spawned[0][1] == str(target)
+    # ...and the correction is persisted to the DB (not just a local copy).
+    assert healed is not None
+    assert healed.workspace_kind == "dir"
+    assert healed.workspace_path == str(target)
+
+
+def test_dispatch_review_self_heals_persisted_scheme_prefix(
+    kanban_home, all_assignees_spawnable, tmp_path
+):
+    """The review-queue claim path must self-heal a persisted scheme prefix the
+    same way the ready-queue path does. Regression for the Codex P2: a legacy
+    task already in status='review' with workspace_path='<scheme>:<abs>' bypassed
+    the heal, branched on the unpromoted workspace_kind, and could trip the
+    spawn-failure circuit breaker."""
+    target = tmp_path / "healed-dir"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append((task.workspace_kind, task.workspace_path, workspace))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review-heal", assignee="alice")
+        _set_task_status(conn, tid, "review")
+        # Malformed persisted value on a review-status task: 'dir:<abs>'
+        # jammed into workspace_path with the default scratch kind.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? "
+                "WHERE id = ?",
+                (f"dir:{target}", tid),
+            )
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        healed = kb.get_task(conn, tid)
+
+    # The spawned task object carries the healed (promoted) values...
+    assert spawned and spawned[0][0] == "dir"
+    assert spawned[0][1] == str(target)
+    # ...and the correction is persisted to the DB, not just a local copy.
+    assert healed is not None
+    assert healed.workspace_kind == "dir"
+    assert healed.workspace_path == str(target)
+
+
+def test_resolve_workspace_persists_healed_kind_with_conn(kanban_home, tmp_path):
+    """resolve_workspace(conn=...) must persist BOTH the promoted kind and the
+    bare path for a legacy row, so callers that only write back the resolved
+    path (the manual ``hermes kanban claim`` path) don't leave a stale
+    workspace_kind='scratch' in the DB. Codex P2: persist healed kinds for
+    manual claims."""
+    target = tmp_path / "legacy-dir"
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="manual-heal", assignee="alice")
+        # Malformed persisted value: 'dir:<abs>' with default scratch kind.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? "
+                "WHERE id = ?",
+                (f"dir:{target}", tid),
+            )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        resolved = kb.resolve_workspace(task, conn=conn)
+        healed = kb.get_task(conn, tid)
+
+    assert resolved == target
+    # The correction is persisted (not just a local copy): kind promoted to dir.
+    assert healed is not None
+    assert healed.workspace_kind == "dir"
+    assert healed.workspace_path == str(target)
+
+
+def test_resolve_workspace_without_conn_does_not_persist(kanban_home, tmp_path):
+    """Without a conn, resolve_workspace still heals its local copy (back-compat
+    for read-only callers) but must NOT touch the DB."""
+    target = tmp_path / "legacy-dir2"
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="noconn-heal", assignee="alice")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? "
+                "WHERE id = ?",
+                (f"dir:{target}", tid),
+            )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        resolved = kb.resolve_workspace(task)  # no conn
+        unhealed = kb.get_task(conn, tid)
+
+    assert resolved == target
+    # DB row is unchanged because no conn was supplied.
+    assert unhealed is not None
+    assert unhealed.workspace_kind == "scratch"
+    assert unhealed.workspace_path == f"dir:{target}"
 
 
 def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawnable):
