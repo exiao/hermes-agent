@@ -5124,6 +5124,14 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # This direct INSERT bypasses create_task's guard, so a child (or
+            # an inherited legacy root) carrying a 'worktree:'/'dir:'/'scratch:'
+            # scheme prefix inside workspace_path would land malformed. Strip it
+            # here so the stored row is a bare absolute path with the right kind.
+            child_ws_kind, child_ws_path = _strip_workspace_scheme(
+                child_ws_kind, child_ws_path
+            )
+            child_ws_kind = child_ws_kind or "scratch"
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
@@ -5515,7 +5523,12 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
@@ -5549,7 +5562,19 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     # circuit breaker. Strip the scheme so the task recovers instead of blocking.
     _healed_kind, _healed_path = _strip_workspace_scheme(kind, task.workspace_path)
     kind = _healed_kind or "scratch"
-    if _healed_path != task.workspace_path:
+    if _healed_path != task.workspace_path or kind != (task.workspace_kind or "scratch"):
+        # Persist the correction when a connection is supplied so callers that
+        # only write back the resolved path (e.g. the manual ``hermes kanban
+        # claim`` path) don't leave a stale workspace_kind in the DB. The
+        # dispatcher already persists via _heal_claimed_workspace before it
+        # reaches here, so a redundant UPDATE there is harmless and idempotent.
+        if conn is not None:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET workspace_kind = ?, workspace_path = ? "
+                    "WHERE id = ?",
+                    (kind, _healed_path, task.id),
+                )
         task = replace(task, workspace_kind=kind, workspace_path=_healed_path)
     if kind == "scratch":
         if task.workspace_path:

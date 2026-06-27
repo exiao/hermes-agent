@@ -1871,6 +1871,58 @@ def test_dispatch_review_self_heals_persisted_scheme_prefix(
     assert healed.workspace_path == str(target)
 
 
+def test_resolve_workspace_persists_healed_kind_with_conn(kanban_home, tmp_path):
+    """resolve_workspace(conn=...) must persist BOTH the promoted kind and the
+    bare path for a legacy row, so callers that only write back the resolved
+    path (the manual ``hermes kanban claim`` path) don't leave a stale
+    workspace_kind='scratch' in the DB. Codex P2: persist healed kinds for
+    manual claims."""
+    target = tmp_path / "legacy-dir"
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="manual-heal", assignee="alice")
+        # Malformed persisted value: 'dir:<abs>' with default scratch kind.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? "
+                "WHERE id = ?",
+                (f"dir:{target}", tid),
+            )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        resolved = kb.resolve_workspace(task, conn=conn)
+        healed = kb.get_task(conn, tid)
+
+    assert resolved == target
+    # The correction is persisted (not just a local copy): kind promoted to dir.
+    assert healed is not None
+    assert healed.workspace_kind == "dir"
+    assert healed.workspace_path == str(target)
+
+
+def test_resolve_workspace_without_conn_does_not_persist(kanban_home, tmp_path):
+    """Without a conn, resolve_workspace still heals its local copy (back-compat
+    for read-only callers) but must NOT touch the DB."""
+    target = tmp_path / "legacy-dir2"
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="noconn-heal", assignee="alice")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? "
+                "WHERE id = ?",
+                (f"dir:{target}", tid),
+            )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        resolved = kb.resolve_workspace(task)  # no conn
+        unhealed = kb.get_task(conn, tid)
+
+    assert resolved == target
+    # DB row is unchanged because no conn was supplied.
+    assert unhealed is not None
+    assert unhealed.workspace_kind == "scratch"
+    assert unhealed.workspace_path == f"dir:{target}"
+
+
 def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawnable):
     def boom(task, workspace):
         raise RuntimeError("spawn failed")
