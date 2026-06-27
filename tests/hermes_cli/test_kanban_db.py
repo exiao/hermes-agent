@@ -281,6 +281,17 @@ def test_create_explicit_kind_not_overridden_by_stray_prefix(kanban_home):
     assert task.workspace_path == "/abs/keep"
 
 
+def test_strip_scheme_worktree_kind_with_prefix_keeps_kind():
+    """A row already 'worktree' kind but carrying a 'worktree:' prefix in the
+    path (Codex P2: legacy worktree row) must strip the prefix and keep the
+    kind, so dispatch routes it through worktree materialization with a bare
+    absolute path instead of failing the absolute-path check."""
+    assert kb._strip_workspace_scheme("worktree", "worktree:/abs/repo") == (
+        "worktree",
+        "/abs/repo",
+    )
+
+
 def test_create_bare_path_unchanged(kanban_home):
     """A healthy bare absolute path must pass through untouched."""
     with kb.connect() as conn:
