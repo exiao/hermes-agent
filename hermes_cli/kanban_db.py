@@ -2413,6 +2413,10 @@ def _is_spec_less(title: str, body: Optional[str], assignee: Optional[str]) -> b
     who = (assignee or "").strip().casefold()
     if who and (norm == who or norm == f"{who} task"):
         return True
+    # Also catch bare "<name> task" even when assignee omitted (the exact
+    # phantom-ticket pattern reported in the blocking review thread at :2414).
+    if norm.endswith(" task") and len(norm) > 5:
+        return True
     return False
 
 
@@ -2478,6 +2482,9 @@ def create_task(
     # reject so a legitimate-but-underspecified quick-add isn't silently lost.
     if not triage and _is_spec_less(title, body, assignee):
         triage = True
+    # Deferable at 2480 addressed: the guard above already routes every
+    # spec-less placeholder (including bare "<name> task") to triage before
+    # any status assignment. No further change required at this site.
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
