@@ -3626,7 +3626,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _kanban_iter_override = None
         if os.getenv("HERMES_KANBAN_TASK") and os.getenv("HERMES_MAX_ITERATIONS"):
             try:
-                _kanban_iter_override = int(os.getenv("HERMES_MAX_ITERATIONS", ""))
+                _val = int(os.getenv("HERMES_MAX_ITERATIONS", ""))
+                # Only a strictly-positive cap is meaningful; 0/negative would
+                # immediately terminate the agent loop, so ignore it and fall
+                # through to the config/profile default.
+                if _val > 0:
+                    _kanban_iter_override = _val
             except (TypeError, ValueError):
                 _kanban_iter_override = None
         if max_turns is not None:  # CLI arg was explicitly set

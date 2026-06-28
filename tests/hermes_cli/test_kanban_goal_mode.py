@@ -212,6 +212,15 @@ def test_explicit_max_turns_overrides_lane_default(kanban_home):
     assert turns == 12
 
 
+def test_non_positive_explicit_max_turns_falls_back_to_default(kanban_home):
+    # A 0/negative --goal-max-turns would create a nonsensical 0-turn loop;
+    # it must fall back to the default rather than be taken literally.
+    task = _db_task(kanban_home, title="t", assignee="dev", goal_mode=True, goal_max_turns=0)
+    gm, turns = kb._resolve_lane_goal_defaults(task, {})
+    assert gm is True
+    assert turns == kb.DEFAULT_GOAL_MODE_MAX_TURNS
+
+
 def test_config_goal_mode_lanes_overrides_builtin(kanban_home):
     cfg = {"goal_mode_lanes": ["pm"], "goal_mode_default_max_turns": 3}
     # `pm` now defaults on...

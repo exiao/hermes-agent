@@ -7589,7 +7589,14 @@ def _resolve_lane_goal_defaults(
         return False, None
 
     if task.goal_max_turns is not None:
-        max_turns: Optional[int] = int(task.goal_max_turns)
+        # Validate the explicit per-task budget the same way the config default
+        # is parsed: a non-positive/garbage --goal-max-turns would otherwise
+        # yield a nonsensical 0-turn loop. Fall back to the default on bad input.
+        max_turns: Optional[int] = _positive_int(
+            task.goal_max_turns,
+            DEFAULT_GOAL_MODE_MAX_TURNS,
+            minimum=1,
+        )
     else:
         max_turns = _positive_int(
             cfg.get("goal_mode_default_max_turns"),
