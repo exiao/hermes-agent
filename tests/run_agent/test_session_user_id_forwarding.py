@@ -16,7 +16,18 @@ from unittest.mock import patch
 
 
 def _make_agent(session_db, *, user_id, platform, session_id):
-    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+    # Stub get_model_context_length so ContextCompressor init never probes the
+    # OpenRouter endpoint / fetches model metadata. Without this, a cold CI
+    # worker (no warm ~/.hermes cache) makes a live network call here, adding
+    # long timeouts or failing under socket-blocking test setups. We only care
+    # about the session-row user_id, not the real context window.
+    with (
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}),
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            return_value=200_000,
+        ),
+    ):
         from run_agent import AIAgent
 
         return AIAgent(
