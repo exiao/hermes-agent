@@ -91,6 +91,7 @@ gateway:
     focus_line:            "Foco: \"{topic}\""
     summary_failed:        "⚠️ Falha ao gerar o resumo ({error}). {count} mensagem(ns) histórica(s) foram removidas e substituídas por um marcador; o contexto anterior já não pode ser recuperado. Considera verificar a configuração do modelo auxiliary.compression."
     aborted:               "⚠️ Compressão abortada ({error}). Nenhuma mensagem foi removida — a conversa está inalterada. Executa /compress para tentar de novo, /reset para uma sessão nova, ou verifica a configuração do modelo auxiliary.compression."
+    rotation_failed:       "⚠️ Compression could not be saved (session rotation failed). No messages were dropped — your conversation is unchanged. Run /compress to retry."
     aux_failed:            "ℹ️ O modelo de compressão configurado `{model}` falhou ({error}). Recuperado com o teu modelo principal — o contexto está intacto — mas talvez queiras verificar `auxiliary.compression.model` em config.yaml."
     failed:                "Compressão falhou: {error}"
 

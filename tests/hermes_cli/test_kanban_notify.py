@@ -452,6 +452,12 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     from gateway.run import GatewayRunner
     from gateway.config import Platform
 
+    # kanban create now validates the assignee against list_profiles_on_disk();
+    # seed the `alice` profile this test routes to so the create succeeds.
+    alice_dir = kanban_home / "profiles" / "alice"
+    alice_dir.mkdir(parents=True, exist_ok=True)
+    (alice_dir / "config.yaml").write_text("model: {}\n")
+
     kb.create_board("projx")
 
     runner = object.__new__(GatewayRunner)

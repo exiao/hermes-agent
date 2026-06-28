@@ -320,10 +320,11 @@ class TestVideoToolsetRegistration:
         assert entry.is_async is True
         assert entry.emoji == "🎬"
 
-    def test_not_in_core_tools(self):
-        """video_analyze should NOT be in _HERMES_CORE_TOOLS (default disabled)."""
+    def test_in_core_tools(self):
+        """video_analyze ships in _HERMES_CORE_TOOLS (video toolset enabled by
+        default — see patch note enable-video-toolset-default.md)."""
         from toolsets import _HERMES_CORE_TOOLS
-        assert "video_analyze" not in _HERMES_CORE_TOOLS
+        assert "video_analyze" in _HERMES_CORE_TOOLS
 
     def test_in_video_toolset_definition(self):
         """Toolset 'video' should contain video_analyze."""
