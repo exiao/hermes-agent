@@ -1601,9 +1601,8 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "Reason: {reason}\n\n"
     "Take the next concrete step toward completing the task. When the work "
     "is genuinely finished, call kanban_complete with a summary. If you are "
-    "blocked, call kanban_block with a reason AND a kind (needs_input, "
-    "capability, transient, or dependency). Do not stop without calling one "
-    "of them."
+    "blocked and need human input, call kanban_block with a reason. Do not "
+    "stop without calling one of them."
 )
 
 # Fed when the judge believes the work is done but the worker never called
@@ -1614,8 +1613,7 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "Reason: {reason}\n\n"
     "If the task is genuinely done, call kanban_complete now with a short "
     "summary of what you did. If something still blocks completion, call "
-    "kanban_block with the reason and a kind (needs_input, capability, "
-    "transient, or dependency) instead."
+    "kanban_block with the reason instead."
 )
 
 

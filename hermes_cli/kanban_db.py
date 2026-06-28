@@ -123,60 +123,6 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
-# Human-facing header tag derived from a block ``kind``. The tag is the FIRST
-# thing a triager reads in a Signal/Telegram push, so it says — in two words —
-# whether they must act:
-#
-#   * ``needs_input`` → ``DECISION NEEDED`` (the ONLY kind that should ping a human
-#                       for a decision)
-#   * ``capability``  → ``ROUTING`` (a hard wall: no creds/access/wrong lane —
-#                       a routing bug for the orchestrator, NOT a human decision)
-#   * ``transient``   → ``RETRY`` (flaky; may clear on its own)
-#
-# ``dependency`` has no header: it never reaches ``blocked`` (it routes to
-# ``todo``). ``None`` (legacy / dispatcher-internal block) has no header either,
-# so back-compat callers are untouched.
-BLOCK_KIND_HEADERS = {
-    "needs_input": "DECISION NEEDED",
-    "capability": "ROUTING",
-    "transient": "RETRY",
-}
-
-
-def header_for_block_kind(kind: Optional[str]) -> Optional[str]:
-    """Return the human-facing header tag for a block ``kind`` (or ``None``)."""
-    if not kind:
-        return None
-    return BLOCK_KIND_HEADERS.get(kind)
-
-
-def ensure_reason_header(reason: Optional[str], kind: Optional[str]) -> Optional[str]:
-    """Normalize a block ``reason`` to LEAD with the header tag for ``kind``.
-
-    Makes every typed block self-labeling at the source, so both the board and
-    the Signal push show ``DECISION NEEDED: …`` / ``ROUTING: …`` / ``RETRY: …``
-    regardless of whether the worker remembered to type it. Idempotent: if the
-    reason already starts with the right header (case-insensitive, optional
-    ``:`` / ``—`` / ``-`` separator) it is returned unchanged so we never
-    double-stamp ``DECISION NEEDED: DECISION NEEDED: …``. When ``kind`` has no
-    header (``dependency`` / ``None``) the reason is returned untouched.
-    """
-    header = header_for_block_kind(kind)
-    if not header:
-        return reason
-    text = (reason or "").strip()
-    if not text:
-        return f"{header}:"
-    # Already led with this header? Leave it alone (idempotent).
-    low = text.lower()
-    hlow = header.lower()
-    if low.startswith(hlow):
-        rest = text[len(header):].lstrip()
-        if not rest or rest[0] in {":", "—", "-"}:
-            return text
-    return f"{header}: {text}"
-
-
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -4644,12 +4590,6 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
-    # Self-labeling: normalize the stored reason to LEAD with the header tag
-    # for this kind (DECISION NEEDED / ROUTING / RETRY). Applied once here so the
-    # task row, the run summary, the event payload, AND the Signal push all
-    # carry the same headed reason no matter which surface (tool / CLI /
-    # dispatcher) called us. Idempotent and a no-op for dependency/None.
-    reason = ensure_reason_header(reason, kind)
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):

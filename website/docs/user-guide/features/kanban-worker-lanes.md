@@ -51,7 +51,7 @@ For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spa
 Every claim must end in exactly one of:
 
 - `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done`.
-- `kanban_block(reason=..., kind=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs. (`kind` is required — `dependency` / `needs_input` / `capability` / `transient`.)
+- `kanban_block(reason=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs.
 - The worker process exits without a tool call. The kernel reaps it and emits `crashed` (PID died) or `gave_up` (consecutive-failure breaker tripped) or `timed_out` (max_runtime exceeded). This is the failure path; healthy workers don't end here.
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.

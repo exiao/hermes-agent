@@ -1,23 +1,29 @@
-"""Regression: blocked-task notifications are self-labeling by ``kind``.
+"""Regression: blocked-task notifications are self-labeling.
 
-A worker's typed block (kanban_db.VALID_BLOCK_KINDS) must produce a Signal/
-Telegram push whose FIRST line says — at a glance — whether the reader must
-act:
+The Signal/Telegram push for a blocked task leads with a header that says — at a
+glance — whether the reader must act:
 
-  needs_input → ``🔴 DECISION NEEDED — <id>: <title>``
-  capability  → ``🟠 ROUTING — <id>: <title>``  (NOT a human-action item)
-  transient   → ``🟡 RETRY — <id>: <title>``
+  🔴 DECISION NEEDED — <id>: <title>   (a human has to decide; the default)
+  🟠 ROUTING — <id>: <title>           (a hard wall: creds/access/lane)
+  🟡 RETRY — <id>: <title>             (flaky / transient)
 
-An un-typed/legacy block keeps the historical ``⏸ … blocked: <reason>`` shape.
-These drive the real ``_kanban_notifier_watcher`` against a temp DB so the whole
-producer → notifier path is exercised (the header is normalized into the stored
-reason by ``block_task`` and the typed ``kind`` rides in the event payload).
+The header needs NO agent-facing contract: a worker writes a plain ``reason``
+and the watcher infers the tag from the text (``_infer_block_header``). When a
+worker did pass the optional upstream ``kind`` param it is honored directly. An
+empty reason keeps the historical ``⏸ … blocked`` shape.
+
+Tests drive the real ``_kanban_notifier_watcher`` against a temp DB so the whole
+producer → notifier path is exercised, plus pure-formatter and pure-classifier
+units.
 """
 
 import asyncio
 
 from gateway.config import Platform
-from gateway.kanban_watchers import _format_block_notification
+from gateway.kanban_watchers import (
+    _format_block_notification,
+    _infer_block_header,
+)
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -51,7 +57,7 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
-def _typed_block_subscription(reason, kind, title="do the thing"):
+def _block_subscription(reason, kind=None, title="do the thing"):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title=title, assignee="dev")
@@ -64,115 +70,116 @@ def _typed_block_subscription(reason, kind, title="do the thing"):
 
 
 # ---------------------------------------------------------------------------
-# Pure formatter unit tests (no DB)
+# Pure classifier units — the reason text drives the header, no kind needed
 # ---------------------------------------------------------------------------
 
 
-def test_format_needs_input_leads_with_decision_needed():
+def test_infer_routing_from_access_wording():
+    assert _infer_block_header("No access to the prod vault to rotate the token") == "🟠 ROUTING"
+    assert _infer_block_header("403 forbidden hitting the deploy API") == "🟠 ROUTING"
+
+
+def test_infer_retry_from_transient_wording():
+    assert _infer_block_header("429 rate limit from the search API, try again later") == "🟡 RETRY"
+    assert _infer_block_header("connection reset, looks flaky") == "🟡 RETRY"
+
+
+def test_infer_defaults_to_decision_needed():
+    # Anything that isn't clearly routing/transient is treated as a human
+    # decision — the safe default (surface it rather than hide it).
+    assert _infer_block_header("Should I key the limiter on IP or user_id?") == "🔴 DECISION NEEDED"
+
+
+def test_infer_empty_reason_has_no_header():
+    assert _infer_block_header("") is None
+    assert _infer_block_header("   ") is None
+
+
+# ---------------------------------------------------------------------------
+# Pure formatter units
+# ---------------------------------------------------------------------------
+
+
+def test_format_infers_decision_needed_from_reason():
     msg = _format_block_notification(
-        "needs_input", "t_abc", "merge CPE PRs #795-799", "which env first?"
+        None, "t_abc", "merge CPE PRs #795-799", "which env should I migrate first?"
     )
     assert msg.splitlines()[0] == "🔴 DECISION NEEDED — t_abc: merge CPE PRs #795-799"
-    assert "which env first?" in msg
+    assert "which env should I migrate first?" in msg
 
 
-def test_format_capability_reads_as_routing_not_decision():
+def test_format_infers_routing_from_reason():
     msg = _format_block_notification(
-        "capability", "t_def", "rotate prod token", "no access to the vault"
+        None, "t_def", "rotate prod token", "no access to the vault"
     )
-    first = msg.splitlines()[0]
-    assert first == "🟠 ROUTING — t_def: rotate prod token"
-    # A routing/capability block must NOT read as a human-decision item.
+    assert msg.splitlines()[0] == "🟠 ROUTING — t_def: rotate prod token"
     assert "DECISION NEEDED" not in msg
 
 
-def test_format_transient_leads_with_retry():
-    msg = _format_block_notification("transient", "t_g", "crawl feed", "429 from API")
+def test_format_infers_retry_from_reason():
+    msg = _format_block_notification(None, "t_g", "crawl feed", "429 from API, transient")
     assert msg.splitlines()[0] == "🟡 RETRY — t_g: crawl feed"
 
 
-def test_format_untyped_keeps_legacy_blocked_shape():
-    msg = _format_block_notification(None, "t_legacy", "old task", "stuck on something")
-    assert msg == "⏸ Kanban t_legacy blocked: stuck on something"
+def test_format_explicit_kind_overrides_inference():
+    # A worker that DID pass the optional kind gets exactly that header even if
+    # the reason text would infer differently.
+    msg = _format_block_notification(
+        "capability", "t_h", "do thing", "should I pick A or B?"
+    )
+    assert msg.splitlines()[0] == "🟠 ROUTING — t_h: do thing"
+
+
+def test_format_empty_reason_keeps_legacy_blocked_shape():
+    msg = _format_block_notification(None, "t_i", "do thing", "")
+    assert msg == "⏸ Kanban t_i blocked"
 
 
 def test_format_includes_assignee_tag():
     msg = _format_block_notification(
-        "needs_input", "t_a", "title", "reason", tag="@dev "
+        None, "t_a", "title", "pick a region", tag="@dev "
     )
     assert msg.splitlines()[0] == "🔴 DECISION NEEDED — @dev t_a: title"
 
 
 # ---------------------------------------------------------------------------
-# End-to-end through the real notifier watcher
+# End-to-end: real notifier watcher against a temp DB
 # ---------------------------------------------------------------------------
 
 
-def test_needs_input_block_pushes_decision_needed_header(tmp_path, monkeypatch):
-    db_path = tmp_path / "needs-input.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+def test_decision_block_pushes_decision_needed_header(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
     kb.init_db()
-
-    tid = _typed_block_subscription(
-        "merge CPE migration PRs #795-799", "needs_input", title="ship CPE migration"
-    )
+    _block_subscription("Should I key the limiter on IP or user_id?")
     adapter = RecordingAdapter()
-    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
-
-    assert len(adapter.sent) == 1
-    text = adapter.sent[0]["text"]
-    first = text.splitlines()[0]
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.sent, "expected a push"
+    first = adapter.sent[0]["text"].splitlines()[0]
     assert first.startswith("🔴 DECISION NEEDED — ")
-    assert tid in first
-    assert "ship CPE migration" in first
-    # The reason still rides in the body (block_task stamps the DECISION NEEDED:
-    # header into the stored reason; that's fine — it's below the headline).
-    assert "merge CPE migration PRs #795-799" in text
 
 
-def test_capability_block_pushes_routing_header_not_decision(tmp_path, monkeypatch):
-    db_path = tmp_path / "capability.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+def test_routing_block_pushes_routing_header_not_decision(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
     kb.init_db()
-
-    tid = _typed_block_subscription(
-        "no creds for the prod vault — wrong lane", "capability",
-        title="rotate prod token",
-    )
+    _block_subscription("No access to the vault, cannot rotate the prod token")
     adapter = RecordingAdapter()
-    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
-
-    assert len(adapter.sent) == 1
-    text = adapter.sent[0]["text"]
-    first = text.splitlines()[0]
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.sent, "expected a push"
+    first = adapter.sent[0]["text"].splitlines()[0]
     assert first.startswith("🟠 ROUTING — ")
-    assert tid in first
-    assert "rotate prod token" in first
-    # A routing block is for the orchestrator, never a decision-needed headline.
-    assert not first.startswith("🔴")
-    assert "DECISION NEEDED" not in first
+    assert "DECISION NEEDED" not in adapter.sent[0]["text"]
 
 
-def test_untyped_block_keeps_legacy_line(tmp_path, monkeypatch):
-    """An un-typed (legacy/dispatcher) block keeps the ⏸ … blocked shape."""
-    db_path = tmp_path / "untyped.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+def test_empty_reason_block_keeps_legacy_shape(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
     kb.init_db()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="legacy task", assignee="dev")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
-        kb.block_task(conn, tid, reason="generic stuck")  # kind=None
-    finally:
-        conn.close()
-
+    _block_subscription("")
     adapter = RecordingAdapter()
-    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
-
-    assert len(adapter.sent) == 1
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.sent, "expected a push"
     text = adapter.sent[0]["text"]
-    assert "blocked" in text
-    assert "generic stuck" in text
+    assert "⏸" in text and "blocked" in text
     assert "DECISION NEEDED" not in text

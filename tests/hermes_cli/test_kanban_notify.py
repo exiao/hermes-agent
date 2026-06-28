@@ -218,10 +218,10 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    # A block notification is either the legacy "⏸ … blocked" line (untyped)
-    # or a typed self-labeling header (🔴 DECISION NEEDED / 🟠 ROUTING / 🟡 RETRY)
-    # introduced by the kind-aware notify format. This scenario uses needs_input
-    # then capability, so match both shapes rather than the bare word "blocked".
+    # A block notification is either the legacy "⏸ … blocked" line (empty
+    # reason) or a self-labeling header (🔴 DECISION NEEDED / 🟠 ROUTING /
+    # 🟡 RETRY) chosen from the kind/reason. Match both shapes rather than the
+    # bare word "blocked".
     _BLOCK_MARKERS = ("blocked", "DECISION NEEDED", "ROUTING", "RETRY")
     blocked_deliveries = [
         m for m in delivered_msgs if any(mark in m for mark in _BLOCK_MARKERS)

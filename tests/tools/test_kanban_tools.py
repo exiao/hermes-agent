@@ -610,7 +610,7 @@ def test_complete_retry_with_corrected_created_cards_succeeds(worker_env):
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification", "kind": "needs_input"})
+    out = kt._handle_block({"reason": "need clarification"})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
@@ -624,133 +624,8 @@ def test_block_happy_path(worker_env):
 def test_block_rejects_empty_reason(worker_env):
     from tools import kanban_tools as kt
     for bad in ["", "   ", None]:
-        out = kt._handle_block({"reason": bad, "kind": "needs_input"})
+        out = kt._handle_block({"reason": bad})
         assert json.loads(out).get("error")
-
-
-def test_block_requires_kind(worker_env):
-    """A worker block with no kind is rejected, never silently stored generic."""
-    from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
-    err = json.loads(out).get("error", "")
-    assert "kind is required" in err
-    # The task must NOT have been blocked.
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        assert kb.get_task(conn, worker_env).status != "blocked"
-    finally:
-        conn.close()
-
-
-def test_block_redirects_merge_ready_to_complete(worker_env):
-    """Merge-ready / awaiting-merge is not a block — steer to kanban_complete."""
-    from tools import kanban_tools as kt
-    for reason in (
-        "DONE-PENDING-MERGE: PR #47 ready for Eric to merge",
-        "merge-ready, awaiting Eric's merge",
-        "the fix is staged and ready to merge",
-    ):
-        out = kt._handle_block({"reason": reason, "kind": "needs_input"})
-        err = json.loads(out).get("error", "")
-        assert "kanban_complete" in err
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        assert kb.get_task(conn, worker_env).status != "blocked"
-    finally:
-        conn.close()
-
-
-def test_block_dependency_may_mention_pending_merge(worker_env):
-    """A `dependency` block waits on ANOTHER task that may itself be pending a
-    merge ("waiting on parent PR pending merge"). The merge-ready redirect must
-    NOT fire for dependency kinds — it should route to todo for auto-resume, not
-    be rejected as if the current task were merge-ready."""
-    from tools import kanban_tools as kt
-    out = kt._handle_block(
-        {"reason": "waiting on parent PR #47, pending merge", "kind": "dependency"}
-    )
-    parsed = json.loads(out)
-    # Not rejected as merge-ready: no kanban_complete steer.
-    assert "kanban_complete" not in parsed.get("error", "")
-    assert parsed.get("ok") is True
-    # dependency routes to todo (auto-resume), not blocked.
-    assert parsed.get("status") != "blocked"
-
-
-def test_block_redirects_review_required_to_complete(worker_env):
-    """A finished-code handoff that only needs review (`review-required`, the
-    exact wording the worker prompts tell agents to use) is merge-ready work and
-    must steer to kanban_complete — not sit in the blocked/human-decision queue,
-    even though it carries the required `kind`."""
-    from tools import kanban_tools as kt
-    for reason in (
-        "review-required: kanban block self-labeling fix",
-        "review required — PR #56 staged for Eric",
-    ):
-        out = kt._handle_block({"reason": reason, "kind": "needs_input"})
-        err = json.loads(out).get("error", "")
-        assert "kanban_complete" in err, reason
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        assert kb.get_task(conn, worker_env).status != "blocked"
-    finally:
-        conn.close()
-
-
-def test_block_negated_merge_ready_is_a_real_block(worker_env):
-    """A real blocker phrased with a negated merge-ready clause ("CI is failing;
-    not ready to merge") must NOT be redirected to kanban_complete — the
-    negation directly qualifies the merge-ready phrase, so it is not done. The
-    redirect guard must let these through to be recorded as a real block."""
-    from tools import kanban_tools as kt
-    for reason in (
-        "CI is failing; not ready to merge",
-        "conflicts unresolved, not ready for merge",
-        "blocked on creds — the PR isn't ready to merge yet",
-    ):
-        out = kt._handle_block({"reason": reason, "kind": "transient"})
-        parsed = json.loads(out)
-        # The merge-ready redirect must NOT fire for a negated phrase.
-        assert "kanban_complete" not in parsed.get("error", ""), reason
-
-
-def test_block_merge_ready_with_unrelated_negation_still_redirects(worker_env):
-    """An affirmative merge-ready reason that merely contains an UNRELATED
-    negation elsewhere ("merge-ready; no blockers remain") must still redirect
-    to kanban_complete — the negation must qualify the merge-ready phrase, not
-    just appear anywhere in the reason."""
-    from tools import kanban_tools as kt
-    for reason in (
-        "merge-ready; no blockers remain",
-        "done pending merge; no further action needed",
-    ):
-        out = kt._handle_block({"reason": reason, "kind": "needs_input"})
-        err = json.loads(out).get("error", "")
-        assert "kanban_complete" in err, reason
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        assert kb.get_task(conn, worker_env).status != "blocked"
-    finally:
-        conn.close()
-
-
-def test_block_typed_reason_is_headed(worker_env):
-    """The stored reason for a typed block leads with the header tag."""
-    from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "which prod region?", "kind": "needs_input"})
-    assert json.loads(out)["ok"] is True
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        events = [e for e in kb.list_events(conn, worker_env) if e.kind == "blocked"]
-        assert events
-        assert (events[-1].payload or {}).get("reason", "").startswith("DECISION NEEDED:")
-    finally:
-        conn.close()
 
 
 def test_heartbeat_happy_path(worker_env):
@@ -1379,7 +1254,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_600, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
@@ -1825,7 +1700,6 @@ def test_board_param_routes_block_to_alt_board(multi_board_env):
     out = kt._handle_block({
         "task_id": alt_seed,
         "reason": "need input on alt board",
-        "kind": "needs_input",
         "board": "alt",
     })
     d = json.loads(out)

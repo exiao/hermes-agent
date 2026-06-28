@@ -154,23 +154,61 @@ def _clip_notify_detail(text: str, limit: int = _NOTIFY_DETAIL_MAX) -> str:
     return text[:limit] + f"… ({len(text) - limit} more chars; see board)"
 
 
-# Self-labeling block notifications. A worker's block carries a typed ``kind``
-# (kanban_db.VALID_BLOCK_KINDS); the push leads with a header that says — at a
-# glance, before any reason text — whether the reader must ACT:
+# Self-labeling block notifications. The push leads with a header that says — at
+# a glance, before any reason text — whether the reader must ACT:
 #
-#   needs_input → 🔴 DECISION NEEDED   (the only kind that asks Eric to decide)
-#   capability  → 🟠 ROUTING         (a wall for the orchestrator, not Eric)
-#   transient   → 🟡 RETRY           (flaky; may clear on its own)
-#   None/legacy → ⏸ … blocked        (unchanged, back-compat)
+#   🔴 DECISION NEEDED  a human has to decide something (the default — when in
+#                       doubt, surface it)
+#   🟠 ROUTING          a hard wall: no creds/access/wrong lane (a routing bug
+#                       for the orchestrator, not a decision)
+#   🟡 RETRY            flaky / rate-limited / transient; may clear on its own
 #
-# The full reason still rides in the body so nothing is lost — it's just below
-# the headline instead of being the whole message. This is the half that turns
-# "a wall of identical ⏸ blocked paragraphs" into a triage-at-a-glance feed.
+# The header is chosen WITHOUT any agent-facing contract: the worker just writes
+# a plain ``reason`` like it always has, and the classifier below reads the text
+# to pick the tag. A block that already carries an explicit ``kind`` (the tool
+# still accepts the optional upstream param) is honored directly; otherwise the
+# reason text is classified. Misclassification is cosmetic-only — the header is a
+# hint, the full reason always rides in the body, and the default is the
+# act-on-it tag so the failure mode is "you glance at one extra thing", never a
+# dropped alert.
 _BLOCK_KIND_NOTIFY = {
     "needs_input": "🔴 DECISION NEEDED",
     "capability": "🟠 ROUTING",
     "transient": "🟡 RETRY",
 }
+
+# Reason-text → header inference. Order matters: a reason can mention several
+# things, so check the most specific / least-human buckets first and fall
+# through to the human-decision default.
+_ROUTING_HINTS = (
+    "no access", "no creds", "no credential", "not authorized", "unauthorized",
+    "permission denied", "can't reach", "cannot reach", "wrong lane",
+    "no vault", "missing token", "missing key", "missing api key", "403",
+    "forbidden", "not provisioned", "no permission",
+)
+_RETRY_HINTS = (
+    "rate limit", "rate-limit", "429", "timeout", "timed out", "flaky",
+    "transient", "try again", "temporarily", "503", "502", "connection reset",
+    "may clear", "retry",
+)
+
+
+def _infer_block_header(reason_detail: str) -> Optional[str]:
+    """Pick a self-labeling header from a free-text block ``reason``.
+
+    Returns the emoji header tag, or ``None`` for an empty reason (which falls
+    back to the legacy ``⏸ … blocked`` shape). A non-empty reason ALWAYS gets a
+    header; an ambiguous one defaults to 🔴 DECISION NEEDED so anything that
+    might need a human is surfaced as one.
+    """
+    text = (reason_detail or "").strip().lower()
+    if not text:
+        return None
+    if any(h in text for h in _ROUTING_HINTS):
+        return _BLOCK_KIND_NOTIFY["capability"]
+    if any(h in text for h in _RETRY_HINTS):
+        return _BLOCK_KIND_NOTIFY["transient"]
+    return _BLOCK_KIND_NOTIFY["needs_input"]
 
 
 def _format_block_notification(
@@ -183,13 +221,16 @@ def _format_block_notification(
     """Build the blocked-event push text.
 
     ``reason_detail`` is the already-clipped reason (may be ""). ``tag`` is the
-    ``@assignee `` attribution prefix. For a typed block the first line is a
-    self-labeling header (``🔴 DECISION NEEDED — <id>: <title>``) and the reason
-    follows on its own line; for an un-typed/legacy block the historical
-    ``⏸ … blocked: <reason>`` shape is preserved so existing consumers (and the
+    ``@assignee `` attribution prefix. The first line is a self-labeling header
+    (``🔴 DECISION NEEDED — <id>: <title>``) and the reason follows on its own
+    line. ``block_kind`` is honored when a worker set the optional kind param;
+    otherwise the header is inferred from the reason text. An empty reason falls
+    back to the historical ``⏸ … blocked`` shape so existing consumers (and the
     notify-untruncate regression tests) keep working.
     """
     header = _BLOCK_KIND_NOTIFY.get(block_kind or "")
+    if not header:
+        header = _infer_block_header(reason_detail)
     if header:
         head = f"{header} — {tag}{task_id}: {title}"
         return f"{head}\n{reason_detail}" if reason_detail else head
