@@ -2392,6 +2392,23 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 _PLACEHOLDER_TITLES = frozenset({"untitled", "task", "new task", "todo", "tbd"})
 
 
+def _default_assignee() -> Optional[str]:
+    """Resolve ``kanban.default_assignee`` from config, or None.
+
+    Used by the create-time spec-less guard so a placeholder created without an
+    explicit assignee (relying on the operator's default) is still keyed on the
+    assignee the dispatcher will actually auto-assign it to. Best-effort: any
+    config-load failure (test stubs, exotic envs) resolves to None.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        return (kanban_cfg.get("default_assignee") or "").strip() or None
+    except Exception:
+        return None
+
+
 def _is_spec_less(title: str, body: Optional[str], assignee: Optional[str]) -> bool:
     """Return True when a task has no spec a worker could act on.
 
@@ -2402,6 +2419,11 @@ def _is_spec_less(title: str, body: Optional[str], assignee: Optional[str]) -> b
     task gives a worker nothing to do; routing it to a lane just makes the worker
     block with needs_input. Callers should park these in ``triage`` for a
     specifier to flesh out instead of dispatching them.
+
+    The ``"<assignee> task"`` / assignee-name patterns are keyed on the resolved
+    assignee, so callers that rely on ``kanban.default_assignee`` (no explicit
+    assignee) must pass that resolved value in — otherwise a ``"default task"``
+    placeholder slips through and the dispatcher auto-assigns + spawns it.
     """
     if (body or "").strip():
         return False
@@ -2412,10 +2434,6 @@ def _is_spec_less(title: str, body: Optional[str], assignee: Optional[str]) -> b
         return True
     who = (assignee or "").strip().casefold()
     if who and (norm == who or norm == f"{who} task"):
-        return True
-    # Also catch bare "<name> task" even when assignee omitted (the exact
-    # phantom-ticket pattern reported in the blocking review thread at :2414).
-    if norm.endswith(" task") and len(norm) > 5:
         return True
     return False
 
@@ -2480,11 +2498,8 @@ def create_task(
     # park it in ``triage`` so a specifier can flesh out the spec (or archive
     # it) before it is promoted to ``todo``. We route-to-triage rather than hard
     # reject so a legitimate-but-underspecified quick-add isn't silently lost.
-    if not triage and _is_spec_less(title, body, assignee):
+    if not triage and _is_spec_less(title, body, assignee or _default_assignee()):
         triage = True
-    # Deferable at 2480 addressed: the guard above already routes every
-    # spec-less placeholder (including bare "<name> task") to triage before
-    # any status assignment. No further change required at this site.
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -5181,16 +5196,28 @@ def decompose_triage_task(
                 child_ws_kind, child_ws_path
             )
             child_ws_kind = child_ws_kind or "scratch"
+            # Direct INSERT bypasses create_task's spec-less guard too: a
+            # malformed decomposer result (e.g. {"title":"dev task","body":"",
+            # "assignee":"dev"}) would otherwise land as 'todo' and be promoted
+            # to 'ready' by recompute_ready(), reaching a worker lane with no
+            # spec. Park such a child in 'triage' (non-dispatchable) so a
+            # specifier can flesh it out, mirroring the create_task guard.
+            child_status = (
+                "triage"
+                if _is_spec_less(title, body, assignee or _default_assignee())
+                else "todo"
+            )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    child_status,
                     child_ws_kind,
                     child_ws_path,
                     tenant,

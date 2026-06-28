@@ -103,3 +103,50 @@ def test_explicit_triage_still_honoured(kanban_home):
         assert task.status == "triage", task.status
     finally:
         conn.close()
+
+
+def test_default_assignee_placeholder_routed_to_triage(kanban_home, monkeypatch):
+    """No explicit assignee but kanban.default_assignee resolves the placeholder.
+
+    Regression for the P2: ``create_task(title="default task")`` with no
+    assignee must still be caught — otherwise the dispatcher auto-assigns it to
+    ``kanban.default_assignee`` and spawns a spec-less worker. We resolve the
+    default assignee inside the guard and key the placeholder check on it.
+    """
+    monkeypatch.setattr(kb, "_default_assignee", lambda: "default")
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="default task")  # no assignee
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage", task.status
+    finally:
+        conn.close()
+
+
+def test_decompose_spec_less_child_parked_in_triage(kanban_home):
+    """A malformed decomposer result with a spec-less child must not reach a
+    worker lane. The child path INSERTs directly (bypassing create_task), so
+    the guard is applied there too: spec-less children land in ``triage``,
+    well-specified ones promote to ``ready`` as usual.
+    """
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="rough idea", triage=True)
+        children = [
+            {"title": "dev task", "body": "", "assignee": "dev"},  # spec-less
+            {"title": "Wire the API client", "body": "use httpx", "assignee": "dev"},
+        ]
+        ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=children,
+            author="decomposer",
+        )
+        assert ids is not None and len(ids) == 2
+        spec_less, real = kb.get_task(conn, ids[0]), kb.get_task(conn, ids[1])
+        assert spec_less.status == "triage", spec_less.status
+        assert real.status == "ready", real.status
+    finally:
+        conn.close()
