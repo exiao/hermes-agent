@@ -91,6 +91,7 @@ gateway:
     focus_line:            "Фокус: \"{topic}\""
     summary_failed:        "⚠️ Не удалось сгенерировать сводку ({error}). {count} историч. сообщений было удалено и заменено заполнителем; предыдущий контекст больше нельзя восстановить. Проверьте конфигурацию модели auxiliary.compression."
     aborted:               "⚠️ Сжатие прервано ({error}). Сообщения не были удалены — разговор не изменился. Запустите /compress для повторной попытки, /reset для новой сессии или проверьте конфигурацию модели auxiliary.compression."
+    rotation_failed:       "⚠️ Compression could not be saved (session rotation failed). No messages were dropped — your conversation is unchanged. Run /compress to retry."
     aux_failed:            "ℹ️ Настроенная модель сжатия `{model}` дала сбой ({error}). Восстановлено с помощью основной модели — контекст не повреждён — но рекомендуется проверить `auxiliary.compression.model` в config.yaml."
     failed:                "Сжатие не удалось: {error}"
 

@@ -631,7 +631,12 @@ def compress_context(
                         source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=agent.model,
                         model_config=agent._session_init_model_config,
-                        user_id=agent._user_id,
+                        # Carry the platform user identity onto the continuation
+                        # row. Without it the compressed child has user_id=NULL
+                        # and drops out of per-user lookups like
+                        # SessionDB.list_unlinked_telegram_sessions_for_user()
+                        # (filters source='telegram' AND user_id=?). None for CLI.
+                        user_id=getattr(agent, "_user_id", None),
                         parent_session_id=old_session_id,
                     )
                 except Exception as _cs_err:
