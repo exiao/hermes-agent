@@ -489,16 +489,22 @@ class TestMemoryBatch:
         assert "stale two" not in store.memory_entries
         assert "usage" in result
 
-    def test_batch_frees_room_for_otherwise_overflowing_add(self, store):
+    def test_batch_frees_room_for_otherwise_overflowing_add(self, store, tmp_path, monkeypatch):
         # store limit is 500 (fixture). Fill it, then a single add would
-        # overflow — but a batch that removes first lands in ONE call.
+        # overflow — it spills to .pending.md rather than landing in hot
+        # memory. A batch that removes first lands the add in hot memory in
+        # ONE call.
+        monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+        (tmp_path / "episodes").mkdir(exist_ok=True)
         store.add("memory", "x" * 240)
         store.add("memory", "y" * 240)  # ~485 chars, near the 500 limit
         big_add = {"action": "add", "content": "z" * 200}
-        # single add overflows
+        # single add overflows hot memory — spills to pending instead of landing
         single = json.loads(memory_tool(action="add", target="memory", content="z" * 200, store=store))
-        assert single["success"] is False
-        # batch that removes one big entry + adds succeeds atomically
+        assert single["success"] is True
+        assert single["spilled_to_pending"] is True
+        assert ("z" * 200) not in store.memory_entries
+        # batch that removes one big entry + adds succeeds atomically in hot memory
         result = json.loads(memory_tool(
             target="memory",
             operations=[{"action": "remove", "old_text": "x" * 240}, big_add],

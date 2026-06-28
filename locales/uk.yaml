@@ -91,6 +91,7 @@ gateway:
     focus_line:            "Фокус: \"{topic}\""
     summary_failed:        "⚠️ Не вдалося згенерувати зведення ({error}). {count} історичних повідомлень було видалено та замінено заповнювачем; попередній контекст більше не можна відновити. Перевірте конфігурацію моделі auxiliary.compression."
     aborted:               "⚠️ Стиснення скасовано ({error}). Жодне повідомлення не було видалено — розмова не змінилася. Виконайте /compress, щоб повторити спробу, /reset для нової сесії, або перевірте конфігурацію моделі auxiliary.compression."
+    rotation_failed:       "⚠️ Compression could not be saved (session rotation failed). No messages were dropped — your conversation is unchanged. Run /compress to retry."
     aux_failed:            "ℹ️ Налаштована модель стиснення `{model}` зазнала збою ({error}). Відновлено за допомогою основної моделі — контекст не пошкоджений — але варто перевірити `auxiliary.compression.model` у config.yaml."
     failed:                "Стиснення не вдалося: {error}"
 

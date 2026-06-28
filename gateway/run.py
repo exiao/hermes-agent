@@ -12837,10 +12837,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
+                # Pass the gateway source so the continuation session row
+                # _compress_context creates records the real platform (telegram/
+                # discord/slack) instead of falling back to source='cli', which
+                # would hide post-compression messages from source-filtered
+                # SessionDB searches.
+                platform=_platform_config_key(source.platform) if source.platform else None,
+                user_id=source.user_id,
+                chat_id=source.chat_id,
+                chat_name=source.chat_name,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
+                session_db=self._session_db,
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
-
+                # Prevent close() from ending the newly rotated continuation
+                # session — _compress_context rotates session_id and the gateway
+                # session entry now points at the new id, which must remain open
+                # for the next user turn. Without this, _cleanup_agent_resources
+                # -> AIAgent.close() marks the live session ended with
+                # agent_close (matches the parallel handler in slash_commands.py).
+                tmp_agent._end_session_on_close = False
                 # Estimate with system prompt + tool schemas included so the
                 # figure reflects real request pressure, not a transcript-only
                 # underestimate (#6217). Must be computed after tmp_agent is
@@ -12866,19 +12884,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if partial and tail:
                     compressed = rejoin_compressed_head_and_tail(compressed, tail)
 
-                # _compress_context already calls end_session() on the old session
-                # (preserving its full transcript in SQLite) and creates a new
-                # session_id for the continuation.  Write the compressed messages
-                # into the NEW session so the original history stays searchable.
+                # With session_db passed, _compress_context itself durably
+                # persists the result, and how it persisted dictates whether we
+                # may write here:
+                #   - rotated: it ended the old session and created an EMPTY
+                #     continuation row. We must write the compressed transcript
+                #     into that new id so the continuation has content.
+                #   - in-place: it called the NON-destructive archive_and_compact
+                #     on the same id (old turns kept active=0 + FTS-searchable,
+                #     compressed set inserted active=1). Writing here would route
+                #     to the DESTRUCTIVE replace_messages, DELETE every row for
+                #     the id, and wipe the archived pre-compression history.
+                #   - abort (neither): session_id rolled back unchanged for a
+                #     FAILURE reason; writing would overwrite the original
+                #     transcript with only the summary (#44794).
+                # So rewrite ONLY on rotation; in-place and abort are left alone.
                 new_session_id = tmp_agent.session_id
-                if new_session_id != session_entry.session_id:
+                rotated = new_session_id != session_entry.session_id
+                if rotated:
                     session_entry.session_id = new_session_id
                     self.session_store._save()
                     self._sync_telegram_topic_binding(
                         source, session_entry, reason="compress-command",
                     )
-
-                self.session_store.rewrite_transcript(new_session_id, compressed)
+                    self.session_store.rewrite_transcript(new_session_id, compressed)
+                else:
+                    _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
+                    if not _in_place:
+                        # Unchanged session id and not in-place: nothing was
+                        # persisted (no rewrite_transcript, no archive_and_compact).
+                        # Two distinct reasons land here, and they need different
+                        # messages:
+                        #   (a) the compressor ABORTED — the aux summarizer failed
+                        #       and returned the messages unchanged. The original
+                        #       transcript is intact; fall through to the summary
+                        #       path so the _summary_aborted / aux_failed block can
+                        #       surface the actual model/config error and guidance.
+                        #   (b) a genuine rotation save failure (no abort flag):
+                        #       report a no-op so the user isn't told compression
+                        #       succeeded while the next turn reloads the full
+                        #       uncompressed transcript (#44794).
+                        _aborted = bool(getattr(compressor, "_last_compress_aborted", False))
+                        if not _aborted:
+                            logger.warning(
+                                "Manual /compress: session rotation did not occur "
+                                "(session_id unchanged), in-place mode is off, and "
+                                "the compressor did not abort — nothing persisted; "
+                                "reporting no-op and preserving original transcript "
+                                "(#44794)."
+                            )
+                            return t("gateway.compress.rotation_failed")
+                    elif partial and tail:
+                        # In-place compaction archived + inserted only the
+                        # compressed HEAD; the verbatim tail we rejoined above
+                        # ("/compress here" keeps the recent exchanges) is not
+                        # yet in the live (active=1) set, so the next turn would
+                        # reload head-only and silently drop those kept turns.
+                        # Re-persist the rejoined head+tail through the SAME
+                        # non-destructive path (archive_and_compact) so the tail
+                        # lands in the active set without deleting the archived
+                        # pre-compression history.
+                        _db = getattr(tmp_agent, "_session_db", None) or self._session_db
+                        if _db is not None:
+                            _db.archive_and_compact(new_session_id, compressed)
+                    # else (full in-place): archive_and_compact already persisted
+                    # the complete compacted set; no further write needed.
                 # Reset stored token count — transcript changed, old value is stale
                 self.session_store.update_session(
                     session_entry.session_key, last_prompt_tokens=0
