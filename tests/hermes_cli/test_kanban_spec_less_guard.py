@@ -54,6 +54,15 @@ def test_is_spec_less_true(title, body, assignee):
         ("review", None, "reviewer"),                         # not "<assignee> task" / != assignee
         ("dev tasks", None, "dev"),                           # plural — not the placeholder
         ("parent", None, "worker"),                           # ordinary short title
+        # Legitimate body-less "<word> task" titles must NOT be force-triaged:
+        # the "<assignee> task" pattern is keyed on the resolved assignee, so a
+        # title that merely ends in " task" but != "<assignee> task" is a real
+        # task name, not the phantom-ticket fingerprint. (Regression guard for
+        # the dropped assignee-independent ``endswith(" task")`` catch-all.)
+        ("Deploy task", None, "dev"),
+        ("Migration task", None, "dev"),
+        ("Cleanup task", None, "ops"),
+        ("Research task", None, "researcher"),
     ],
 )
 def test_is_spec_less_false(title, body, assignee):
@@ -148,5 +157,56 @@ def test_decompose_spec_less_child_parked_in_triage(kanban_home):
         spec_less, real = kb.get_task(conn, ids[0]), kb.get_task(conn, ids[1])
         assert spec_less.status == "triage", spec_less.status
         assert real.status == "ready", real.status
+    finally:
+        conn.close()
+
+
+# --- negative: legitimate "<word> task" titles must NOT be force-triaged -----
+
+
+@pytest.mark.parametrize("title", ["Deploy task", "Migration task", "Cleanup task", "Research task"])
+def test_legit_word_task_title_still_ready(kanban_home, title):
+    """A body-less title that merely ends in " task" but is not the
+    ``"<assignee> task"`` fingerprint is a real task name, not a placeholder.
+    It must reach a worker lane in ``ready`` — the dropped assignee-independent
+    ``endswith(" task")`` catch-all used to wrongly route these to triage.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title=title, assignee="dev")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready", task.status
+    finally:
+        conn.close()
+
+
+def test_decompose_legit_word_task_children_promote(kanban_home):
+    """The decompose path must not over-triage legitimate "<word> task"
+    children. Only the ``"<assignee> task"`` fingerprint is spec-less; real
+    body-less task names (Deploy/Migration/Cleanup/Research) promote to
+    ``ready`` like any other well-titled child.
+    """
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="rough idea", triage=True)
+        children = [
+            {"title": "Deploy task", "body": "", "assignee": "dev"},
+            {"title": "Migration task", "body": "", "assignee": "dev"},
+            {"title": "Cleanup task", "body": "", "assignee": "ops"},
+            {"title": "Research task", "body": "", "assignee": "researcher"},
+        ]
+        ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=children,
+            author="decomposer",
+        )
+        assert ids is not None and len(ids) == 4
+        for cid in ids:
+            child = kb.get_task(conn, cid)
+            assert child is not None
+            assert child.status == "ready", (child.title, child.status)
     finally:
         conn.close()
