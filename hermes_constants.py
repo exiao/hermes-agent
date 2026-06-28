@@ -110,31 +110,42 @@ def get_hermes_home() -> Path:
     return _get_platform_default_hermes_home()
 
 
-def get_default_hermes_root() -> Path:
+def get_default_hermes_root(home: str | os.PathLike | None = None) -> Path:
     """Return the root Hermes directory for profile-level operations.
 
     In standard deployments this is the platform-native Hermes home
     (``~/.hermes`` on POSIX, ``%LOCALAPPDATA%\\hermes`` on native Windows).
 
-    In Docker or custom deployments where ``HERMES_HOME`` points outside
-    ``~/.hermes`` (e.g. ``/opt/data``), returns ``HERMES_HOME`` directly
+    In Docker or custom deployments where the home points outside
+    ``~/.hermes`` (e.g. ``/opt/data``), returns the home directly
     — that IS the root.
 
-    In profile mode where ``HERMES_HOME`` is ``<root>/profiles/<name>``,
+    In profile mode where the home is ``<root>/profiles/<name>``,
     returns ``<root>`` so that ``profile list`` can see all profiles.
     Works both for standard (``~/.hermes/profiles/coder``) and Docker
     (``/opt/data/profiles/coder``) layouts.
 
+    ``home`` selects which home path the root is derived from. When ``None``
+    (the default) the process ``HERMES_HOME`` env var is used, preserving the
+    historical behavior for every existing caller. When an explicit path is
+    passed, the root is derived from *that* path instead — this lets callers
+    that already hold an isolated/custom home (e.g. ``load_hermes_dotenv``)
+    resolve the correct root without mutating ``os.environ`` or leaking the
+    real ``~/.hermes`` root into an unrelated home.
+
     Import-safe — no dependencies beyond stdlib.
     """
     native_home = _get_platform_default_hermes_home()
-    env_home = os.environ.get("HERMES_HOME", "")
+    if home is not None:
+        env_home = str(home)
+    else:
+        env_home = os.environ.get("HERMES_HOME", "")
     if not env_home:
         return native_home
     env_path = Path(env_home)
     try:
         env_path.resolve().relative_to(native_home.resolve())
-        # HERMES_HOME is under ~/.hermes (normal or profile mode)
+        # home is under ~/.hermes (normal or profile mode)
         return native_home
     except ValueError:
         pass
@@ -146,7 +157,7 @@ def get_default_hermes_root() -> Path:
     if env_path.parent.name == "profiles":
         return env_path.parent.parent
 
-    # Not a profile path — HERMES_HOME itself is the root
+    # Not a profile path — home itself is the root
     return env_path
 
 

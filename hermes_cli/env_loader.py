@@ -245,7 +245,12 @@ def load_hermes_dotenv(
     try:
         from hermes_constants import get_default_hermes_root
 
-        root_home = get_default_hermes_root()
+        # Derive the root from the home we are actually loading, NOT from the
+        # process HERMES_HOME env var. A caller may pass an isolated/custom
+        # hermes_home (tests, embeddings) without exporting a matching
+        # HERMES_HOME; resolving via the env var would wrongly inherit the
+        # user's real ~/.hermes/.env into that unrelated home (secret leak).
+        root_home = get_default_hermes_root(home_path)
         candidate = root_home / ".env"
         if candidate.resolve() != user_env.resolve():
             root_env = candidate

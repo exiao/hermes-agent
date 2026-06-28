@@ -168,3 +168,62 @@ def test_root_home_does_not_double_load_its_own_env(tmp_path, monkeypatch):
 
     assert loaded == [root / ".env"]
     assert os.getenv("OPENAI_API_KEY") == "sk-root"
+
+
+def test_isolated_home_does_not_inherit_real_root_env(tmp_path, monkeypatch):
+    """An explicit isolated hermes_home must NOT inherit the real root .env.
+
+    Regression for the secret-isolation bug: when a caller passes an explicit
+    hermes_home WITHOUT exporting a matching HERMES_HOME (tests, embeddings),
+    the root layer used to be resolved from the HERMES_HOME env var, so the
+    user's real ~/.hermes/.env leaked its secrets into the unrelated home.
+    The root must be derived from the passed home_path instead — an isolated
+    home that is not a <root>/profiles/<name> path has no shared root and
+    loads ONLY its own .env.
+    """
+    # A "real" root .env exists at the platform default location.
+    real_root = tmp_path / ".hermes"
+    real_root.mkdir()
+    (real_root / ".env").write_text("CPE_GITHUB_TOKEN=secret-from-real-root\n", encoding="utf-8")
+
+    # An isolated home elsewhere on disk (NOT under ~/.hermes, NOT a profile).
+    isolated = tmp_path / "isolated_home"
+    isolated.mkdir()
+    (isolated / ".env").write_text("OPENAI_API_KEY=sk-isolated\n", encoding="utf-8")
+
+    # Point Path.home() at tmp_path so the platform default root is the fake
+    # real_root above — but do NOT export HERMES_HOME (the buggy code read it).
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("CPE_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=isolated)
+
+    # Only the isolated home's own .env is loaded; the real root .env is NOT.
+    assert loaded == [isolated / ".env"]
+    assert (real_root / ".env") not in loaded
+    assert os.getenv("OPENAI_API_KEY") == "sk-isolated"
+    assert os.getenv("CPE_GITHUB_TOKEN") is None
+
+
+def test_get_default_hermes_root_derives_from_passed_home(tmp_path, monkeypatch):
+    """get_default_hermes_root(home) uses the arg, not the HERMES_HOME env var."""
+    from hermes_constants import get_default_hermes_root
+
+    native = tmp_path / ".hermes"
+    native.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    # Env var points somewhere unrelated; the explicit arg must win.
+    monkeypatch.setenv("HERMES_HOME", str(native))
+
+    # A profile path resolves to its <root>.
+    profile = native / "profiles" / "worker"
+    assert get_default_hermes_root(profile) == native
+
+    # An isolated custom home (not under ~/.hermes, not a profile) is its own root.
+    isolated = tmp_path / "isolated_home"
+    assert get_default_hermes_root(isolated) == isolated
+
+    # No arg → falls back to the env var (historical behavior preserved).
+    assert get_default_hermes_root() == native
