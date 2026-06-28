@@ -679,6 +679,65 @@ def test_block_dependency_may_mention_pending_merge(worker_env):
     assert parsed.get("status") != "blocked"
 
 
+def test_block_redirects_review_required_to_complete(worker_env):
+    """A finished-code handoff that only needs review (`review-required`, the
+    exact wording the worker prompts tell agents to use) is merge-ready work and
+    must steer to kanban_complete — not sit in the blocked/human-decision queue,
+    even though it carries the required `kind`."""
+    from tools import kanban_tools as kt
+    for reason in (
+        "review-required: kanban block self-labeling fix",
+        "review required — PR #56 staged for Eric",
+    ):
+        out = kt._handle_block({"reason": reason, "kind": "needs_input"})
+        err = json.loads(out).get("error", "")
+        assert "kanban_complete" in err, reason
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status != "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_negated_merge_ready_is_a_real_block(worker_env):
+    """A real blocker phrased with a negated merge-ready clause ("CI is failing;
+    not ready to merge") must NOT be redirected to kanban_complete — the
+    negation directly qualifies the merge-ready phrase, so it is not done. The
+    redirect guard must let these through to be recorded as a real block."""
+    from tools import kanban_tools as kt
+    for reason in (
+        "CI is failing; not ready to merge",
+        "conflicts unresolved, not ready for merge",
+        "blocked on creds — the PR isn't ready to merge yet",
+    ):
+        out = kt._handle_block({"reason": reason, "kind": "transient"})
+        parsed = json.loads(out)
+        # The merge-ready redirect must NOT fire for a negated phrase.
+        assert "kanban_complete" not in parsed.get("error", ""), reason
+
+
+def test_block_merge_ready_with_unrelated_negation_still_redirects(worker_env):
+    """An affirmative merge-ready reason that merely contains an UNRELATED
+    negation elsewhere ("merge-ready; no blockers remain") must still redirect
+    to kanban_complete — the negation must qualify the merge-ready phrase, not
+    just appear anywhere in the reason."""
+    from tools import kanban_tools as kt
+    for reason in (
+        "merge-ready; no blockers remain",
+        "done pending merge; no further action needed",
+    ):
+        out = kt._handle_block({"reason": reason, "kind": "needs_input"})
+        err = json.loads(out).get("error", "")
+        assert "kanban_complete" in err, reason
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status != "blocked"
+    finally:
+        conn.close()
+
+
 def test_block_typed_reason_is_headed(worker_env):
     """The stored reason for a typed block leads with the header tag."""
     from tools import kanban_tools as kt
@@ -1320,7 +1379,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 5_600, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 

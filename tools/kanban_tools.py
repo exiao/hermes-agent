@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -649,10 +650,21 @@ def _handle_block(args: dict, **kw) -> str:
     # waits on ANOTHER task that may itself be "pending merge" (e.g. "waiting on
     # parent PR pending merge") and must route to todo for auto-resume, not be
     # rejected as merge-ready. So skip the redirect for dependency blocks.
+    # A worker that finished code and only needs review/merge should land in the
+    # review (done) queue, not the human-decision (blocked) queue — so
+    # `review-required` is a merge-ready marker too, even though it carries the
+    # new `kind`. Negation must qualify the merge-ready PHRASE itself: "not ready
+    # to merge" suppresses the redirect (a real blocker), but an unrelated
+    # negation elsewhere ("merge-ready; no blockers remain") must NOT. We detect
+    # that with a regex that fires only when a negator directly precedes a marker
+    # (within a couple of words), instead of a global "is there any 'no' in the
+    # reason" check that mis-fires in both directions.
     _reason_low = str(reason).lower()
     _MERGE_READY_MARKERS = (
         "done-pending-merge",
         "done pending merge",
+        "review-required",
+        "review required",
         "merge-ready",
         "merge ready",
         "ready to merge",
@@ -661,11 +673,18 @@ def _handle_block(args: dict, **kw) -> str:
         "awaiting eric's merge",
         "pending merge",
     )
-    _NEGATION = ("not ", "n't ", "no ", "never ")
+    _marker_alt = "|".join(re.escape(m) for m in _MERGE_READY_MARKERS)
+    _has_marker = re.search(_marker_alt, _reason_low) is not None
+    # Negator immediately qualifying a marker: "not <up to 2 words> <marker>",
+    # covering not / no / never / -n't (e.g. "isn't ready to merge").
+    _negated_marker = re.search(
+        r"(?:\bnot\b|n't\b|\bno\b|\bnever\b)\s+(?:\w+\s+){0,2}(?:" + _marker_alt + r")",
+        _reason_low,
+    ) is not None
     if (
         kind != "dependency"
-        and any(m in _reason_low for m in _MERGE_READY_MARKERS)
-        and not any(n in _reason_low for n in _NEGATION)
+        and _has_marker
+        and not _negated_marker
     ):
         return tool_error(
             "this reads as merge-ready / awaiting-merge, which is not a block. "
