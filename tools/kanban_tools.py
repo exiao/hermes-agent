@@ -661,7 +661,12 @@ def _handle_block(args: dict, **kw) -> str:
         "awaiting eric's merge",
         "pending merge",
     )
-    if kind != "dependency" and any(m in _reason_low for m in _MERGE_READY_MARKERS):
+    _NEGATION = ("not ", "n't ", "no ", "never ")
+    if (
+        kind != "dependency"
+        and any(m in _reason_low for m in _MERGE_READY_MARKERS)
+        and not any(n in _reason_low for n in _NEGATION)
+    ):
         return tool_error(
             "this reads as merge-ready / awaiting-merge, which is not a block. "
             "Per constitution rule 2a, merge-ready work goes to DONE, not "
