@@ -12911,12 +12911,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
                     if not _in_place:
+                        # Rotation aborted (session_id rolled back unchanged for
+                        # a failure reason) AND not in-place: nothing was
+                        # persisted — no rewrite_transcript, no archive_and_compact.
+                        # The original transcript is intact, so do NOT fall
+                        # through to the "Compressed" success path (which would
+                        # tell the user compression succeeded while the next turn
+                        # reloads the full uncompressed transcript). Return a
+                        # no-op message instead.
                         logger.warning(
                             "Manual /compress: session rotation did not occur "
                             "(session_id unchanged) and in-place mode is off — "
-                            "preserving original transcript instead of "
-                            "overwriting it (#44794)."
+                            "nothing persisted; reporting no-op and preserving "
+                            "original transcript (#44794)."
                         )
+                        return t("gateway.compress.rotation_failed")
                     elif partial and tail:
                         # In-place compaction archived + inserted only the
                         # compressed HEAD; the verbatim tail we rejoined above

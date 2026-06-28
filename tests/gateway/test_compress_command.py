@@ -354,10 +354,14 @@ async def test_compress_command_preserves_transcript_when_rotation_aborts():
         patch("run_agent.AIAgent", return_value=agent_instance),
         patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
     ):
-        await runner._handle_compress_command(_make_event())
+        result = await runner._handle_compress_command(_make_event())
 
     # The original transcript must be preserved — no destructive rewrite.
     runner.session_store.rewrite_transcript.assert_not_called()
+    # Nothing was persisted, so the user must NOT be told compression succeeded;
+    # the handler returns the no-op message instead of the "Compressed" summary.
+    assert "could not be saved" in result
+    assert "Compressed:" not in result
 
 
 @pytest.mark.asyncio

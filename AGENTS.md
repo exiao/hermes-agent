@@ -1275,34 +1275,40 @@ scripts/run_tests.sh --no-isolate tests/foo/          # disable subprocess isola
 
 ### Faster feedback loops
 
-The suite is ~17k tests and each test pays a heavy fixed cost before any
+The suite is ~17k tests and each test file pays a heavy fixed cost before any
 assertion runs: importing `run_agent.py`, `gateway/run.py`, and `agent/*`
 pulls in the whole agent core (openai, anthropic, discord, lark, websockets,
 opentelemetry, the full provider registry) at collection time — multiple
-seconds per file. On top of that, subprocess-per-test isolation adds
-~0.5–1.0s/test of Python startup. So total wall time is dominated by import +
-process spawn, not the test bodies. Knobs, fastest payoff first:
+seconds per file. The runner (`scripts/run_tests_parallel.py`) spawns one
+`python -m pytest <file>` subprocess per file, so that import cost is paid
+once per file and the per-file processes run in a parallel pool. Total wall
+time is dominated by import + process spawn, not the test bodies. Knobs,
+fastest payoff first:
 
-- **Scope to what you changed.** A single file or `::test` is almost always
-  the right loop; the full `tests/` dir is a pre-push check, not an inner loop.
+- **Scope to what you changed.** A single file is almost always the right
+  loop; the full `tests/` dir is a pre-push check, not an inner loop.
   `scripts/run_tests.sh tests/tools/test_url_safety.py`
-- **Let xdist parallelize.** The wrapper already passes `-n auto` (all cores).
-  If you call pytest directly you're single-process and serial — that's the
-  #1 reason a manual run feels slow. Add `-n auto` yourself, or just use the
-  wrapper.
-- **`--no-isolate` for tight debugging.** Drops the subprocess spawn per test
-  (the ~0.5–1.0s tax). Fine for a file you're iterating on; re-run with
-  isolation before pushing since some tests only pass in a fresh process.
-- **`-p no:cacheprovider`** avoids `.pytest_cache` writes on a loaded box;
-  marginal but free.
+- **Pass multiple paths** to restrict discovery to just the dirs you touched:
+  `scripts/run_tests.sh tests/gateway/ tests/tools/`
+- **Tune the worker pool with `-j`.** It defaults to `cpu_count*2` (or
+  `$HERMES_TEST_WORKERS`). On a loaded box, *lowering* it (`-j 4`) can be
+  faster than oversubscribing; for a tiny scoped run the default is fine.
+- **Pass pytest flags after `--`.** Everything after a literal `--` is
+  forwarded to each per-file pytest invocation:
+  `scripts/run_tests.sh tests/foo.py -- -x --tb=long`.
 - **A loaded machine is your slowest variable.** Multiple agent sessions + a
   running gateway compete for cores; CI's clean runner is often faster than
   local wall-clock despite sharding into 8 slices.
 
-Quick scoped run, parallel, no isolation, for inner-loop debugging:
+> Note: this fork's runner is the per-file subprocess pool in
+> `scripts/run_tests_parallel.py` (parallelism via `-j`). It does NOT use
+> pytest-xdist (`-n auto`) or accept a `--no-isolate` flag — those belong to a
+> different runner variant and will not parse here. Use `-j` and path scoping.
+
+Quick scoped run for an inner-loop:
 
 ```bash
-scripts/run_tests.sh --no-isolate tests/tools/test_url_safety.py
+scripts/run_tests.sh tests/tools/test_url_safety.py
 ```
 
 ### Subprocess-per-test isolation

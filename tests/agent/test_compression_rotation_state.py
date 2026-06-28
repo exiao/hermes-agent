@@ -130,3 +130,24 @@ class TestPlatformForwardedAtBoundary:
         kwargs = calls[-1].kwargs
         assert kwargs.get("platform") == "telegram"
         assert kwargs.get("boundary_reason") == "compression"
+
+
+class TestUserIdPropagatesOnRotation:
+    def test_continuation_row_carries_user_id(self, tmp_path: Path):
+        """A compressed continuation must keep the platform user_id so per-user
+        lookups (e.g. list_unlinked_telegram_sessions_for_user, which filters
+        source='telegram' AND user_id=?) still find it. Without forwarding
+        agent._user_id the child row gets user_id=NULL and disappears."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_USERID_ROT"
+        db.create_session(parent, source="telegram", user_id="tg-user-42")
+        agent = _build_agent_with_db(db, parent, platform="telegram")
+        agent._user_id = "tg-user-42"
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        child = agent.session_id
+        assert child != parent  # rotation happened
+
+        child_row = db.get_session(child)
+        assert child_row is not None
+        assert child_row["user_id"] == "tg-user-42"
