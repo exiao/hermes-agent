@@ -2385,6 +2385,37 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+# Bare placeholder titles that carry no spec on their own. A task whose title is
+# one of these (or the literal "<assignee> task" / the assignee name itself) AND
+# whose body is empty has no work in it — it must never reach a worker lane in
+# ``ready``. See ``_is_spec_less``.
+_PLACEHOLDER_TITLES = frozenset({"untitled", "task", "new task", "todo", "tbd"})
+
+
+def _is_spec_less(title: str, body: Optional[str], assignee: Optional[str]) -> bool:
+    """Return True when a task has no spec a worker could act on.
+
+    Spec-less == empty/whitespace body AND a placeholder title. A placeholder
+    title is one of the bare ``_PLACEHOLDER_TITLES``, the literal
+    ``"<assignee> task"`` (e.g. ``"dev task"`` — the fingerprint of the phantom
+    tickets that blocked the dev lane), or the assignee name on its own. Such a
+    task gives a worker nothing to do; routing it to a lane just makes the worker
+    block with needs_input. Callers should park these in ``triage`` for a
+    specifier to flesh out instead of dispatching them.
+    """
+    if (body or "").strip():
+        return False
+    norm = (title or "").strip().casefold()
+    if not norm:
+        return True
+    if norm in _PLACEHOLDER_TITLES:
+        return True
+    who = (assignee or "").strip().casefold()
+    if who and (norm == who or norm == f"{who} task"):
+        return True
+    return False
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2436,6 +2467,17 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # Create-time guard against spec-less placeholder tasks. A task with an
+    # empty body and a bare placeholder title (e.g. the literal "dev task" /
+    # "untitled" / the assignee name) carries no work a worker could act on —
+    # dispatching it to a lane just makes the worker block with needs_input
+    # (this is exactly what produced the phantom "dev task" tickets that blocked
+    # the dev lane). Such a task must never reach a worker lane in ``ready``;
+    # park it in ``triage`` so a specifier can flesh out the spec (or archive
+    # it) before it is promoted to ``todo``. We route-to-triage rather than hard
+    # reject so a legitimate-but-underspecified quick-add isn't silently lost.
+    if not triage and _is_spec_less(title, body, assignee):
+        triage = True
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
