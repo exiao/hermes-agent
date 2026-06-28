@@ -643,6 +643,12 @@ def _handle_block(args: dict, **kw) -> str:
     # note), not `blocked` — otherwise it clogs the human-action queue looking
     # like something Eric must decide. Redirect that case to kanban_complete
     # instead of silently parking it in blocked.
+    #
+    # Scope: only for kinds that claim the CURRENT task is finished
+    # (needs_input/capability/transient). A `dependency` block legitimately
+    # waits on ANOTHER task that may itself be "pending merge" (e.g. "waiting on
+    # parent PR pending merge") and must route to todo for auto-resume, not be
+    # rejected as merge-ready. So skip the redirect for dependency blocks.
     _reason_low = str(reason).lower()
     _MERGE_READY_MARKERS = (
         "done-pending-merge",
@@ -655,7 +661,7 @@ def _handle_block(args: dict, **kw) -> str:
         "awaiting eric's merge",
         "pending merge",
     )
-    if any(m in _reason_low for m in _MERGE_READY_MARKERS):
+    if kind != "dependency" and any(m in _reason_low for m in _MERGE_READY_MARKERS):
         return tool_error(
             "this reads as merge-ready / awaiting-merge, which is not a block. "
             "Per constitution rule 2a, merge-ready work goes to DONE, not "

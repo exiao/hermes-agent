@@ -194,7 +194,7 @@ def _format_block_notification(
         head = f"{header} — {tag}{task_id}: {title}"
         return f"{head}\n{reason_detail}" if reason_detail else head
     suffix = f": {reason_detail}" if reason_detail else ""
-    return f"⏸ {tag}{task_id} blocked{suffix}"
+    return f"⏸ {tag}Kanban {task_id} blocked{suffix}"
 
 
 def _resolve_on_complete_review_config(

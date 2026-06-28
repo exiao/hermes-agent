@@ -93,7 +93,7 @@ def test_format_transient_leads_with_retry():
 
 def test_format_untyped_keeps_legacy_blocked_shape():
     msg = _format_block_notification(None, "t_legacy", "old task", "stuck on something")
-    assert msg == "⏸ t_legacy blocked: stuck on something"
+    assert msg == "⏸ Kanban t_legacy blocked: stuck on something"
 
 
 def test_format_includes_assignee_tag():

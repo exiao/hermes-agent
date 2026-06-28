@@ -662,6 +662,23 @@ def test_block_redirects_merge_ready_to_complete(worker_env):
         conn.close()
 
 
+def test_block_dependency_may_mention_pending_merge(worker_env):
+    """A `dependency` block waits on ANOTHER task that may itself be pending a
+    merge ("waiting on parent PR pending merge"). The merge-ready redirect must
+    NOT fire for dependency kinds — it should route to todo for auto-resume, not
+    be rejected as if the current task were merge-ready."""
+    from tools import kanban_tools as kt
+    out = kt._handle_block(
+        {"reason": "waiting on parent PR #47, pending merge", "kind": "dependency"}
+    )
+    parsed = json.loads(out)
+    # Not rejected as merge-ready: no kanban_complete steer.
+    assert "kanban_complete" not in parsed.get("error", "")
+    assert parsed.get("ok") is True
+    # dependency routes to todo (auto-resume), not blocked.
+    assert parsed.get("status") != "blocked"
+
+
 def test_block_typed_reason_is_headed(worker_env):
     """The stored reason for a typed block leads with the header tag."""
     from tools import kanban_tools as kt
