@@ -340,9 +340,11 @@ async def test_compress_command_preserves_transcript_when_rotation_aborts():
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
     agent_instance.compression_in_place = False
-    # Rotation aborted: session_id stays at the original AND not in-place.
+    # Genuine rotation save failure (NOT a summarizer abort): session_id
+    # stays at the original, not in-place, and the compressor did not abort.
     agent_instance.session_id = "sess-1"
     agent_instance._last_compaction_in_place = False
+    agent_instance.context_compressor._last_compress_aborted = False
     agent_instance._compress_context.return_value = (compressed, "")
 
     def _estimate(messages, **_kwargs):
@@ -362,6 +364,53 @@ async def test_compress_command_preserves_transcript_when_rotation_aborts():
     # the handler returns the no-op message instead of the "Compressed" summary.
     assert "could not be saved" in result
     assert "Compressed:" not in result
+
+
+@pytest.mark.asyncio
+async def test_compress_command_surfaces_abort_error_not_rotation_failure():
+    """When the aux summarizer ABORTS, _compress_context returns the messages
+    unchanged with the same session id and sets _last_compress_aborted — but
+    NOT _last_compaction_in_place. That lands in the same unchanged-id branch
+    as a genuine rotation save failure, so the handler must distinguish them:
+    on abort it must fall through to the summary path and surface the real
+    "Compression aborted" guidance + error, NOT the misleading
+    "could not be saved (session rotation failed)" no-op."""
+    history = _make_history()
+    runner = _make_runner(history)
+    runner._session_db = object()
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.compression_in_place = False
+    # Summarizer abort: unchanged id, not in-place, but abort flag set and the
+    # compressor returns the messages unchanged.
+    agent_instance.session_id = "sess-1"
+    agent_instance._last_compaction_in_place = False
+    agent_instance.context_compressor._last_compress_aborted = True
+    agent_instance.context_compressor._last_summary_error = "aux model 503"
+    agent_instance._compress_context.return_value = (history, "")
+
+    def _estimate(messages, **_kwargs):
+        return 100 if messages == history else 60
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    # Original transcript preserved (no destructive rewrite) ...
+    runner.session_store.rewrite_transcript.assert_not_called()
+    # ... but the user sees the real abort guidance + error, NOT the
+    # rotation-failure no-op message.
+    assert "Compression aborted" in result
+    assert "aux model 503" in result
+    assert "could not be saved" not in result
 
 
 @pytest.mark.asyncio

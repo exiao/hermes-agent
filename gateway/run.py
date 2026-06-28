@@ -12911,21 +12911,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
                     if not _in_place:
-                        # Rotation aborted (session_id rolled back unchanged for
-                        # a failure reason) AND not in-place: nothing was
-                        # persisted — no rewrite_transcript, no archive_and_compact.
-                        # The original transcript is intact, so do NOT fall
-                        # through to the "Compressed" success path (which would
-                        # tell the user compression succeeded while the next turn
-                        # reloads the full uncompressed transcript). Return a
-                        # no-op message instead.
-                        logger.warning(
-                            "Manual /compress: session rotation did not occur "
-                            "(session_id unchanged) and in-place mode is off — "
-                            "nothing persisted; reporting no-op and preserving "
-                            "original transcript (#44794)."
-                        )
-                        return t("gateway.compress.rotation_failed")
+                        # Unchanged session id and not in-place: nothing was
+                        # persisted (no rewrite_transcript, no archive_and_compact).
+                        # Two distinct reasons land here, and they need different
+                        # messages:
+                        #   (a) the compressor ABORTED — the aux summarizer failed
+                        #       and returned the messages unchanged. The original
+                        #       transcript is intact; fall through to the summary
+                        #       path so the _summary_aborted / aux_failed block can
+                        #       surface the actual model/config error and guidance.
+                        #   (b) a genuine rotation save failure (no abort flag):
+                        #       report a no-op so the user isn't told compression
+                        #       succeeded while the next turn reloads the full
+                        #       uncompressed transcript (#44794).
+                        _aborted = bool(getattr(compressor, "_last_compress_aborted", False))
+                        if not _aborted:
+                            logger.warning(
+                                "Manual /compress: session rotation did not occur "
+                                "(session_id unchanged), in-place mode is off, and "
+                                "the compressor did not abort — nothing persisted; "
+                                "reporting no-op and preserving original transcript "
+                                "(#44794)."
+                            )
+                            return t("gateway.compress.rotation_failed")
                     elif partial and tail:
                         # In-place compaction archived + inserted only the
                         # compressed HEAD; the verbatim tail we rejoined above
