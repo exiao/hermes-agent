@@ -63,6 +63,14 @@ class TestIgnoreUserConfigEnvGate:
         """Point cli._hermes_home at tmp_path and return a fresh load_cli_config."""
         import cli
         monkeypatch.setattr(cli, "_hermes_home", tmp_path)
+        # Also isolate the PROJECT-config fallback. load_cli_config() derives it
+        # from ``Path(cli.__file__).parent / 'cli-config.yaml'`` (the repo root).
+        # That file is gitignored, but another test in the same CI slice can
+        # leave a real cli-config.yaml at the repo root; when --ignore-user-config
+        # skips the user config, the fallback would then read that stale file and
+        # leak its model.default into this test. Point __file__ at tmp_path so the
+        # fallback resolves to an empty dir and the built-in defaults are used.
+        monkeypatch.setattr(cli, "__file__", str(tmp_path / "cli.py"))
         return cli.load_cli_config
 
     def test_user_config_loaded_when_flag_unset(self, tmp_path, monkeypatch):
