@@ -158,7 +158,7 @@ def _clip_notify_detail(text: str, limit: int = _NOTIFY_DETAIL_MAX) -> str:
 # (kanban_db.VALID_BLOCK_KINDS); the push leads with a header that says — at a
 # glance, before any reason text — whether the reader must ACT:
 #
-#   needs_input → 🔴 ERIC DECISION   (the only kind that asks Eric to decide)
+#   needs_input → 🔴 DECISION NEEDED   (the only kind that asks Eric to decide)
 #   capability  → 🟠 ROUTING         (a wall for the orchestrator, not Eric)
 #   transient   → 🟡 RETRY           (flaky; may clear on its own)
 #   None/legacy → ⏸ … blocked        (unchanged, back-compat)
@@ -167,7 +167,7 @@ def _clip_notify_detail(text: str, limit: int = _NOTIFY_DETAIL_MAX) -> str:
 # the headline instead of being the whole message. This is the half that turns
 # "a wall of identical ⏸ blocked paragraphs" into a triage-at-a-glance feed.
 _BLOCK_KIND_NOTIFY = {
-    "needs_input": "🔴 ERIC DECISION",
+    "needs_input": "🔴 DECISION NEEDED",
     "capability": "🟠 ROUTING",
     "transient": "🟡 RETRY",
 }
@@ -184,7 +184,7 @@ def _format_block_notification(
 
     ``reason_detail`` is the already-clipped reason (may be ""). ``tag`` is the
     ``@assignee `` attribution prefix. For a typed block the first line is a
-    self-labeling header (``🔴 ERIC DECISION — <id>: <title>``) and the reason
+    self-labeling header (``🔴 DECISION NEEDED — <id>: <title>``) and the reason
     follows on its own line; for an un-typed/legacy block the historical
     ``⏸ … blocked: <reason>`` shape is preserved so existing consumers (and the
     notify-untruncate regression tests) keep working.

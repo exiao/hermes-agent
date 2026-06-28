@@ -632,7 +632,7 @@ def _handle_block(args: dict, **kw) -> str:
     # name WHY it's stuck — which also picks the right header tag downstream.
     if kind is None or not str(kind).strip():
         return tool_error(
-            "kind is required: 'needs_input' (you need an Eric decision), "
+            "kind is required: 'needs_input' (you need a human decision), "
             "'capability' (a hard wall — no creds/access/wrong lane, a routing "
             "bug for the orchestrator), 'transient' (flaky, may clear on "
             "retry), or 'dependency' (waiting on another task — routes to todo "
@@ -1272,10 +1272,10 @@ KANBAN_BLOCK_SCHEMA = {
         "``kind`` is REQUIRED — it decides routing AND the header tag the human "
         "sees: 'dependency' (waiting on another task — goes to todo and "
         "auto-resumes when that task finishes, no human needed), 'needs_input' "
-        "(you need an Eric decision/answer → shows as 'ERIC DECISION'), "
+        "(you need a human decision/answer → shows as 'DECISION NEEDED'), "
         "'capability' (a hard wall: no access, missing credentials, wrong lane, "
         "an action no agent can do → shows as 'ROUTING', for the orchestrator, "
-        "NOT an Eric decision), or 'transient' (a flaky failure that may clear "
+        "NOT a human decision), or 'transient' (a flaky failure that may clear "
         "→ shows as 'RETRY'). ``reason`` is shown to the human on the board. "
         "Do NOT block for merge-ready / awaiting-merge work — that goes to "
         "kanban_complete (done), not blocked. If a task keeps getting unblocked "
@@ -1296,7 +1296,7 @@ KANBAN_BLOCK_SCHEMA = {
                     "What you need answered or what stopped you, in one or "
                     "two sentences. Don't paste the whole conversation; the "
                     "human has the board and can ask follow-ups via comments. "
-                    "A header tag matching ``kind`` (ERIC DECISION / ROUTING / "
+                    "A header tag matching ``kind`` (DECISION NEEDED / ROUTING / "
                     "RETRY) is added automatically, so just write the reason."
                 ),
             },
@@ -1305,7 +1305,7 @@ KANBAN_BLOCK_SCHEMA = {
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
                     "REQUIRED. Why you're blocked. 'dependency' waits in todo "
-                    "and resumes automatically; 'needs_input' → ERIC DECISION "
+                    "and resumes automatically; 'needs_input' → DECISION NEEDED "
                     "(only kind that asks Eric to decide); 'capability' → "
                     "ROUTING (a wall for the orchestrator, not Eric); "
                     "'transient' → RETRY."

@@ -689,7 +689,7 @@ def test_block_typed_reason_is_headed(worker_env):
     try:
         events = [e for e in kb.list_events(conn, worker_env) if e.kind == "blocked"]
         assert events
-        assert (events[-1].payload or {}).get("reason", "").startswith("ERIC DECISION:")
+        assert (events[-1].payload or {}).get("reason", "").startswith("DECISION NEEDED:")
     finally:
         conn.close()
 

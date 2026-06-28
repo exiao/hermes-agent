@@ -203,13 +203,13 @@ def test_block_without_kind_is_backward_compatible(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Self-labeling header tag (ERIC DECISION / ROUTING / RETRY)
+# Self-labeling header tag (DECISION NEEDED / ROUTING / RETRY)
 # ---------------------------------------------------------------------------
 
 
 def test_ensure_reason_header_prepends_per_kind() -> None:
     assert kb.ensure_reason_header("which key?", "needs_input") == (
-        "ERIC DECISION: which key?"
+        "DECISION NEEDED: which key?"
     )
     assert kb.ensure_reason_header("no vault access", "capability") == (
         "ROUTING: no vault access"
@@ -224,8 +224,8 @@ def test_ensure_reason_header_is_idempotent() -> None:
     assert kb.ensure_reason_header(once, "needs_input") == once
     # Already-headed (any case / separator) is left alone, not double-stamped.
     assert kb.ensure_reason_header(
-        "eric decision - pick a region", "needs_input"
-    ) == "eric decision - pick a region"
+        "decision needed - pick a region", "needs_input"
+    ) == "decision needed - pick a region"
 
 
 def test_ensure_reason_header_noop_for_dependency_and_none() -> None:
@@ -243,11 +243,11 @@ def test_block_stamps_header_into_stored_reason_and_event(kanban_home: Path) -> 
         ]
         assert blocked_events
         payload = blocked_events[-1].payload or {}
-        assert payload.get("reason", "").startswith("ERIC DECISION:")
+        assert payload.get("reason", "").startswith("DECISION NEEDED:")
         assert payload.get("kind") == "needs_input"
         # The run summary carries the headed reason too.
         runs = kb.list_runs(conn, tid, include_active=False)
-        assert runs and runs[-1].summary.startswith("ERIC DECISION:")
+        assert runs and runs[-1].summary.startswith("DECISION NEEDED:")
 
 
 def test_block_capability_event_reads_routing(kanban_home: Path) -> None:

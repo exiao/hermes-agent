@@ -4,8 +4,8 @@ A worker's typed block (kanban_db.VALID_BLOCK_KINDS) must produce a Signal/
 Telegram push whose FIRST line says — at a glance — whether the reader must
 act:
 
-  needs_input → ``🔴 ERIC DECISION — <id>: <title>``
-  capability  → ``🟠 ROUTING — <id>: <title>``  (NOT an Eric-action item)
+  needs_input → ``🔴 DECISION NEEDED — <id>: <title>``
+  capability  → ``🟠 ROUTING — <id>: <title>``  (NOT a human-action item)
   transient   → ``🟡 RETRY — <id>: <title>``
 
 An un-typed/legacy block keeps the historical ``⏸ … blocked: <reason>`` shape.
@@ -68,22 +68,22 @@ def _typed_block_subscription(reason, kind, title="do the thing"):
 # ---------------------------------------------------------------------------
 
 
-def test_format_needs_input_leads_with_eric_decision():
+def test_format_needs_input_leads_with_decision_needed():
     msg = _format_block_notification(
         "needs_input", "t_abc", "merge CPE PRs #795-799", "which env first?"
     )
-    assert msg.splitlines()[0] == "🔴 ERIC DECISION — t_abc: merge CPE PRs #795-799"
+    assert msg.splitlines()[0] == "🔴 DECISION NEEDED — t_abc: merge CPE PRs #795-799"
     assert "which env first?" in msg
 
 
-def test_format_capability_reads_as_routing_not_eric_action():
+def test_format_capability_reads_as_routing_not_decision():
     msg = _format_block_notification(
         "capability", "t_def", "rotate prod token", "no access to the vault"
     )
     first = msg.splitlines()[0]
     assert first == "🟠 ROUTING — t_def: rotate prod token"
-    # A routing/capability block must NOT read as an Eric decision item.
-    assert "ERIC DECISION" not in msg
+    # A routing/capability block must NOT read as a human-decision item.
+    assert "DECISION NEEDED" not in msg
 
 
 def test_format_transient_leads_with_retry():
@@ -100,7 +100,7 @@ def test_format_includes_assignee_tag():
     msg = _format_block_notification(
         "needs_input", "t_a", "title", "reason", tag="@dev "
     )
-    assert msg.splitlines()[0] == "🔴 ERIC DECISION — @dev t_a: title"
+    assert msg.splitlines()[0] == "🔴 DECISION NEEDED — @dev t_a: title"
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ def test_format_includes_assignee_tag():
 # ---------------------------------------------------------------------------
 
 
-def test_needs_input_block_pushes_eric_decision_header(tmp_path, monkeypatch):
+def test_needs_input_block_pushes_decision_needed_header(tmp_path, monkeypatch):
     db_path = tmp_path / "needs-input.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -122,15 +122,15 @@ def test_needs_input_block_pushes_eric_decision_header(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     text = adapter.sent[0]["text"]
     first = text.splitlines()[0]
-    assert first.startswith("🔴 ERIC DECISION — ")
+    assert first.startswith("🔴 DECISION NEEDED — ")
     assert tid in first
     assert "ship CPE migration" in first
-    # The reason still rides in the body (block_task stamps the ERIC DECISION:
+    # The reason still rides in the body (block_task stamps the DECISION NEEDED:
     # header into the stored reason; that's fine — it's below the headline).
     assert "merge CPE migration PRs #795-799" in text
 
 
-def test_capability_block_pushes_routing_header_not_eric(tmp_path, monkeypatch):
+def test_capability_block_pushes_routing_header_not_decision(tmp_path, monkeypatch):
     db_path = tmp_path / "capability.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -148,9 +148,9 @@ def test_capability_block_pushes_routing_header_not_eric(tmp_path, monkeypatch):
     assert first.startswith("🟠 ROUTING — ")
     assert tid in first
     assert "rotate prod token" in first
-    # A routing block is for the orchestrator, never an Eric-decision headline.
+    # A routing block is for the orchestrator, never a decision-needed headline.
     assert not first.startswith("🔴")
-    assert "ERIC DECISION" not in first
+    assert "DECISION NEEDED" not in first
 
 
 def test_untyped_block_keeps_legacy_line(tmp_path, monkeypatch):
@@ -175,4 +175,4 @@ def test_untyped_block_keeps_legacy_line(tmp_path, monkeypatch):
     text = adapter.sent[0]["text"]
     assert "blocked" in text
     assert "generic stuck" in text
-    assert "ERIC DECISION" not in text
+    assert "DECISION NEEDED" not in text
