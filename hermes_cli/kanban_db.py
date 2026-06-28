@@ -2640,6 +2640,22 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # Fail-fast: a persistent-workspace task (dir/worktree) with no
+                # resolvable path is an un-spawnable zombie. By this point the
+                # board-default and project-worktree resolution have both run,
+                # so a still-NULL path is genuinely unresolvable. Raising inside
+                # the txn aborts cleanly (no orphan row) rather than storing a
+                # 'ready' row that burns its retries on spawn_failed at dispatch.
+                if workspace_kind in {"dir", "worktree"} and not workspace_path:
+                    raise ValueError(
+                        f"workspace_kind={workspace_kind!r} requires a workspace_path, "
+                        f"but none could be resolved. Fix one of: "
+                        f"(1) pass --workspace {workspace_kind}:<abs-repo-path>, "
+                        f"(2) set a board default_workdir "
+                        f"(hermes kanban boards set-default-workdir <board> <abs-path>), or "
+                        f"(3) link the task to a project (--project <slug>)."
+                    )
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -5132,6 +5148,21 @@ def decompose_triage_task(
                 child_ws_kind, child_ws_path
             )
             child_ws_kind = child_ws_kind or "scratch"
+            # Same fail-fast guard create_task applies: a child that inherits
+            # (or is given) a persistent kind but ends with no path — e.g. the
+            # kinds-mismatch branch above set child_ws_path=None — is an
+            # un-spawnable zombie. Raise inside the txn so the WHOLE
+            # decomposition rolls back (no orphan children) rather than minting
+            # a child that burns its retries on spawn_failed.
+            if child_ws_kind in {"dir", "worktree"} and not child_ws_path:
+                raise ValueError(
+                    f"decompose child[{idx}] {title!r}: workspace_kind="
+                    f"{child_ws_kind!r} requires a workspace_path, but none could "
+                    f"be resolved (root workspace_kind="
+                    f"{root_ws_kind!r}, path={root_ws_path!r}). Give the child an "
+                    f"explicit workspace_path or a kind that matches the root's "
+                    f"so it can inherit the root path."
+                )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "

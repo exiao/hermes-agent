@@ -2413,22 +2413,53 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
 
 
 def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
-    """With neither an explicit workspace_path nor a board default_workdir,
-    resolution fails loudly pointing at default_workdir / worktree:<path> —
-    rather than silently materializing under the dispatcher's CWD (the old
-    behavior that scattered worktrees under whatever dir launched the
-    gateway)."""
+    """A worktree task with neither an explicit workspace_path nor a board
+    default_workdir is un-spawnable, so create_task must fail LOUDLY at create
+    time rather than storing a 'ready' row that burns its retries on
+    spawn_failed at dispatch (the silent-zombie bug, t_c7b4b1a6).
+
+    The raise happens inside the write_txn, so NO orphan row is left behind.
+    """
     # Park the dispatcher CWD inside a real git repo so the OLD cwd-anchored
     # code would have "succeeded" — proving the new code does NOT use cwd.
     decoy_repo = tmp_path / "decoy"
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
-        task = kb.get_task(conn, t)
-        assert task is not None
-        with pytest.raises(ValueError, match="default_workdir"):
-            kb.resolve_workspace(task)
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="requires a workspace_path"):
+            kb.create_task(conn, title="ship", workspace_kind="worktree")
+        # The txn aborted cleanly — no orphan row.
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert after == before
+
+
+def test_dir_no_path_no_board_default_raises(kanban_home):
+    """The same fail-fast guard applies to workspace_kind='dir'."""
+    with kb.connect() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="requires a workspace_path"):
+            kb.create_task(conn, title="ship", workspace_kind="dir")
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert after == before
+
+
+def test_worktree_explicit_path_succeeds_control(kanban_home, tmp_path):
+    """Control for the fail-fast guard: the SAME call WITH an explicit
+    worktree path succeeds and stores the row."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(repo)
 
 
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):

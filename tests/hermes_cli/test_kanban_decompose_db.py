@@ -279,3 +279,37 @@ def test_decompose_strips_prefix_from_inherited_legacy_root(kanban_home):
         inh = kb.get_task(conn, child_ids[0])
     assert inh.workspace_kind == "worktree"
     assert inh.workspace_path == "/abs/legacy"
+
+
+def test_decompose_child_kind_mismatch_no_path_raises_and_rolls_back(kanban_home):
+    """A child that inherits a persistent kind but ends with no resolvable
+    path is an un-spawnable zombie — same defect as create_task's silent
+    NULL-path bug. Here the root is 'dir' (with a path) and a child overrides
+    workspace_kind='worktree' WITHOUT a path: kinds mismatch, so the child
+    can't inherit the root's dir path and ends with child_ws_path=None.
+
+    The guard must raise inside the write_txn, rolling back the WHOLE
+    decomposition: no children created, root stays in triage.
+    """
+    proj = "/home/teknium/myproject"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="codegen root", assignee="worker",
+            workspace_kind="dir", workspace_path=proj, triage=True,
+        )
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="requires a workspace_path"):
+            kb.decompose_triage_task(
+                conn, tid, root_assignee="orchestrator",
+                children=[
+                    {"title": "ok part"},
+                    {"title": "bad part", "workspace_kind": "worktree"},
+                ],
+                author="decomposer",
+            )
+        # Whole decomposition rolled back: no children, count unchanged.
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert after == before
+        # Root untouched — still in triage, not flipped to todo.
+        root = kb.get_task(conn, tid)
+        assert root.status == "triage"
