@@ -168,3 +168,251 @@ def test_root_home_does_not_double_load_its_own_env(tmp_path, monkeypatch):
 
     assert loaded == [root / ".env"]
     assert os.getenv("OPENAI_API_KEY") == "sk-root"
+
+
+def test_isolated_home_does_not_inherit_real_root_env(tmp_path, monkeypatch):
+    """An explicit isolated hermes_home must NOT inherit the real root .env.
+
+    Regression for the secret-isolation bug: when a caller passes an explicit
+    hermes_home WITHOUT exporting a matching HERMES_HOME (tests, embeddings),
+    the root layer used to be resolved from the HERMES_HOME env var, so the
+    user's real ~/.hermes/.env leaked its secrets into the unrelated home.
+    The root must be derived from the passed home_path instead — an isolated
+    home that is not a <root>/profiles/<name> path has no shared root and
+    loads ONLY its own .env.
+    """
+    # A "real" root .env exists at the platform default location.
+    real_root = tmp_path / ".hermes"
+    real_root.mkdir()
+    (real_root / ".env").write_text("CPE_GITHUB_TOKEN=secret-from-real-root\n", encoding="utf-8")
+
+    # An isolated home elsewhere on disk (NOT under ~/.hermes, NOT a profile).
+    isolated = tmp_path / "isolated_home"
+    isolated.mkdir()
+    (isolated / ".env").write_text("OPENAI_API_KEY=sk-isolated\n", encoding="utf-8")
+
+    # Point Path.home() at tmp_path so the platform default root is the fake
+    # real_root above — but do NOT export HERMES_HOME (the buggy code read it).
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("CPE_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=isolated)
+
+    # Only the isolated home's own .env is loaded; the real root .env is NOT.
+    assert loaded == [isolated / ".env"]
+    assert (real_root / ".env") not in loaded
+    assert os.getenv("OPENAI_API_KEY") == "sk-isolated"
+    assert os.getenv("CPE_GITHUB_TOKEN") is None
+
+
+def test_get_default_hermes_root_derives_from_passed_home(tmp_path, monkeypatch):
+    """get_default_hermes_root(home) uses the arg, not the HERMES_HOME env var."""
+    from hermes_constants import get_default_hermes_root
+
+    native = tmp_path / ".hermes"
+    native.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    # Env var points somewhere unrelated; the explicit arg must win.
+    monkeypatch.setenv("HERMES_HOME", str(native))
+
+    # A profile path resolves to its <root>.
+    profile = native / "profiles" / "worker"
+    assert get_default_hermes_root(profile) == native
+
+    # An isolated custom home (not under ~/.hermes, not a profile) is its own root.
+    isolated = tmp_path / "isolated_home"
+    assert get_default_hermes_root(isolated) == isolated
+
+    # No arg → falls back to the env var (historical behavior preserved).
+    assert get_default_hermes_root() == native
+
+
+def test_get_default_hermes_root_resolves_relative_home(tmp_path, monkeypatch):
+    """A relative ``home`` must yield an ABSOLUTE root, independent of cwd.
+
+    The returned root is later used to locate ``.env``; a relative path would
+    be re-anchored to whatever cwd is active at that point. Resolving upfront
+    keeps the root stable.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    native = tmp_path / ".hermes"
+    native.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    # Run from inside tmp_path and pass a relative isolated home.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "isolated_home").mkdir()
+
+    root = get_default_hermes_root("isolated_home")
+    assert root.is_absolute()
+    assert root == (tmp_path / "isolated_home").resolve()
+
+    # A relative profile path still resolves to its absolute <root>.
+    (native / "profiles" / "worker").mkdir(parents=True)
+    monkeypatch.chdir(native / "profiles")
+    rel_profile_root = get_default_hermes_root("worker")
+    assert rel_profile_root.is_absolute()
+    assert rel_profile_root == native.resolve()
+
+
+def test_get_default_hermes_root_symlinked_profile_keeps_real_root(tmp_path, monkeypatch):
+    """A profile dir that is a symlink outside the root still derives the real root.
+
+    Regression for the codex P2: ``<root>/profiles/<name>`` may be a symlink to
+    storage outside the Hermes root. Resolving the home with ``.resolve()`` first
+    would follow the link and erase the textual ``profiles/<name>`` segment, so the
+    profile-shape check would miss and the function would return the link TARGET as
+    its own root -- breaking shared-root ``.env`` secret isolation. The root must be
+    derived from the logical profile path BEFORE following symlinks.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    native = tmp_path / ".hermes"
+    (native / "profiles").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    # The profile's storage lives OUTSIDE the Hermes root; the logical profile
+    # dir <root>/profiles/worker is a symlink to it.
+    target = tmp_path / "external_storage" / "worker_data"
+    target.mkdir(parents=True)
+    logical_profile = native / "profiles" / "worker"
+    logical_profile.symlink_to(target, target_is_directory=True)
+
+    # Despite the symlink, the root is the real Hermes root (grandparent of the
+    # logical profile path), NOT the link target's parent.
+    assert get_default_hermes_root(logical_profile) == native.resolve()
+
+
+def test_symlinked_profile_still_loads_shared_root_env(tmp_path, monkeypatch):
+    """End-to-end: a symlinked profile dir still inherits the shared root .env.
+
+    Ties the get_default_hermes_root symlink fix to the secret-isolation
+    guarantee this PR adds: load_hermes_dotenv must load the shared
+    <root>/.env BEFORE the profile's own .env even when the profile dir is a
+    symlink to storage outside the root.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles").mkdir(parents=True)
+    (root / ".env").write_text("CPE_GITHUB_TOKEN=shared-root-secret\n", encoding="utf-8")
+
+    target = tmp_path / "external_storage" / "worker_data"
+    target.mkdir(parents=True)
+    (target / ".env").write_text("OPENAI_API_KEY=sk-profile\n", encoding="utf-8")
+    profile = root / "profiles" / "worker"
+    profile.symlink_to(target, target_is_directory=True)
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("CPE_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=profile)
+
+    # Shared root .env loaded as the base layer, profile .env on top.
+    assert (root / ".env") in loaded
+    assert (profile / ".env") in loaded
+    assert os.getenv("CPE_GITHUB_TOKEN") == "shared-root-secret"
+    assert os.getenv("OPENAI_API_KEY") == "sk-profile"
+
+
+def test_get_default_hermes_root_alias_to_native_profile(tmp_path, monkeypatch):
+    """A home symlink OUTSIDE ~/.hermes whose target is a native profile is native.
+
+    Regression for codex P2 "Preserve native profile symlink aliases": when
+    HERMES_HOME is a symlink outside ~/.hermes that resolves to
+    ~/.hermes/profiles/<name>, the root must still be the native root so the
+    shared ~/.hermes/.env is loaded (alias/wrapper deployments).
+    """
+    from hermes_constants import get_default_hermes_root
+
+    native = tmp_path / ".hermes"
+    profile = native / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    # An alias OUTSIDE the root that points AT the native profile dir.
+    alias = tmp_path / "coder_alias"
+    alias.symlink_to(profile, target_is_directory=True)
+
+    assert get_default_hermes_root(alias) == native.resolve()
+
+
+def test_get_default_hermes_root_symlink_under_root_to_outside_is_custom(tmp_path, monkeypatch):
+    """A symlink UNDER ~/.hermes pointing to outside storage is a custom home.
+
+    Regression for codex P2 "Do not inherit root secrets for symlinked custom
+    homes": ~/.hermes/work -> /mnt/work must resolve to the OUTSIDE target as
+    its own root (no shared ~/.hermes/.env leak), not be treated as native
+    merely because the entry point is textually under ~/.hermes.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    native = tmp_path / ".hermes"
+    native.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    outside = tmp_path / "mnt" / "work-hermes"
+    outside.mkdir(parents=True)
+    work = native / "work"
+    work.symlink_to(outside, target_is_directory=True)
+
+    # The custom home is its own root (the resolved outside target), NOT native.
+    assert get_default_hermes_root(work) == outside.resolve()
+    assert get_default_hermes_root(work) != native.resolve()
+
+
+def test_symlinked_custom_home_under_root_does_not_inherit_root_env(tmp_path, monkeypatch):
+    """End-to-end: a symlinked custom home under ~/.hermes does NOT load root .env."""
+    native = tmp_path / ".hermes"
+    native.mkdir()
+    (native / ".env").write_text("CPE_GITHUB_TOKEN=root-secret\n", encoding="utf-8")
+
+    outside = tmp_path / "mnt" / "work-hermes"
+    outside.mkdir(parents=True)
+    (outside / ".env").write_text("OPENAI_API_KEY=sk-work\n", encoding="utf-8")
+    work = native / "work"
+    work.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("CPE_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=work)
+
+    # Only the custom home's own .env loads; the native root .env is NOT inherited.
+    assert (native / ".env") not in loaded
+    assert os.getenv("OPENAI_API_KEY") == "sk-work"
+    assert os.getenv("CPE_GITHUB_TOKEN") is None
+
+
+def test_empty_hermes_home_env_falls_back_to_default_root(tmp_path, monkeypatch):
+    """A bare HERMES_HOME= export must fall back to ~/.hermes, not cwd.
+
+    Regression for codex P2 "Treat empty HERMES_HOME as unset": an empty
+    HERMES_HOME used to make home_path == Path("") (cwd), so the root was the
+    working directory and the real ~/.hermes/.env was skipped.
+    """
+    native = tmp_path / ".hermes"
+    native.mkdir()
+    (native / ".env").write_text("CPE_GITHUB_TOKEN=root-secret\n", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HERMES_HOME", "")  # exported empty, NOT unset
+    monkeypatch.delenv("CPE_GITHUB_TOKEN", raising=False)
+    # Run from an unrelated cwd to prove the root is not derived from it.
+    work_cwd = tmp_path / "some" / "cwd"
+    work_cwd.mkdir(parents=True)
+    monkeypatch.chdir(work_cwd)
+
+    loaded = load_hermes_dotenv()  # no explicit hermes_home
+
+    assert (native / ".env") in loaded
+    assert os.getenv("CPE_GITHUB_TOKEN") == "root-secret"

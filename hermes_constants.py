@@ -110,44 +110,74 @@ def get_hermes_home() -> Path:
     return _get_platform_default_hermes_home()
 
 
-def get_default_hermes_root() -> Path:
+def get_default_hermes_root(home: str | os.PathLike | None = None) -> Path:
     """Return the root Hermes directory for profile-level operations.
 
     In standard deployments this is the platform-native Hermes home
     (``~/.hermes`` on POSIX, ``%LOCALAPPDATA%\\hermes`` on native Windows).
 
-    In Docker or custom deployments where ``HERMES_HOME`` points outside
-    ``~/.hermes`` (e.g. ``/opt/data``), returns ``HERMES_HOME`` directly
+    In Docker or custom deployments where the home points outside
+    ``~/.hermes`` (e.g. ``/opt/data``), returns the home directly
     — that IS the root.
 
-    In profile mode where ``HERMES_HOME`` is ``<root>/profiles/<name>``,
+    In profile mode where the home is ``<root>/profiles/<name>``,
     returns ``<root>`` so that ``profile list`` can see all profiles.
     Works both for standard (``~/.hermes/profiles/coder``) and Docker
     (``/opt/data/profiles/coder``) layouts.
 
+    ``home`` selects which home path the root is derived from. When ``None``
+    (the default) the process ``HERMES_HOME`` env var is used, preserving the
+    historical behavior for every existing caller. When an explicit path is
+    passed, the root is derived from *that* path instead — this lets callers
+    that already hold an isolated/custom home (e.g. ``load_hermes_dotenv``)
+    resolve the correct root without mutating ``os.environ`` or leaking the
+    real ``~/.hermes`` root into an unrelated home.
+
     Import-safe — no dependencies beyond stdlib.
     """
     native_home = _get_platform_default_hermes_home()
-    env_home = os.environ.get("HERMES_HOME", "")
+    if home is not None:
+        env_home = str(home)
+    else:
+        env_home = os.environ.get("HERMES_HOME", "")
     if not env_home:
         return native_home
-    env_path = Path(env_home)
+    # Absolutize WITHOUT following symlinks: ``os.path.abspath`` anchors a
+    # relative ``home`` to cwd and normalizes ``..`` (gemini's note) while
+    # preserving the textual ``profiles/<name>`` segment for the shape check
+    # below. ``real_path`` is the symlink-resolved form, used for containment
+    # so the root decision tracks where the home physically lives.
+    abs_path = Path(os.path.abspath(env_home))
+    real_path = abs_path.resolve()
+    native_real = native_home.resolve()
+
+    # Logical profile shape first: a profile dir ``<root>/profiles/<name>``
+    # that is itself a symlink to storage OUTSIDE the root still derives the
+    # real Hermes root from its logical path (the original P2 fix). Checking
+    # the un-resolved path is what preserves the ``profiles/<name>`` segment.
+    if abs_path.parent.name == "profiles":
+        return abs_path.parent.parent.resolve()
+
+    # Containment on the RESOLVED path: a home whose physical location is under
+    # the native root is native (covers a normal home, a native profile, and an
+    # alias symlink pointing AT a native path). A home that is textually under
+    # ``~/.hermes`` but symlinks to storage OUTSIDE it resolves elsewhere and so
+    # is correctly treated as a custom deployment — no shared-secret inheritance.
     try:
-        env_path.resolve().relative_to(native_home.resolve())
-        # HERMES_HOME is under ~/.hermes (normal or profile mode)
+        real_path.relative_to(native_real)
         return native_home
     except ValueError:
         pass
 
     # Docker / custom deployment.
-    # Check if this is a profile path: <root>/profiles/<name>
-    # If the immediate parent dir is named "profiles", the root is
-    # the grandparent — this covers Docker profiles correctly.
-    if env_path.parent.name == "profiles":
-        return env_path.parent.parent
+    # A resolved profile path ``<root>/profiles/<name>`` outside the native
+    # root returns its grandparent — covers Docker profiles correctly.
+    if real_path.parent.name == "profiles":
+        return real_path.parent.parent
 
-    # Not a profile path — HERMES_HOME itself is the root
-    return env_path
+    # Not a profile path — the home itself is the root (resolved so the
+    # returned value is absolute and stable across cwd changes).
+    return real_path
 
 
 def _get_packaged_data_dir(name: str) -> Path | None:
