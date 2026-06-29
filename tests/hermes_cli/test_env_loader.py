@@ -227,3 +227,33 @@ def test_get_default_hermes_root_derives_from_passed_home(tmp_path, monkeypatch)
 
     # No arg → falls back to the env var (historical behavior preserved).
     assert get_default_hermes_root() == native
+
+
+def test_get_default_hermes_root_resolves_relative_home(tmp_path, monkeypatch):
+    """A relative ``home`` must yield an ABSOLUTE root, independent of cwd.
+
+    The returned root is later used to locate ``.env``; a relative path would
+    be re-anchored to whatever cwd is active at that point. Resolving upfront
+    keeps the root stable.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    native = tmp_path / ".hermes"
+    native.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    # Run from inside tmp_path and pass a relative isolated home.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "isolated_home").mkdir()
+
+    root = get_default_hermes_root("isolated_home")
+    assert root.is_absolute()
+    assert root == (tmp_path / "isolated_home").resolve()
+
+    # A relative profile path still resolves to its absolute <root>.
+    (native / "profiles" / "worker").mkdir(parents=True)
+    monkeypatch.chdir(native / "profiles")
+    rel_profile_root = get_default_hermes_root("worker")
+    assert rel_profile_root.is_absolute()
+    assert rel_profile_root == native.resolve()

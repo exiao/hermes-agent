@@ -142,9 +142,12 @@ def get_default_hermes_root(home: str | os.PathLike | None = None) -> Path:
         env_home = os.environ.get("HERMES_HOME", "")
     if not env_home:
         return native_home
-    env_path = Path(env_home)
+    # Resolve upfront so the root is always absolute, even when a relative
+    # ``home`` is passed (the returned root is used to locate ``.env`` later,
+    # and a relative path would be re-anchored to whatever cwd is active then).
+    env_path = Path(env_home).resolve()
     try:
-        env_path.resolve().relative_to(native_home.resolve())
+        env_path.relative_to(native_home.resolve())
         # home is under ~/.hermes (normal or profile mode)
         return native_home
     except ValueError:
