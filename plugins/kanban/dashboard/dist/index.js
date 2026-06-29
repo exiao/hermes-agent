@@ -1027,6 +1027,9 @@
       setTenantFilter("");
       setAssigneeFilter("");
       setIncludeArchived(false);
+      // Reset the done window too: a "Load all" on the previous board must not
+      // force the new board to ship its whole completed history on first paint.
+      setDoneLimit(null);
       clearSelected();
     }, [board, clearSelected]);
 

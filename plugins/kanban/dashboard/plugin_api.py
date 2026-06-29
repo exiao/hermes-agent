@@ -386,11 +386,14 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 # Live columns (triage/todo/scheduled/ready/running/blocked/review) are
 # naturally small and always returned in full.
 _WINDOWED_COLUMNS: frozenset[str] = frozenset({"done", "archived"})
-# Server-side default + clamp for the ``done``/``archived`` window. The
-# default keeps first paint cheap (a recent tail, not 300+ cards); the
-# ceiling stops a tiny ``done_since`` from pulling the whole history.
+# Server-side default + ceiling for the ``done``/``archived`` window. The
+# default keeps first paint cheap (a recent tail, not 300+ cards). The
+# ceiling is a DoS guard against a pathological ``done_limit``, not a cap on
+# reachable history: it sits well above any realistic completed-card count so
+# an explicit "Load all" returns the whole column. (A board that genuinely
+# exceeds it should move to cursor pagination, not silently drop history.)
 _DONE_LIMIT_DEFAULT = 50
-_DONE_LIMIT_MAX = 500
+_DONE_LIMIT_MAX = 100_000
 
 
 def _windowed_terminal_tasks(

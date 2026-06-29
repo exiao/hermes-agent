@@ -256,11 +256,32 @@ def test_board_done_limit_expand_returns_older(client):
 
 
 def test_board_done_limit_clamped_to_ceiling(client):
-    """An absurd done_limit is clamped server-side, never an unbounded scan."""
+    """An absurd done_limit is clamped to the DoS ceiling, never an unbounded
+    scan, but the ceiling sits well above realistic history so an explicit
+    "Load all" never drops completed cards (regression: a low ceiling made
+    older done cards permanently unreachable)."""
+    from plugins.kanban.dashboard import plugin_api
+
     _seed_done_tasks(client, 5)
-    data = client.get("/api/plugins/kanban/board?done_limit=999999").json()
-    # done_window echoes the clamped value (DONE_LIMIT_MAX = 500).
-    assert data["done_window"]["limit"] == 500
+    data = client.get("/api/plugins/kanban/board?done_limit=999_999_999").json()
+    # done_window echoes the clamped value (the DoS ceiling), which is high
+    # enough that any realistic completed column is returned in full.
+    assert data["done_window"]["limit"] == plugin_api._DONE_LIMIT_MAX
+    assert plugin_api._DONE_LIMIT_MAX >= 100_000
+
+
+def test_board_load_all_reaches_history_beyond_old_cap(client):
+    """A "Load all" request returns the entire done column even when it
+    exceeds the previous 500-card cap — no card is permanently unreachable
+    and has_more flips to False once the full tail is returned."""
+    ids = _seed_done_tasks(client, 520)  # > the old _DONE_LIMIT_MAX of 500
+
+    data = client.get("/api/plugins/kanban/board?done_limit=100000").json()
+    done = _done_column(data)
+    assert done["total"] == 520
+    assert len(done["tasks"]) == 520, "every done card must be reachable"
+    assert done["has_more"] is False
+    assert set(ids) == set(t["id"] for t in done["tasks"])
 
 
 def test_board_done_since_date_range(client):
