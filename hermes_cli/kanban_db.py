@@ -2750,12 +2750,12 @@ def create_task(
                 # no .git) is stored happily, then burns two spawns and a
                 # circuit-breaker block before anyone sees the real error.
                 # Validate here, at the point of creation, with the same message
-                # style as the NULL-path guard above. Skip project-linked tasks:
-                # their path is a not-yet-created ``<repo>/.worktrees/<id>`` dir
-                # anchored on the project's already-validated primary repo.
+                # style as the NULL-path guard above. For project-linked tasks
+                # this validates the generated ``<repo>/.worktrees/<id>`` path
+                # against the project's primary folder, because projects can be
+                # manually pointed at paths that are not git repos.
                 if (
                     workspace_kind == "worktree"
-                    and project_repo is None
                     and not _worktree_path_resolvable(str(workspace_path))
                 ):
                     raise ValueError(
