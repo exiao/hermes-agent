@@ -5619,7 +5619,10 @@ def _is_linked_worktree_checkout(path: Path) -> bool:
     common_dir = _git_common_dir(path)
     if git_dir is None or common_dir is None:
         return False
-    return git_dir != common_dir
+    repo_root = _git_toplevel(path)
+    if repo_root is None:
+        return False
+    return git_dir != common_dir and path.resolve(strict=False) == repo_root
 
 
 def _nearest_existing_path(path: Path) -> Path:
@@ -5631,6 +5634,8 @@ def _nearest_existing_path(path: Path) -> Path:
 
 def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
     current = _nearest_existing_path(path).resolve(strict=False)
+    if not current.is_dir():
+        return None
     while True:
         repo_root = _git_toplevel(current)
         if repo_root is not None:
@@ -5758,6 +5763,12 @@ def _resolve_worktree_workspace(
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
+
+    if requested.exists():
+        raise ValueError(
+            f"task {task.id} worktree path {task.workspace_path!r} is an existing path "
+            "but is not a git repo root or linked worktree checkout root"
+        )
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:

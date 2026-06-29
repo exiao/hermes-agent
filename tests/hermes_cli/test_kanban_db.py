@@ -2599,6 +2599,63 @@ def test_worktree_existing_repo_subdir_rejected_at_create(kanban_home, tmp_path)
             )
 
 
+def test_worktree_existing_linked_worktree_subdir_rejected_at_create(
+    kanban_home, tmp_path
+):
+    """Only the linked worktree checkout root is a valid existing anchor."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "linked", str(linked), "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subdir = linked / "pkg"
+    subdir.mkdir()
+
+    with kb.connect() as conn:
+        ok = kb.create_task(
+            conn,
+            title="linked root",
+            workspace_kind="worktree",
+            workspace_path=str(linked),
+        )
+        assert kb.get_task(conn, ok) is not None
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="not .*inside a git repo"):
+            kb.create_task(
+                conn,
+                title="linked subdir",
+                workspace_kind="worktree",
+                workspace_path=str(subdir),
+            )
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert after == before
+
+
+def test_worktree_missing_target_under_file_ancestor_rejected_at_create(
+    kanban_home, tmp_path
+):
+    """A missing worktree target cannot be materialized below a file path."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / "README.md" / "wt"
+
+    with kb.connect() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="not .*inside a git repo"):
+            kb.create_task(
+                conn,
+                title="file ancestor",
+                workspace_kind="worktree",
+                workspace_path=str(target),
+            )
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert after == before
+
+
 def test_worktree_missing_target_skips_direct_git_probe(tmp_path, monkeypatch):
     """A missing target is resolved from ancestors without `git -C <missing>`."""
     repo = tmp_path / "repo"
