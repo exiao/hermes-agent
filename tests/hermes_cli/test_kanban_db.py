@@ -2545,6 +2545,23 @@ def test_worktree_target_under_repo_accepted_at_create(kanban_home, tmp_path):
     assert task.workspace_path == str(target)
 
 
+def test_worktree_existing_repo_subdir_rejected_at_create(kanban_home, tmp_path):
+    """Existing non-worktree dirs inside a repo are not valid worktree anchors."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subdir = repo / "src"
+    subdir.mkdir()
+
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="not .*inside a git repo"):
+            kb.create_task(
+                conn,
+                title="ship",
+                workspace_kind="worktree",
+                workspace_path=str(subdir),
+            )
+
+
 def test_worktree_missing_target_skips_direct_git_probe(tmp_path, monkeypatch):
     """A missing target is resolved from ancestors without `git -C <missing>`."""
     repo = tmp_path / "repo"

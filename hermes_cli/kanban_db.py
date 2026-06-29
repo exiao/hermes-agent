@@ -5640,6 +5640,7 @@ def _worktree_path_resolvable(workspace_path: str) -> bool:
         repo_root = _git_toplevel(requested)
         if repo_root is not None and requested_resolved == repo_root:
             return True
+        return False
     return _repo_root_for_worktree_target(requested.parent) is not None
 
 
