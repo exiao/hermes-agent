@@ -206,7 +206,7 @@ class _StableEnviron(MutableMapping[str, str]):
         return self._snapshot_keys.get(self._encode_key(key), key)
 
     def _read_view(self) -> dict[str, str]:
-        return {**self._snapshot, **self._writes}
+        return self._snapshot.copy()
 
     # --- reads: served from the frozen snapshot ---
     def __getitem__(self, key: str) -> str:
