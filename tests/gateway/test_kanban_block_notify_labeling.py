@@ -221,6 +221,47 @@ def test_infer_relative_which_clause_is_not_a_decision():
     )
 
 
+def test_infer_modal_negated_retry_defers_to_access_evidence():
+    # Round-2 finding: the negation strip must cover modal and adjective-
+    # qualified negations, not just "do not retry" / "don't try again". A
+    # credential block worded "should not retry" / "not safe to retry until
+    # credentials exist" / "must not try again" is an operator routing action.
+    assert (
+        _infer_block_header(
+            "Missing API key; should not retry until the key is provisioned"
+        )
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header(
+            "No vault access; not safe to retry until credentials exist"
+        )
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header(
+            "Missing api key; must not try again until rotated"
+        )
+        == "🟠 ROUTING"
+    )
+    # A POSITIVE retry instruction still classifies as transient.
+    assert (
+        _infer_block_header("Search API was flaky — try again in a minute")
+        == "🟡 RETRY"
+    )
+
+
+def test_infer_common_status_codes_bucket_correctly():
+    # Round-2 finding: status-code shorthand should classify without the worker
+    # also spelling out words. 401 (unauthorized) is an access wall; 408/504
+    # (request/gateway timeout) are transient. Codes only count in HTTP context.
+    assert _infer_block_header("API returned 401") == "🟠 ROUTING"
+    assert _infer_block_header("HTTP 504 from gateway") == "🟡 RETRY"
+    assert _infer_block_header("server gave 408") == "🟡 RETRY"
+    # No HTTP/error context → a bare number is not a status code.
+    assert _infer_block_header("Finished 401 of the rows") == "🔴 DECISION NEEDED"
+
+
 def test_infer_empty_reason_has_no_header():
     assert _infer_block_header("") is None
     assert _infer_block_header("   ") is None

@@ -225,16 +225,27 @@ _RETRY_HINTS = (
     "transient", "try again", "temporarily", "connection reset",
     "may clear", "retry",
 )
-# A retry word immediately preceded by a negation ("do not retry", "don't try
-# again", "no retry", "cannot retry") is NOT transient — it's an operator
-# instruction that the work needs routing, not a "may clear on its own" signal.
-# We strip these negated retry phrases out of the text before scanning for
-# positive retry evidence so finding-4 credential blocks defer to their hard
-# access wording. ``rate limit`` / ``timed out`` / ``flaky`` (state-of-the-world
+# A retry word reached through a negation ("do not retry", "don't try again",
+# "should not retry", "must not retry", "not safe to retry until credentials
+# exist", "no retry") is NOT transient — it's an operator instruction that the
+# work needs routing, not a "may clear on its own" signal. We strip these
+# negated retry phrases out of the text before scanning for positive retry
+# evidence so finding-4 credential blocks defer to their hard access wording.
+# The negator may be a bare/contracted "not" or a modal negation (should/must/
+# can/will/would/do + n't), optionally followed by a short qualifier span
+# ("safe to", "able to", "ok to", "going to", "supposed to") before the retry
+# token. ``rate limit`` / ``timed out`` / ``flaky`` (state-of-the-world
 # observations, not imperatives) are intentionally NOT negation-gated here.
 _NEGATED_RETRY_RE = re.compile(
-    r"\b(?:do(?:es)?\s*n[o']?t|don'?t|never|no|cannot|can'?t|won'?t|"
-    r"without)\s+(?:ever\s+)?(?:retry|retrying|try\s+again|trying\s+again)\b"
+    r"\b(?:"
+    r"(?:do(?:es)?|should|must|can|could|will|would|shall|may|might|is|are|was|were|be)"
+    r"\s*n[o']?t"  # do/should/must/… not  +  is/are not
+    r"|don'?t|doesn'?t|shouldn'?t|mustn'?t|can'?t|cannot|couldn'?t|won'?t|wouldn'?t|"
+    r"shan'?t|isn'?t|aren'?t|wasn'?t|weren'?t|never|not|no"
+    r")\s+"
+    r"(?:(?:ever|safe|able|ok|okay|going|meant|supposed|wise|advisable)\s+)?"
+    r"(?:to\s+)?"
+    r"(?:retry|retrying|try\s+again|trying\s+again)\b"
 )
 
 # HTTP status codes are strong signals, but a bare ``403``/``429`` substring
@@ -245,8 +256,13 @@ _NEGATED_RETRY_RE = re.compile(
 # issue/PR/ticket/URL reference and (b) sits in an explicit HTTP/error context
 # (``status``/``code``/``http``/``returned``/``responded``/``error`` nearby, or
 # an HTTP method/scheme). Default stays 🔴 DECISION NEEDED.
-_ROUTING_STATUS_CODES = ("403",)
-_RETRY_STATUS_CODES = ("429", "503", "502")
+# Auth/access failures (401 Unauthorized, 403 Forbidden) are a routing wall;
+# rate-limit / gateway / timeout failures (408 Request Timeout, 429 Too Many
+# Requests, 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout) are
+# transient. Bare 4xx/5xx codes only count in HTTP/error context (see
+# ``_has_status_code``) so a ticket slug like ``HERMES-429`` never triggers.
+_ROUTING_STATUS_CODES = ("401", "403")
+_RETRY_STATUS_CODES = ("408", "429", "502", "503", "504")
 # Strip explicit non-HTTP references (``#403``, ``pr 403``, ``issue 429``,
 # ``gh-502``, ``HERMES-429``, ``.../issues/429``) before looking for a code.
 # The ``<word>-NNN`` arm must NOT eat a genuine hyphenated HTTP-status marker
