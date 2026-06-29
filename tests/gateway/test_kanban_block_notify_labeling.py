@@ -350,9 +350,126 @@ def test_infer_determiner_negated_transient_defers_to_access():
     )
 
 
+def test_infer_plural_needs_wording_is_a_decision():
+    # Round-5 finding: plural "Needs input:" / "Needs guidance:" must match the
+    # decision rung like the singular forms do, not fall through to RETRY.
+    assert (
+        _infer_block_header("Needs input: retry the migration or revert")
+        == "🔴 DECISION NEEDED"
+    )
+    assert (
+        _infer_block_header("Needs guidance: retry the migration or revert")
+        == "🔴 DECISION NEEDED"
+    )
+
+
+def test_infer_generic_count_is_not_a_status_code():
+    # Round-5 finding: a bare count that equals a status code must NOT be read as
+    # one just because a generic verb (got/gave) is nearby. Those weak verbs are
+    # no longer HTTP context, so "Got 504 failing tests" stays DECISION.
+    assert _infer_block_header("Got 504 failing tests; need triage") == "🔴 DECISION NEEDED"
+    assert _infer_block_header("gave 429 rows back to the caller") == "🔴 DECISION NEEDED"
+    # A genuine status code with strong context still classifies.
+    assert _infer_block_header("server gave 408") == "🟡 RETRY"
+
+
+def test_infer_cannot_access_is_routing():
+    # Round-5 finding: "Can't access" / "Cannot access" hard walls must route,
+    # not only the "no access" phrasing.
+    assert (
+        _infer_block_header("Can't access the prod vault to rotate the token")
+        == "🟠 ROUTING"
+    )
+    assert _infer_block_header("Cannot access the credentials") == "🟠 ROUTING"
+
+
+def test_infer_temporary_adjective_is_transient():
+    # Round-5 finding: the adjective "temporary" (not only "temporarily") is a
+    # plainly transient self-description.
+    assert _infer_block_header("Temporary outage in the upstream API") == "🟡 RETRY"
+
+
+def test_infer_access_gated_retry_is_routing():
+    # Round-5 finding: a retry GATED on operator access-restoration can't clear
+    # on its own, so it routes. ("retry after key is provisioned" / "try again
+    # once credentials exist".) An unconditional momentary retry stays RETRY.
+    assert (
+        _infer_block_header("Missing API key; retry after key is provisioned")
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header("No vault access; try again once credentials exist")
+        == "🟠 ROUTING"
+    )
+    # A genuine rate-limit with a status code is still transient.
+    assert (
+        _infer_block_header("No access to the API right now: 429 rate limit")
+        == "🟡 RETRY"
+    )
+
+
+def test_infer_schemeless_url_path_id_is_not_a_status_code():
+    # Round-5 finding: a schemeless host/path link (no http(s)://) must be
+    # stripped too, so its numeric path id isn't read as a status code.
+    assert (
+        _infer_block_header(
+            "review api.github.com/repos/org/repo/actions/runs/504"
+        )
+        == "🔴 DECISION NEEDED"
+    )
+
+
 def test_infer_empty_reason_has_no_header():
     assert _infer_block_header("") is None
     assert _infer_block_header("   ") is None
+
+
+def test_infer_get_verb_is_not_http_context():
+    # Round-6 finding: "get" is too common a plain-English verb to count as HTTP
+    # context. A count that equals a status code after "get" ("get 429 results")
+    # must stay DECISION, not be downgraded to RETRY/ROUTING. The strong HTTP
+    # markers (returned/api/server/http/method verbs) still classify.
+    assert _infer_block_header("get 429 results back from the query") == "🔴 DECISION NEEDED"
+    assert _infer_block_header("Need to get 403 rows reviewed") == "🔴 DECISION NEEDED"
+    assert _infer_block_header("get 504 failing tests triaged") == "🔴 DECISION NEEDED"
+    # A genuine status code with strong HTTP context still classifies.
+    assert _infer_block_header("API returned 429, rate limited") == "🟡 RETRY"
+    assert _infer_block_header("deploy API returned 403") == "🟠 ROUTING"
+
+
+def test_infer_access_gated_retry_covers_verb_forms():
+    # Round-6 finding: the conditional-retry scrub must cover the gerund/verb
+    # forms of the access words (provisioning/granting/rotating/restore/
+    # restoring), so a retry gated on those phrasings routes, not RETRY.
+    assert (
+        _infer_block_header("Missing API key; retry after provisioning the key")
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header("No vault access; try again once we restore access")
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header("No creds; retry after granting the token scope")
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header(
+            "Missing key; try again when restoring credentials access"
+        )
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header(
+            "Missing API key; retry once rotating the key completes"
+        )
+        == "🟠 ROUTING"
+    )
+    # An unconditional momentary retry stays transient.
+    assert (
+        _infer_block_header("Search API was flaky — try again in a minute")
+        == "🟡 RETRY"
+    )
 
 
 # ---------------------------------------------------------------------------
