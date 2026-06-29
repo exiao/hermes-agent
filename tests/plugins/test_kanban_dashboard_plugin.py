@@ -421,6 +421,51 @@ def test_board_aggregate_queries_are_scoped_to_returned_cards(kanban_home, monke
     assert all("WHERE l.parent_id IN" in q for q in progress_queries), progress_queries
 
 
+def test_board_chunks_returned_task_id_queries(client, monkeypatch):
+    """Large load-all windows must not exceed SQLite's host-parameter limit."""
+
+    module = _load_plugin_module()
+    monkeypatch.setattr(module, "_SQLITE_IN_CHUNK_SIZE", 3)
+    monkeypatch.setattr(kb, "_SQLITE_IN_CHUNK_SIZE", 3)
+
+    conn = kb.connect()
+    ids = _seed_done_tasks(client, 8)
+    for left, right in zip(ids, ids[1:]):
+        kb.link_tasks(conn, left, right)
+    for tid in ids:
+        kb.add_comment(conn, tid, "tester", "comment")
+
+    class TrackingConn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=()):
+            if " IN (" in sql:
+                assert len(tuple(params)) <= 3, sql
+            return self._inner.execute(sql, params)
+
+        def close(self):
+            self._inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(module, "_conn", lambda board=None: TrackingConn(conn))
+
+    payload = module.get_board(
+        tenant=None,
+        workflow_template_id=None,
+        current_step_key=None,
+        done_limit=100000,
+        done_since=None,
+        board=None,
+    )
+
+    done = _done_column(payload)
+    assert [t["id"] for t in done["tasks"]] == list(reversed(ids))
+    assert all(t["comment_count"] == 1 for t in done["tasks"])
+
+
 def test_board_live_columns_are_full_and_unwindowed(client):
     """Live (non-terminal) columns are never windowed: total == len(tasks)
     and has_more is false even with many cards."""

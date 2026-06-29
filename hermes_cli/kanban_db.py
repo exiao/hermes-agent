@@ -89,6 +89,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.sqlite_util import chunked_sqlite_params as _sqlite_chunks
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+_SQLITE_IN_CHUNK_SIZE = 500
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -9204,20 +9206,23 @@ def latest_summaries(
     ids = list(task_ids)
     if not ids:
         return {}
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"""
-        SELECT task_id, summary FROM (
-            SELECT task_id, summary,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY task_id
-                       ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
-                   ) AS rn
-              FROM task_runs
-             WHERE task_id IN ({placeholders})
-               AND summary IS NOT NULL AND summary != ''
-        ) WHERE rn = 1
-        """,
-        ids,
-    ).fetchall()
-    return {r["task_id"]: r["summary"] for r in rows}
+    out: dict[str, str] = {}
+    for chunk in _sqlite_chunks(ids, _SQLITE_IN_CHUNK_SIZE):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT task_id, summary FROM (
+                SELECT task_id, summary,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id
+                           ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+                       ) AS rn
+                  FROM task_runs
+                 WHERE task_id IN ({placeholders})
+                   AND summary IS NOT NULL AND summary != ''
+            ) WHERE rn = 1
+            """,
+            chunk,
+        ).fetchall()
+        out.update({r["task_id"]: r["summary"] for r in rows})
+    return out

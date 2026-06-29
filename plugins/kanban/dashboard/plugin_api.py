@@ -50,10 +50,13 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.sqlite_util import chunked_sqlite_params as _sqlite_chunks
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_SQLITE_IN_CHUNK_SIZE = 500
 
 
 # ---------------------------------------------------------------------------
@@ -273,11 +276,15 @@ def _compute_task_diagnostics(
     if task_ids is not None:
         if not task_ids:
             return {}
-        placeholders = ",".join(["?"] * len(task_ids))
-        rows = conn.execute(
-            f"SELECT * FROM tasks WHERE id IN ({placeholders})",
-            tuple(task_ids),
-        ).fetchall()
+        rows = []
+        for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
+            placeholders = ",".join(["?"] * len(chunk))
+            rows.extend(
+                conn.execute(
+                    f"SELECT * FROM tasks WHERE id IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchall()
+            )
     else:
         rows = conn.execute(
             "SELECT * FROM tasks WHERE status != 'archived'",
@@ -291,19 +298,22 @@ def _compute_task_diagnostics(
     # (hundreds of tasks), but we can add pagination / filtering later
     # if profiling shows it's a hotspot.
     row_ids = [r["id"] for r in rows]
-    placeholders = ",".join(["?"] * len(row_ids))
     events_by_task: dict[str, list] = {tid: [] for tid in row_ids}
-    for ev_row in conn.execute(
-        f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
-        tuple(row_ids),
-    ).fetchall():
-        events_by_task.setdefault(ev_row["task_id"], []).append(ev_row)
+    for chunk in _sqlite_chunks(row_ids, _SQLITE_IN_CHUNK_SIZE):
+        placeholders = ",".join(["?"] * len(chunk))
+        for ev_row in conn.execute(
+            f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
+            tuple(chunk),
+        ).fetchall():
+            events_by_task.setdefault(ev_row["task_id"], []).append(ev_row)
     runs_by_task: dict[str, list] = {tid: [] for tid in row_ids}
-    for run_row in conn.execute(
-        f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
-        tuple(row_ids),
-    ).fetchall():
-        runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
+    for chunk in _sqlite_chunks(row_ids, _SQLITE_IN_CHUNK_SIZE):
+        placeholders = ",".join(["?"] * len(chunk))
+        for run_row in conn.execute(
+            f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
+            tuple(chunk),
+        ).fetchall():
+            runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
     out: dict[str, list[dict]] = {}
     for r in rows:
@@ -543,22 +553,24 @@ def get_board(
 
         tasks = live_tasks + windowed_tasks
         task_ids = [t.id for t in tasks]
-        task_id_set = set(task_ids)
-        task_placeholders = ",".join("?" for _ in task_ids)
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
         if task_ids:
-            for row in conn.execute(
-                "SELECT parent_id, child_id FROM task_links "
-                f"WHERE parent_id IN ({task_placeholders}) "
-                f"OR child_id IN ({task_placeholders})",
-                (*task_ids, *task_ids),
-            ).fetchall():
-                if row["parent_id"] in task_id_set:
+            for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
+                task_placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    "SELECT parent_id, child_id FROM task_links "
+                    f"WHERE parent_id IN ({task_placeholders})",
+                    chunk,
+                ).fetchall():
                     link_counts.setdefault(
                         row["parent_id"], {"parents": 0, "children": 0}
                     )["children"] += 1
-                if row["child_id"] in task_id_set:
+                for row in conn.execute(
+                    "SELECT parent_id, child_id FROM task_links "
+                    f"WHERE child_id IN ({task_placeholders})",
+                    chunk,
+                ).fetchall():
                     link_counts.setdefault(
                         row["child_id"], {"parents": 0, "children": 0}
                     )["parents"] += 1
@@ -566,31 +578,37 @@ def get_board(
         # Comment + event counts (both cheap aggregates).
         comment_counts: dict[str, int] = {}
         if task_ids:
-            comment_counts = {
-                r["task_id"]: r["n"]
-                for r in conn.execute(
-                    "SELECT task_id, COUNT(*) AS n FROM task_comments "
-                    f"WHERE task_id IN ({task_placeholders}) "
-                    "GROUP BY task_id",
-                    task_ids,
+            for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
+                task_placeholders = ",".join("?" for _ in chunk)
+                comment_counts.update(
+                    {
+                        r["task_id"]: r["n"]
+                        for r in conn.execute(
+                            "SELECT task_id, COUNT(*) AS n FROM task_comments "
+                            f"WHERE task_id IN ({task_placeholders}) "
+                            "GROUP BY task_id",
+                            chunk,
+                        )
+                    }
                 )
-            }
 
         # Progress rollup: for each parent, how many children are done / total.
         # One pass over task_links joined with child status — cheaper than
         # N per-task queries and the plugin uses it to render "N/M".
         progress: dict[str, dict[str, int]] = {}
         if task_ids:
-            for row in conn.execute(
-                "SELECT l.parent_id AS pid, t.status AS cstatus "
-                "FROM task_links l JOIN tasks t ON t.id = l.child_id "
-                f"WHERE l.parent_id IN ({task_placeholders})",
-                task_ids,
-            ).fetchall():
-                p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
-                p["total"] += 1
-                if row["cstatus"] == "done":
-                    p["done"] += 1
+            for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
+                task_placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    "SELECT l.parent_id AS pid, t.status AS cstatus "
+                    "FROM task_links l JOIN tasks t ON t.id = l.child_id "
+                    f"WHERE l.parent_id IN ({task_placeholders})",
+                    chunk,
+                ).fetchall():
+                    p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
+                    p["total"] += 1
+                    if row["cstatus"] == "done":
+                        p["done"] += 1
 
         # Diagnostics rollup for this board — see kanban_diagnostics.
         # We get the full structured list per task AND a compact
