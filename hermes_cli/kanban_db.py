@@ -2656,7 +2656,14 @@ def create_task(
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
         if board_default:
-            workspace_path = str(board_default)
+            if workspace_kind == "worktree":
+                default_anchor = Path(str(board_default)).expanduser()
+                if default_anchor.is_absolute():
+                    default_repo = _git_toplevel(default_anchor)
+                    if default_repo is not None:
+                        workspace_path = str(default_repo)
+            else:
+                workspace_path = str(board_default)
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -2740,6 +2747,33 @@ def create_task(
                         f"(1) pass --workspace {workspace_kind}:<abs-repo-path>, "
                         f"(2) set a board default_workdir "
                         f"(hermes kanban boards set-default-workdir <board> <abs-path>), or "
+                        f"(3) link the task to a project (--project <slug>)."
+                    )
+
+                # Fail-fast: a ``worktree:`` path must resolve to a git repo at
+                # create time, mirroring the spawn-time check in
+                # ``_resolve_worktree_workspace``. Without this, a path that is
+                # not a repo (e.g. an umbrella dir like ~/projects/content with
+                # no .git) is stored happily, then burns two spawns and a
+                # circuit-breaker block before anyone sees the real error.
+                # Validate here, at the point of creation, with the same message
+                # style as the NULL-path guard above. For project-linked tasks
+                # this validates the generated ``<repo>/.worktrees/<id>`` path
+                # against the project's primary folder, because projects can be
+                # manually pointed at paths that are not git repos.
+                if (
+                    workspace_kind == "worktree"
+                    and workspace_path
+                    and not _worktree_path_resolvable(str(workspace_path))
+                ):
+                    raise ValueError(
+                        f"workspace_kind='worktree' path {workspace_path!r} is not "
+                        f"inside a git repo and does not point at a git repo root. "
+                        f"A worktree anchor must be an absolute path to a git repo "
+                        f"root (or an existing linked worktree checkout). Fix one of: "
+                        f"(1) pass --workspace worktree:<abs-repo-root>, "
+                        f"(2) set a board default_workdir to a git repo "
+                        f"(hermes kanban boards set-default-workdir <board> <abs-repo-root>), or "
                         f"(3) link the task to a project (--project <slug>)."
                     )
 
@@ -5262,6 +5296,12 @@ def decompose_triage_task(
                     read_board_metadata(get_current_board()).get("default_workdir")
                 )
                 if board_default and child_ws_kind == "worktree":
+                    default_anchor = Path(str(board_default)).expanduser()
+                    if not default_anchor.is_absolute() or _git_toplevel(default_anchor) is None:
+                        raise ValueError(
+                            f"decompose child[{idx}] {title!r}: workspace_kind='worktree' "
+                            f"board default_workdir {board_default!r} is not inside a git repo"
+                        )
                     # A worktree child with no path is anchored per-task by
                     # dispatch at ``<repo>/.worktrees/<task-id>`` via
                     # _resolve_worktree_workspace's no-path branch (which derives
@@ -5288,6 +5328,16 @@ def decompose_triage_task(
                         f"so it can inherit the root path, or set a board "
                         f"default_workdir."
                     )
+            if (
+                child_ws_kind == "worktree"
+                and child_ws_path
+                and not _worktree_path_resolvable(str(child_ws_path))
+            ):
+                raise ValueError(
+                    f"decompose child[{idx}] {title!r}: workspace_kind='worktree' "
+                    f"path {child_ws_path!r} is not inside a git repo and does not "
+                    "point at a git repo root"
+                )
             # Direct INSERT bypasses create_task's spec-less guard too: a
             # malformed decomposer result (e.g. {"title":"dev task","body":"",
             # "assignee":"dev"}) would otherwise land as 'todo' and be promoted
@@ -5569,7 +5619,10 @@ def _is_linked_worktree_checkout(path: Path) -> bool:
     common_dir = _git_common_dir(path)
     if git_dir is None or common_dir is None:
         return False
-    return git_dir != common_dir
+    repo_root = _git_toplevel(path)
+    if repo_root is None:
+        return False
+    return git_dir != common_dir and path.resolve(strict=False) == repo_root
 
 
 def _nearest_existing_path(path: Path) -> Path:
@@ -5581,6 +5634,8 @@ def _nearest_existing_path(path: Path) -> Path:
 
 def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
     current = _nearest_existing_path(path).resolve(strict=False)
+    if not current.is_dir():
+        return None
     while True:
         repo_root = _git_toplevel(current)
         if repo_root is not None:
@@ -5588,6 +5643,34 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         if current == current.parent:
             return None
         current = current.parent
+
+
+def _worktree_path_resolvable(workspace_path: str) -> bool:
+    """Return True if ``workspace_path`` is usable as a worktree anchor.
+
+    Mirrors the accept-cases of ``_resolve_worktree_workspace`` so a path that
+    create_task accepts is one spawn can actually resolve. A path is resolvable
+    when it is (1) absolute, and (2) either an existing linked worktree checkout,
+    a git repo root, or a target whose nearest existing ancestor lives inside a
+    git repo (so a linked worktree can be materialized there). A non-absolute
+    path, or one that walks up to the filesystem root without finding a repo
+    (e.g. an umbrella dir like ~/projects/content with no .git), is rejected.
+    """
+    try:
+        requested = Path(workspace_path).expanduser()
+    except Exception:
+        return False
+    if not requested.is_absolute():
+        return False
+    requested_resolved = requested.resolve(strict=False)
+    if requested.exists():
+        if _is_linked_worktree_checkout(requested):
+            return True
+        repo_root = _git_toplevel(requested)
+        if repo_root is not None and requested_resolved == repo_root:
+            return True
+        return False
+    return _repo_root_for_worktree_target(requested.parent) is not None
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
@@ -5680,6 +5763,12 @@ def _resolve_worktree_workspace(
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
+
+    if requested.exists():
+        raise ValueError(
+            f"task {task.id} worktree path {task.workspace_path!r} is an existing path "
+            "but is not a git repo root or linked worktree checkout root"
+        )
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
