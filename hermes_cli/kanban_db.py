@@ -2657,14 +2657,26 @@ def create_task(
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if initial_status == "blocked":
+                #
+                # ``triage`` wins over ``initial_status == 'blocked'``: a
+                # spec-less placeholder (the guard above sets ``triage=True``)
+                # must never reach a worker lane, and ``blocked`` is not a
+                # terminal park — ``unblock_task`` promotes a parent-free
+                # blocked task straight to ``ready``, which would spawn the
+                # placeholder despite the guard. Routing it to ``triage``
+                # keeps it out of every lane until a specifier fleshes it out.
+                if triage:
+                    task_status = "triage"
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                elif triage:
-                    task_status = "triage"
                 else:
                     task_status = "ready"
                     if parents:
@@ -5001,6 +5013,18 @@ def specify_triage_task(
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        # Re-check the spec-less guard against the *post-update* values. A
+        # specifier (auxiliary LLM) can return a title-only response or omit
+        # the body, in which case the placeholder is still spec-less — promoting
+        # it to ``todo``/``ready`` would land the empty card on a worker lane,
+        # defeating the create-time guard that parked it in triage. Compute the
+        # effective title/body/assignee the UPDATE would write and refuse the
+        # promotion (leave it in triage) when they remain spec-less.
+        eff_title = title.strip() if (title is not None and title.strip()) else (existing["title"] or "")
+        eff_body = body if body is not None else (existing["body"] or "")
+        eff_assignee = assignee if assignee is not None else (existing["assignee"] or None)
+        if _is_spec_less(eff_title, eff_body, eff_assignee or _default_assignee()):
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []

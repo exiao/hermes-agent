@@ -210,3 +210,67 @@ def test_decompose_legit_word_task_children_promote(kanban_home):
             assert child.status == "ready", (child.title, child.status)
     finally:
         conn.close()
+
+
+# --- P2: spec-less placeholder must win over initial_status='blocked' --------
+
+
+def test_spec_less_blocked_placeholder_forced_to_triage(kanban_home):
+    """A spec-less placeholder created with ``initial_status='blocked'`` must
+    land in ``triage``, not ``blocked``.
+
+    Regression for the P2: ``blocked`` is not a terminal park —
+    ``unblock_task`` promotes a parent-free blocked task straight to ``ready``,
+    which would spawn the placeholder despite the guard. The spec-less guard
+    (triage) must take precedence over the ``blocked`` initial status, and the
+    card must stay out of every worker lane even after an unblock.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="dev task", assignee="dev", initial_status="blocked"
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage", task.status
+        # And an unblock attempt cannot promote it to ready (it isn't blocked).
+        kb.unblock_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage", task.status
+    finally:
+        conn.close()
+
+
+# --- P2: triage promotion must re-check the spec-less guard -------------------
+
+
+def test_specify_title_only_does_not_promote_spec_less(kanban_home):
+    """``specify_triage_task`` must not promote a card that is still spec-less.
+
+    Regression for the P2: a specifier (auxiliary LLM) can return a title-only
+    response or omit the body. Promoting such a card to ``todo``/``ready``
+    would land the empty placeholder on a worker lane, defeating the
+    create-time guard. The promotion path re-checks ``_is_spec_less`` against
+    the post-update values and refuses (stays in triage) when still spec-less.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="dev task", assignee="dev")
+        t0 = kb.get_task(conn, tid)
+        assert t0 is not None and t0.status == "triage"
+        # Title-only "specify" that leaves the card spec-less: refused.
+        ok = kb.specify_triage_task(conn, tid, title="dev task")
+        assert ok is False
+        t1 = kb.get_task(conn, tid)
+        assert t1 is not None and t1.status == "triage"
+        # A real spec (non-empty body) promotes as usual.
+        ok = kb.specify_triage_task(
+            conn, tid, title="Wire the dev API client", body="use httpx, pin <1"
+        )
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status in ("todo", "ready"), task.status
+    finally:
+        conn.close()
