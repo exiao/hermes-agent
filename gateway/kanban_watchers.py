@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -183,14 +184,35 @@ _BLOCK_KIND_NOTIFY = {
 _ROUTING_HINTS = (
     "no access", "no creds", "no credential", "not authorized", "unauthorized",
     "permission denied", "can't reach", "cannot reach", "wrong lane",
-    "no vault", "missing token", "missing key", "missing api key", "403",
+    "no vault", "missing token", "missing key", "missing api key",
     "forbidden", "not provisioned", "no permission",
 )
 _RETRY_HINTS = (
-    "rate limit", "rate-limit", "429", "timeout", "timed out", "flaky",
-    "transient", "try again", "temporarily", "503", "502", "connection reset",
+    "rate limit", "rate-limit", "timeout", "timed out", "flaky",
+    "transient", "try again", "temporarily", "connection reset",
     "may clear", "retry",
 )
+
+# HTTP status codes are strong signals, but a bare ``403``/``429`` substring
+# also matches an unrelated ticket reference like ``merge PR #403?`` and would
+# wrongly downgrade a human-decision block to ROUTING/RETRY. Only treat a
+# numeric code as a status code when it is an HTTP-error-context token: a
+# standalone 3-digit number that is NOT an issue/PR/ticket reference (``#NNN``,
+# ``pr NNN``, ``issue NNN``, ``ticket NNN``). Default stays 🔴 DECISION NEEDED.
+_ROUTING_STATUS_CODES = ("403",)
+_RETRY_STATUS_CODES = ("429", "503", "502")
+_ISSUE_REF_RE = re.compile(r"(?:#|\b(?:pr|issue|ticket|gh)[\s#-]*)\d{1,4}\b")
+
+
+def _has_status_code(text: str, codes: tuple) -> bool:
+    """True when ``text`` cites one of ``codes`` as a bare HTTP status code.
+
+    A code only counts as a standalone ``\\bNNN\\b`` token whose match span is
+    not part of an issue/PR/ticket reference (those are stripped first), so
+    ``returned 403`` classifies as routing while ``merge PR #403?`` does not.
+    """
+    stripped = _ISSUE_REF_RE.sub(" ", text)
+    return any(re.search(rf"\b{code}\b", stripped) for code in codes)
 
 
 def _infer_block_header(reason_detail: str) -> Optional[str]:
@@ -204,9 +226,13 @@ def _infer_block_header(reason_detail: str) -> Optional[str]:
     text = (reason_detail or "").strip().lower()
     if not text:
         return None
-    if any(h in text for h in _ROUTING_HINTS):
+    if any(h in text for h in _ROUTING_HINTS) or _has_status_code(
+        text, _ROUTING_STATUS_CODES
+    ):
         return _BLOCK_KIND_NOTIFY["capability"]
-    if any(h in text for h in _RETRY_HINTS):
+    if any(h in text for h in _RETRY_HINTS) or _has_status_code(
+        text, _RETRY_STATUS_CODES
+    ):
         return _BLOCK_KIND_NOTIFY["transient"]
     return _BLOCK_KIND_NOTIFY["needs_input"]
 

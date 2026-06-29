@@ -90,6 +90,18 @@ def test_infer_defaults_to_decision_needed():
     assert _infer_block_header("Should I key the limiter on IP or user_id?") == "🔴 DECISION NEEDED"
 
 
+def test_infer_issue_number_is_not_a_status_code():
+    # A reason that cites an unrelated ticket/PR number must NOT match the bare
+    # HTTP-status hints (403/429/...) and wrongly downgrade a human-decision
+    # block to ROUTING/RETRY. The default stays 🔴 DECISION NEEDED.
+    assert _infer_block_header("Should I merge PR #403?") == "🔴 DECISION NEEDED"
+    assert _infer_block_header("Waiting on a call: close issue 429 or keep it?") == "🔴 DECISION NEEDED"
+    assert _infer_block_header("gh-502 needs Eric's design decision") == "🔴 DECISION NEEDED"
+    # A genuine status code in error context still classifies.
+    assert _infer_block_header("deploy API returned 403") == "🟠 ROUTING"
+    assert _infer_block_header("search API returned 429, transient") == "🟡 RETRY"
+
+
 def test_infer_empty_reason_has_no_header():
     assert _infer_block_header("") is None
     assert _infer_block_header("   ") is None
