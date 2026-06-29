@@ -2426,17 +2426,18 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
     assert ws != repo  # not the shared default verbatim
 
 
-def test_worktree_no_path_subdir_board_default_keeps_null_anchor(
+def test_worktree_no_path_subdir_board_default_persists_repo_root_anchor(
     kanban_home, tmp_path
 ):
     """A board default_workdir may be a package/subdir inside the repo.
 
-    Persisting that subdir as the explicit worktree target would be rejected as
-    an existing non-worktree directory and would bypass the no-path resolver
-    branch that correctly anchors at ``<repo>/.worktrees/<id>``.
+    Persist the resolved repo root, not the raw subdir, so dispatch stays
+    path-stable even if the board default changes before the task is claimed.
     """
     repo = tmp_path / "repo"
     _init_git_repo(repo)
+    other_repo = tmp_path / "other"
+    _init_git_repo(other_repo)
     subdir = repo / "packages" / "core"
     subdir.mkdir(parents=True)
     kb.create_board("wt-subdir-default-board", default_workdir=str(subdir))
@@ -2450,7 +2451,8 @@ def test_worktree_no_path_subdir_board_default_keeps_null_anchor(
         task = kb.get_task(conn, tid)
     assert task is not None
     assert task.workspace_kind == "worktree"
-    assert task.workspace_path is None
+    assert task.workspace_path == str(repo)
+    kb.write_board_metadata("wt-subdir-default-board", default_workdir=str(other_repo))
     ws = kb.resolve_workspace(task, board="wt-subdir-default-board")
     assert ws == repo / ".worktrees" / tid
     assert ws != subdir

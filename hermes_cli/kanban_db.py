@@ -2647,7 +2647,6 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
-    worktree_board_default_anchor_valid = False
     if (
         workspace_path is None
         and project_repo is None
@@ -2662,9 +2661,7 @@ def create_task(
                 if default_anchor.is_absolute():
                     default_repo = _git_toplevel(default_anchor)
                     if default_repo is not None:
-                        worktree_board_default_anchor_valid = True
-                        if default_anchor.resolve(strict=False) == default_repo:
-                            workspace_path = str(board_default)
+                        workspace_path = str(default_repo)
             else:
                 workspace_path = str(board_default)
 
@@ -2743,8 +2740,6 @@ def create_task(
                 # 'ready' row that burns its retries on spawn_failed at dispatch.
                 if workspace_kind in {"dir", "worktree"} and not (
                     workspace_path and workspace_path.strip()
-                ) and not (
-                    workspace_kind == "worktree" and worktree_board_default_anchor_valid
                 ):
                     raise ValueError(
                         f"workspace_kind={workspace_kind!r} requires a workspace_path, "
