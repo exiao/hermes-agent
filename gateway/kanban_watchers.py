@@ -269,8 +269,9 @@ _CONDITIONAL_RETRY_RE = re.compile(
     r"[^.;:\n]*?"
     r"\b(?:after|until|once|when|as\s+soon\s+as)\b"
     r"[^.;:\n]*?"
-    r"\b(?:provision|provisioned|credential|credentials|key|keys|token|access|"
-    r"grant|granted|rotate|rotated|exist|exists|available|restored)\b"
+    r"\b(?:provision|provisioned|provisioning|credential|credentials|key|keys|"
+    r"token|access|grant|granted|granting|rotate|rotated|rotating|exist|exists|"
+    r"available|restore|restored|restoring)\b"
 )
 
 # HTTP status codes are strong signals, but a bare ``403``/``429`` substring
@@ -297,15 +298,18 @@ _RETRY_STATUS_CODES = ("408", "429", "502", "503", "504")
 # whose prefix the context regex accepts is NEVER stripped before the code is
 # seen (that mismatch was the recurring "hyphenated marker" bug class).
 # Only STRONG HTTP markers belong here: bare generic verbs like ``got``/``gave``
-# are excluded because they make ordinary counts read as status codes (``Got 504
-# failing tests`` must stay DECISION, not RETRY). ``returned``/``responded`` ARE
-# kept — they are HTTP-specific enough in this context that ``API returned 504``
-# is unambiguous, and the strong noun (``api``/``server``) usually co-occurs.
+# /``get`` are excluded because they make ordinary counts read as status codes
+# (``Got 504 failing tests`` / ``get 429 results`` must stay DECISION, not
+# RETRY). ``returned``/``responded`` ARE kept — they are HTTP-specific enough in
+# this context that ``API returned 504`` is unambiguous, and the strong noun
+# (``api``/``server``) usually co-occurs. The HTTP method verbs kept below
+# (``post``/``put``/``patch``/``delete``) are far rarer as plain English than
+# ``get``, so they stay; ``get`` is dropped as too common a verb.
 _HTTP_CONTEXT_WORDS = (
     "http", "https", "status", "code", "error", "errored", "returned",
     "responded", "response", "api", "server", "endpoint",
     "request", "forbidden", "unauthorized", "gateway", "upstream",
-    "get", "post", "put", "patch", "delete",
+    "post", "put", "patch", "delete",
 )
 _HTTP_CONTEXT_RE = re.compile(
     r"\b(?:" + "|".join(_HTTP_CONTEXT_WORDS) + r"|rate[\s-]?limit)\b"

@@ -424,6 +424,54 @@ def test_infer_empty_reason_has_no_header():
     assert _infer_block_header("   ") is None
 
 
+def test_infer_get_verb_is_not_http_context():
+    # Round-6 finding: "get" is too common a plain-English verb to count as HTTP
+    # context. A count that equals a status code after "get" ("get 429 results")
+    # must stay DECISION, not be downgraded to RETRY/ROUTING. The strong HTTP
+    # markers (returned/api/server/http/method verbs) still classify.
+    assert _infer_block_header("get 429 results back from the query") == "🔴 DECISION NEEDED"
+    assert _infer_block_header("Need to get 403 rows reviewed") == "🔴 DECISION NEEDED"
+    assert _infer_block_header("get 504 failing tests triaged") == "🔴 DECISION NEEDED"
+    # A genuine status code with strong HTTP context still classifies.
+    assert _infer_block_header("API returned 429, rate limited") == "🟡 RETRY"
+    assert _infer_block_header("deploy API returned 403") == "🟠 ROUTING"
+
+
+def test_infer_access_gated_retry_covers_verb_forms():
+    # Round-6 finding: the conditional-retry scrub must cover the gerund/verb
+    # forms of the access words (provisioning/granting/rotating/restore/
+    # restoring), so a retry gated on those phrasings routes, not RETRY.
+    assert (
+        _infer_block_header("Missing API key; retry after provisioning the key")
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header("No vault access; try again once we restore access")
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header("No creds; retry after granting the token scope")
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header(
+            "Missing key; try again when restoring credentials access"
+        )
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header(
+            "Missing API key; retry once rotating the key completes"
+        )
+        == "🟠 ROUTING"
+    )
+    # An unconditional momentary retry stays transient.
+    assert (
+        _infer_block_header("Search API was flaky — try again in a minute")
+        == "🟡 RETRY"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure formatter units
 # ---------------------------------------------------------------------------
