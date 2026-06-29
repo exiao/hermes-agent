@@ -73,7 +73,6 @@ class TestCreditsNoticesToggle:
         """The gate stops emission only — get_credits_state still returns data."""
         agent = _agent_with_state()
         agent.notice_callback = lambda n: None
-        agent._credits_session_start_micros = None
         with patch("hermes_cli.config.load_config", return_value=_cfg(False)):
             agent._emit_credits_notices()
         assert agent.get_credits_state() is not None
