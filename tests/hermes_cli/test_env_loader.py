@@ -257,3 +257,64 @@ def test_get_default_hermes_root_resolves_relative_home(tmp_path, monkeypatch):
     rel_profile_root = get_default_hermes_root("worker")
     assert rel_profile_root.is_absolute()
     assert rel_profile_root == native.resolve()
+
+
+def test_get_default_hermes_root_symlinked_profile_keeps_real_root(tmp_path, monkeypatch):
+    """A profile dir that is a symlink outside the root still derives the real root.
+
+    Regression for the codex P2: ``<root>/profiles/<name>`` may be a symlink to
+    storage outside the Hermes root. Resolving the home with ``.resolve()`` first
+    would follow the link and erase the textual ``profiles/<name>`` segment, so the
+    profile-shape check would miss and the function would return the link TARGET as
+    its own root -- breaking shared-root ``.env`` secret isolation. The root must be
+    derived from the logical profile path BEFORE following symlinks.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    native = tmp_path / ".hermes"
+    (native / "profiles").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    # The profile's storage lives OUTSIDE the Hermes root; the logical profile
+    # dir <root>/profiles/worker is a symlink to it.
+    target = tmp_path / "external_storage" / "worker_data"
+    target.mkdir(parents=True)
+    logical_profile = native / "profiles" / "worker"
+    logical_profile.symlink_to(target, target_is_directory=True)
+
+    # Despite the symlink, the root is the real Hermes root (grandparent of the
+    # logical profile path), NOT the link target's parent.
+    assert get_default_hermes_root(logical_profile) == native.resolve()
+
+
+def test_symlinked_profile_still_loads_shared_root_env(tmp_path, monkeypatch):
+    """End-to-end: a symlinked profile dir still inherits the shared root .env.
+
+    Ties the get_default_hermes_root symlink fix to the secret-isolation
+    guarantee this PR adds: load_hermes_dotenv must load the shared
+    <root>/.env BEFORE the profile's own .env even when the profile dir is a
+    symlink to storage outside the root.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles").mkdir(parents=True)
+    (root / ".env").write_text("CPE_GITHUB_TOKEN=shared-root-secret\n", encoding="utf-8")
+
+    target = tmp_path / "external_storage" / "worker_data"
+    target.mkdir(parents=True)
+    (target / ".env").write_text("OPENAI_API_KEY=sk-profile\n", encoding="utf-8")
+    profile = root / "profiles" / "worker"
+    profile.symlink_to(target, target_is_directory=True)
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("CPE_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=profile)
+
+    # Shared root .env loaded as the base layer, profile .env on top.
+    assert (root / ".env") in loaded
+    assert (profile / ".env") in loaded
+    assert os.getenv("CPE_GITHUB_TOKEN") == "shared-root-secret"
+    assert os.getenv("OPENAI_API_KEY") == "sk-profile"
