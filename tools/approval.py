@@ -820,6 +820,82 @@ def _build_self_term_scan_view(command_lower: str) -> str:
     return view
 
 
+# =========================================================================
+# Force-push carve-out (mirror the shell git-guard at ~/.local/bin/git)
+# =========================================================================
+# The shell PATH wrapper (~/.local/bin/git) already encodes the safe rule:
+# force-pushing a FEATURE branch (rebasing your own PR) is allowed; it only
+# blocks a force-push that could rewrite the default branch (main/master) —
+# either via a main/master-targeting refspec or a bare force while standing on
+# a main/master checkout. A force-WITH-LEASE to a feature branch sails through.
+#
+# The three force-push DANGEROUS_PATTERNS entries below do not make that
+# distinction — they flag EVERY force push for an operator prompt, which stalls
+# routine PR-rebase work headless. This carve-out narrows them to match the
+# shell guard: a force-WITH-LEASE push whose target ref is NOT the default
+# branch is auto-allowed; everything else (a bare force, any force whose refspec
+# targets main/master) still prompts. The lease is the safety belt — it refuses
+# if the remote moved since the last fetch, so even on a shared worktree branch
+# the second pusher's lease bounces instead of clobbering. A bare force is NOT
+# covered (no lease = no safety belt), so it keeps prompting.
+#
+# The main/master refspec forms here are the SAME ones the shell guard
+# enumerates (lines ~49-62 of ~/.local/bin/git) so the two layers cannot
+# disagree. The main/master push patterns in DANGEROUS_PATTERNS stay active as
+# an independent backstop.
+_FORCE_PUSH_DESCRIPTIONS = frozenset({
+    "git force push (rewrites remote history)",
+    "git force push short flag (rewrites remote history)",
+    "git force-with-lease push (rewrites remote history)",
+})
+
+# A bare --force flag (NOT the --force-with-lease form). `--force-with-lease`
+# contains the substring `--force`, so require a word boundary that the lease
+# suffix does not satisfy: --force/--force=… followed by end or a non-hyphen.
+_BARE_FORCE_FLAG_RE = re.compile(r'--force(?![\w-])')
+# Short force flag: -f, or packed combos like -uf / -fv (a flag token that is
+# all letters and contains an `f`). Excludes long flags (already handled above).
+_SHORT_FORCE_FLAG_RE = re.compile(r'(?<![\w-])-[a-z]*f[a-z]*(?![\w-])')
+_FORCE_WITH_LEASE_RE = re.compile(r'--force-with-lease(?:=\S*)?(?![\w])')
+# Refspec/target forms that would rewrite the default branch — mirrors the
+# shell guard's main/master enumeration (`+main`, `HEAD:main`, `*:main`,
+# `main:main`, a bare `main`/`master` push target, the `+`/colon force forms).
+_DEFAULT_BRANCH_PUSH_RE = re.compile(
+    r'(?:^|\s)(?:\+?main|\+?master|head:main|head:master|\S*:main|\S*:master)(?:\s|$)'
+)
+
+
+def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
+    """True iff *command_lower* is a force-WITH-LEASE git push to a NON-default
+    branch — the exact case the shell git-guard auto-allows.
+
+    *command_lower* is the already-normalized + lowercased command (same view
+    the dangerous-pattern loop scans). Returns False (→ keep prompting) for:
+      - anything that is not a `git push`,
+      - a push with no `--force-with-lease` (a bare `--force`/`-f` has no lease
+        safety belt, so it stays gated),
+      - a push that ALSO carries a bare `--force`/`-f` (the bare force could
+        still clobber regardless of the lease intent),
+      - a push whose refspec/target is the default branch (main/master).
+    """
+    if not re.search(r'\bgit\s+push\b', command_lower):
+        return False
+    # Require the lease form — the safety belt that makes auto-approve safe.
+    if not _FORCE_WITH_LEASE_RE.search(command_lower):
+        return False
+    # Reject if a BARE force is also present (e.g. `--force --force-with-lease`
+    # or `-f`). Strip the lease token first so its `--force` substring and any
+    # `=<expected>` value don't read as a bare force.
+    without_lease = _FORCE_WITH_LEASE_RE.sub(' ', command_lower)
+    if _BARE_FORCE_FLAG_RE.search(without_lease) or _SHORT_FORCE_FLAG_RE.search(without_lease):
+        return False
+    # Reject if the refspec/target is the default branch — let the main/master
+    # patterns (and this guard's refusal) handle it via the normal prompt.
+    if _DEFAULT_BRANCH_PUSH_RE.search(command_lower):
+        return False
+    return True
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
@@ -832,7 +908,14 @@ def detect_dangerous_command(command: str) -> tuple:
     # obfuscated/redirected self-kills are still caught while redirect targets
     # with a self keyword are not false positives.
     self_term_view = _build_self_term_scan_view(command_lower)
+    # Branch-aware force-push carve-out: a force-with-lease push to a non-default
+    # branch is safe (mirrors ~/.local/bin/git), so suppress the three blanket
+    # force-push patterns for it. All other patterns (incl. the main/master push
+    # backstop) still apply.
+    skip_force_push = _is_safe_lease_push_to_feature_branch(command_lower)
     for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+        if skip_force_push and description in _FORCE_PUSH_DESCRIPTIONS:
+            continue
         target = self_term_view if description in _SELF_TERM_DESCRIPTIONS else command_lower
         if pattern_re.search(target):
             pattern_key = description

@@ -1361,11 +1361,42 @@ class TestGitDestructiveOps:
             assert dangerous is True, f"expected block, got allow for: {cmd}"
             assert "main/master" in (desc or ""), f"wrong reason for: {cmd} -> {desc}"
 
-    def test_git_push_force_with_lease_flagged(self):
-        """--force-with-lease still rewrites history and MUST be flagged."""
+    def test_git_push_force_with_lease_to_feature_branch_not_flagged(self):
+        """A force-WITH-LEASE push to a NON-default branch is the routine
+        PR-rebase case the shell git-guard (~/.local/bin/git) already allows.
+        The lease is the safety belt (it refuses if the remote moved), so this
+        auto-approves headless instead of stalling for an operator prompt.
+        """
         cmd = "git push --force-with-lease origin feature"
         dangerous, _, _ = detect_dangerous_command(cmd)
-        assert dangerous is True
+        assert dangerous is False
+
+    def test_git_push_force_with_lease_to_main_still_flagged(self):
+        """A force-with-lease whose refspec targets the DEFAULT branch could
+        rewrite main/master and MUST still be flagged (mirrors the shell guard's
+        main/master refspec enumeration)."""
+        for cmd in (
+            "git push --force-with-lease origin main",
+            "git push --force-with-lease origin master",
+            "git push --force-with-lease origin HEAD:main",
+            "git push --force-with-lease origin feature:main",
+            "git push --force-with-lease origin +main",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_git_push_bare_force_still_flagged_even_on_feature_branch(self):
+        """A BARE force (no lease) has no safety belt, so it keeps prompting
+        regardless of target branch — only the lease form is carved out."""
+        for cmd in (
+            "git push --force origin feature",
+            "git push -f origin feature",
+            "git push --force",
+            # bare force AND lease together: the bare force could still clobber
+            "git push --force --force-with-lease origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
 
     def test_gh_pr_merge_flagged(self):
         """`gh pr merge` bypasses PR review and MUST be flagged."""
