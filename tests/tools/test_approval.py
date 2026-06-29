@@ -1434,6 +1434,17 @@ class TestGitDestructiveOps:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is True, f"expected block, got allow for: {cmd}"
 
+    def test_force_with_lease_re_excludes_trailing_hyphen_flag(self):
+        """`_FORCE_WITH_LEASE_RE` must match the real lease flag (bare and the
+        `=<expected>` value form) but NOT a different flag that merely starts
+        with the same string, e.g. `--force-with-lease-foo`. The trailing-hyphen
+        exclusion (`(?![\\w-])`) is what draws that boundary."""
+        rx = approval_module._FORCE_WITH_LEASE_RE
+        assert rx.search("--force-with-lease")
+        assert rx.search("--force-with-lease=origin/main")
+        assert rx.search("--force-with-lease=expected-sha")
+        assert not rx.search("--force-with-lease-foo")
+
     def test_gh_pr_merge_flagged(self):
         """`gh pr merge` bypasses PR review and MUST be flagged."""
         for cmd in ("gh pr merge 42 --squash", "gh pr merge 42", "gh pr merge"):

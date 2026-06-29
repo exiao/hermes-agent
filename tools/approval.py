@@ -866,7 +866,10 @@ _BARE_FORCE_FLAG_RE = re.compile(r'--force(?![\w-])')
 # Short force flag: -f, or packed combos like -uf / -fv (a flag token that is
 # all letters and contains an `f`). Excludes long flags (already handled above).
 _SHORT_FORCE_FLAG_RE = re.compile(r'(?<![\w-])-[a-z]*f[a-z]*(?![\w-])')
-_FORCE_WITH_LEASE_RE = re.compile(r'--force-with-lease(?:=\S*)?(?![\w])')
+# Exclude a trailing hyphen too (`(?![\w-])`) so a different flag that merely
+# starts with this string (e.g. `--force-with-lease-foo`) is not misread as the
+# lease form — matches the boundary convention used by the bare-force regexes.
+_FORCE_WITH_LEASE_RE = re.compile(r'--force-with-lease(?:=\S*)?(?![\w-])')
 # Refspec/target forms that would rewrite the default branch — mirrors the
 # shell guard's main/master enumeration (`+main`, `HEAD:main`, `*:main`,
 # `main:main`, a bare `main`/`master` push target, the `+`/colon force forms),
