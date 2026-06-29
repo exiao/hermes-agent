@@ -2848,9 +2848,17 @@ def list_tasks(
     order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    exclude_statuses: Optional[Iterable[str]] = None,
 ) -> list[Task]:
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
+    if exclude_statuses:
+        excluded = sorted(set(exclude_statuses))
+        bad = [s for s in excluded if s not in VALID_STATUSES]
+        if bad:
+            raise ValueError(f"exclude_statuses must be subset of {sorted(VALID_STATUSES)}")
+        query += f" AND status NOT IN ({','.join('?' for _ in excluded)})"
+        params.extend(excluded)
     if assignee is not None:
         query += " AND assignee = ?"
         params.append(_canonical_assignee(assignee))
@@ -5397,7 +5405,13 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            # Stamp a terminal timestamp on archive if the task never reached
+            # 'done' (and so has no completed_at). The dashboard windows the
+            # terminal columns by completed_at DESC; without this, an old task
+            # archived today sorts by its original created_at and can fall off
+            # the first archived page despite being the most recent arrival.
+            "    completed_at = COALESCE(completed_at, CAST(strftime('%s','now') AS INTEGER)) "
             "WHERE id = ? AND status != 'archived'",
             (task_id,),
         )

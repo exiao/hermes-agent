@@ -3503,6 +3503,44 @@ def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
             "parent is archived"
         )
 
+
+def test_archive_stamps_completed_at_when_not_done(kanban_home):
+    """Archiving a never-done task stamps completed_at so the dashboard's
+    terminal-column windowing (ordered by completed_at DESC) places it by
+    archive time, not its original created_at. An already-done task keeps
+    its original completion timestamp."""
+    with kb.connect() as conn:
+        # never-done -> gets a completed_at on archive
+        t = kb.create_task(conn, title="never done")
+        assert kb.get_task(conn, t).completed_at is None
+        assert kb.archive_task(conn, t)
+        assert kb.get_task(conn, t).completed_at is not None
+
+        # already-done -> completed_at preserved (not overwritten on archive)
+        d = kb.create_task(conn, title="was done")
+        kb.complete_task(conn, d)
+        original = kb.get_task(conn, d).completed_at
+        assert original is not None
+        assert kb.archive_task(conn, d)
+        assert kb.get_task(conn, d).completed_at == original
+
+
+def test_list_tasks_exclude_statuses(kanban_home):
+    """exclude_statuses drops the named statuses in SQL so the live-board
+    pass never materializes the (potentially huge) done/archived history."""
+    with kb.connect() as conn:
+        ready = kb.create_task(conn, title="ready one")
+        done = kb.create_task(conn, title="done one")
+        kb.complete_task(conn, done)
+
+        live = kb.list_tasks(conn, exclude_statuses={"done", "archived"})
+        ids = {t.id for t in live}
+        assert ready in ids
+        assert done not in ids
+
+        with pytest.raises(ValueError):
+            kb.list_tasks(conn, exclude_statuses={"not-a-status"})
+
 # ---------------------------------------------------------------------------
 # _add_column_if_missing / _migrate_add_optional_columns idempotency (#21708)
 # ---------------------------------------------------------------------------

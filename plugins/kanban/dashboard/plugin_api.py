@@ -503,18 +503,17 @@ def get_board(
         # Live (non-terminal) columns: full, naturally small. We pull
         # everything except the windowed terminal columns here, then fetch
         # the terminal columns separately with a bounded query so the done
-        # history never ships in full on first paint.
-        live_tasks = [
-            t
-            for t in kanban_db.list_tasks(
-                conn,
-                tenant=tenant,
-                include_archived=False,
-                workflow_template_id=workflow_template_id,
-                current_step_key=current_step_key,
-            )
-            if t.status not in _WINDOWED_COLUMNS
-        ]
+        # history never ships in full on first paint. Exclude the windowed
+        # (terminal) statuses in SQL so we never materialize the full done
+        # history just to drop it in Python.
+        live_tasks = kanban_db.list_tasks(
+            conn,
+            tenant=tenant,
+            include_archived=False,
+            workflow_template_id=workflow_template_id,
+            current_step_key=current_step_key,
+            exclude_statuses=_WINDOWED_COLUMNS,
+        )
 
         # Windowed terminal columns: done always, archived only when shown.
         windowed_status = ["done"]
