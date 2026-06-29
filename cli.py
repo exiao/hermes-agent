@@ -1158,7 +1158,7 @@ def _kanban_worker_rate_limit_exit_code(failure_reason, *, is_kanban_worker):
         return None
     try:
         from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE
-    except Exception:
+    except ImportError:
         _RL_CODE = 75
     return _RL_CODE
 
