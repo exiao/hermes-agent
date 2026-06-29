@@ -162,14 +162,13 @@ BOARD_COLUMNS: list[str] = [
 # failure/crash counters are broken by the successful run that put the card
 # here. The board-load pass drops both terminal columns from the default scan.
 #
-# ``done`` cards get a narrow re-inclusion: the event-signal warnings in
-# ``_WARNING_EVENT_KINDS`` (a blocked completion / a phantom-ref advisory) do
-# fire on a successfully-completed card, so the pass re-admits the (tiny) set of
-# ``done`` cards carrying such an event that is still *active* (no
-# ``completed``/``edited`` event arrived after it) — never the full done
-# column, whose event history grows every day and otherwise yields zero badges,
-# and never a done card whose warning was later cleared by a subsequent
-# completion/edit (it would yield no badge, so scanning its history is wasted).
+# ``done`` cards get two narrow re-inclusions for rules that can still fire on
+# a completed card: active event-signal warnings in ``_WARNING_EVENT_KINDS``
+# (a blocked completion / a phantom-ref advisory), plus block↔unblock cycling
+# candidates. The pass never re-admits the full done column, whose event history
+# grows every day and otherwise yields zero badges, and never a done card whose
+# warning was later cleared by a subsequent completion/edit (it would yield no
+# badge, so scanning its history is wasted).
 #
 # ``archived`` is excluded outright, matching the prior fleet query
 # (``status != 'archived'``): the default ``task_ids=None`` diagnostics (and the
@@ -301,14 +300,18 @@ def _compute_task_diagnostics(
             tuple(task_ids),
         ).fetchall()
     else:
-        # Board-load path. Two rules can fire on a card that is NOT live/stuck:
+        # Board-load path. Three rules can fire on a card that is NOT live/stuck:
         # ``hallucinated_cards`` (a blocked completion leaves the card in its
-        # prior state) and ``prose_phantom_refs`` (an advisory that fires on a
+        # prior state), ``prose_phantom_refs`` (an advisory that fires on a
         # *successful* completion, so it legitimately surfaces on a ``done``
-        # card). Both key off the ``_WARNING_EVENT_KINDS`` events. Every other
-        # rule requires a live/stuck status. So the candidate set is:
+        # card), and ``block_unblock_cycling`` (no current-status gate; it only
+        # counts recent blocked/unblocked events). The first two key off the
+        # ``_WARNING_EVENT_KINDS`` events. Every other rule requires a live/stuck
+        # status. So the candidate set is:
         #   (a) all non-terminal cards, PLUS
-        #   (b) ``done`` cards that carry one of those warning events.
+        #   (b) ``done`` cards that carry an active warning event, PLUS
+        #   (c) ``done`` cards with enough recent blocked/unblocked events to
+        #       potentially satisfy the block-cycle rule.
         # ``archived`` is excluded from both branches (the prior fleet query
         # used ``status != 'archived'``; archived is hidden from the default
         # board/diagnostics view, so it must not surface here via a stale event).
@@ -322,7 +325,7 @@ def _compute_task_diagnostics(
         # ``EXISTS (... WHERE e.task_id = t.id AND e.kind IN (...))`` lets SQLite
         # drive the ``idx_events_task`` index (leading column ``task_id``) and
         # probe only the small set of done cards. ``UNION ALL`` (not ``UNION``)
-        # because the two branches are disjoint by status — no dedup needed.
+        # because the three branches are made disjoint — no dedup needed.
         #
         # The re-include predicate matches the rule engine's
         # ``_active_hallucination_events``: a warning event counts only when no
@@ -333,11 +336,21 @@ def _compute_task_diagnostics(
         # board load for nothing — the inner ``NOT EXISTS`` excludes it. Both
         # correlated subqueries filter on ``e.task_id = t.id``, so each rides
         # the ``idx_events_task`` index rather than scanning the event log.
+        # Branch (c) uses the same task_id-leading index and a cheap count
+        # prefilter; the exact transition count remains inside the rule engine
+        # after the candidate's event history is materialised. It excludes cards
+        # already admitted by branch (b) so ``UNION ALL`` cannot duplicate rows.
         terminal = tuple(sorted(_DIAGNOSTIC_TERMINAL_STATUSES))
         reinclude = tuple(sorted(_DIAGNOSTIC_WARNING_REINCLUDE_STATUSES))
         status_ph = ",".join(["?"] * len(terminal))
         reinclude_ph = ",".join(["?"] * len(reinclude))
         kind_ph = ",".join(["?"] * len(_WARNING_EVENT_KINDS))
+        block_cycle_threshold = kd._positive_int(
+            diag_config.get("block_cycle_threshold"), 3,
+        )
+        block_cycle_cutoff = int(
+            time.time() - float(diag_config.get("block_cycle_window_seconds", 24 * 3600)),
+        )
         rows = conn.execute(
             f"SELECT * FROM tasks WHERE status NOT IN ({status_ph}) "
             f"UNION ALL "
@@ -347,8 +360,36 @@ def _compute_task_diagnostics(
             f"            AND NOT EXISTS (SELECT 1 FROM task_events c "
             f"                WHERE c.task_id = t.id "
             f"                AND c.kind IN ('completed', 'edited') "
-            f"                AND c.id > e.id))",
-            terminal + reinclude + tuple(_WARNING_EVENT_KINDS),
+            f"                AND c.id > e.id)) "
+            f"UNION ALL "
+            f"SELECT t.* FROM tasks t WHERE t.status IN ({reinclude_ph}) "
+            f"AND (SELECT COUNT(*) FROM task_events e "
+            f"     WHERE e.task_id = t.id "
+            f"     AND e.kind = 'blocked' "
+            f"     AND e.created_at >= ?) >= ? "
+            f"AND (SELECT COUNT(*) FROM task_events e "
+            f"     WHERE e.task_id = t.id "
+            f"     AND e.kind = 'unblocked' "
+            f"     AND e.created_at >= ?) >= ? "
+            f"AND NOT EXISTS (SELECT 1 FROM task_events w "
+            f"    WHERE w.task_id = t.id AND w.kind IN ({kind_ph}) "
+            f"    AND NOT EXISTS (SELECT 1 FROM task_events c "
+            f"        WHERE c.task_id = t.id "
+            f"        AND c.kind IN ('completed', 'edited') "
+            f"        AND c.id > w.id))",
+            (
+                terminal
+                + reinclude
+                + tuple(_WARNING_EVENT_KINDS)
+                + reinclude
+                + (
+                    block_cycle_cutoff,
+                    block_cycle_threshold,
+                    block_cycle_cutoff,
+                    block_cycle_threshold,
+                )
+                + tuple(_WARNING_EVENT_KINDS)
+            ),
         ).fetchall()
 
     if not rows:

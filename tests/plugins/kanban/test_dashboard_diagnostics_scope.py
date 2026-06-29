@@ -6,9 +6,11 @@ history (the hotspot: hundreds of finished cards, ~15K-and-growing events, zero
 badges). It scopes to:
 
   (a) every non-terminal card, PLUS
-  (b) the small set of terminal (done/archived) cards that carry an active
-      ``_WARNING_EVENT_KINDS`` event — because ``hallucinated_cards`` and the
-      ``prose_phantom_refs`` advisory legitimately fire on those.
+  (b) the small set of done cards that carry an active ``_WARNING_EVENT_KINDS``
+      event — because ``hallucinated_cards`` and the ``prose_phantom_refs``
+      advisory legitimately fire on those, PLUS
+  (c) done cards with enough recent block/unblock events to potentially trigger
+      ``block_unblock_cycling``.
 
 A plain ``done`` card with no warning event must be excluded. The explicit
 ``task_ids=[...]`` path (drawer open) must stay unscoped.
@@ -25,8 +27,6 @@ import re
 import sys
 import time
 from pathlib import Path
-
-import pytest
 
 from hermes_cli import kanban_db as kb
 
@@ -53,15 +53,13 @@ def _load_plugin_module():
 plugin_api = _load_plugin_module()
 
 
-@pytest.fixture
-def board_db(tmp_path, monkeypatch):
+def _make_board_db(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     db_path = tmp_path / "kanban.db"
-    conn = kb.connect(db_path=db_path)
-    return conn
+    return kb.connect(db_path=db_path)
 
 
 def _set_status(conn, task_id, status):
@@ -81,8 +79,8 @@ def _emit_event(conn, task_id, kind, payload, *, after=False):
     conn.commit()
 
 
-def test_board_load_skips_plain_done_card_but_keeps_live(board_db):
-    conn = board_db
+def test_board_load_skips_plain_done_card_but_keeps_live(tmp_path, monkeypatch):
+    conn = _make_board_db(tmp_path, monkeypatch)
     # Live blocked card with an active hallucination signal — must be flagged.
     blocked = kb.create_task(conn, title="blocked", assignee="x",
                              initial_status="blocked")
@@ -99,12 +97,12 @@ def test_board_load_skips_plain_done_card_but_keeps_live(board_db):
     assert done_plain not in diags, "plain done card was flagged on board load"
 
 
-def test_board_load_keeps_done_card_with_phantom_ref_advisory(board_db):
+def test_board_load_keeps_done_card_with_phantom_ref_advisory(tmp_path, monkeypatch):
     """A ``done`` card whose completion summary referenced an unresolved id
     carries an active ``suspected_hallucinated_references`` event AFTER its
     ``completed`` event. ``prose_phantom_refs`` fires on it, and the board-load
     pass must still surface that advisory (don't regress the feature)."""
-    conn = board_db
+    conn = _make_board_db(tmp_path, monkeypatch)
     done = kb.create_task(conn, title="done w/ phantom ref", assignee="x")
     _set_status(conn, done, "done")
     # completed first, then the advisory after it (so it stays active).
@@ -119,33 +117,33 @@ def test_board_load_keeps_done_card_with_phantom_ref_advisory(board_db):
     assert "prose_phantom_refs" in kinds
 
 
-def test_board_load_excludes_archived_without_signal(board_db):
-    conn = board_db
+def test_board_load_excludes_archived_without_signal(tmp_path, monkeypatch):
+    conn = _make_board_db(tmp_path, monkeypatch)
     archived = kb.create_task(conn, title="archived", assignee="x")
     _set_status(conn, archived, "archived")
     diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
     assert archived not in diags
 
 
-def test_drawer_path_unscoped(board_db):
+def test_drawer_path_unscoped(tmp_path, monkeypatch):
     """The explicit task_ids path (drawer open) still computes whatever id it's
     handed, including a plain done card — it does not apply the board-load
     status/event scoping."""
-    conn = board_db
+    conn = _make_board_db(tmp_path, monkeypatch)
     done = kb.create_task(conn, title="done", assignee="x")
     _set_status(conn, done, "done")
     result = plugin_api._compute_task_diagnostics(conn, task_ids=[done])
     assert isinstance(result, dict)
 
 
-def test_board_load_excludes_archived_with_warning_event(board_db):
+def test_board_load_excludes_archived_with_warning_event(tmp_path, monkeypatch):
     """Archived cards stay out of the default (task_ids=None) diagnostics even
     when they carry an active warning event. The prior fleet query used
     ``status != 'archived'``; archived is hidden from the default board view, so
     a stale phantom-ref advisory on an archived card must not keep the default
     diagnostics non-empty. (A ``done`` card with the same event IS re-included —
     see test_board_load_keeps_done_card_with_phantom_ref_advisory.)"""
-    conn = board_db
+    conn = _make_board_db(tmp_path, monkeypatch)
     archived = kb.create_task(conn, title="archived w/ advisory", assignee="x")
     _set_status(conn, archived, "archived")
     _emit_event(conn, archived, "completed", {})
@@ -180,7 +178,7 @@ def _scanned_task_ids(conn):
     return captured
 
 
-def test_board_load_skips_done_card_whose_warning_was_cleared(board_db):
+def test_board_load_skips_done_card_whose_warning_was_cleared(tmp_path, monkeypatch):
     """A ``done`` card that once hit ``completion_blocked_hallucination`` but was
     then completed/edited (clearing the warning, per the rule engine's
     ``_active_hallucination_events``) yields no badge. Re-including it would just
@@ -188,7 +186,7 @@ def test_board_load_skips_done_card_whose_warning_was_cleared(board_db):
     pass must NOT pull it into the candidate scan — it stays excluded just like a
     plain done card.
     """
-    conn = board_db
+    conn = _make_board_db(tmp_path, monkeypatch)
     # Done card: blocked-completion warning, THEN a clean completed event after
     # it (greater id) — the warning is no longer active.
     cleared = kb.create_task(conn, title="done, warning cleared", assignee="x")
@@ -214,3 +212,38 @@ def test_board_load_skips_done_card_whose_warning_was_cleared(board_db):
         "cleared done card's history was materialised on board load"
     )
     assert active in scanned, "active-warning done card was dropped from the scan"
+
+
+def test_board_load_keeps_done_card_with_block_cycle_diagnostic(tmp_path, monkeypatch):
+    """``block_unblock_cycling`` has no current-status gate, so a done card
+    whose recent history crossed the cycle threshold must stay in the default
+    board-load candidate set even without a hallucination-warning event."""
+    conn = _make_board_db(tmp_path, monkeypatch)
+    cycled = kb.create_task(conn, title="done after cycling", assignee="x")
+    for kind in (
+        "blocked",
+        "unblocked",
+        "blocked",
+        "unblocked",
+        "blocked",
+        "unblocked",
+        "blocked",
+    ):
+        _emit_event(conn, cycled, kind, {"reason": "same wall"})
+    _set_status(conn, cycled, "done")
+
+    quiet_done = kb.create_task(conn, title="quiet done", assignee="x")
+    _emit_event(conn, quiet_done, "blocked", {"reason": "once"})
+    _emit_event(conn, quiet_done, "unblocked", {})
+    _set_status(conn, quiet_done, "done")
+
+    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+
+    assert cycled in diags, "done block-cycle card lost its diagnostic badge"
+    kinds = {d["kind"] for d in diags[cycled]}
+    assert "block_unblock_cycling" in kinds
+    assert quiet_done not in diags
+
+    scanned = _scanned_task_ids(conn)
+    assert cycled in scanned, "done block-cycle card was dropped from the scan"
+    assert quiet_done not in scanned, "low-signal done card was scanned"
