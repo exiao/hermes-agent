@@ -1729,6 +1729,23 @@ class TestGitDestructiveOps:
         )
         assert dangerous is False
 
+    def test_git_push_lease_carveout_rejects_bare_option_terminator(self):
+        """The bare `--` option terminator is not a refspec — git treats
+        `git push --force-with-lease origin --` as an OMITTED-refspec push
+        (push.default → could be main). It must not be counted as proof of an
+        explicit destination, so the carve-out keeps prompting. A real feature
+        refspec after `--` still carves out."""
+        for cmd in (
+            "git push --force-with-lease origin --",
+            "git push --force-with-lease -- origin",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin -- feature"
+        )
+        assert dangerous is False
+
     def test_gh_pr_merge_flagged(self):
         """`gh pr merge` bypasses PR review and MUST be flagged."""
         for cmd in ("gh pr merge 42 --squash", "gh pr merge 42", "gh pr merge"):

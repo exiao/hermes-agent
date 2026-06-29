@@ -1065,8 +1065,13 @@ def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
     # A short flag's leading char may be a letter (`--repo`, `-q`) OR a digit —
     # git push documents numeric short flags `-4`/`-6` (IPv4/IPv6); without the
     # digit they'd survive and be miscounted as a refspec. A remote/refspec
-    # never starts with a dash, so this only drops flags.
-    tokens = [t for t in pruned if not re.match(r'--?[a-z0-9]', t)]
+    # never starts with a dash, so this only drops flags. Also drop the bare `--`
+    # option terminator: git does not treat it as a refspec (`git push origin --`
+    # is an omitted-refspec push), so it must not count toward the explicit-
+    # destination check below.
+    tokens = [
+        t for t in pruned if t != '--' and not re.match(r'--?[a-z0-9]', t)
+    ]
     # First surviving token is the remote; a refspec must follow it.
     if len(tokens) < 2:
         return False
