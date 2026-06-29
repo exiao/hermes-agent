@@ -25,8 +25,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 import cli as cli_mod
 from cli import HermesCLI
 from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
@@ -52,7 +50,7 @@ def _make_chat_cli(result):
     c.api_key = ""
     c.api_mode = "chat_completions"
     c.conversation_history = []
-    c.final_response_markdown = False
+    c.final_response_markdown = "strip"
     c._session_db = None
     c._voice_tts = False
     c._voice_mode = False
@@ -94,20 +92,20 @@ def _make_chat_cli(result):
     return c
 
 
-@pytest.mark.parametrize("reason", ["rate_limit", "billing"])
-def test_chat_stashes_transient_failure_reason(reason):
+def test_chat_stashes_transient_failure_reason():
     """A failed run carrying a transient throttle reason is stashed verbatim
     so the non-quiet ``-q`` caller can map it to the EX_TEMPFAIL sentinel."""
-    c = _make_chat_cli(
-        {
-            "final_response": "",
-            "failed": True,
-            "failure_reason": reason,
-            "messages": [],
-        }
-    )
-    c.chat("work kanban task t_x")
-    assert c._last_failure_reason == reason
+    for reason in ["rate_limit", "billing"]:
+        c = _make_chat_cli(
+            {
+                "final_response": "",
+                "failed": True,
+                "failure_reason": reason,
+                "messages": [],
+            }
+        )
+        c.chat("work kanban task t_x")
+        assert c._last_failure_reason == reason
 
 
 def test_chat_stashes_none_on_clean_turn():
@@ -211,19 +209,33 @@ def _drive_non_quiet_q(monkeypatch, *, failure_reason, kanban_task):
     return calls, finalize_count
 
 
-@pytest.mark.parametrize("reason", ["rate_limit", "billing"])
-def test_worker_q_rate_limit_exits_tempfail_and_finalizes_once(monkeypatch, reason):
+def _assert_system_exit_code(expected_code, func, /, *args, **kwargs):
+    try:
+        func(*args, **kwargs)
+    except SystemExit as exc:
+        assert exc.code == expected_code
+        return
+    raise AssertionError(f"expected SystemExit({expected_code})")
+
+
+def test_worker_q_rate_limit_exits_tempfail_and_finalizes_once(monkeypatch):
     """A kanban-worker ``-q`` run that died on a transient throttle exits with
     the EX_TEMPFAIL sentinel (75) AND finalizes exactly once."""
-    calls, finalize_count = _drive_non_quiet_q(
-        monkeypatch, failure_reason=reason, kanban_task="t_worker"
-    )
+    for reason in ["rate_limit", "billing"]:
+        calls, finalize_count = _drive_non_quiet_q(
+            monkeypatch, failure_reason=reason, kanban_task="t_worker"
+        )
 
-    with pytest.raises(SystemExit) as exc_info:
-        cli_mod.main(query="work kanban task t_worker", quiet=False, toolsets="terminal")
+        _assert_system_exit_code(
+            KANBAN_RATE_LIMIT_EXIT_CODE,
+            cli_mod.main,
+            query="work kanban task t_worker",
+            quiet=False,
+            toolsets="terminal",
+        )
 
-    assert exc_info.value.code == KANBAN_RATE_LIMIT_EXIT_CODE == 75
-    assert finalize_count["n"] == 1  # finalize-once: lease released exactly once
+        assert KANBAN_RATE_LIMIT_EXIT_CODE == 75
+        assert finalize_count["n"] == 1  # finalize-once: lease released exactly once
 
 
 def test_worker_q_non_transient_exits_clean_not_tempfail(monkeypatch):
@@ -262,10 +274,13 @@ def test_worker_q_deferred_exit_fires_after_finalize(monkeypatch):
         monkeypatch, failure_reason="rate_limit", kanban_task="t_worker"
     )
 
-    with pytest.raises(SystemExit) as exc_info:
-        cli_mod.main(query="work kanban task t_worker", quiet=False, toolsets="terminal")
-
-    assert exc_info.value.code == 75
+    _assert_system_exit_code(
+        75,
+        cli_mod.main,
+        query="work kanban task t_worker",
+        quiet=False,
+        toolsets="terminal",
+    )
     # summary → finalize ordering, and both ran before the deferred exit raised.
     assert "summary" in calls and "finalize" in calls
     assert calls.index("summary") < calls.index("finalize")
