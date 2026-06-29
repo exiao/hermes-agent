@@ -229,7 +229,6 @@ class _StableEnviron:
 
     def __delitem__(self, key):
         del self._real[key]
-        self._snapshot.pop(key, None)
 
     def setdefault(self, key, default=None):
         if key not in self._snapshot:
@@ -237,7 +236,6 @@ class _StableEnviron:
         return self._snapshot[key]
 
     def pop(self, key, *args):
-        self._snapshot.pop(key, None)
         return self._real.pop(key, *args)
 
     def __getattr__(self, name):

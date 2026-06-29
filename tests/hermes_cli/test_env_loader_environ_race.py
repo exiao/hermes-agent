@@ -192,6 +192,19 @@ def test_loader_tolerates_key_deleted_while_building_snapshot(tmp_path, monkeypa
     assert racing.get("BAZ") == "gamma"
 
 
+def test_stable_environ_pop_does_not_mutate_snapshot():
+    """Concurrent unpins must not make an already-listed snapshot key vanish."""
+    real = {"PATH": "/usr/bin", "HERMES_KANBAN_BOARD": "main"}
+    stable = env_loader._StableEnviron(real)
+
+    keys = list(stable.keys())
+    stable.pop("HERMES_KANBAN_BOARD", None)
+
+    assert "HERMES_KANBAN_BOARD" in keys
+    assert stable["HERMES_KANBAN_BOARD"] == "main"
+    assert "HERMES_KANBAN_BOARD" not in real
+
+
 def test_concurrent_loads_do_not_leak_stable_environ(tmp_path, monkeypatch):
     """Overlapping _load_dotenv_with_fallback calls must not permanently leak
     the _StableEnviron wrapper as the process-wide os.environ.
