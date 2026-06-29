@@ -3612,9 +3612,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
         else:
             self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-        # Max turns priority: CLI arg > config file > env var > default
+        # Max turns priority: CLI arg > config file > env var > default.
+        #
+        # Exception for kanban workers: the dispatcher injects
+        # HERMES_MAX_ITERATIONS from the `kanban.worker_max_iterations` config
+        # knob (see kanban_db._resolve_worker_max_iterations). That env var is an
+        # explicit per-dispatch override and must win over the profile's default
+        # `agent.max_turns` (which is 90 from DEFAULT_CONFIG for every profile
+        # that doesn't set it) — otherwise the knob would be silently dead. We
+        # scope this precedence flip to the kanban-worker context only
+        # (HERMES_KANBAN_TASK set) so normal CLI/gateway sessions keep the
+        # config-over-env ordering users expect.
+        _kanban_iter_override = None
+        if os.getenv("HERMES_KANBAN_TASK") and os.getenv("HERMES_MAX_ITERATIONS"):
+            try:
+                _val = int(os.getenv("HERMES_MAX_ITERATIONS", ""))
+                # Only a strictly-positive cap is meaningful; 0/negative would
+                # immediately terminate the agent loop, so ignore it and fall
+                # through to the config/profile default.
+                if _val > 0:
+                    _kanban_iter_override = _val
+            except (TypeError, ValueError):
+                _kanban_iter_override = None
         if max_turns is not None:  # CLI arg was explicitly set
             self.max_turns = max_turns
+        elif _kanban_iter_override is not None:
+            self.max_turns = _kanban_iter_override
         elif CLI_CONFIG["agent"].get("max_turns"):
             self.max_turns = CLI_CONFIG["agent"]["max_turns"]
         elif CLI_CONFIG.get("max_turns"):  # Backwards compat: root-level max_turns

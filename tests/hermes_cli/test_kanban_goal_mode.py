@@ -172,6 +172,163 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Lane goal-mode defaults + worker_max_iterations resolver
+# ---------------------------------------------------------------------------
+
+def _db_task(kanban_home, **create_kw):
+    """Create a real task row and return its Task view (resolver inputs)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, **create_kw)
+        return kb.get_task(conn, tid)
+
+
+def test_lane_default_enables_goal_mode_for_checkable_lane(kanban_home):
+    # `dev` is a default goal-mode lane; no explicit task opt-in needed.
+    task = _db_task(kanban_home, title="t", assignee="dev")
+    gm, turns = kb._resolve_lane_goal_defaults(task, {})
+    assert gm is True
+    assert turns == kb.DEFAULT_GOAL_MODE_MAX_TURNS
+
+
+def test_lane_default_off_for_judgment_lane(kanban_home):
+    task = _db_task(kanban_home, title="t", assignee="designer")
+    gm, turns = kb._resolve_lane_goal_defaults(task, {})
+    assert gm is False
+    assert turns is None
+
+
+def test_explicit_task_goal_mode_wins_for_non_lane(kanban_home):
+    # A non-default lane that explicitly asked for goal mode still gets it.
+    task = _db_task(kanban_home, title="t", assignee="designer", goal_mode=True)
+    gm, turns = kb._resolve_lane_goal_defaults(task, {})
+    assert gm is True
+    assert turns == kb.DEFAULT_GOAL_MODE_MAX_TURNS
+
+
+def test_explicit_max_turns_overrides_lane_default(kanban_home):
+    task = _db_task(kanban_home, title="t", assignee="dev", goal_mode=True, goal_max_turns=12)
+    gm, turns = kb._resolve_lane_goal_defaults(task, {})
+    assert gm is True
+    assert turns == 12
+
+
+def test_non_positive_explicit_max_turns_falls_back_to_default(kanban_home):
+    # A 0/negative --goal-max-turns would create a nonsensical 0-turn loop;
+    # it must fall back to the default rather than be taken literally.
+    task = _db_task(kanban_home, title="t", assignee="dev", goal_mode=True, goal_max_turns=0)
+    gm, turns = kb._resolve_lane_goal_defaults(task, {})
+    assert gm is True
+    assert turns == kb.DEFAULT_GOAL_MODE_MAX_TURNS
+
+
+def test_config_goal_mode_lanes_overrides_builtin(kanban_home):
+    cfg = {"goal_mode_lanes": ["pm"], "goal_mode_default_max_turns": 3}
+    # `pm` now defaults on...
+    pm_task = _db_task(kanban_home, title="t", assignee="pm")
+    assert kb._resolve_lane_goal_defaults(pm_task, cfg) == (True, 3)
+    # ...and `dev` no longer does (config list replaces the built-in).
+    dev_task = _db_task(kanban_home, title="t2", assignee="dev")
+    gm2, _ = kb._resolve_lane_goal_defaults(dev_task, cfg)
+    assert gm2 is False
+
+
+def test_config_empty_lane_list_disables_all_defaults(kanban_home):
+    task = _db_task(kanban_home, title="t", assignee="dev")
+    gm, _ = kb._resolve_lane_goal_defaults(task, {"goal_mode_lanes": []})
+    assert gm is False
+
+
+def test_worker_max_iterations_only_for_non_goal():
+    cfg = {"worker_max_iterations": 150}
+    assert kb._resolve_worker_max_iterations(False, cfg) == 150
+    # Goal-mode dispatches keep the 90 per-run cap regardless of the knob.
+    assert kb._resolve_worker_max_iterations(True, cfg) is None
+
+
+def test_worker_max_iterations_unset_or_invalid():
+    assert kb._resolve_worker_max_iterations(False, {}) is None
+    assert kb._resolve_worker_max_iterations(False, {"worker_max_iterations": 0}) is None
+    assert kb._resolve_worker_max_iterations(False, {"worker_max_iterations": "nope"}) is None
+
+
+# ---------------------------------------------------------------------------
+# Spawn env: lane defaults + worker_max_iterations injection
+# ---------------------------------------------------------------------------
+
+def _capture_spawn_env(kanban_home, monkeypatch, task, kanban_cfg):
+    captured = {}
+
+    class _FakeProc:
+        pid = 5000
+
+    def _fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs.get("env", {})
+        return _FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(kb, "_load_kanban_cfg", lambda: kanban_cfg)
+    kb._default_spawn(task, str(kanban_home))
+    return captured["env"]
+
+
+def test_spawn_lane_default_sets_goal_env(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ci sweep", assignee="dev")
+        task = kb.get_task(conn, tid)
+    env = _capture_spawn_env(kanban_home, monkeypatch, task, {})
+    assert env.get("HERMES_KANBAN_GOAL_MODE") == "1"
+    assert env.get("HERMES_KANBAN_GOAL_MAX_TURNS") == str(kb.DEFAULT_GOAL_MODE_MAX_TURNS)
+    # Goal-mode dispatch must NOT also inject HERMES_MAX_ITERATIONS.
+    assert "HERMES_MAX_ITERATIONS" not in env
+
+
+def test_spawn_worker_max_iterations_for_non_goal_lane(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="design pass", assignee="designer")
+        task = kb.get_task(conn, tid)
+    env = _capture_spawn_env(
+        kanban_home, monkeypatch, task, {"worker_max_iterations": 150}
+    )
+    assert env.get("HERMES_MAX_ITERATIONS") == "150"
+    assert "HERMES_KANBAN_GOAL_MODE" not in env
+
+
+def test_spawn_goal_lane_ignores_worker_max_iterations(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ci sweep", assignee="dev")
+        task = kb.get_task(conn, tid)
+    env = _capture_spawn_env(
+        kanban_home, monkeypatch, task, {"worker_max_iterations": 150}
+    )
+    assert env.get("HERMES_KANBAN_GOAL_MODE") == "1"
+    assert "HERMES_MAX_ITERATIONS" not in env
+
+
+def test_spawn_goal_lane_drops_inherited_max_iterations(kanban_home, monkeypatch):
+    # A HERMES_MAX_ITERATIONS leaking from the dispatcher's own env must NOT
+    # raise a goal-mode worker's per-run cap — goal mode keeps the 90 cap.
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "200")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ci sweep", assignee="dev")
+        task = kb.get_task(conn, tid)
+    env = _capture_spawn_env(kanban_home, monkeypatch, task, {})
+    assert env.get("HERMES_KANBAN_GOAL_MODE") == "1"
+    assert "HERMES_MAX_ITERATIONS" not in env
+
+
+def test_spawn_non_goal_drops_inherited_max_iterations_when_unset(kanban_home, monkeypatch):
+    # No config knob → a non-goal worker's per-run cap comes from config/profile,
+    # not an ambient HERMES_MAX_ITERATIONS inherited from the dispatcher.
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "200")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="design pass", assignee="designer")
+        task = kb.get_task(conn, tid)
+    env = _capture_spawn_env(kanban_home, monkeypatch, task, {})
+    assert "HERMES_KANBAN_GOAL_MODE" not in env
+    assert "HERMES_MAX_ITERATIONS" not in env
+
+
+# ---------------------------------------------------------------------------
 # Goal loop logic (callback-injected, no live model)
 # ---------------------------------------------------------------------------
 
