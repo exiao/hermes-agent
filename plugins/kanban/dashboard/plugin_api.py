@@ -56,6 +56,9 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
+
 
 # ---------------------------------------------------------------------------
 # Auth helper — WebSocket only (HTTP routes live behind the dashboard's
@@ -352,6 +355,8 @@ def _compute_task_diagnostics(
             )
         except OverflowError:
             block_cycle_threshold = 3
+        if block_cycle_threshold > _SQLITE_INT_MAX:
+            block_cycle_threshold = 3
         try:
             block_cycle_window_seconds = float(
                 diag_config.get("block_cycle_window_seconds", 24 * 3600),
@@ -363,6 +368,8 @@ def _compute_task_diagnostics(
         block_cycle_cutoff = int(
             time.time() - block_cycle_window_seconds,
         )
+        if not _SQLITE_INT_MIN <= block_cycle_cutoff <= _SQLITE_INT_MAX:
+            block_cycle_cutoff = int(time.time() - (24 * 3600))
         rows = conn.execute(
             f"SELECT * FROM tasks WHERE status NOT IN ({status_ph}) "
             f"UNION ALL "
