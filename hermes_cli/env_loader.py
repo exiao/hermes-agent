@@ -232,7 +232,12 @@ def load_hermes_dotenv(
     """
     loaded: list[Path] = []
 
-    home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    # Treat an EMPTY ``HERMES_HOME`` as unset, matching ``get_hermes_home()``
+    # (which does ``os.environ.get("HERMES_HOME", "").strip()``). A bare
+    # ``HERMES_HOME=`` export must fall back to the platform default, NOT to
+    # ``Path("")`` (== cwd), which would derive the root from the working
+    # directory and skip the real ``~/.hermes/.env``.
+    home_path = Path(hermes_home or os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 

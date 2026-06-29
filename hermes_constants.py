@@ -144,30 +144,40 @@ def get_default_hermes_root(home: str | os.PathLike | None = None) -> Path:
         return native_home
     # Absolutize WITHOUT following symlinks: ``os.path.abspath`` anchors a
     # relative ``home`` to cwd and normalizes ``..`` (gemini's note) while
-    # preserving the textual ``profiles/<name>`` segment. A plain ``.resolve()``
-    # would follow a symlinked profile dir to its target and erase that segment,
-    # so the ``profiles`` shape check below would miss and we'd return the link
-    # target as its own root — breaking shared-root ``.env`` secret isolation.
-    env_path = Path(os.path.abspath(env_home))
+    # preserving the textual ``profiles/<name>`` segment for the shape check
+    # below. ``real_path`` is the symlink-resolved form, used for containment
+    # so the root decision tracks where the home physically lives.
+    abs_path = Path(os.path.abspath(env_home))
+    real_path = abs_path.resolve()
+    native_real = native_home.resolve()
+
+    # Logical profile shape first: a profile dir ``<root>/profiles/<name>``
+    # that is itself a symlink to storage OUTSIDE the root still derives the
+    # real Hermes root from its logical path (the original P2 fix). Checking
+    # the un-resolved path is what preserves the ``profiles/<name>`` segment.
+    if abs_path.parent.name == "profiles":
+        return abs_path.parent.parent.resolve()
+
+    # Containment on the RESOLVED path: a home whose physical location is under
+    # the native root is native (covers a normal home, a native profile, and an
+    # alias symlink pointing AT a native path). A home that is textually under
+    # ``~/.hermes`` but symlinks to storage OUTSIDE it resolves elsewhere and so
+    # is correctly treated as a custom deployment — no shared-secret inheritance.
     try:
-        env_path.relative_to(native_home.resolve())
-        # home is under ~/.hermes (normal or profile mode)
+        real_path.relative_to(native_real)
         return native_home
     except ValueError:
         pass
 
     # Docker / custom deployment.
-    # Check if this is a profile path: <root>/profiles/<name>
-    # If the immediate parent dir is named "profiles", the root is
-    # the grandparent — this covers Docker profiles correctly. The shape
-    # check runs on the un-symlink-resolved path so a profile dir that is a
-    # symlink outside the root still resolves its ``.env`` against the true
-    # Hermes root. Only the final returned value is canonicalized.
-    if env_path.parent.name == "profiles":
-        return env_path.parent.parent.resolve()
+    # A resolved profile path ``<root>/profiles/<name>`` outside the native
+    # root returns its grandparent — covers Docker profiles correctly.
+    if real_path.parent.name == "profiles":
+        return real_path.parent.parent
 
-    # Not a profile path — home itself is the root
-    return env_path.resolve()
+    # Not a profile path — the home itself is the root (resolved so the
+    # returned value is absolute and stable across cwd changes).
+    return real_path
 
 
 def _get_packaged_data_dir(name: str) -> Path | None:
