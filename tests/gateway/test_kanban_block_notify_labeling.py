@@ -162,6 +162,65 @@ def test_infer_access_plus_retry_prefers_retry():
     )
 
 
+def test_infer_hyphenated_http_status_marker_is_transient():
+    # Finding 3: common HTTP-status notation (``HTTP-429``, ``status-503``) must
+    # be recognised as a transient status. The issue-ref strip must NOT eat the
+    # whole ``http-429``/``status-503`` token before the numeric code is seen,
+    # or a genuine transient falls through to the default 🔴 DECISION NEEDED.
+    assert _infer_block_header("HTTP-429 from upstream") == "🟡 RETRY"
+    assert _infer_block_header("status-503 from the API") == "🟡 RETRY"
+    assert _infer_block_header("https-502 talking to the gateway") == "🟡 RETRY"
+    # A real ticket slug with the same number is still NOT a status code.
+    assert (
+        _infer_block_header("Should I close HERMES-429 or keep it?")
+        == "🔴 DECISION NEEDED"
+    )
+
+
+def test_infer_negated_retry_defers_to_access_evidence():
+    # Finding 4: a negated retry instruction is the opposite of transient — it's
+    # an operator routing action. A credential/access block whose wording says
+    # "do not retry / don't try again until provisioned" must route, not RETRY.
+    assert (
+        _infer_block_header(
+            "Missing API key; do not retry until the key is provisioned"
+        )
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header(
+            "No vault access; don't try again until credentials exist"
+        )
+        == "🟠 ROUTING"
+    )
+    # A POSITIVE retry instruction still classifies as transient.
+    assert (
+        _infer_block_header("Search API was flaky — try again in a minute")
+        == "🟡 RETRY"
+    )
+
+
+def test_infer_relative_which_clause_is_not_a_decision():
+    # Finding 5: a bare "which " inside an ordinary relative clause must NOT be
+    # read as a human choice. These are transient failures described with normal
+    # explanatory grammar, so they classify by their retry/status evidence.
+    assert (
+        _infer_block_header(
+            "The deploy API, which returned 429, is rate-limited; try again later"
+        )
+        == "🟡 RETRY"
+    )
+    assert (
+        _infer_block_header("Search endpoint which timed out looks flaky")
+        == "🟡 RETRY"
+    )
+    # A genuine "which … ?" question is still a decision (trailing-? path).
+    assert (
+        _infer_block_header("Which limiter key should I use, IP or user_id?")
+        == "🔴 DECISION NEEDED"
+    )
+
+
 def test_infer_empty_reason_has_no_header():
     assert _infer_block_header("") is None
     assert _infer_block_header("   ") is None
