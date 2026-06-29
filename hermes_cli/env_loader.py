@@ -246,7 +246,13 @@ class _StableEnviron(MutableMapping[str, str]):
         return self._read_view().values()
 
     def copy(self) -> dict[str, str]:
-        return self._read_view()
+        copied = {
+            key: value
+            for key, value in self._snapshot.items()
+            if self._encode_key(key) not in self._deleted_keys
+        }
+        copied.update(self._writes)
+        return copied
 
     # --- writes: pass through to the real os.environ AND keep the snapshot
     # coherent so a later read in the same load sees what was just written ---
