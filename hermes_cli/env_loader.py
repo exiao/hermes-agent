@@ -4,10 +4,23 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
 from utils import atomic_replace
+
+
+# Serializes the os.environ swap/restore in _load_dotenv_with_fallback.  The
+# swap rebinds the *global* os.environ to a _StableEnviron snapshot; if two
+# loads overlap, the inner call captures the outer call's wrapper as its
+# "real" environ and restores THAT on exit, leaking the frozen-snapshot
+# wrapper as the process-wide os.environ permanently (all later reads go
+# stale).  load_hermes_dotenv() is called from many entrypoints/tools with no
+# other serialization (mcp_tool, feishu rules, gateway hot-reload), so the
+# swap window must be mutually exclusive.  The load is short and this only
+# guards the brief snapshot/restore, so contention is negligible.
+_LOAD_DOTENV_LOCK = threading.Lock()
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -227,16 +240,22 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     # can delete a key between enumerate and get, raising KeyError mid-load.
     # The write-through snapshot gives dotenv a stable view for reads while its
     # writes still land on the real environment. Restored in finally.
-    stable = _StableEnviron(os.environ)
-    real_environ = os.environ
-    os.environ = stable  # type: ignore[assignment]
-    try:
+    # Serialize the global os.environ swap so two overlapping loads can't nest
+    # the rebind and leak a _StableEnviron wrapper as the process-wide
+    # os.environ (see _LOAD_DOTENV_LOCK).  real_environ MUST be captured inside
+    # the lock: capturing it before would let this call read another in-flight
+    # load's wrapper as "real" and restore that wrapper on exit.
+    with _LOAD_DOTENV_LOCK:
+        real_environ = os.environ
+        stable = _StableEnviron(real_environ)
+        os.environ = stable  # type: ignore[assignment]
         try:
-            load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
-        except UnicodeDecodeError:
-            load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
-    finally:
-        os.environ = real_environ  # type: ignore[assignment]
+            try:
+                load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+            except UnicodeDecodeError:
+                load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        finally:
+            os.environ = real_environ  # type: ignore[assignment]
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars

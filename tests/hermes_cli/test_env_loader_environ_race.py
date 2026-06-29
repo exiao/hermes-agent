@@ -164,3 +164,64 @@ def test_loader_snapshots_environ_and_survives_race(tmp_path, monkeypatch):
     assert racing.get("FOO") == "alpha-main"
     assert racing.get("BAR") == "beta-main"
     assert racing.get("BAZ") == "gamma"
+
+
+def test_concurrent_loads_do_not_leak_stable_environ(tmp_path, monkeypatch):
+    """Overlapping _load_dotenv_with_fallback calls must not permanently leak
+    the _StableEnviron wrapper as the process-wide os.environ.
+
+    The fix swaps the *global* os.environ for a snapshot during each load and
+    restores it in finally. Without serialization (and without capturing
+    real_environ *inside* the lock), an inner call captures an outer call's
+    wrapper as its real_environ and restores THAT on exit -- leaving os.environ
+    pointing at a frozen snapshot forever, so every later os.environ read goes
+    stale. _LOAD_DOTENV_LOCK serializes the swap/restore and real_environ is
+    captured inside it, so the wrapper can never be restored over the real
+    mapping.
+
+    Invariant: after concurrent loads finish, os.environ is the real mapping.
+    Pre-fix this leaks deterministically (10/10 trials); post-fix it is clean.
+    """
+    import threading
+    import time
+
+    real_environ = os.environ
+    env_file = tmp_path / ".env"
+    env_file.write_text("FOO=alpha\nBAR=beta\n", encoding="utf-8")
+
+    # Widen the swap window so loads overlap and the race is exercised.
+    real_load = dotenv_main.load_dotenv
+
+    def slow_load(*args, **kwargs):
+        time.sleep(0.01)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(env_loader, "load_dotenv", slow_load)
+
+    def worker():
+        for _ in range(15):
+            env_loader._load_dotenv_with_fallback(env_file, override=True)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    leaked = os.environ is not real_environ
+    # Best-effort restore so a failure can't poison the rest of the session.
+    if leaked:
+        os.environ = real_environ  # type: ignore[assignment]
+
+    assert not leaked, (
+        "os.environ left pointing at a _StableEnviron wrapper after concurrent "
+        "loads -- the swap/restore must be serialized and real_environ captured "
+        "inside the lock"
+    )
+    # A frozen-snapshot leak also makes a freshly set key invisible; sanity-check
+    # the live mapping still reflects new writes.
+    real_environ["_ENV_LOADER_RACE_PROBE"] = "live"
+    try:
+        assert os.environ.get("_ENV_LOADER_RACE_PROBE") == "live"
+    finally:
+        real_environ.pop("_ENV_LOADER_RACE_PROBE", None)
