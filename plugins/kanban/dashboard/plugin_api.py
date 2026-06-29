@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import asdict
@@ -57,6 +58,8 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 _SQLITE_IN_CHUNK_SIZE = 500
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +162,27 @@ def _conn(board: Optional[str] = None):
 BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
+
+# Terminal columns: a card here is finished. Almost no diagnostic rule can fire
+# on one — the status-gated rules need triage/blocked/ready, and the unified
+# failure/crash counters are broken by the successful run that put the card
+# here. The board-load pass drops both terminal columns from the default scan.
+#
+# ``done`` cards get two narrow re-inclusions for rules that can still fire on
+# a completed card: active event-signal warnings in ``_WARNING_EVENT_KINDS``
+# (a blocked completion / a phantom-ref advisory), plus block↔unblock cycling
+# candidates. The pass never re-admits the full done column, whose event history
+# grows every day and otherwise yields zero badges, and never a done card whose
+# warning was later cleared by a subsequent completion/edit (it would yield no
+# badge, so scanning its history is wasted).
+#
+# ``archived`` is excluded outright, matching the prior fleet query
+# (``status != 'archived'``): the default ``task_ids=None`` diagnostics (and the
+# /board view) hide archived unless the caller explicitly asks, so an archived
+# card must not keep the default diagnostics non-empty via a stale warning event.
+_DIAGNOSTIC_TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "archived"})
+# Of the terminal statuses, only ``done`` is re-admitted via a warning event.
+_DIAGNOSTIC_WARNING_REINCLUDE_STATUSES: frozenset[str] = frozenset({"done"})
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -286,8 +310,111 @@ def _compute_task_diagnostics(
                 ).fetchall()
             )
     else:
+        # Board-load path. Three rules can fire on a card that is NOT live/stuck:
+        # ``hallucinated_cards`` (a blocked completion leaves the card in its
+        # prior state), ``prose_phantom_refs`` (an advisory that fires on a
+        # *successful* completion, so it legitimately surfaces on a ``done``
+        # card), and ``block_unblock_cycling`` (no current-status gate; it only
+        # counts recent blocked/unblocked events). The first two key off the
+        # ``_WARNING_EVENT_KINDS`` events. Every other rule requires a live/stuck
+        # status. So the candidate set is:
+        #   (a) all non-terminal cards, PLUS
+        #   (b) ``done`` cards that carry an active warning event, PLUS
+        #   (c) ``done`` cards with enough recent blocked/unblocked events to
+        #       potentially satisfy the block-cycle rule.
+        # ``archived`` is excluded from both branches (the prior fleet query
+        # used ``status != 'archived'``; archived is hidden from the default
+        # board/diagnostics view, so it must not surface here via a stale event).
+        # This drops the per-card event/run scan over the entire done column
+        # (hundreds of cards, ~15K-and-growing events, zero badges) — the
+        # actual hotspot — while preserving every diagnostic that can fire.
+        #
+        # Branch (b) uses a correlated ``EXISTS`` (not ``IN (SELECT DISTINCT
+        # ... WHERE kind ...)``): ``task_events`` has no index on ``kind``, so
+        # the ``IN`` form forces a full table scan of the (growing) event log.
+        # ``EXISTS (... WHERE e.task_id = t.id AND e.kind IN (...))`` lets SQLite
+        # drive the ``idx_events_task`` index (leading column ``task_id``) and
+        # probe only the small set of done cards. ``UNION ALL`` (not ``UNION``)
+        # because the three branches are made disjoint — no dedup needed.
+        #
+        # The re-include predicate matches the rule engine's
+        # ``_active_hallucination_events``: a warning event counts only when no
+        # ``completed``/``edited`` event arrives *strictly after* it (greater
+        # ``id``). A done card whose warning was later cleared by a subsequent
+        # completion/edit yields zero badges, so re-including it would just
+        # re-materialise its (potentially large) event/run history on every
+        # board load for nothing — the inner ``NOT EXISTS`` excludes it. Both
+        # correlated subqueries filter on ``e.task_id = t.id``, so each rides
+        # the ``idx_events_task`` index rather than scanning the event log.
+        # Branch (c) uses the same task_id-leading index and a cheap count
+        # prefilter; the exact transition count remains inside the rule engine
+        # after the candidate's event history is materialised. It excludes cards
+        # already admitted by branch (b) so ``UNION ALL`` cannot duplicate rows.
+        terminal = tuple(sorted(_DIAGNOSTIC_TERMINAL_STATUSES))
+        reinclude = tuple(sorted(_DIAGNOSTIC_WARNING_REINCLUDE_STATUSES))
+        status_ph = ",".join(["?"] * len(terminal))
+        reinclude_ph = ",".join(["?"] * len(reinclude))
+        kind_ph = ",".join(["?"] * len(_WARNING_EVENT_KINDS))
+        try:
+            block_cycle_threshold = kd._positive_int(
+                diag_config.get("block_cycle_threshold"), 3,
+            )
+        except OverflowError:
+            block_cycle_threshold = 3
+        if block_cycle_threshold > _SQLITE_INT_MAX:
+            block_cycle_threshold = 3
+        try:
+            block_cycle_window_seconds = float(
+                diag_config.get("block_cycle_window_seconds", 24 * 3600),
+            )
+        except (TypeError, ValueError):
+            block_cycle_window_seconds = 24 * 3600
+        if not math.isfinite(block_cycle_window_seconds):
+            block_cycle_window_seconds = 24 * 3600
+        block_cycle_cutoff = int(
+            time.time() - block_cycle_window_seconds,
+        )
+        if not _SQLITE_INT_MIN <= block_cycle_cutoff <= _SQLITE_INT_MAX:
+            block_cycle_cutoff = int(time.time() - (24 * 3600))
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'",
+            f"SELECT * FROM tasks WHERE status NOT IN ({status_ph}) "
+            f"UNION ALL "
+            f"SELECT t.* FROM tasks t WHERE t.status IN ({reinclude_ph}) "
+            f"AND EXISTS (SELECT 1 FROM task_events e "
+            f"            WHERE e.task_id = t.id AND e.kind IN ({kind_ph}) "
+            f"            AND NOT EXISTS (SELECT 1 FROM task_events c "
+            f"                WHERE c.task_id = t.id "
+            f"                AND c.kind IN ('completed', 'edited') "
+            f"                AND c.id > e.id)) "
+            f"UNION ALL "
+            f"SELECT t.* FROM tasks t WHERE t.status IN ({reinclude_ph}) "
+            f"AND (SELECT COUNT(*) FROM task_events e "
+            f"     WHERE e.task_id = t.id "
+            f"     AND e.kind = 'blocked' "
+            f"     AND e.created_at >= ?) >= ? "
+            f"AND (SELECT COUNT(*) FROM task_events e "
+            f"     WHERE e.task_id = t.id "
+            f"     AND e.kind = 'unblocked' "
+            f"     AND e.created_at >= ?) >= ? "
+            f"AND NOT EXISTS (SELECT 1 FROM task_events w "
+            f"    WHERE w.task_id = t.id AND w.kind IN ({kind_ph}) "
+            f"    AND NOT EXISTS (SELECT 1 FROM task_events c "
+            f"        WHERE c.task_id = t.id "
+            f"        AND c.kind IN ('completed', 'edited') "
+            f"        AND c.id > w.id))",
+            (
+                terminal
+                + reinclude
+                + tuple(_WARNING_EVENT_KINDS)
+                + reinclude
+                + (
+                    block_cycle_cutoff,
+                    block_cycle_threshold,
+                    block_cycle_cutoff,
+                    block_cycle_threshold,
+                )
+                + tuple(_WARNING_EVENT_KINDS)
+            ),
         ).fetchall()
 
     if not rows:
