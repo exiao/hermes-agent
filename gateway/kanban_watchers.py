@@ -179,11 +179,29 @@ _BLOCK_KIND_NOTIFY = {
 }
 
 # Reason-text → header inference. Order matters: a reason can mention several
-# things, so check the most specific / least-human buckets first and fall
-# through to the human-decision default.
+# things. An explicit human-CHOICE wins first (the act-on-it default), then the
+# transient bucket (rate-limit/timeout — operator-no-action), then a hard
+# access/lane wall. The retry check precedes routing so a reason that cites both
+# a generic access phrase AND a transient signal (``no access right now: 429
+# rate limit``) is bucketed by its retryable evidence, not downgraded to a
+# routing wall.
+#
+# Decision/question wording is the strongest signal: a reason like ``Should I
+# retry the failed migration or roll back?`` or ``I can't reach a decision
+# between A and B without input`` names retry/reach but is plainly a human
+# choice, so it must surface as 🔴 DECISION NEEDED rather than be downgraded to
+# transient/routing by an incidental substring.
+_DECISION_HINTS = (
+    "should i ", "should we ", "do i ", "do we ", "which ", "or roll back",
+    "roll back or", "reach a decision", "make a decision", "need a decision",
+    "needs a decision", "need a call", "your call", "decide ", "decide?",
+    "without input", "without a decision", "need input", "need guidance",
+    "human decision", "judgment call", "judgement call",
+)
 _ROUTING_HINTS = (
     "no access", "no creds", "no credential", "not authorized", "unauthorized",
-    "permission denied", "can't reach", "cannot reach", "wrong lane",
+    "permission denied", "can't reach the", "cannot reach the",
+    "can't reach a service", "wrong lane",
     "no vault", "missing token", "missing key", "missing api key",
     "forbidden", "not provisioned", "no permission",
 )
@@ -194,23 +212,40 @@ _RETRY_HINTS = (
 )
 
 # HTTP status codes are strong signals, but a bare ``403``/``429`` substring
-# also matches an unrelated ticket reference like ``merge PR #403?`` and would
-# wrongly downgrade a human-decision block to ROUTING/RETRY. Only treat a
-# numeric code as a status code when it is an HTTP-error-context token: a
-# standalone 3-digit number that is NOT an issue/PR/ticket reference (``#NNN``,
-# ``pr NNN``, ``issue NNN``, ``ticket NNN``). Default stays 🔴 DECISION NEEDED.
+# also matches an unrelated ticket reference like ``merge PR #403?``, a ticket
+# slug ``HERMES-429``, or an issue URL ``/issues/429`` — and would wrongly
+# downgrade a human-decision block to ROUTING/RETRY. Only treat a numeric code
+# as a status code when it is a standalone token that (a) is NOT part of an
+# issue/PR/ticket/URL reference and (b) sits in an explicit HTTP/error context
+# (``status``/``code``/``http``/``returned``/``responded``/``error`` nearby, or
+# an HTTP method/scheme). Default stays 🔴 DECISION NEEDED.
 _ROUTING_STATUS_CODES = ("403",)
 _RETRY_STATUS_CODES = ("429", "503", "502")
-_ISSUE_REF_RE = re.compile(r"(?:#|\b(?:pr|issue|ticket|gh)[\s#-]*)\d{1,4}\b")
+# Strip explicit non-HTTP references (``#403``, ``pr 403``, ``issue 429``,
+# ``gh-502``, ``HERMES-429``, ``.../issues/429``) before looking for a code.
+_ISSUE_REF_RE = re.compile(
+    r"(?:#|\b(?:pr|issue|issues|ticket|gh)[\s#/-]*|[a-z]+-)\d{1,4}\b"
+)
+# An HTTP/error context token must appear in the reason for a bare code to count
+# as a status code (vs. an arbitrary 3-digit number).
+_HTTP_CONTEXT_RE = re.compile(
+    r"\b(?:http|https|status|code|error|errored|returned|responded|response|"
+    r"got|gave|api|server|endpoint|request|rate[\s-]?limit|forbidden|"
+    r"unauthorized|gateway|get|post|put|patch|delete)\b"
+)
 
 
 def _has_status_code(text: str, codes: tuple) -> bool:
     """True when ``text`` cites one of ``codes`` as a bare HTTP status code.
 
-    A code only counts as a standalone ``\\bNNN\\b`` token whose match span is
-    not part of an issue/PR/ticket reference (those are stripped first), so
-    ``returned 403`` classifies as routing while ``merge PR #403?`` does not.
+    A code only counts when (a) it is a standalone ``\\bNNN\\b`` token whose
+    match span is not part of an issue/PR/ticket/URL reference (those are
+    stripped first) AND (b) the reason carries explicit HTTP/error context, so
+    ``deploy API returned 403`` classifies while ``Should I close HERMES-429?``
+    or ``.../issues/429`` does not.
     """
+    if not _HTTP_CONTEXT_RE.search(text):
+        return False
     stripped = _ISSUE_REF_RE.sub(" ", text)
     return any(re.search(rf"\b{code}\b", stripped) for code in codes)
 
@@ -222,18 +257,28 @@ def _infer_block_header(reason_detail: str) -> Optional[str]:
     back to the legacy ``⏸ … blocked`` shape). A non-empty reason ALWAYS gets a
     header; an ambiguous one defaults to 🔴 DECISION NEEDED so anything that
     might need a human is surfaced as one.
+
+    Precedence: explicit human-CHOICE wording wins first (a question/decision is
+    always act-on-it, even when it mentions ``retry`` or ``can't reach`` as an
+    option); then transient/retry evidence; then a hard access/lane wall.
+    Checking retry before routing means a reason with BOTH a generic access
+    phrase AND a transient signal (``no access right now: 429 rate limit``) is
+    bucketed 🟡 RETRY by its retryable evidence rather than 🟠 ROUTING.
     """
     text = (reason_detail or "").strip().lower()
     if not text:
         return None
-    if any(h in text for h in _ROUTING_HINTS) or _has_status_code(
-        text, _ROUTING_STATUS_CODES
-    ):
-        return _BLOCK_KIND_NOTIFY["capability"]
+    # A human choice/question wins over any incidental routing/retry substring.
+    if any(h in text for h in _DECISION_HINTS) or text.endswith("?"):
+        return _BLOCK_KIND_NOTIFY["needs_input"]
     if any(h in text for h in _RETRY_HINTS) or _has_status_code(
         text, _RETRY_STATUS_CODES
     ):
         return _BLOCK_KIND_NOTIFY["transient"]
+    if any(h in text for h in _ROUTING_HINTS) or _has_status_code(
+        text, _ROUTING_STATUS_CODES
+    ):
+        return _BLOCK_KIND_NOTIFY["capability"]
     return _BLOCK_KIND_NOTIFY["needs_input"]
 
 

@@ -102,6 +102,66 @@ def test_infer_issue_number_is_not_a_status_code():
     assert _infer_block_header("search API returned 429, transient") == "🟡 RETRY"
 
 
+def test_infer_retry_question_is_a_decision_not_transient():
+    # A human CHOICE that merely mentions "retry" as one option must surface as
+    # a decision, not be downgraded to 🟡 RETRY by the bare "retry" substring.
+    assert (
+        _infer_block_header("Should I retry the failed migration or roll back?")
+        == "🔴 DECISION NEEDED"
+    )
+    # …even without a trailing "?" — the choice wording itself wins.
+    assert (
+        _infer_block_header("Need a decision: retry the failed migration or roll back")
+        == "🔴 DECISION NEEDED"
+    )
+
+
+def test_infer_reach_a_decision_is_not_routing():
+    # "can't reach a decision …" names reachability but is plainly a human
+    # choice; it must NOT match the access/routing bucket.
+    assert (
+        _infer_block_header(
+            "I can't reach a decision between A and B without input"
+        )
+        == "🔴 DECISION NEEDED"
+    )
+    # The genuine reachability-wall wording still routes.
+    assert (
+        _infer_block_header("Can't reach the deploy endpoint, network is down")
+        == "🟠 ROUTING"
+    )
+
+
+def test_infer_non_http_code_is_not_a_status_code():
+    # A non-HTTP identifier that happens to equal a status code (a ticket slug
+    # or an issue URL) must NOT match the bare \\bNNN\\b status hint without an
+    # explicit HTTP/error context. Default stays 🔴 DECISION NEEDED.
+    assert (
+        _infer_block_header("Should I close HERMES-429 or keep it?")
+        == "🔴 DECISION NEEDED"
+    )
+    assert (
+        _infer_block_header(
+            "Blocked on github.com/exiao/hermes-agent/issues/429 — needs a call"
+        )
+        == "🔴 DECISION NEEDED"
+    )
+
+
+def test_infer_access_plus_retry_prefers_retry():
+    # When a reason carries BOTH a generic access phrase AND an explicit
+    # transient signal, the retryable evidence wins — an operator-no-action
+    # 🟡 RETRY, not a routing wall.
+    assert (
+        _infer_block_header("No access to the API right now: 429 rate limit")
+        == "🟡 RETRY"
+    )
+    assert (
+        _infer_block_header("Unauthorized for a moment, timed out — try again")
+        == "🟡 RETRY"
+    )
+
+
 def test_infer_empty_reason_has_no_header():
     assert _infer_block_header("") is None
     assert _infer_block_header("   ") is None
