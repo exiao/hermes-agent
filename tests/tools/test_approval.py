@@ -1525,14 +1525,21 @@ class TestGitDestructiveOps:
             assert dangerous is False, f"expected allow, got block for: {cmd}"
 
     def test_git_push_lease_carveout_rejects_delete_pushes(self):
-        """A leased DELETE push (`--delete` / `-d`) removes the remote ref —
-        just as destructive as a force rewrite, and the flag-strip would
-        otherwise leave it reading like a routine feature rebase. Must keep
-        prompting regardless of branch."""
+        """A leased DELETE push removes the remote ref — just as destructive as
+        a force rewrite. Both the `--delete` / `-d` flag forms AND the
+        colon-prefix `:branch` shorthand (`git push origin :feature`) must keep
+        prompting regardless of branch — the flag-strip / RHS-parse would
+        otherwise leave them reading like a routine feature rebase."""
         for cmd in (
             "git push --force-with-lease --delete origin feature",
             "git push --force-with-lease -d origin feature",
             "git push --force-with-lease --delete origin main",
+            # Colon-prefix delete shorthand: empty SOURCE in `src:dst`.
+            "git push --force-with-lease origin :feature",
+            "git push --force-with-lease origin :refs/heads/feature",
+            "git push --force-with-lease origin :main",
+            "git push --force-with-lease origin :live-config",
+            "git push --force-with-lease origin :'feature'",
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is True, f"expected block, got allow for: {cmd}"

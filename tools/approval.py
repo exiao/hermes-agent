@@ -921,9 +921,10 @@ def _refspec_destination(refspec: str) -> Optional[str]:
 
     Handles `src:dst` (uses the RHS), bare `branch` / `refs/heads/branch`, and
     rejects: wildcards (`*`), `HEAD` (resolves to the current checkout — may be
-    main), the bare `:` matching-refspec, an empty RHS (`src:` = delete), and
-    any ref outside `refs/heads/` (`refs/tags/…`, `refs/notes/…`, etc. — a
-    leased tag rewrite must NOT slip through).
+    main), the bare `:` matching-refspec, an empty RHS (`src:` = delete), an
+    empty SOURCE (`:dst` = the colon-prefix delete shorthand), and any ref
+    outside `refs/heads/` (`refs/tags/…`, `refs/notes/…`, etc. — a leased tag
+    rewrite must NOT slip through).
     """
     rs = refspec.strip()
     # Strip surrounding shell quotes the detection view may still carry (the
@@ -935,9 +936,13 @@ def _refspec_destination(refspec: str) -> Optional[str]:
     if not rs or '*' in rs:
         return None
     # `src:dst` — the written ref is the RHS. A bare `:` (matching refspec) or a
-    # `src:` (delete) leaves an empty dst → reject.
+    # `src:` (delete) leaves an empty dst → reject. An empty SOURCE (`:dst`) is
+    # the colon-prefix DELETE shorthand (`git push origin :feature` removes the
+    # remote ref) — just as destructive as `--delete`, so reject it too.
     if ':' in rs:
-        dst = rs.split(':', 1)[1]
+        src, dst = rs.split(':', 1)
+        if not src.strip('\'"`'):
+            return None
     else:
         dst = rs
     dst = dst.strip('\'"`')
