@@ -143,11 +143,100 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
+class _StableEnviron:
+    """Write-through snapshot of ``os.environ`` for use during ``load_dotenv``.
+
+    python-dotenv's ``resolve_variables`` interpolates each ``.env`` line by
+    doing ``env.update(os.environ)`` — which enumerates ``os.environ``'s keys
+    then fetches each by key. ``os.environ`` is a live, shared, mutable
+    mapping; Hermes pins/unpins env vars (notably ``HERMES_KANBAN_BOARD``,
+    set in ``hermes_cli/main.py`` and pinned/restored in
+    ``gateway/kanban_watchers.py``) on the fly from other threads. When a
+    concurrent unpin deletes a key *between* the enumerate and the get, dotenv
+    raises ``KeyError`` and crashes the load (observed 2026-06-29: a chat turn
+    died with ``KeyError: HERMES_KANBAN_BOARD``).
+
+    This wrapper presents a **frozen snapshot** of the environment for all
+    *reads* (so no concurrent deletion can race the enumerate-then-get) while
+    *writes* pass through to the real ``os.environ`` (so the load still takes
+    effect). Swapping ``os.environ`` for an instance of this across the
+    ``load_dotenv`` call fixes the whole class of concurrently-mutated env
+    vars, not just the board pin — with no change to interpolation or override
+    semantics.
+    """
+
+    def __init__(self, real_environ):
+        self._real = real_environ
+        self._snapshot = dict(real_environ)
+
+    # --- reads: served from the frozen snapshot ---
+    def __getitem__(self, key):
+        return self._snapshot[key]
+
+    def __iter__(self):
+        return iter(self._snapshot)
+
+    def __len__(self):
+        return len(self._snapshot)
+
+    def __contains__(self, key):
+        return key in self._snapshot
+
+    def keys(self):
+        return self._snapshot.keys()
+
+    def items(self):
+        return self._snapshot.items()
+
+    def values(self):
+        return self._snapshot.values()
+
+    def get(self, key, default=None):
+        return self._snapshot.get(key, default)
+
+    # --- writes: pass through to the real os.environ AND keep the snapshot
+    # coherent so a later read in the same load sees what was just written ---
+    def __setitem__(self, key, value):
+        self._real[key] = value
+        self._snapshot[key] = value
+
+    def __delitem__(self, key):
+        del self._real[key]
+        self._snapshot.pop(key, None)
+
+    def setdefault(self, key, default=None):
+        if key not in self._snapshot:
+            self[key] = default
+        return self._snapshot[key]
+
+    def pop(self, key, *args):
+        self._snapshot.pop(key, None)
+        return self._real.pop(key, *args)
+
+    def __getattr__(self, name):
+        # Anything we didn't explicitly model (e.g. encodekey) falls through
+        # to the real os._Environ.
+        return getattr(self._real, name)
+
+
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    # Snapshot os.environ for the duration of the dotenv load. python-dotenv
+    # reads the live ``os.environ`` while interpolating (env.update(os.environ)
+    # once per .env line); a concurrent mutation of that shared mapping —
+    # Hermes pins/unpins HERMES_KANBAN_BOARD on os.environ from other threads —
+    # can delete a key between enumerate and get, raising KeyError mid-load.
+    # The write-through snapshot gives dotenv a stable view for reads while its
+    # writes still land on the real environment. Restored in finally.
+    stable = _StableEnviron(os.environ)
+    real_environ = os.environ
+    os.environ = stable  # type: ignore[assignment]
     try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        try:
+            load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        except UnicodeDecodeError:
+            load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+    finally:
+        os.environ = real_environ  # type: ignore[assignment]
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
