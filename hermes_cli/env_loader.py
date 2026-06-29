@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from utils import atomic_replace
@@ -150,7 +151,7 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
-def _snapshot_environ(real_environ) -> dict[str, str]:
+def _snapshot_environ(real_environ: Any) -> dict[str, str]:
     """Copy an environment mapping while tolerating concurrent key deletion."""
     snapshot: dict[str, str] = {}
     for key in list(real_environ.keys()):
@@ -164,7 +165,7 @@ def _snapshot_environ(real_environ) -> dict[str, str]:
     return snapshot
 
 
-class _StableEnviron(MutableMapping):
+class _StableEnviron(MutableMapping[str, str]):
     """Write-through snapshot of ``os.environ`` for use during ``load_dotenv``.
 
     python-dotenv's ``resolve_variables`` interpolates each ``.env`` line by
@@ -186,22 +187,35 @@ class _StableEnviron(MutableMapping):
     semantics.
     """
 
-    def __init__(self, real_environ):
+    def __init__(self, real_environ: Any):
         self._real = real_environ
         self._snapshot = _snapshot_environ(real_environ)
+        self._snapshot_keys = {self._encode_key(key): key for key in self._snapshot}
+
+    def _encode_key(self, key: Any) -> Any:
+        encode_key = getattr(self._real, "encodekey", None)
+        if encode_key is None:
+            return key
+        try:
+            return encode_key(key)
+        except Exception:  # noqa: BLE001 - match os._Environ's fail-open reads
+            return key
+
+    def _snapshot_key(self, key: Any) -> Any:
+        return self._snapshot_keys.get(self._encode_key(key), key)
 
     # --- reads: served from the frozen snapshot ---
-    def __getitem__(self, key):
-        return self._snapshot[key]
+    def __getitem__(self, key: str) -> str:
+        return self._snapshot[self._snapshot_key(key)]
 
     def __iter__(self):
         return iter(self._snapshot)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._snapshot)
 
-    def __contains__(self, key):
-        return key in self._snapshot
+    def __contains__(self, key: object) -> bool:
+        return self._snapshot_key(key) in self._snapshot
 
     def keys(self):
         return self._snapshot.keys()
@@ -212,30 +226,22 @@ class _StableEnviron(MutableMapping):
     def values(self):
         return self._snapshot.values()
 
-    def get(self, key, default=None):
-        return self._snapshot.get(key, default)
-
-    def copy(self):
+    def copy(self) -> dict[str, str]:
         return self._snapshot.copy()
 
     # --- writes: pass through to the real os.environ AND keep the snapshot
     # coherent so a later read in the same load sees what was just written ---
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: str, value: str) -> None:
         self._real[key] = value
-        self._snapshot[key] = value
+        snapshot_key = self._snapshot_key(key)
+        self._snapshot[snapshot_key] = value
+        self._snapshot_keys[self._encode_key(key)] = snapshot_key
 
-    def __delitem__(self, key):
+    def __delitem__(self, key: str) -> None:
         del self._real[key]
-        self._snapshot.pop(key, None)
-
-    def setdefault(self, key, default=None):
-        if key not in self._snapshot:
-            self[key] = default
-        return self._snapshot[key]
-
-    def pop(self, key, *args):
-        self._snapshot.pop(key, None)
-        return self._real.pop(key, *args)
+        snapshot_key = self._snapshot_key(key)
+        self._snapshot.pop(snapshot_key, None)
+        self._snapshot_keys.pop(self._encode_key(key), None)
 
     def __getattr__(self, name):
         # Anything we didn't explicitly model (e.g. encodekey) falls through

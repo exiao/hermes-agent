@@ -118,6 +118,22 @@ class _InitialSnapshotRaceEnviron(_RacingEnviron):
         return self._all_keys()
 
 
+class _CaseNormalizingEnviron(dict):
+    """Windows-like env mapping that normalizes keys case-insensitively."""
+
+    def encodekey(self, key):
+        return key.upper()
+
+    def __getitem__(self, key):
+        return super().__getitem__(self.encodekey(key))
+
+    def __setitem__(self, key, value):
+        return super().__setitem__(self.encodekey(key), value)
+
+    def __delitem__(self, key):
+        return super().__delitem__(self.encodekey(key))
+
+
 def _write_interpolating_env(tmp_path):
     """A .env with >=2 interpolated lines.
 
@@ -192,6 +208,19 @@ def test_stable_environ_is_mutable_mapping_with_snapshot_copy():
     real["EXISTING"] = "mutated-outside-snapshot"
     assert copied["EXISTING"] == "old"
     assert stable["EXISTING"] == "old"
+
+
+def test_stable_environ_preserves_case_normalized_key_reads():
+    """Windows normalizes env keys, so snapshot lookups must too."""
+    real = _CaseNormalizingEnviron()
+    real["PATH"] = "old"
+    stable = env_loader._StableEnviron(real)
+
+    assert "Path" in stable
+    assert stable["Path"] == "old"
+    assert stable.get("Path") == "old"
+    assert stable.setdefault("Path", "new") == "old"
+    assert real["PATH"] == "old"
 
 
 def test_loader_tolerates_key_deleted_during_initial_snapshot(tmp_path, monkeypatch):
