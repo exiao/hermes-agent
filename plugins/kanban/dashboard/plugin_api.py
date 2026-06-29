@@ -429,8 +429,9 @@ def _windowed_terminal_tasks(
     if current_step_key is not None:
         where.append("current_step_key = ?")
         params.append(current_step_key)
+    terminal_ts = "COALESCE(archived_at, completed_at)"
     if done_since is not None:
-        where.append("completed_at IS NOT NULL AND completed_at >= ?")
+        where.append(f"{terminal_ts} IS NOT NULL AND {terminal_ts} >= ?")
         params.append(int(done_since))
     where_sql = " AND ".join(where)
 
@@ -438,10 +439,12 @@ def _windowed_terminal_tasks(
         f"SELECT COUNT(*) AS n FROM tasks WHERE {where_sql}", params
     ).fetchone()["n"]
 
-    # Newest-completed first; NULL completed_at sorts last so any
+    # Newest terminal-event first; archived_at wins for archived cards so
+    # re-archiving a previously done card moves it back into the first window
+    # without rewriting its original completion time. NULLs sort last so any
     # not-yet-stamped terminal rows don't crowd out real recent ones.
     order = (
-        "ORDER BY (completed_at IS NULL), completed_at DESC, created_at DESC"
+        f"ORDER BY ({terminal_ts} IS NULL), {terminal_ts} DESC, created_at DESC"
     )
     rows = conn.execute(
         f"SELECT * FROM tasks WHERE {where_sql} {order} LIMIT ?",
@@ -535,38 +538,55 @@ def get_board(
             column_totals[st] = total
 
         tasks = live_tasks + windowed_tasks
+        task_ids = [t.id for t in tasks]
+        task_id_set = set(task_ids)
+        task_placeholders = ",".join("?" for _ in task_ids)
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
-        for row in conn.execute(
-            "SELECT parent_id, child_id FROM task_links"
-        ).fetchall():
-            link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})[
-                "children"
-            ] += 1
-            link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})[
-                "parents"
-            ] += 1
+        if task_ids:
+            for row in conn.execute(
+                "SELECT parent_id, child_id FROM task_links "
+                f"WHERE parent_id IN ({task_placeholders}) "
+                f"OR child_id IN ({task_placeholders})",
+                (*task_ids, *task_ids),
+            ).fetchall():
+                if row["parent_id"] in task_id_set:
+                    link_counts.setdefault(
+                        row["parent_id"], {"parents": 0, "children": 0}
+                    )["children"] += 1
+                if row["child_id"] in task_id_set:
+                    link_counts.setdefault(
+                        row["child_id"], {"parents": 0, "children": 0}
+                    )["parents"] += 1
 
         # Comment + event counts (both cheap aggregates).
-        comment_counts: dict[str, int] = {
-            r["task_id"]: r["n"]
-            for r in conn.execute(
-                "SELECT task_id, COUNT(*) AS n FROM task_comments GROUP BY task_id"
-            )
-        }
+        comment_counts: dict[str, int] = {}
+        if task_ids:
+            comment_counts = {
+                r["task_id"]: r["n"]
+                for r in conn.execute(
+                    "SELECT task_id, COUNT(*) AS n FROM task_comments "
+                    f"WHERE task_id IN ({task_placeholders}) "
+                    "GROUP BY task_id",
+                    task_ids,
+                )
+            }
 
         # Progress rollup: for each parent, how many children are done / total.
         # One pass over task_links joined with child status — cheaper than
         # N per-task queries and the plugin uses it to render "N/M".
         progress: dict[str, dict[str, int]] = {}
-        for row in conn.execute(
-            "SELECT l.parent_id AS pid, t.status AS cstatus "
-            "FROM task_links l JOIN tasks t ON t.id = l.child_id"
-        ).fetchall():
-            p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
-            p["total"] += 1
-            if row["cstatus"] == "done":
-                p["done"] += 1
+        if task_ids:
+            for row in conn.execute(
+                "SELECT l.parent_id AS pid, t.status AS cstatus "
+                "FROM task_links l JOIN tasks t ON t.id = l.child_id "
+                f"WHERE l.parent_id IN ({task_placeholders})",
+                task_ids,
+            ).fetchall():
+                p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
+                p["total"] += 1
+                if row["cstatus"] == "done":
+                    p["done"] += 1
 
         # Diagnostics rollup for this board — see kanban_diagnostics.
         # We get the full structured list per task AND a compact
@@ -580,7 +600,7 @@ def get_board(
         # this change exists to remove. Cards we don't return can't show a
         # badge anyway.
         diagnostics_per_task = _compute_task_diagnostics(
-            conn, task_ids=[t.id for t in tasks]
+            conn, task_ids=task_ids
         )
 
         latest_event_id = conn.execute(
@@ -595,7 +615,7 @@ def get_board(
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        summary_map = kanban_db.latest_summaries(conn, task_ids)
 
         for t in tasks:
             full = summary_map.get(t.id)

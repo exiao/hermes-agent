@@ -62,6 +62,24 @@ def test_init_creates_expected_tables(kanban_home):
     assert {"tasks", "task_links", "task_comments", "task_events"} <= names
 
 
+def test_terminal_window_index_matches_board_order(kanban_home):
+    """The board's done/archived window should not sort terminal history with a temp B-tree."""
+
+    with kb.connect() as conn:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT * FROM tasks WHERE status = ? "
+            "ORDER BY (COALESCE(archived_at, completed_at) IS NULL), "
+            "COALESCE(archived_at, completed_at) DESC, created_at DESC "
+            "LIMIT ?",
+            ("done", 50),
+        ).fetchall()
+
+    details = [row["detail"] for row in plan]
+    assert any("idx_tasks_terminal_window" in detail for detail in details), details
+    assert not any("USE TEMP B-TREE" in detail.upper() for detail in details), details
+
+
 def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
     """All kanban connections should use the explicit busy-timeout knob.
 
@@ -1563,6 +1581,52 @@ def test_archive_hides_from_default_list(kanban_home):
         assert kb.archive_task(conn, t)
         assert len(kb.list_tasks(conn)) == 0
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
+
+
+def test_archive_task_stamps_archive_time_without_rewriting_completion(kanban_home):
+    """Archiving a done card updates the archive-window timestamp, not completed_at."""
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="done long ago")
+        kb.complete_task(conn, t)
+        old_completed_at = 1_000
+        conn.execute(
+            "UPDATE tasks SET completed_at = ? WHERE id = ?",
+            (old_completed_at, t),
+        )
+
+        before_archive = int(time.time())
+        assert kb.archive_task(conn, t)
+
+        row = conn.execute(
+            "SELECT completed_at, archived_at FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        assert row["completed_at"] == old_completed_at
+        assert row["archived_at"] >= before_archive
+
+
+def test_archive_task_refreshes_archive_time_on_rearchive(kanban_home):
+    """Re-archiving a reopened card should move it to the front of archived windows."""
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reopened archived card")
+        kb.complete_task(conn, t)
+        assert kb.archive_task(conn, t)
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', archived_at = ? WHERE id = ?",
+            (100, t),
+        )
+
+        before_rearchive = int(time.time())
+        assert kb.archive_task(conn, t)
+
+        archived_at = conn.execute(
+            "SELECT archived_at FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()["archived_at"]
+        assert archived_at >= before_rearchive
+        assert archived_at != 100
 
 
 def test_delete_archived_task_removes_related_rows(kanban_home):

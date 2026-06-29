@@ -25,8 +25,8 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py for tests."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -38,7 +38,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
 
 
 @pytest.fixture
@@ -295,6 +300,102 @@ def test_board_done_since_date_range(client):
     returned = set(t["id"] for t in done["tasks"])
     assert returned == set(ids[6:]), "done_since window mismatch"
     assert data["done_window"]["since"] == since
+
+
+def test_archived_window_uses_archive_timestamp_not_completion_timestamp(client):
+    """A recently archived old done card must appear in the first archived page."""
+
+    hidden_old_archived = _seed_done_tasks(client, 55, base_completed_at=10_000)
+    conn = kb.connect()
+    try:
+        with conn:
+            for i, tid in enumerate(hidden_old_archived):
+                conn.execute(
+                    "UPDATE tasks SET status = 'archived', archived_at = ? WHERE id = ?",
+                    (10_000 + i, tid),
+                )
+
+            recent = kb.create_task(conn, title="completed long ago, archived today")
+            kb.complete_task(conn, recent)
+            conn.execute(
+                "UPDATE tasks SET completed_at = ? WHERE id = ?",
+                (1_000, recent),
+            )
+            assert kb.archive_task(conn, recent)
+    finally:
+        conn.close()
+
+    data = client.get("/api/plugins/kanban/board?include_archived=true&done_limit=50").json()
+    archived = next(c for c in data["columns"] if c["name"] == "archived")
+    returned = [t["id"] for t in archived["tasks"]]
+    assert recent in returned
+    assert returned[0] == recent
+
+
+def test_board_aggregate_queries_are_scoped_to_returned_cards(kanban_home, monkeypatch):
+    """Board aggregates should not scan hidden terminal-card history."""
+
+    module = _load_plugin_module()
+    conn = kb.connect()
+    parent = kb.create_task(conn, title="visible parent")
+    child = kb.create_task(conn, title="visible child", parents=[parent])
+    hidden_done = kb.create_task(conn, title="hidden done history")
+    kb.add_comment(conn, hidden_done, "user", "hidden comment")
+    conn.execute(
+        "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+        (1_000, hidden_done),
+    )
+
+    queries: list[str] = []
+
+    class TrackingConn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=()):
+            queries.append(" ".join(sql.split()))
+            return self._inner.execute(sql, params)
+
+        def close(self):
+            self._inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(module, "_conn", lambda board=None: TrackingConn(conn))
+
+    payload = module.get_board(
+        tenant=None,
+        workflow_template_id=None,
+        current_step_key=None,
+        done_limit=0,
+        done_since=None,
+        board=None,
+    )
+    returned_ids = {
+        task["id"]
+        for column in payload["columns"]
+        for task in column["tasks"]
+    }
+    assert parent in returned_ids
+    assert child in returned_ids
+    assert hidden_done not in returned_ids
+
+    link_count_queries = [
+        q for q in queries if q.startswith("SELECT parent_id, child_id FROM task_links")
+    ]
+    assert link_count_queries
+    assert all("WHERE" in q for q in link_count_queries), link_count_queries
+
+    comment_count_queries = [
+        q for q in queries if "FROM task_comments" in q and "GROUP BY task_id" in q
+    ]
+    assert comment_count_queries
+    assert all("WHERE task_id IN" in q for q in comment_count_queries), comment_count_queries
+
+    progress_queries = [q for q in queries if "FROM task_links l JOIN tasks t" in q]
+    assert progress_queries
+    assert all("WHERE l.parent_id IN" in q for q in progress_queries), progress_queries
 
 
 def test_board_live_columns_are_full_and_unwindowed(client):

@@ -1147,6 +1147,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
     completed_at         INTEGER,
+    -- Timestamp of the latest archive event. Separate from completed_at so
+    -- archiving/re-archiving a previously done card moves it to the front of
+    -- archived windows without rewriting its original completion time.
+    archived_at          INTEGER,
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
@@ -1902,6 +1906,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
+    if "archived_at" not in cols:
+        _add_column_if_missing(conn, "tasks", "archived_at", "archived_at INTEGER")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
@@ -2043,6 +2049,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    terminal_index_cols = {"status", "archived_at", "completed_at", "created_at"}
+    if terminal_index_cols <= cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_terminal_window "
+            "ON tasks(status, "
+            "(COALESCE(archived_at, completed_at) IS NULL), "
+            "COALESCE(archived_at, completed_at) DESC, created_at DESC)"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -5406,11 +5420,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-            # Stamp a terminal timestamp on archive if the task never reached
-            # 'done' (and so has no completed_at). The dashboard windows the
-            # terminal columns by completed_at DESC; without this, an old task
-            # archived today sorts by its original created_at and can fall off
-            # the first archived page despite being the most recent arrival.
+            # Keep completion time semantically stable while stamping the
+            # latest archive event for archived-window ordering. Re-archiving a
+            # reopened card intentionally refreshes archived_at.
+            "    archived_at = CAST(strftime('%s','now') AS INTEGER), "
             "    completed_at = COALESCE(completed_at, CAST(strftime('%s','now') AS INTEGER)) "
             "WHERE id = ? AND status != 'archived'",
             (task_id,),
