@@ -1519,10 +1519,30 @@ class TestGitDestructiveOps:
             "git push --force-with-lease origin my-main",
             "git push --force-with-lease origin feature/head",
             "git push --force-with-lease origin refs/heads/feature",
-            "git push --force-with-lease origin HEAD:feature",
+            "git push --force-with-lease origin HEAD:refs/heads/feature",
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, f"expected allow, got block for: {cmd}"
+
+    def test_git_push_lease_carveout_rejects_unqualified_colon_destinations(self):
+        """A colon-form refspec writes the RHS destination. If that RHS is
+        unqualified, Git may expand it against an existing remote tag/other ref
+        (`HEAD:v1` can update `refs/tags/v1` when such a tag exists). The
+        branch-only carve-out cannot resolve remote namespaces, so colon-form
+        destinations must be explicit `refs/heads/<branch>` refs. Bare
+        source-only branch pushes (`origin feature`) remain allowed above."""
+        for cmd in (
+            "git push --force-with-lease=refs/tags/v1:old origin HEAD:v1",
+            "git push --force-with-lease origin HEAD:feature",
+            "git push --force-with-lease origin feature:v1",
+            "git push --force-with-lease origin refs/heads/feature:v1",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin HEAD:refs/heads/feature"
+        )
+        assert dangerous is False
 
     def test_git_push_lease_carveout_rejects_delete_pushes(self):
         """A leased DELETE push removes the remote ref — just as destructive as
@@ -1547,21 +1567,21 @@ class TestGitDestructiveOps:
     def test_git_push_lease_carveout_normalizes_quoted_protected_destination(self):
         """A shell-quoted protected destination (`HEAD:'main'`, `'master'`) must
         still be caught — the carve-out validates the bare branch name after
-        stripping surrounding quotes, while a quoted ordinary feature branch
-        still carves out."""
+        stripping surrounding quotes. A quoted bare source-only feature branch
+        still carves out; quoted colon-form destinations stay gated unless the
+        RHS is fully-qualified as refs/heads (covered above)."""
         for cmd in (
             "git push --force-with-lease origin HEAD:'main'",
+            "git push --force-with-lease origin HEAD:'feature'",
             "git push --force-with-lease origin 'master'",
             "git push --force-with-lease origin 'live-config'",
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is True, f"expected block, got allow for: {cmd}"
-        for cmd in (
-            "git push --force-with-lease origin 'feature'",
-            "git push --force-with-lease origin HEAD:'feature'",
-        ):
-            dangerous, _, _ = detect_dangerous_command(cmd)
-            assert dangerous is False, f"expected allow, got block for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin 'feature'"
+        )
+        assert dangerous is False
 
     def test_git_push_lease_carveout_boolean_flags_do_not_eat_refspec(self):
         """A boolean push flag like `--force-if-includes` takes no value, so it

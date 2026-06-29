@@ -944,7 +944,16 @@ def _refspec_destination(refspec: str) -> Optional[str]:
     # `src:` (delete) leaves an empty dst → reject. An empty SOURCE (`:dst`) is
     # the colon-prefix DELETE shorthand (`git push origin :feature` removes the
     # remote ref) — just as destructive as `--delete`, so reject it too.
-    if ':' in rs:
+    #
+    # In colon form, require the RHS destination to be fully qualified as
+    # `refs/heads/<branch>`. Git resolves an unqualified RHS against the remote
+    # namespace, so `HEAD:v1` can update an existing remote tag `refs/tags/v1`;
+    # without remote ref resolution, the branch-only carve-out cannot safely
+    # accept unqualified colon destinations. Bare source-only pushes like
+    # `git push origin feature` are handled by the `else` branch and remain the
+    # ordinary feature-branch convenience this carve-out exists to allow.
+    colon_form = ':' in rs
+    if colon_form:
         src, dst = rs.split(':', 1)
         if not src.strip('\'"`'):
             return None
@@ -958,6 +967,10 @@ def _refspec_destination(refspec: str) -> Optional[str]:
         return None
     # Qualified refs: only refs/heads/<branch> is a branch push; refs/tags/…,
     # refs/notes/…, refs/remotes/… and any other namespace are not carved out.
+    # In colon form, an unqualified destination is also not carved out because
+    # Git may expand it to an existing non-branch remote ref.
+    if colon_form and not dst.startswith('refs/heads/'):
+        return None
     if dst.startswith('refs/'):
         if not dst.startswith('refs/heads/'):
             return None
