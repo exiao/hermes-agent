@@ -190,6 +190,7 @@ class _StableEnviron(MutableMapping[str, str]):
     def __init__(self, real_environ: Any):
         self._real = real_environ
         self._snapshot = _snapshot_environ(real_environ)
+        self._writes: dict[str, str] = {}
         self._snapshot_keys = {self._encode_key(key): key for key in self._snapshot}
 
     def _encode_key(self, key: Any) -> Any:
@@ -204,44 +205,52 @@ class _StableEnviron(MutableMapping[str, str]):
     def _snapshot_key(self, key: Any) -> Any:
         return self._snapshot_keys.get(self._encode_key(key), key)
 
+    def _read_view(self) -> dict[str, str]:
+        return {**self._snapshot, **self._writes}
+
     # --- reads: served from the frozen snapshot ---
     def __getitem__(self, key: str) -> str:
-        return self._snapshot[self._snapshot_key(key)]
+        snapshot_key = self._snapshot_key(key)
+        if snapshot_key in self._writes:
+            return self._writes[snapshot_key]
+        return self._snapshot[snapshot_key]
 
     def __iter__(self):
-        return iter(self._snapshot)
+        return iter(self._read_view())
 
     def __len__(self) -> int:
-        return len(self._snapshot)
+        return len(self._read_view())
 
     def __contains__(self, key: object) -> bool:
-        return self._snapshot_key(key) in self._snapshot
+        snapshot_key = self._snapshot_key(key)
+        return snapshot_key in self._snapshot or snapshot_key in self._writes
 
     def keys(self):
-        return self._snapshot.keys()
+        return self._read_view().keys()
 
     def items(self):
-        return self._snapshot.items()
+        return self._read_view().items()
 
     def values(self):
-        return self._snapshot.values()
+        return self._read_view().values()
 
     def copy(self) -> dict[str, str]:
-        return self._snapshot.copy()
+        return self._read_view()
 
     # --- writes: pass through to the real os.environ AND keep the snapshot
     # coherent so a later read in the same load sees what was just written ---
     def __setitem__(self, key: str, value: str) -> None:
         self._real[key] = value
         snapshot_key = self._snapshot_key(key)
-        self._snapshot[snapshot_key] = value
+        self._writes[snapshot_key] = value
         self._snapshot_keys[self._encode_key(key)] = snapshot_key
 
     def __delitem__(self, key: str) -> None:
         del self._real[key]
         snapshot_key = self._snapshot_key(key)
-        self._snapshot.pop(snapshot_key, None)
-        self._snapshot_keys.pop(self._encode_key(key), None)
+        self._writes.pop(snapshot_key, None)
+        if snapshot_key not in self._snapshot:
+            self._snapshot_keys.pop(self._encode_key(key), None)
 
     def __getattr__(self, name):
         # Anything we didn't explicitly model (e.g. encodekey) falls through

@@ -223,6 +223,19 @@ def test_stable_environ_preserves_case_normalized_key_reads():
     assert real["PATH"] == "old"
 
 
+def test_stable_environ_delete_does_not_mutate_read_snapshot():
+    """Concurrent unpin deletes must not invalidate an active keys/get pass."""
+    real = {"HERMES_KANBAN_BOARD": "main"}
+    stable = env_loader._StableEnviron(real)
+
+    keys = stable.keys()
+    del stable["HERMES_KANBAN_BOARD"]
+
+    assert "HERMES_KANBAN_BOARD" in keys
+    assert stable["HERMES_KANBAN_BOARD"] == "main"
+    assert "HERMES_KANBAN_BOARD" not in real
+
+
 def test_loader_tolerates_key_deleted_during_initial_snapshot(tmp_path, monkeypatch):
     """The first stable snapshot must not reintroduce the same TOCTOU crash."""
     env_file = _write_interpolating_env(tmp_path)
