@@ -160,13 +160,21 @@ BOARD_COLUMNS: list[str] = [
 # Terminal columns: a card here is finished. Almost no diagnostic rule can fire
 # on one — the status-gated rules need triage/blocked/ready, and the unified
 # failure/crash counters are broken by the successful run that put the card
-# here. The two exceptions are the event-signal warnings in
-# ``_WARNING_EVENT_KINDS`` (a blocked completion / a phantom-ref advisory),
-# which the board-load pass re-includes terminal cards for explicitly. So the
-# board-load diagnostics pass scopes itself to non-terminal cards PLUS the
-# (tiny) set of terminal cards carrying such an event — never the full done
-# column, whose event history grows every day and otherwise yields zero badges.
+# here. The board-load pass drops both terminal columns from the default scan.
+#
+# ``done`` cards get a narrow re-inclusion: the event-signal warnings in
+# ``_WARNING_EVENT_KINDS`` (a blocked completion / a phantom-ref advisory) do
+# fire on a successfully-completed card, so the pass re-admits the (tiny) set of
+# ``done`` cards carrying such an event — never the full done column, whose
+# event history grows every day and otherwise yields zero badges.
+#
+# ``archived`` is excluded outright, matching the prior fleet query
+# (``status != 'archived'``): the default ``task_ids=None`` diagnostics (and the
+# /board view) hide archived unless the caller explicitly asks, so an archived
+# card must not keep the default diagnostics non-empty via a stale warning event.
 _DIAGNOSTIC_TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "archived"})
+# Of the terminal statuses, only ``done`` is re-admitted via a warning event.
+_DIAGNOSTIC_WARNING_REINCLUDE_STATUSES: frozenset[str] = frozenset({"done"})
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -297,22 +305,33 @@ def _compute_task_diagnostics(
         # card). Both key off the ``_WARNING_EVENT_KINDS`` events. Every other
         # rule requires a live/stuck status. So the candidate set is:
         #   (a) all non-terminal cards, PLUS
-        #   (b) terminal (done/archived) cards that carry one of those warning
-        #       events.
+        #   (b) ``done`` cards that carry one of those warning events.
+        # ``archived`` is excluded from both branches (the prior fleet query
+        # used ``status != 'archived'``; archived is hidden from the default
+        # board/diagnostics view, so it must not surface here via a stale event).
         # This drops the per-card event/run scan over the entire done column
         # (hundreds of cards, ~15K-and-growing events, zero badges) — the
         # actual hotspot — while preserving every diagnostic that can fire.
-        # Set (b) is a tiny indexed lookup, not a full-column slurp.
+        #
+        # Branch (b) uses a correlated ``EXISTS`` (not ``IN (SELECT DISTINCT
+        # ... WHERE kind ...)``): ``task_events`` has no index on ``kind``, so
+        # the ``IN`` form forces a full table scan of the (growing) event log.
+        # ``EXISTS (... WHERE e.task_id = t.id AND e.kind IN (...))`` lets SQLite
+        # drive the ``idx_events_task`` index (leading column ``task_id``) and
+        # probe only the small set of done cards. ``UNION ALL`` (not ``UNION``)
+        # because the two branches are disjoint by status — no dedup needed.
         terminal = tuple(sorted(_DIAGNOSTIC_TERMINAL_STATUSES))
+        reinclude = tuple(sorted(_DIAGNOSTIC_WARNING_REINCLUDE_STATUSES))
         status_ph = ",".join(["?"] * len(terminal))
+        reinclude_ph = ",".join(["?"] * len(reinclude))
         kind_ph = ",".join(["?"] * len(_WARNING_EVENT_KINDS))
         rows = conn.execute(
             f"SELECT * FROM tasks WHERE status NOT IN ({status_ph}) "
-            f"UNION "
-            f"SELECT t.* FROM tasks t WHERE t.status IN ({status_ph}) "
-            f"AND t.id IN (SELECT DISTINCT task_id FROM task_events "
-            f"             WHERE kind IN ({kind_ph}))",
-            terminal + terminal + tuple(_WARNING_EVENT_KINDS),
+            f"UNION ALL "
+            f"SELECT t.* FROM tasks t WHERE t.status IN ({reinclude_ph}) "
+            f"AND EXISTS (SELECT 1 FROM task_events e "
+            f"            WHERE e.task_id = t.id AND e.kind IN ({kind_ph}))",
+            terminal + reinclude + tuple(_WARNING_EVENT_KINDS),
         ).fetchall()
 
     if not rows:

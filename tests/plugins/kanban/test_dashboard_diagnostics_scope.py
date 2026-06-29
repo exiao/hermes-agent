@@ -137,8 +137,20 @@ def test_drawer_path_unscoped(board_db):
     assert isinstance(result, dict)
 
 
-def test_terminal_status_set_invariant():
-    """Invariant: the terminal set is exactly the two finished columns. Guards
-    that adding a new terminal column forces the board-load scope to be
-    reconsidered."""
-    assert plugin_api._DIAGNOSTIC_TERMINAL_STATUSES == frozenset({"done", "archived"})
+def test_board_load_excludes_archived_with_warning_event(board_db):
+    """Archived cards stay out of the default (task_ids=None) diagnostics even
+    when they carry an active warning event. The prior fleet query used
+    ``status != 'archived'``; archived is hidden from the default board view, so
+    a stale phantom-ref advisory on an archived card must not keep the default
+    diagnostics non-empty. (A ``done`` card with the same event IS re-included —
+    see test_board_load_keeps_done_card_with_phantom_ref_advisory.)"""
+    conn = board_db
+    archived = kb.create_task(conn, title="archived w/ advisory", assignee="x")
+    _set_status(conn, archived, "archived")
+    _emit_event(conn, archived, "completed", {})
+    _emit_event(conn, archived, "suspected_hallucinated_references",
+                {"phantom_refs": ["t_deadbeef1234"]}, after=True)
+
+    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+
+    assert archived not in diags, "archived card surfaced in default diagnostics"
