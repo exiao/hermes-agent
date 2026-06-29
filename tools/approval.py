@@ -1041,6 +1041,15 @@ def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
     if len(tokens) < 2:
         return False
     refspecs = tokens[1:]
+    # Reject the `git push <remote> tag <name>` shorthand: git documents `tag
+    # <tag>` as sugar for `refs/tags/<tag>:refs/tags/<tag>`, so a leased
+    # `--force-with-lease=refs/tags/v1:<old> origin tag v1` force-updates a TAG
+    # while the tokens (`tag`, `v1`) look like two ordinary branch refspecs. The
+    # shorthand needs the literal `tag` keyword FOLLOWED by a name, so only
+    # reject when a name trails it (a lone `tag` is an ordinary branch named
+    # "tag", validated as a normal destination below). Keep prompting otherwise.
+    if len(refspecs) >= 2 and refspecs[0] == 'tag':
+        return False
     # Reject a leading-`+` refspec (forced update, no lease guarantee).
     if any(rs.startswith('+') or ':+' in rs for rs in refspecs):
         return False

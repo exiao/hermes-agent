@@ -1650,6 +1650,25 @@ class TestGitDestructiveOps:
         )
         assert dangerous is False
 
+    def test_git_push_lease_carveout_rejects_tag_shorthand(self):
+        """The `git push <remote> tag <name>` shorthand expands to a tag
+        refspec (`refs/tags/<name>`), so a leased `--force-with-lease=refs/
+        tags/v1:<old> origin tag v1` force-updates a TAG while the tokens
+        (`tag`, `v1`) look like two ordinary branch refspecs. Must keep
+        prompting. A branch literally named `tag` (lone token) is still an
+        ordinary feature push and carves out."""
+        for cmd in (
+            "git push --force-with-lease origin tag v1",
+            "git push --force-with-lease=refs/tags/v1:old origin tag v1",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        # A lone branch named "tag" is a normal feature push.
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin tag"
+        )
+        assert dangerous is False
+
     def test_gh_pr_merge_flagged(self):
         """`gh pr merge` bypasses PR review and MUST be flagged."""
         for cmd in ("gh pr merge 42 --squash", "gh pr merge 42", "gh pr merge"):
