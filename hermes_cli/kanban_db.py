@@ -5634,11 +5634,12 @@ def _worktree_path_resolvable(workspace_path: str) -> bool:
     if not requested.is_absolute():
         return False
     requested_resolved = requested.resolve(strict=False)
-    if requested.exists() and _is_linked_worktree_checkout(requested):
-        return True
-    repo_root = _git_toplevel(requested)
-    if repo_root is not None and requested_resolved == repo_root:
-        return True
+    if requested.exists():
+        if _is_linked_worktree_checkout(requested):
+            return True
+        repo_root = _git_toplevel(requested)
+        if repo_root is not None and requested_resolved == repo_root:
+            return True
     return _repo_root_for_worktree_target(requested.parent) is not None
 
 

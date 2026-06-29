@@ -241,19 +241,21 @@ def test_workspace_kind_validation(kanban_home):
         kb.create_task(conn, title="bad ws", workspace_kind="cloud")
 
 
-def test_create_strips_worktree_scheme_from_workspace_path(kanban_home):
+def test_create_strips_worktree_scheme_from_workspace_path(kanban_home, tmp_path):
     """A 'worktree:<path>' value jammed into workspace_path must split into
     workspace_kind='worktree' + a BARE absolute workspace_path (regression for
     the scheme prefix that tripped the dispatcher circuit breaker)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
             title="scheme in path",
-            workspace_path="worktree:/Users/testuser/projects/CPE-research/research-agent",
+            workspace_path=f"worktree:{repo}",
         )
         task = kb.get_task(conn, tid)
     assert task.workspace_kind == "worktree"
-    assert task.workspace_path == "/Users/testuser/projects/CPE-research/research-agent"
+    assert task.workspace_path == str(repo)
     assert not task.workspace_path.startswith("worktree:")
 
 
@@ -292,19 +294,21 @@ def test_strip_scheme_worktree_kind_with_prefix_keeps_kind():
     )
 
 
-def test_create_bare_path_unchanged(kanban_home):
+def test_create_bare_path_unchanged(kanban_home, tmp_path):
     """A healthy bare absolute path must pass through untouched."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
             title="bare path",
             workspace_kind="worktree",
-            workspace_path="/Users/testuser/projects/CPE-research/research-agent",
+            workspace_path=str(repo),
         )
         task = kb.get_task(conn, tid)
     assert task is not None
     assert task.workspace_kind == "worktree"
-    assert task.workspace_path == "/Users/testuser/projects/CPE-research/research-agent"
+    assert task.workspace_path == str(repo)
 
 
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
@@ -2539,6 +2543,24 @@ def test_worktree_target_under_repo_accepted_at_create(kanban_home, tmp_path):
         task = kb.get_task(conn, tid)
     assert task is not None
     assert task.workspace_path == str(target)
+
+
+def test_worktree_missing_target_skips_direct_git_probe(tmp_path, monkeypatch):
+    """A missing target is resolved from ancestors without `git -C <missing>`."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "my-task"
+    original_git_toplevel = kb._git_toplevel
+    probed: list[Path] = []
+
+    def tracking_git_toplevel(path: Path):
+        probed.append(path)
+        return original_git_toplevel(path)
+
+    monkeypatch.setattr(kb, "_git_toplevel", tracking_git_toplevel)
+
+    assert kb._worktree_path_resolvable(str(target)) is True
+    assert target not in probed
 
 
 
