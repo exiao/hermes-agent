@@ -2743,6 +2743,32 @@ def create_task(
                         f"(3) link the task to a project (--project <slug>)."
                     )
 
+                # Fail-fast: a ``worktree:`` path must resolve to a git repo at
+                # create time, mirroring the spawn-time check in
+                # ``_resolve_worktree_workspace``. Without this, a path that is
+                # not a repo (e.g. an umbrella dir like ~/projects/content with
+                # no .git) is stored happily, then burns two spawns and a
+                # circuit-breaker block before anyone sees the real error.
+                # Validate here, at the point of creation, with the same message
+                # style as the NULL-path guard above. Skip project-linked tasks:
+                # their path is a not-yet-created ``<repo>/.worktrees/<id>`` dir
+                # anchored on the project's already-validated primary repo.
+                if (
+                    workspace_kind == "worktree"
+                    and project_repo is None
+                    and not _worktree_path_resolvable(str(workspace_path))
+                ):
+                    raise ValueError(
+                        f"workspace_kind='worktree' path {workspace_path!r} is not "
+                        f"inside a git repo and does not point at a git repo root. "
+                        f"A worktree anchor must be an absolute path to a git repo "
+                        f"root (or an existing linked worktree checkout). Fix one of: "
+                        f"(1) pass --workspace worktree:<abs-repo-root>, "
+                        f"(2) set a board default_workdir to a git repo "
+                        f"(hermes kanban boards set-default-workdir <board> <abs-repo-root>), or "
+                        f"(3) link the task to a project (--project <slug>)."
+                    )
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -5588,6 +5614,33 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         if current == current.parent:
             return None
         current = current.parent
+
+
+def _worktree_path_resolvable(workspace_path: str) -> bool:
+    """Return True if ``workspace_path`` is usable as a worktree anchor.
+
+    Mirrors the accept-cases of ``_resolve_worktree_workspace`` so a path that
+    create_task accepts is one spawn can actually resolve. A path is resolvable
+    when it is (1) absolute, and (2) either an existing linked worktree checkout,
+    a git repo root, or a target whose nearest existing ancestor lives inside a
+    git repo (so a linked worktree can be materialized there). A non-absolute
+    path, or one that walks up to the filesystem root without finding a repo
+    (e.g. an umbrella dir like ~/projects/content with no .git), is rejected.
+    """
+    try:
+        requested = Path(workspace_path).expanduser()
+    except Exception:
+        return False
+    if not requested.is_absolute():
+        return False
+    requested_resolved = requested.resolve(strict=False)
+    if requested.exists() and _is_linked_worktree_checkout(requested):
+        return True
+    repo_root = _git_toplevel(requested)
+    if repo_root is not None and requested_resolved == repo_root:
+        return True
+    return _repo_root_for_worktree_target(requested.parent) is not None
+
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:

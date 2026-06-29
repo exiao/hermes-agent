@@ -308,7 +308,12 @@ def test_create_bare_path_unchanged(kanban_home):
 
 
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
-    target = tmp_path / ".worktrees" / "t6-wire"
+    # Anchor the worktree target inside a real git repo so it passes the
+    # create-time repo-root guard (the target itself need not exist yet — its
+    # parent being inside the repo is enough for the materialize semantics).
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "t6-wire"
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
@@ -2460,6 +2465,81 @@ def test_worktree_explicit_path_succeeds_control(kanban_home, tmp_path):
     assert task is not None
     assert task.workspace_kind == "worktree"
     assert task.workspace_path == str(repo)
+
+
+def test_worktree_explicit_non_repo_path_raises_at_create(kanban_home, tmp_path, monkeypatch):
+    """Fail-fast (t_f19db0e0): a ``worktree`` task whose explicit path is a real
+    directory that is NOT a git repo (e.g. an umbrella dir like
+    ~/projects/content with no .git) must be rejected at CREATE time, not stored
+    and then blocked after two spawn failures + a circuit-breaker trip.
+
+    The path exists but neither it nor any ancestor is a git repo, so
+    ``_resolve_worktree_workspace`` would raise at spawn. We surface that error
+    here, inside the write_txn, leaving NO orphan row.
+    """
+    # A real, existing directory with no git anywhere up the tree. Put it under
+    # its own isolated root so no ambient repo (e.g. the checkout running the
+    # tests) is found by the upward walk.
+    isolated_root = tmp_path / "no_git_root"
+    not_a_repo = isolated_root / "content"
+    not_a_repo.mkdir(parents=True)
+    # Park the dispatcher CWD inside a real repo so a cwd-anchored shortcut
+    # could not mask the bug.
+    decoy_repo = tmp_path / "decoy"
+    _init_git_repo(decoy_repo)
+    monkeypatch.chdir(decoy_repo)
+    with kb.connect() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="not .*inside a git repo"):
+            kb.create_task(
+                conn,
+                title="ship",
+                workspace_kind="worktree",
+                workspace_path=str(not_a_repo),
+            )
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert after == before  # txn aborted cleanly, no zombie row
+
+
+def test_worktree_repo_root_path_accepted_at_create(kanban_home, tmp_path):
+    """Accept case: an explicit path that IS a git repo root passes the new
+    create-time guard and stores the row (the path the dispatcher later anchors
+    a per-task ``<repo>/.worktrees/<id>`` on)."""
+    repo = tmp_path / "real-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        # The stored row must actually resolve at spawn time (end-to-end check).
+        ws = kb.resolve_workspace(task, conn=conn)
+    assert task.workspace_path == str(repo)
+    assert ws == repo / ".worktrees" / tid
+
+
+def test_worktree_target_under_repo_accepted_at_create(kanban_home, tmp_path):
+    """Accept case: an explicit target path that does not exist yet but whose
+    parent lives inside a git repo (the ``<repo>/.worktrees/<id>`` materialize
+    semantics) must NOT be rejected by the create-time guard."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "my-task"  # parent is inside the repo
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workspace_path == str(target)
+
 
 
 def test_worktree_no_path_non_current_board_default_succeeds(kanban_home, tmp_path, monkeypatch):
