@@ -180,7 +180,21 @@ class _StableEnviron:
 
     def __init__(self, real_environ):
         self._real = real_environ
-        self._snapshot = dict(real_environ)
+        self._snapshot = self._snapshot_environ(real_environ)
+
+    @staticmethod
+    def _snapshot_environ(real_environ):
+        snapshot = {}
+        for key in list(real_environ.keys()):
+            try:
+                snapshot[key] = real_environ[key]
+            except KeyError:
+                # A concurrent thread can delete a key after keys() lists it
+                # but before we fetch it. Skip vanished keys so constructing
+                # the stable snapshot cannot trip the same enumerate/get race
+                # this wrapper is meant to hide from python-dotenv.
+                continue
+        return snapshot
 
     # --- reads: served from the frozen snapshot ---
     def __getitem__(self, key):

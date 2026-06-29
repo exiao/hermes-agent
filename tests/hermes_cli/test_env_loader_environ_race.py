@@ -166,6 +166,32 @@ def test_loader_snapshots_environ_and_survives_race(tmp_path, monkeypatch):
     assert racing.get("BAZ") == "gamma"
 
 
+def test_loader_tolerates_key_deleted_while_building_snapshot(tmp_path, monkeypatch):
+    """Snapshot construction itself must tolerate enumerate/get races."""
+    env_file = _write_interpolating_env(tmp_path)
+
+    class _VanishingDuringSnapshotEnviron(_RacingEnviron):
+        def keys(self):
+            return self._all_keys()
+
+        def __getitem__(self, key):
+            if key == self._volatile_key:
+                raise KeyError(key)
+            return super().__getitem__(key)
+
+    racing = _VanishingDuringSnapshotEnviron(
+        {"PATH": "/usr/bin"}, "HERMES_KANBAN_BOARD", "main"
+    )
+    monkeypatch.setattr(os, "environ", racing)
+    monkeypatch.setattr(dotenv_main.os, "environ", racing)
+
+    env_loader._load_dotenv_with_fallback(env_file, override=True)
+
+    assert racing.get("FOO") == "alpha-"
+    assert racing.get("BAR") == "beta-"
+    assert racing.get("BAZ") == "gamma"
+
+
 def test_concurrent_loads_do_not_leak_stable_environ(tmp_path, monkeypatch):
     """Overlapping _load_dotenv_with_fallback calls must not permanently leak
     the _StableEnviron wrapper as the process-wide os.environ.
