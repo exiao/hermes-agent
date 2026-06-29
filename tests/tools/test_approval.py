@@ -1630,6 +1630,26 @@ class TestGitDestructiveOps:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, f"expected allow, got block for: {cmd}"
 
+    def test_git_push_lease_carveout_rejects_packed_numeric_force_bundle(self):
+        """A packed short bundle like `-4f` is IPv4 + a BARE `--force` (no lease
+        safety belt), but the short-force regex used to only allow letters
+        around `f`, so `-4f`/`-6f` slipped past the bare-force check and the
+        generic flag-strip then erased the whole token. A leased push carrying a
+        packed numeric force bundle must keep prompting; a packed all-letter
+        bundle without `f` (e.g. `-uq`) still carves out."""
+        for cmd in (
+            "git push --force-with-lease -4f origin feature",
+            "git push --force-with-lease -6f origin feature",
+            "git push --force-with-lease -f4 origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        # A packed bundle WITHOUT a force `f` is a normal feature push.
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease -uq origin feature"
+        )
+        assert dangerous is False
+
     def test_gh_pr_merge_flagged(self):
         """`gh pr merge` bypasses PR review and MUST be flagged."""
         for cmd in ("gh pr merge 42 --squash", "gh pr merge 42", "gh pr merge"):

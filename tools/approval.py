@@ -863,9 +863,13 @@ _FORCE_PUSH_DESCRIPTIONS = frozenset({
 # contains the substring `--force`, so require a word boundary that the lease
 # suffix does not satisfy: --force/--force=… followed by end or a non-hyphen.
 _BARE_FORCE_FLAG_RE = re.compile(r'--force(?![\w-])')
-# Short force flag: -f, or packed combos like -uf / -fv (a flag token that is
-# all letters and contains an `f`). Excludes long flags (already handled above).
-_SHORT_FORCE_FLAG_RE = re.compile(r'(?<![\w-])-[a-z]*f[a-z]*(?![\w-])')
+# Short force flag: -f, or packed combos like -uf / -fv (a flag token that
+# contains an `f`). Excludes long flags (already handled above). The other
+# chars in the bundle may be letters OR digits — git push has numeric short
+# flags `-4`/`-6` (IPv4/IPv6), so a packed `-4f` is IPv4 + a BARE force (which
+# overrides the lease with no safety belt). Matching `[a-z0-9]` around `f`
+# ensures `-4f`/`-6f` are caught as a bare force instead of slipping through.
+_SHORT_FORCE_FLAG_RE = re.compile(r'(?<![\w-])-[a-z0-9]*f[a-z0-9]*(?![\w-])')
 # Exclude a trailing hyphen too (`(?![\w-])`) so a different flag that merely
 # starts with this string (e.g. `--force-with-lease-foo`) is not misread as the
 # lease form — matches the boundary convention used by the bare-force regexes.
