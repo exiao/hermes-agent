@@ -2385,6 +2385,59 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+# Bare placeholder titles that carry no spec on their own. A task whose title is
+# one of these (or the literal "<assignee> task" / the assignee name itself) AND
+# whose body is empty has no work in it — it must never reach a worker lane in
+# ``ready``. See ``_is_spec_less``.
+_PLACEHOLDER_TITLES = frozenset({"untitled", "task", "new task", "todo", "tbd"})
+
+
+def _default_assignee() -> Optional[str]:
+    """Resolve ``kanban.default_assignee`` from config, or None.
+
+    Used by the create-time spec-less guard so a placeholder created without an
+    explicit assignee (relying on the operator's default) is still keyed on the
+    assignee the dispatcher will actually auto-assign it to. Best-effort: any
+    config-load failure (test stubs, exotic envs) resolves to None.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        return (kanban_cfg.get("default_assignee") or "").strip() or None
+    except Exception:
+        return None
+
+
+def _is_spec_less(title: str, body: Optional[str], assignee: Optional[str]) -> bool:
+    """Return True when a task has no spec a worker could act on.
+
+    Spec-less == empty/whitespace body AND a placeholder title. A placeholder
+    title is one of the bare ``_PLACEHOLDER_TITLES``, the literal
+    ``"<assignee> task"`` (e.g. ``"dev task"`` — the fingerprint of the phantom
+    tickets that blocked the dev lane), or the assignee name on its own. Such a
+    task gives a worker nothing to do; routing it to a lane just makes the worker
+    block with needs_input. Callers should park these in ``triage`` for a
+    specifier to flesh out instead of dispatching them.
+
+    The ``"<assignee> task"`` / assignee-name patterns are keyed on the resolved
+    assignee, so callers that rely on ``kanban.default_assignee`` (no explicit
+    assignee) must pass that resolved value in — otherwise a ``"default task"``
+    placeholder slips through and the dispatcher auto-assigns + spawns it.
+    """
+    if (body or "").strip():
+        return False
+    norm = (title or "").strip().casefold()
+    if not norm:
+        return True
+    if norm in _PLACEHOLDER_TITLES:
+        return True
+    who = (assignee or "").strip().casefold()
+    if who and (norm == who or norm == f"{who} task"):
+        return True
+    return False
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2436,6 +2489,17 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # Create-time guard against spec-less placeholder tasks. A task with an
+    # empty body and a bare placeholder title (e.g. the literal "dev task" /
+    # "untitled" / the assignee name) carries no work a worker could act on —
+    # dispatching it to a lane just makes the worker block with needs_input
+    # (this is exactly what produced the phantom "dev task" tickets that blocked
+    # the dev lane). Such a task must never reach a worker lane in ``ready``;
+    # park it in ``triage`` so a specifier can flesh out the spec (or archive
+    # it) before it is promoted to ``todo``. We route-to-triage rather than hard
+    # reject so a legitimate-but-underspecified quick-add isn't silently lost.
+    if not triage and _is_spec_less(title, body, assignee or _default_assignee()):
+        triage = True
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -2602,14 +2666,26 @@ def create_task(
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if initial_status == "blocked":
+                #
+                # ``triage`` wins over ``initial_status == 'blocked'``: a
+                # spec-less placeholder (the guard above sets ``triage=True``)
+                # must never reach a worker lane, and ``blocked`` is not a
+                # terminal park — ``unblock_task`` promotes a parent-free
+                # blocked task straight to ``ready``, which would spawn the
+                # placeholder despite the guard. Routing it to ``triage``
+                # keeps it out of every lane until a specifier fleshes it out.
+                if triage:
+                    task_status = "triage"
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                elif triage:
-                    task_status = "triage"
                 else:
                     task_status = "ready"
                     if parents:
@@ -4965,6 +5041,18 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        # Re-check the spec-less guard against the *post-update* values. A
+        # specifier (auxiliary LLM) can return a title-only response or omit
+        # the body, in which case the placeholder is still spec-less — promoting
+        # it to ``todo``/``ready`` would land the empty card on a worker lane,
+        # defeating the create-time guard that parked it in triage. Compute the
+        # effective title/body/assignee the UPDATE would write and refuse the
+        # promotion (leave it in triage) when they remain spec-less.
+        eff_title = title.strip() if (title is not None and title.strip()) else (existing["title"] or "")
+        eff_body = body if body is not None else (existing["body"] or "")
+        eff_assignee = assignee if assignee is not None else (existing["assignee"] or None)
+        if _is_spec_less(eff_title, eff_body, eff_assignee or _default_assignee()):
+            return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -5200,16 +5288,28 @@ def decompose_triage_task(
                         f"so it can inherit the root path, or set a board "
                         f"default_workdir."
                     )
+            # Direct INSERT bypasses create_task's spec-less guard too: a
+            # malformed decomposer result (e.g. {"title":"dev task","body":"",
+            # "assignee":"dev"}) would otherwise land as 'todo' and be promoted
+            # to 'ready' by recompute_ready(), reaching a worker lane with no
+            # spec. Park such a child in 'triage' (non-dispatchable) so a
+            # specifier can flesh it out, mirroring the create_task guard.
+            child_status = (
+                "triage"
+                if _is_spec_less(title, body, assignee or _default_assignee())
+                else "todo"
+            )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    child_status,
                     child_ws_kind,
                     child_ws_path,
                     tenant,
@@ -5760,6 +5860,17 @@ DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
+
+# Lanes whose tasks have OBJECTIVE done-criteria (CI green, tests pass, threads
+# resolved), so the goal-mode judge can reliably verdict "done". These default
+# to goal-mode at dispatch unless config.yaml overrides `kanban.goal_mode_lanes`.
+# Judgment-heavy lanes (designer, pm, content-creator) are intentionally absent —
+# their tasks lack checkable acceptance criteria, so the judge would be guessing.
+DEFAULT_GOAL_MODE_LANES = ("dev", "pr-babysitter", "cpe-dev", "cpe-research")
+# Default goal-loop turn budget (max # of fresh runs) for a lane-defaulted
+# goal-mode dispatch. The per-task `--goal-max-turns` overrides this; this is the
+# safety ceiling that blocks for a human when the judge never verdicts done.
+DEFAULT_GOAL_MODE_MAX_TURNS = 5
 
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and call kanban_block/kanban_complete before max_runtime_seconds kills it.
@@ -7596,6 +7707,100 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, 
     return max_bytes, backup_count
 
 
+def _load_kanban_cfg() -> dict:
+    """Best-effort load of the ``kanban`` config section. Empty on any error."""
+    try:
+        from hermes_cli.config import load_config
+
+        return (load_config().get("kanban") or {})
+    except Exception:
+        return {}
+
+
+def _resolve_lane_goal_defaults(
+    task: "Task",
+    kanban_cfg: Optional[dict] = None,
+) -> tuple[bool, Optional[int]]:
+    """Resolve the EFFECTIVE goal-mode + turn-budget for a dispatch.
+
+    Heavy lanes with objective done-criteria (CI green, tests pass, threads
+    resolved) default to goal-mode so an oversized task auto-continues across
+    fresh runs instead of blocking when one run hits the 90 per-run iteration
+    cap. The judge verdict is the real stop condition; the turn budget is the
+    safety ceiling.
+
+    Precedence (explicit task value always wins over the lane default):
+      goal_mode  = task.goal_mode OR (assignee in kanban.goal_mode_lanes)
+      max_turns  = task.goal_max_turns                       (explicit --goal-max-turns)
+                   else kanban.goal_mode_default_max_turns    (config)
+                   else DEFAULT_GOAL_MODE_MAX_TURNS
+
+    ``kanban.goal_mode_lanes`` overrides ``DEFAULT_GOAL_MODE_LANES`` when present
+    (a list of profile names; an explicit empty list disables all lane defaults).
+    Returns ``(goal_mode, goal_max_turns)``. ``goal_max_turns`` is ``None`` only
+    when goal-mode is off, so the env stays clean for single-shot workers.
+    """
+    if kanban_cfg is None:
+        kanban_cfg = _load_kanban_cfg()
+    cfg = kanban_cfg or {}
+
+    lanes_cfg = cfg.get("goal_mode_lanes")
+    if isinstance(lanes_cfg, (list, tuple)):
+        lanes = {str(x).strip().lower() for x in lanes_cfg if str(x).strip()}
+    else:
+        lanes = {x.lower() for x in DEFAULT_GOAL_MODE_LANES}
+
+    assignee = (task.assignee or "").strip().lower()
+    lane_default = assignee in lanes
+    goal_mode = bool(task.goal_mode) or lane_default
+    if not goal_mode:
+        return False, None
+
+    if task.goal_max_turns is not None:
+        # Validate the explicit per-task budget the same way the config default
+        # is parsed: a non-positive/garbage --goal-max-turns would otherwise
+        # yield a nonsensical 0-turn loop. Fall back to the default on bad input.
+        max_turns: Optional[int] = _positive_int(
+            task.goal_max_turns,
+            DEFAULT_GOAL_MODE_MAX_TURNS,
+            minimum=1,
+        )
+    else:
+        max_turns = _positive_int(
+            cfg.get("goal_mode_default_max_turns"),
+            DEFAULT_GOAL_MODE_MAX_TURNS,
+            minimum=1,
+        )
+    return True, max_turns
+
+
+def _resolve_worker_max_iterations(
+    goal_mode: bool,
+    kanban_cfg: Optional[dict] = None,
+) -> Optional[int]:
+    """Resolve ``kanban.worker_max_iterations`` for a NON-goal dispatch.
+
+    A single per-run iteration cap injected as ``HERMES_MAX_ITERATIONS`` into
+    the worker env, raising the default 90 for a lane whose tasks genuinely fit
+    in ~130-150 turns but shouldn't loop. This is the fallback lever for lanes
+    that aren't checkable enough for goal-mode.
+
+    Goal-mode dispatches deliberately IGNORE this knob: they keep the 90 per-run
+    cap so each run is a fresh, cache-friendly context window and the Ralph-style
+    judge loop (not one fat run) does the spanning. Returns ``None`` when unset,
+    non-positive, or under goal-mode — leaving the worker's own default in place.
+    """
+    if goal_mode:
+        return None
+    if kanban_cfg is None:
+        kanban_cfg = _load_kanban_cfg()
+    raw = (kanban_cfg or {}).get("worker_max_iterations")
+    if raw is None:
+        return None
+    val = _positive_int(raw, 0, minimum=1)
+    return val or None
+
+
 def _rotated_log_path(log_path: Path, generation: int) -> Path:
     return log_path.with_suffix(log_path.suffix + f".{generation}")
 
@@ -7895,12 +8100,38 @@ def _default_spawn(
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
-    # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
-    # when enabled so non-goal tasks keep a clean env.
-    if task.goal_mode:
+    # Ralph-style /goal judge loop (see cli.py quiet-mode path). The effective
+    # goal-mode is resolved from the task row OR a lane default in
+    # ``kanban.goal_mode_lanes`` (heavy checkable lanes auto-continue across
+    # runs); explicit per-task --goal/--goal-max-turns always win. Only set the
+    # env when enabled so non-goal tasks keep a clean env.
+    _kanban_cfg = _load_kanban_cfg()
+    _eff_goal_mode, _eff_goal_max_turns = _resolve_lane_goal_defaults(
+        task, _kanban_cfg
+    )
+    if _eff_goal_mode:
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
-        if task.goal_max_turns is not None:
-            env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+        if _eff_goal_max_turns is not None:
+            env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(_eff_goal_max_turns))
+        # Goal-mode keeps the per-run 90 iteration cap on purpose (each
+        # judge-cycle stays a manageable context window). Drop any
+        # HERMES_MAX_ITERATIONS inherited from the dispatcher's own env so it
+        # can't silently raise the per-run cap for a goal-mode worker.
+        env.pop("HERMES_MAX_ITERATIONS", None)
+    else:
+        # Fallback lever for NON-goal lanes: raise the per-run 90 iteration cap
+        # via kanban.worker_max_iterations. Goal-mode lanes deliberately keep the
+        # 90 cap and span via fresh runs instead (see _resolve_worker_max_iterations).
+        # Make the cap deterministic from config: set it when the knob is present,
+        # otherwise drop any value inherited from the dispatcher's own env so a
+        # worker's per-run cap is governed by config/profile, not ambient env.
+        _worker_max_iters = _resolve_worker_max_iterations(
+            _eff_goal_mode, _kanban_cfg
+        )
+        if _worker_max_iters is not None:
+            env["HERMES_MAX_ITERATIONS"] = str(int(_worker_max_iters))
+        else:
+            env.pop("HERMES_MAX_ITERATIONS", None)
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_TIMEOUT"),

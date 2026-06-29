@@ -90,6 +90,41 @@ class TestMaxTurnsResolution:
         cli = _make_cli()
         assert isinstance(cli.max_turns, int) and cli.max_turns == 90
 
+    def test_kanban_worker_max_iterations_overrides_config_default(self):
+        """A kanban worker's injected HERMES_MAX_ITERATIONS must beat the
+        profile's agent.max_turns (90 from DEFAULT_CONFIG) — otherwise the
+        kanban.worker_max_iterations knob would be silently dead, since the
+        config default is always present and would win first."""
+        cli_obj = _make_cli(
+            config_overrides={"agent": {"max_turns": 90}},
+            env_overrides={
+                "HERMES_KANBAN_TASK": "t_abc",
+                "HERMES_MAX_ITERATIONS": "150",
+            },
+        )
+        assert cli_obj.max_turns == 150
+
+    def test_non_kanban_env_var_does_not_override_config(self):
+        """Outside the kanban-worker context, config still wins over the env
+        var (unchanged precedence for normal CLI/gateway sessions)."""
+        cli_obj = _make_cli(
+            config_overrides={"agent": {"max_turns": 90}},
+            env_overrides={"HERMES_MAX_ITERATIONS": "150"},
+        )
+        assert cli_obj.max_turns == 90
+
+    def test_explicit_cli_arg_beats_kanban_override(self):
+        """An explicit --max-turns CLI arg still wins over the kanban env."""
+        cli_obj = _make_cli(
+            max_turns=33,
+            config_overrides={"agent": {"max_turns": 90}},
+            env_overrides={
+                "HERMES_KANBAN_TASK": "t_abc",
+                "HERMES_MAX_ITERATIONS": "150",
+            },
+        )
+        assert cli_obj.max_turns == 33
+
 
 class TestVerboseAndToolProgress:
     def test_default_verbose_is_bool(self):

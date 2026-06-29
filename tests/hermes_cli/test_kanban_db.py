@@ -1316,7 +1316,7 @@ def test_recompute_ready_recovers_below_limit(kanban_home):
     """recompute_ready auto-recovers blocked tasks that haven't hit the
     failure limit yet — the counter is preserved across recovery."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="task", assignee="a")
+        t = kb.create_task(conn, title="real work", body="do the thing", assignee="a")
         kb.claim_task(conn, t)
         # One failure, below the default limit of 2.
         kb._record_task_failure(

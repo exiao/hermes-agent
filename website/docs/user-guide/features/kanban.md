@@ -427,6 +427,34 @@ hermes kanban create "Translate the docs site to French" \
 
 Use it for open-ended, multi-step, or "keep going until X is true" cards. Skip it for cheap one-shot work — the per-turn judge overhead isn't worth it, and the dispatcher's existing retry/circuit-breaker already handles transient worker failures. The judge is only as good as your goal text, so write the body as **explicit acceptance criteria**.
 
+#### Default goal-mode lanes
+
+Some lanes do work that routinely needs several judge-cycles with a checkpoint between them (a CI sweep, driving a PR to mergeable, a multi-file test fix) — they'd otherwise hit the per-run iteration cap, write a "resume from step N" summary, and block for a manual re-dispatch. Those lanes default to goal-mode at dispatch so the card auto-continues until the judge agrees (or the turn budget blocks it for review), without anyone passing `--goal`. Only lanes with **objective** done-criteria (tests pass, CI green, threads resolved) are defaulted — judgment-heavy lanes (designer, pm, content-creator) stay single-shot because the judge can't reliably grade them.
+
+```yaml
+kanban:
+  # Lanes (assignee profiles) that default to goal-mode. Omit to use the
+  # built-in default [dev, pr-babysitter, cpe-dev, cpe-research]; set an
+  # explicit list to override, or [] to disable all lane defaults.
+  goal_mode_lanes: [dev, pr-babysitter, cpe-dev, cpe-research]
+  # Goal-loop turn budget (safety ceiling) for a lane-defaulted card.
+  # Per-task --goal-max-turns always overrides this.
+  goal_mode_default_max_turns: 5
+```
+
+Precedence is explicit-wins: a card created with `--goal` / `goal_mode=True` (and optionally `--goal-max-turns`) keeps its own settings; a lane default only applies when the card didn't ask. Defaults resolve at **dispatch** time, so they cover cards created by any path (tool, CLI, dashboard, webhook, auto-decompose) with no row migration.
+
+#### Raising the per-run cap for non-goal lanes (`worker_max_iterations`)
+
+Goal-mode keeps the per-run iteration cap (default 90) and spans the work across judge-evaluated continuations. For a lane that genuinely fits in a single run of ~130–150 turns but shouldn't loop (no clean judge criteria), raise the cap directly instead of enabling goal-mode:
+
+```yaml
+kanban:
+  worker_max_iterations: 150   # injects HERMES_MAX_ITERATIONS into non-goal workers
+```
+
+This knob is **ignored for goal-mode dispatches** — those keep the 90 cap on purpose so each judge-cycle stays a manageable context window. It only affects workers dispatched in single-shot (non-goal) mode.
+
 ### How the orchestrator behaves
 
 A **well-behaved orchestrator does not do the work itself.** It decomposes the user's goal into tasks, links them, assigns each to one of the profiles you've set up, and steps back. The orchestrator guidance — anti-temptation rules, a Step-0 profile-discovery prompt (the dispatcher silently fails on unknown assignee names, so the orchestrator must ground every card in profiles that actually exist on your machine), and a decomposition playbook keyed on `kanban_create` / `kanban_link` / `kanban_comment` — is injected into the worker's system prompt automatically; there is nothing to install.
