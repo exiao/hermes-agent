@@ -69,8 +69,12 @@ def test_terminal_window_index_matches_board_order(kanban_home):
         plan = conn.execute(
             "EXPLAIN QUERY PLAN "
             "SELECT * FROM tasks WHERE status = ? "
-            "ORDER BY (COALESCE(archived_at, completed_at) IS NULL), "
-            "COALESCE(archived_at, completed_at) DESC, created_at DESC "
+            "ORDER BY (CASE WHEN status = 'archived' "
+            "THEN COALESCE(archived_at, completed_at) "
+            "ELSE completed_at END IS NULL), "
+            "CASE WHEN status = 'archived' "
+            "THEN COALESCE(archived_at, completed_at) "
+            "ELSE completed_at END DESC, created_at DESC "
             "LIMIT ?",
             ("done", 50),
         ).fetchall()
@@ -1627,6 +1631,30 @@ def test_archive_task_refreshes_archive_time_on_rearchive(kanban_home):
         ).fetchone()["archived_at"]
         assert archived_at >= before_rearchive
         assert archived_at != 100
+
+
+def test_migration_backfills_archived_at_from_latest_archive_event(kanban_home):
+    """Legacy archived cards should sort by their archived event after upgrade."""
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy archived card")
+        kb.complete_task(conn, t)
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', completed_at = ?, archived_at = NULL WHERE id = ?",
+            (1_000, t),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            (t, "archived", None, 20_000),
+        )
+
+        kb._migrate_add_optional_columns(conn)
+
+        archived_at = conn.execute(
+            "SELECT archived_at FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()["archived_at"]
+        assert archived_at == 20_000
 
 
 def test_delete_archived_task_removes_related_rows(kanban_home):

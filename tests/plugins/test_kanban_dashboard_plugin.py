@@ -332,6 +332,29 @@ def test_archived_window_uses_archive_timestamp_not_completion_timestamp(client)
     assert returned[0] == recent
 
 
+def test_done_window_ignores_stale_archive_timestamp(client):
+    """A re-completed card should sort by completed_at, not old archived_at."""
+
+    _seed_done_tasks(client, 55, base_completed_at=10_000)
+    conn = kb.connect()
+    try:
+        with conn:
+            recent = kb.create_task(conn, title="re-completed after archive")
+            kb.complete_task(conn, recent)
+            conn.execute(
+                "UPDATE tasks SET completed_at = ?, archived_at = ? WHERE id = ?",
+                (20_000, 1_000, recent),
+            )
+    finally:
+        conn.close()
+
+    data = client.get("/api/plugins/kanban/board?done_limit=50").json()
+    done = next(c for c in data["columns"] if c["name"] == "done")
+    returned = [t["id"] for t in done["tasks"]]
+    assert recent in returned
+    assert returned[0] == recent
+
+
 def test_board_aggregate_queries_are_scoped_to_returned_cards(kanban_home, monkeypatch):
     """Board aggregates should not scan hidden terminal-card history."""
 

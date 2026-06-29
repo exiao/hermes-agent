@@ -1926,6 +1926,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # initial snapshot did not. Re-snapshot here so the legacy-column migration
     # below is truly idempotent and never re-adds columns that already exist.
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if {"id", "status", "archived_at"} <= cols:
+        events_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_events'"
+        ).fetchone()
+        if events_table is not None:
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET archived_at = (
+                       SELECT MAX(created_at)
+                         FROM task_events
+                        WHERE task_events.task_id = tasks.id
+                          AND task_events.kind = 'archived'
+                   )
+                 WHERE status = 'archived'
+                   AND archived_at IS NULL
+                   AND EXISTS (
+                       SELECT 1
+                         FROM task_events
+                        WHERE task_events.task_id = tasks.id
+                          AND task_events.kind = 'archived'
+                   )
+                """
+            )
 
     # Legacy column migration: ``spawn_failures`` → ``consecutive_failures``
     # and ``last_spawn_error`` → ``last_failure_error``.
@@ -2049,13 +2073,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    terminal_ts = "CASE WHEN status = 'archived' THEN COALESCE(archived_at, completed_at) ELSE completed_at END"
     terminal_index_cols = {"status", "archived_at", "completed_at", "created_at"}
     if terminal_index_cols <= cols:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_terminal_window "
             "ON tasks(status, "
-            "(COALESCE(archived_at, completed_at) IS NULL), "
-            "COALESCE(archived_at, completed_at) DESC, created_at DESC)"
+            f"({terminal_ts} IS NULL), "
+            f"{terminal_ts} DESC, created_at DESC)"
         )
 
     # task_events gained a run_id column; back-fill it as NULL for

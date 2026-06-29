@@ -429,7 +429,11 @@ def _windowed_terminal_tasks(
     if current_step_key is not None:
         where.append("current_step_key = ?")
         params.append(current_step_key)
-    terminal_ts = "COALESCE(archived_at, completed_at)"
+    terminal_ts = (
+        "CASE WHEN status = 'archived' "
+        "THEN COALESCE(archived_at, completed_at) "
+        "ELSE completed_at END"
+    )
     if done_since is not None:
         where.append(f"{terminal_ts} IS NOT NULL AND {terminal_ts} >= ?")
         params.append(int(done_since))
