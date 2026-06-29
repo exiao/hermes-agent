@@ -1506,6 +1506,8 @@ class TestGitDestructiveOps:
             "git push --force-with-lease -o ci.skip origin feature",
             "git push --force-with-lease --push-option=ci.skip origin feature",
             "cd repo && git push --force-with-lease origin feature",
+            "cd main && git push --force-with-lease origin feature",
+            "cd /tmp/master && git push --force-with-lease origin feature",
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, f"expected allow, got block for: {cmd}"

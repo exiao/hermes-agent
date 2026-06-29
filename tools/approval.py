@@ -1099,8 +1099,10 @@ def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
         if dst in _PROTECTED_BRANCHES:
             return False
     # Final backstop: the main/master refspec patterns (catches forms the parse
-    # above might normalize differently). Keeps the two layers from disagreeing.
-    if _DEFAULT_BRANCH_PUSH_RE.search(command_lower):
+    # above might normalize differently). Limit this to the parsed push refspecs
+    # so an unrelated shell prefix/path like `cd main && git push ... feature`
+    # does not defeat the safe feature-branch carve-out.
+    if _DEFAULT_BRANCH_PUSH_RE.search(' '.join(refspecs)):
         return False
     return True
 
