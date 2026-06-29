@@ -247,3 +247,24 @@ def test_board_load_keeps_done_card_with_block_cycle_diagnostic(tmp_path, monkey
     scanned = _scanned_task_ids(conn)
     assert cycled in scanned, "done block-cycle card was dropped from the scan"
     assert quiet_done not in scanned, "low-signal done card was scanned"
+
+
+def test_board_load_handles_invalid_block_cycle_window_config(tmp_path, monkeypatch):
+    """A bad block-cycle window value must not crash the default board-load
+    diagnostics pass before the per-rule error guard gets a chance to run."""
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"kanban": {"diagnostics": {"block_cycle_window_seconds": None}}},
+    )
+    conn = _make_board_db(tmp_path, monkeypatch)
+    blocked = kb.create_task(conn, title="blocked", assignee="x",
+                             initial_status="blocked")
+    _emit_event(conn, blocked, "completion_blocked_hallucination",
+                {"phantom_cards": ["t_ghost1"]})
+
+    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+
+    assert blocked in diags, "bad block-cycle config crashed board diagnostics"

@@ -348,8 +348,14 @@ def _compute_task_diagnostics(
         block_cycle_threshold = kd._positive_int(
             diag_config.get("block_cycle_threshold"), 3,
         )
+        try:
+            block_cycle_window_seconds = float(
+                diag_config.get("block_cycle_window_seconds", 24 * 3600),
+            )
+        except (TypeError, ValueError):
+            block_cycle_window_seconds = 24 * 3600
         block_cycle_cutoff = int(
-            time.time() - float(diag_config.get("block_cycle_window_seconds", 24 * 3600)),
+            time.time() - block_cycle_window_seconds,
         )
         rows = conn.execute(
             f"SELECT * FROM tasks WHERE status NOT IN ({status_ph}) "
