@@ -346,9 +346,12 @@ def _compute_task_diagnostics(
         status_ph = ",".join(["?"] * len(terminal))
         reinclude_ph = ",".join(["?"] * len(reinclude))
         kind_ph = ",".join(["?"] * len(_WARNING_EVENT_KINDS))
-        block_cycle_threshold = kd._positive_int(
-            diag_config.get("block_cycle_threshold"), 3,
-        )
+        try:
+            block_cycle_threshold = kd._positive_int(
+                diag_config.get("block_cycle_threshold"), 3,
+            )
+        except OverflowError:
+            block_cycle_threshold = 3
         try:
             block_cycle_window_seconds = float(
                 diag_config.get("block_cycle_window_seconds", 24 * 3600),

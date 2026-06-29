@@ -249,20 +249,23 @@ def test_board_load_keeps_done_card_with_block_cycle_diagnostic(tmp_path, monkey
     assert quiet_done not in scanned, "low-signal done card was scanned"
 
 
-def test_board_load_handles_invalid_block_cycle_window_config(tmp_path, monkeypatch):
-    """A bad block-cycle window value must not crash the default board-load
+def test_board_load_handles_invalid_block_cycle_config(tmp_path, monkeypatch):
+    """A bad block-cycle config value must not crash the default board-load
     diagnostics pass before the per-rule error guard gets a chance to run."""
     from hermes_cli import config as hermes_config
 
-    for invalid_window in (None, "inf"):
+    cases = (
+        {"block_cycle_window_seconds": None},
+        {"block_cycle_window_seconds": "inf"},
+        {"block_cycle_threshold": float("inf")},
+    )
+    for idx, diagnostics_config in enumerate(cases):
         monkeypatch.setattr(
             hermes_config,
             "load_config",
-            lambda value=invalid_window: {
-                "kanban": {"diagnostics": {"block_cycle_window_seconds": value}},
-            },
+            lambda value=diagnostics_config: {"kanban": {"diagnostics": value}},
         )
-        conn = _make_board_db(tmp_path / str(invalid_window), monkeypatch)
+        conn = _make_board_db(tmp_path / f"case-{idx}", monkeypatch)
         blocked = kb.create_task(conn, title="blocked", assignee="x",
                                  initial_status="blocked")
         _emit_event(conn, blocked, "completion_blocked_hallucination",
