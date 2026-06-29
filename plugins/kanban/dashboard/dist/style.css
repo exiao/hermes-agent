@@ -152,6 +152,34 @@
   border-radius: var(--radius-sm, 0.25rem);
 }
 
+/* ---- Windowed-column footer (done/archived "load all") --------------- */
+
+.hermes-kanban-column-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.45rem 0.25rem 0.1rem;
+  margin-top: 0.35rem;
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+  border-top: 1px solid color-mix(in srgb, var(--color-border) 60%, transparent);
+}
+
+.hermes-kanban-column-loadmore {
+  font-size: 0.7rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: var(--radius-sm, 0.25rem);
+  border: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+  background: color-mix(in srgb, var(--color-foreground) 6%, transparent);
+  color: var(--color-foreground);
+  cursor: pointer;
+}
+
+.hermes-kanban-column-loadmore:hover {
+  background: color-mix(in srgb, var(--color-foreground) 12%, transparent);
+}
+
 /* ---- Status dots ----------------------------------------------------- */
 
 .hermes-kanban-dot {

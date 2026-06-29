@@ -189,6 +189,109 @@ def test_tenant_filter(client):
     assert total == 1
 
 
+# ---------------------------------------------------------------------------
+# Done-column windowing — bounded default + expand path
+# ---------------------------------------------------------------------------
+
+
+def _seed_done_tasks(client, n, *, base_completed_at=1_000_000):
+    """Create ``n`` done tasks with strictly increasing completed_at.
+
+    Returns the list of task ids in completion order (oldest → newest).
+    We stamp completed_at directly so ordering/windowing is deterministic
+    regardless of wall-clock time during the test run.
+    """
+    ids = []
+    for i in range(n):
+        tid = client.post(
+            "/api/plugins/kanban/tasks", json={"title": f"done-{i}"}
+        ).json()["task"]["id"]
+        ids.append(tid)
+    conn = kb.connect()
+    try:
+        with conn:
+            for i, tid in enumerate(ids):
+                conn.execute(
+                    "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+                    (base_completed_at + i, tid),
+                )
+    finally:
+        conn.close()
+    return ids
+
+
+def _done_column(payload):
+    return next(c for c in payload["columns"] if c["name"] == "done")
+
+
+def test_board_caps_done_column_at_default(client):
+    """Default board load windows the done column to the server default (50),
+    not the full history, and reports total + has_more."""
+    ids = _seed_done_tasks(client, 60)  # > default of 50
+
+    data = client.get("/api/plugins/kanban/board").json()
+    done = _done_column(data)
+    assert len(done["tasks"]) == 50, "done column not capped at default"
+    assert done["total"] == 60
+    assert done["has_more"] is True
+    # The window is the most-recently-completed tail (newest first).
+    returned = [t["id"] for t in done["tasks"]]
+    assert returned[0] == ids[-1], "newest done card should be first"
+    # The 10 oldest must be the ones dropped from the default window.
+    assert ids[0] not in returned
+
+
+def test_board_done_limit_expand_returns_older(client):
+    """A larger done_limit fetches the older done cards on demand; none are
+    permanently unreachable."""
+    ids = _seed_done_tasks(client, 60)
+
+    data = client.get("/api/plugins/kanban/board?done_limit=100").json()
+    done = _done_column(data)
+    assert len(done["tasks"]) == 60
+    assert done["total"] == 60
+    assert done["has_more"] is False
+    returned = set(t["id"] for t in done["tasks"])
+    assert set(ids) == returned, "expand path must reach every done card"
+
+
+def test_board_done_limit_clamped_to_ceiling(client):
+    """An absurd done_limit is clamped server-side, never an unbounded scan."""
+    _seed_done_tasks(client, 5)
+    data = client.get("/api/plugins/kanban/board?done_limit=999999").json()
+    # done_window echoes the clamped value (DONE_LIMIT_MAX = 500).
+    assert data["done_window"]["limit"] == 500
+
+
+def test_board_done_since_date_range(client):
+    """done_since restricts the done column to cards completed at-or-after a
+    given instant."""
+    ids = _seed_done_tasks(client, 10, base_completed_at=2_000_000)
+    # completed_at runs 2_000_000 .. 2_000_009; ask for the last 4.
+    since = 2_000_006
+    data = client.get(f"/api/plugins/kanban/board?done_since={since}").json()
+    done = _done_column(data)
+    returned = set(t["id"] for t in done["tasks"])
+    assert returned == set(ids[6:]), "done_since window mismatch"
+    assert data["done_window"]["since"] == since
+
+
+def test_board_live_columns_are_full_and_unwindowed(client):
+    """Live (non-terminal) columns are never windowed: total == len(tasks)
+    and has_more is false even with many cards."""
+    for i in range(8):
+        client.post("/api/plugins/kanban/tasks", json={"title": f"todo-{i}"})
+    data = client.get("/api/plugins/kanban/board?done_limit=2").json()
+    live_total = 0
+    for c in data["columns"]:
+        if c["name"] in ("done", "archived"):
+            continue
+        assert c["has_more"] is False, f"live column {c['name']} should not page"
+        assert c["total"] == len(c["tasks"])
+        live_total += len(c["tasks"])
+    assert live_total == 8, "all 8 live cards must stay full across live columns"
+
+
 def test_board_query_param_default_overrides_current_board_pointer(client):
     """Dashboard ``?board=default`` must win even if the CLI's current-board
     pointer targets a non-default board.
