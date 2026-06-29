@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -152,6 +153,265 @@ def _clip_notify_detail(text: str, limit: int = _NOTIFY_DETAIL_MAX) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"… ({len(text) - limit} more chars; see board)"
+
+
+# Self-labeling block notifications. The push leads with a header that says — at
+# a glance, before any reason text — whether the reader must ACT:
+#
+#   🔴 DECISION NEEDED  a human has to decide something (the default — when in
+#                       doubt, surface it)
+#   🟠 ROUTING          a hard wall: no creds/access/wrong lane (a routing bug
+#                       for the orchestrator, not a decision)
+#   🟡 RETRY            flaky / rate-limited / transient; may clear on its own
+#
+# The header is chosen WITHOUT any agent-facing contract: the worker just writes
+# a plain ``reason`` like it always has, and the classifier below reads the text
+# to pick the tag. A block that already carries an explicit ``kind`` (the tool
+# still accepts the optional upstream param) is honored directly; otherwise the
+# reason text is classified. Misclassification is cosmetic-only — the header is a
+# hint, the full reason always rides in the body, and the default is the
+# act-on-it tag so the failure mode is "you glance at one extra thing", never a
+# dropped alert.
+_BLOCK_KIND_NOTIFY = {
+    "needs_input": "🔴 DECISION NEEDED",
+    "capability": "🟠 ROUTING",
+    "transient": "🟡 RETRY",
+}
+
+# Reason-text → header inference. The precedence is modelled EXPLICITLY rather
+# than as an order-dependent substring race, because the buckets overlap (one
+# reason can name a decision, a retry, AND an access wall). The ladder, from the
+# top:
+#
+#   1. Human-CHOICE wording (question/decision)  → 🔴 DECISION NEEDED
+#   2. POSITIVE transient evidence               → 🟡 RETRY
+#      (retry/rate-limit/timeout wording that is NOT negated, OR an HTTP-context
+#       status code) — a genuine "this may clear on its own" signal.
+#   3. Hard access/lane wall                     → 🟠 ROUTING
+#   4. Default                                   → 🔴 DECISION NEEDED
+#
+# Two subtleties the buckets must respect, each pinned by a regression test:
+#
+#  • Decision wording must be CHOICE wording, not any relative clause. A bare
+#    ``which`` fires on ordinary grammar (``The deploy API, which returned 429,
+#    is rate-limited; try again later`` is a RETRY, not a decision), so the
+#    decision hints carry only question/choice phrasings (``should i``, ``or
+#    roll back``, ``your call`` …) and the literal trailing ``?``.
+#  • Retry evidence must be POSITIVE. A negated retry instruction
+#    (``do not retry until the key is provisioned`` / ``don't try again until
+#    credentials exist``) is the opposite of transient — it's an operator
+#    routing action — so negated retry wording does NOT count as transient and
+#    the reason falls through to its hard access evidence (🟠 ROUTING).
+#
+# A reason that cites both a generic access phrase AND a positive transient
+# signal (``no access right now: 429 rate limit``) still buckets 🟡 RETRY,
+# because positive transient evidence is checked before the routing wall.
+_DECISION_HINTS = (
+    "should i ", "should we ", "do i ", "do we ", "or roll back",
+    "roll back or", "reach a decision", "make a decision", "need a decision",
+    "needs a decision", "need a call", "your call", "decide ", "decide?",
+    "decide:", "decide,", "to decide", "without input", "without a decision",
+    "need input", "need guidance", "human decision", "judgment call",
+    "judgement call",
+)
+_ROUTING_HINTS = (
+    "no access", "no creds", "no credential", "not authorized", "unauthorized",
+    "permission denied", "can't reach the", "cannot reach the",
+    "can't reach a service", "wrong lane",
+    "no vault", "missing token", "missing key", "missing api key",
+    "forbidden", "not provisioned", "no permission",
+)
+_RETRY_HINTS = (
+    "rate limit", "rate-limit", "timeout", "timed out", "flaky",
+    "transient", "try again", "temporarily", "connection reset",
+    "may clear", "retry",
+)
+# A transient word reached through a negation ("do not retry", "don't try
+# again", "should not retry", "not safe to retry until credentials exist",
+# "not transient", "won't clear on its own", "no retry") is NOT transient — it's
+# an operator instruction that the work needs routing, not a "may clear on its
+# own" signal. We strip these negated phrases out of the text before scanning
+# for positive transient evidence so credential/access blocks defer to their
+# hard access wording. The negator may be a bare/contracted "not" or a modal
+# negation (should/must/can/will/would/do + n't), optionally followed by a short
+# qualifier span ("safe to", "able to", "going to", "supposed to") before the
+# transient token. The transient tokens scrubbed here mirror the positive
+# evidence words in _RETRY_HINTS so a negated form of ANY of them defers.
+_NEGATED_TRANSIENT_RE = re.compile(
+    r"\b(?:"
+    r"(?:do(?:es)?|should|must|can|could|will|would|shall|may|might|is|are|was|were|be)"
+    r"\s*n[o']?t"  # do/should/must/… not  +  is/are not
+    r"|don'?t|doesn'?t|shouldn'?t|mustn'?t|can'?t|cannot|couldn'?t|won'?t|wouldn'?t|"
+    r"shan'?t|isn'?t|aren'?t|wasn'?t|weren'?t|never|not|no"
+    r")\s+"
+    # optional determiner ("not A retry issue") and/or qualifier span
+    # ("not SAFE TO retry", "not GOING TO retry")
+    r"(?:(?:a|an|the|any)\s+)?"
+    r"(?:(?:ever|safe|able|ok|okay|going|meant|supposed|wise|advisable|longer)\s+)?"
+    r"(?:to\s+)?"
+    # the transient token itself (incl. adjective forms ``retryable``,
+    # ``recoverable``); a trailing noun like ``issue``/``problem`` is fine and
+    # need not be matched.
+    r"(?:retry|retrying|retryable|try\s+again|trying\s+again|transient|"
+    r"temporary|temporarily|flaky|recoverable|clear(?:\s+(?:up|on\s+its\s+own))?)\b"
+)
+
+# HTTP status codes are strong signals, but a bare ``403``/``429`` substring
+# also matches an unrelated ticket reference like ``merge PR #403?``, a ticket
+# slug ``HERMES-429``, or an issue URL ``/issues/429`` — and would wrongly
+# downgrade a human-decision block to ROUTING/RETRY. Only treat a numeric code
+# as a status code when it is a standalone token that (a) is NOT part of an
+# issue/PR/ticket/URL reference and (b) sits in an explicit HTTP/error context
+# (``status``/``code``/``http``/``returned``/``responded``/``error`` nearby, or
+# an HTTP method/scheme). Default stays 🔴 DECISION NEEDED.
+# Auth/access failures (401 Unauthorized, 403 Forbidden) are a routing wall;
+# rate-limit / gateway / timeout failures (408 Request Timeout, 429 Too Many
+# Requests, 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout) are
+# transient. Bare 4xx/5xx codes only count in HTTP/error context (see
+# ``_has_status_code``) so a ticket slug like ``HERMES-429`` never triggers.
+_ROUTING_STATUS_CODES = ("401", "403")
+_RETRY_STATUS_CODES = ("408", "429", "502", "503", "504")
+# HTTP/error context words. A bare 3-digit code only counts as a status code
+# when one of these appears in the reason (so ``deploy API returned 403``
+# classifies but ``Finished 401 of the rows`` does not). This set is the SINGLE
+# SOURCE OF TRUTH for "what reads as HTTP context": it drives both the
+# context gate (``_HTTP_CONTEXT_RE``) AND the hyphenated-marker exemption in the
+# issue-ref strip below, so a hyphenated token like ``api-429``/``gateway-504``
+# whose prefix the context regex accepts is NEVER stripped before the code is
+# seen (that mismatch was the recurring "hyphenated marker" bug class).
+_HTTP_CONTEXT_WORDS = (
+    "http", "https", "status", "code", "error", "errored", "returned",
+    "responded", "response", "got", "gave", "api", "server", "endpoint",
+    "request", "forbidden", "unauthorized", "gateway", "upstream", "edge",
+    "get", "post", "put", "patch", "delete",
+)
+_HTTP_CONTEXT_RE = re.compile(
+    r"\b(?:" + "|".join(_HTTP_CONTEXT_WORDS) + r"|rate[\s-]?limit)\b"
+)
+# Strip explicit non-HTTP references before looking for a code: a leading
+# ``#NNN``; a ``pr``/``issue``/``ticket``/``gh``/``pull`` keyword ref
+# (``pr 403``, ``issue 429``, ``/issues/429``, ``/pull/429``); a project ticket
+# slug (``HERMES-429``); but NOT a hyphenated HTTP-status marker whose prefix is
+# an HTTP-context word (``http-429``, ``status-503``, ``api-429``,
+# ``gateway-504``) — those must survive so ``_has_status_code`` sees the number.
+# The ``<word>-NNN`` arm therefore carries a negative lookahead built from the
+# same ``_HTTP_CONTEXT_WORDS`` set that defines HTTP context.
+_ISSUE_REF_RE = re.compile(
+    r"(?:#|\b(?:pr|issue|issues|ticket|gh|pull)[\s#/-]*"
+    r"|\b(?!(?:" + "|".join(_HTTP_CONTEXT_WORDS) + r")-)[a-z]+-)\d{1,4}\b"
+)
+# A full URL is never status-code evidence: its scheme/host words (``http``,
+# ``https``, ``api``…) would otherwise satisfy the whole-message HTTP-context
+# gate while a numeric path segment (``/actions/runs/504``, ``/pull/429``) reads
+# as a status code. Strip whole URLs from BOTH the context check and the code
+# scan so a pure "review this <url>" handoff stays 🔴 DECISION NEEDED — only
+# inline status wording (``API returned 504``) counts.
+_URL_RE = re.compile(r"\bhttps?://\S+", re.IGNORECASE)
+
+
+def _has_status_code(text: str, codes: tuple) -> bool:
+    """True when ``text`` cites one of ``codes`` as a bare HTTP status code.
+
+    URLs are stripped first (a numeric URL path id is never a status code, and a
+    URL's scheme/host must not satisfy the HTTP-context gate). Then a code only
+    counts when (a) it is a standalone ``\\bNNN\\b`` token whose match span is
+    not part of an issue/PR/ticket reference (stripped next) AND (b) the
+    URL-free text carries explicit HTTP/error context, so ``deploy API returned
+    403`` classifies while ``Should I close HERMES-429?`` or ``review .../pull/
+    403`` or ``.../actions/runs/504`` does not. Hyphenated HTTP-status markers
+    (``http-429``, ``api-429``, ``gateway-504``) survive the issue-ref strip so
+    the numeric code is recognised.
+    """
+    text = _URL_RE.sub(" ", text)
+    if not _HTTP_CONTEXT_RE.search(text):
+        return False
+    stripped = _ISSUE_REF_RE.sub(" ", text)
+    return any(re.search(rf"\b{code}\b", stripped) for code in codes)
+
+
+def _has_positive_transient_evidence(text: str) -> bool:
+    """True when ``text`` carries genuine "may clear on its own" evidence.
+
+    Transient wording counts only when it is NOT negated — a negated instruction
+    (``do not retry``/``not transient``/``won't clear``) is an operator routing
+    action, so the whole class of transient words is scrubbed (via
+    ``_NEGATED_TRANSIENT_RE``) before the hint scan. Surviving positive
+    transient phrases (``rate limit``, ``timed out``, ``flaky``, ``try again``
+    …) and HTTP-context transient status codes are positive evidence.
+    """
+    scrubbed = _NEGATED_TRANSIENT_RE.sub(" ", text)
+    if any(h in scrubbed for h in _RETRY_HINTS):
+        return True
+    return _has_status_code(text, _RETRY_STATUS_CODES)
+
+
+def _infer_block_header(reason_detail: str) -> Optional[str]:
+    """Pick a self-labeling header from a free-text block ``reason``.
+
+    Returns the emoji header tag, or ``None`` for an empty reason (which falls
+    back to the legacy ``⏸ … blocked`` shape). A non-empty reason ALWAYS gets a
+    header; an ambiguous one defaults to 🔴 DECISION NEEDED so anything that
+    might need a human is surfaced as one.
+
+    Explicit precedence ladder (see the module comment above for the rationale
+    and the regression cases each rung pins):
+
+      1. Human CHOICE/question wording           → 🔴 DECISION NEEDED
+      2. POSITIVE (non-negated) transient evidence → 🟡 RETRY
+      3. Hard access/lane wall                    → 🟠 ROUTING
+      4. Default                                  → 🔴 DECISION NEEDED
+
+    Decision wording wins first so a question that names ``retry`` as an option
+    (``Should I retry the failed migration or roll back?``) stays act-on-it.
+    Positive transient evidence is checked before the routing wall so a reason
+    that cites both (``no access right now: 429 rate limit``) buckets 🟡 RETRY.
+    A negated retry instruction (``do not retry until provisioned``) is NOT
+    transient, so a credential block with that wording falls through to its hard
+    access evidence (🟠 ROUTING).
+    """
+    text = (reason_detail or "").strip().lower()
+    if not text:
+        return None
+    # 1. A human choice/question wins over any incidental routing/retry substring.
+    if any(h in text for h in _DECISION_HINTS) or text.endswith("?"):
+        return _BLOCK_KIND_NOTIFY["needs_input"]
+    # 2. Genuine (non-negated) transient evidence.
+    if _has_positive_transient_evidence(text):
+        return _BLOCK_KIND_NOTIFY["transient"]
+    # 3. Hard access/lane wall.
+    if any(h in text for h in _ROUTING_HINTS) or _has_status_code(
+        text, _ROUTING_STATUS_CODES
+    ):
+        return _BLOCK_KIND_NOTIFY["capability"]
+    # 4. Default: surface as a decision.
+    return _BLOCK_KIND_NOTIFY["needs_input"]
+
+
+def _format_block_notification(
+    block_kind: Optional[str],
+    task_id: str,
+    title: str,
+    reason_detail: str,
+    tag: str = "",
+) -> str:
+    """Build the blocked-event push text.
+
+    ``reason_detail`` is the already-clipped reason (may be ""). ``tag`` is the
+    ``@assignee `` attribution prefix. The first line is a self-labeling header
+    (``🔴 DECISION NEEDED — <id>: <title>``) and the reason follows on its own
+    line. ``block_kind`` is honored when a worker set the optional kind param;
+    otherwise the header is inferred from the reason text. An empty reason falls
+    back to the historical ``⏸ … blocked`` shape so existing consumers (and the
+    notify-untruncate regression tests) keep working.
+    """
+    header = _BLOCK_KIND_NOTIFY.get(block_kind or "")
+    if not header:
+        header = _infer_block_header(reason_detail)
+    if header:
+        head = f"{header} — {tag}{task_id}: {title}"
+        return f"{head}\n{reason_detail}" if reason_detail else head
+    suffix = f": {reason_detail}" if reason_detail else ""
+    return f"⏸ {tag}Kanban {task_id} blocked{suffix}"
 
 
 def _resolve_on_complete_review_config(
@@ -587,10 +847,23 @@ class GatewayKanbanWatchersMixin:
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
-                            reason = ""
+                            reason_detail = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {_clip_notify_detail(str(ev.payload['reason']))}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                                reason_detail = _clip_notify_detail(
+                                    str(ev.payload["reason"])
+                                )
+                            # The block's typed kind (needs_input / capability /
+                            # transient / None) drives the self-labeling header.
+                            block_kind = (
+                                ev.payload.get("kind") if ev.payload else None
+                            )
+                            msg = _format_block_notification(
+                                block_kind,
+                                sub["task_id"],
+                                title,
+                                reason_detail,
+                                tag=tag,
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):

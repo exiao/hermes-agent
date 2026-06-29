@@ -218,7 +218,14 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m]
+    # A block notification is either the legacy "⏸ … blocked" line (empty
+    # reason) or a self-labeling header (🔴 DECISION NEEDED / 🟠 ROUTING /
+    # 🟡 RETRY) chosen from the kind/reason. Match both shapes rather than the
+    # bare word "blocked".
+    _BLOCK_MARKERS = ("blocked", "DECISION NEEDED", "ROUTING", "RETRY")
+    blocked_deliveries = [
+        m for m in delivered_msgs if any(mark in m for mark in _BLOCK_MARKERS)
+    ]
     assert "second block" not in blocked_deliveries[0]
     assert "second block" in blocked_deliveries[1]
     assert len(blocked_deliveries) == 2, (

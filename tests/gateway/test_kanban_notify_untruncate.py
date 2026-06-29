@@ -114,7 +114,9 @@ def test_blocked_reason_is_not_clipped_at_160(tmp_path, monkeypatch):
 
     assert len(adapter.sent) == 1
     text = adapter.sent[0]["text"]
-    assert "blocked" in text
+    # A reason with no routing/retry hints self-labels as the human-decision
+    # header (the legacy "⏸ … blocked" shape is now only used for empty reasons).
+    assert "🔴 DECISION NEEDED" in text
     # The whole reason survives — including the tail that the 160-char slice
     # used to drop.
     assert reason in text
