@@ -233,6 +233,8 @@ def test_stable_environ_delete_does_not_mutate_read_snapshot():
 
     assert "HERMES_KANBAN_BOARD" in keys
     assert stable["HERMES_KANBAN_BOARD"] == "main"
+    assert stable.get("HERMES_KANBAN_BOARD") is None
+    assert "HERMES_KANBAN_BOARD" not in stable
     assert "HERMES_KANBAN_BOARD" not in real
 
 
@@ -245,6 +247,8 @@ def test_stable_environ_post_snapshot_writes_stay_out_of_read_keys():
     del stable["HERMES_KANBAN_BOARD"]
 
     assert "HERMES_KANBAN_BOARD" not in keys
+    assert stable.get("HERMES_KANBAN_BOARD") is None
+    assert "HERMES_KANBAN_BOARD" not in stable
     assert "HERMES_KANBAN_BOARD" not in real
 
 

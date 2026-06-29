@@ -191,6 +191,7 @@ class _StableEnviron(MutableMapping[str, str]):
         self._real = real_environ
         self._snapshot = _snapshot_environ(real_environ)
         self._writes: dict[str, str] = {}
+        self._deleted_keys: set[Any] = set()
         self._snapshot_keys = {self._encode_key(key): key for key in self._snapshot}
 
     def _encode_key(self, key: Any) -> Any:
@@ -223,7 +224,17 @@ class _StableEnviron(MutableMapping[str, str]):
 
     def __contains__(self, key: object) -> bool:
         snapshot_key = self._snapshot_key(key)
+        if self._encode_key(key) in self._deleted_keys:
+            return False
         return snapshot_key in self._snapshot or snapshot_key in self._writes
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if self._encode_key(key) in self._deleted_keys:
+            return default
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
     def keys(self):
         return self._read_view().keys()
@@ -243,12 +254,14 @@ class _StableEnviron(MutableMapping[str, str]):
         self._real[key] = value
         snapshot_key = self._snapshot_key(key)
         self._writes[snapshot_key] = value
+        self._deleted_keys.discard(self._encode_key(key))
         self._snapshot_keys[self._encode_key(key)] = snapshot_key
 
     def __delitem__(self, key: str) -> None:
         del self._real[key]
         snapshot_key = self._snapshot_key(key)
         self._writes.pop(snapshot_key, None)
+        self._deleted_keys.add(self._encode_key(key))
         if snapshot_key not in self._snapshot:
             self._snapshot_keys.pop(self._encode_key(key), None)
 
