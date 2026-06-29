@@ -2450,6 +2450,15 @@ def create_task(
         workspace_kind, workspace_path
     )
     workspace_kind = _healed_kind or "scratch"
+    # Normalise a blank/whitespace-only workspace_path to None up front, before
+    # the project-repo and board-default resolution (both of which only fire on
+    # ``workspace_path is None``) and before the fail-fast guard. A JSON/tool
+    # caller that sends ``workspace_path: ""`` with a persistent kind would
+    # otherwise (1) skip the board-default fallback and (2) be rejected by the
+    # guard, even though dispatch's ``_resolve_worktree_workspace`` treats a
+    # blank stored path as "no path" and resolves it from the board default.
+    if workspace_path is not None and not workspace_path.strip():
+        workspace_path = None
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -5164,7 +5173,19 @@ def decompose_triage_task(
                 board_default = (
                     read_board_metadata(get_current_board()).get("default_workdir")
                 )
-                if board_default:
+                if board_default and child_ws_kind == "worktree":
+                    # A worktree child with no path is anchored per-task by
+                    # dispatch at ``<repo>/.worktrees/<task-id>`` via
+                    # _resolve_worktree_workspace's no-path branch (which derives
+                    # the repo root from the board default). Persisting the raw
+                    # default_workdir here would make dispatch treat it as the
+                    # explicit worktree target — and when it points at a SUBDIR
+                    # inside the repo (not the repo root) the child runs in the
+                    # shared checkout instead of an isolated worktree. Keep the
+                    # path NULL so dispatch does the per-task anchoring; we only
+                    # needed the default to confirm the child IS resolvable.
+                    child_ws_path = None
+                elif board_default:
                     child_ws_path = str(board_default)
                 else:
                     # Genuinely unresolvable — raise inside the txn so the WHOLE

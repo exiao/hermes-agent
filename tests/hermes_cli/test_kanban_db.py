@@ -2485,6 +2485,55 @@ def test_worktree_no_path_non_current_board_default_succeeds(kanban_home, tmp_pa
     assert task.workspace_path == str(repo)
 
 
+def test_worktree_blank_path_normalizes_to_none_and_resolves_board_default(
+    kanban_home, tmp_path
+):
+    """Regression (Codex P2a): a JSON/tool caller that sends
+    ``workspace_path=""`` (or whitespace) with workspace_kind='worktree' on a
+    board that HAS a default_workdir must behave exactly like passing None —
+    the blank string is normalized to None at the top of create_task so (1) the
+    board-default fallback fires and (2) the fail-fast guard does NOT reject it.
+    The stored row inherits the board default and dispatch anchors a per-task
+    worktree at ``<repo>/.worktrees/<id>``.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("blank-wt-board", default_workdir=str(repo))
+    with kb.connect(board="blank-wt-board") as conn:
+        for blank in ("", "   ", "\t\n"):
+            tid = kb.create_task(
+                conn,
+                title="ship",
+                workspace_kind="worktree",
+                workspace_path=blank,
+                board="blank-wt-board",
+            )
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            # Blank normalized to None -> inherited the board default.
+            assert task.workspace_path == str(repo)
+            ws = kb.resolve_workspace(task, board="blank-wt-board")
+            assert ws == repo / ".worktrees" / tid
+
+
+def test_worktree_blank_path_no_board_default_still_raises(kanban_home, tmp_path, monkeypatch):
+    """Control for P2a: a blank-string worktree path with NO board default is
+    still genuinely unresolvable, so the guard must raise (the blank string is
+    normalized to None, then the guard fires exactly as for an explicit None).
+    """
+    decoy_repo = tmp_path / "decoy"
+    _init_git_repo(decoy_repo)
+    monkeypatch.chdir(decoy_repo)
+    with kb.connect() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="requires a workspace_path"):
+            kb.create_task(
+                conn, title="ship", workspace_kind="worktree", workspace_path="   "
+            )
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert after == before
+
+
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)

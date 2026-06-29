@@ -4,11 +4,22 @@ from the triage column. LLM-free by design.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+def _init_git_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "kanban@example.com"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Kanban Test"], check=True, capture_output=True, text=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
 @pytest.fixture
@@ -315,16 +326,20 @@ def test_decompose_child_kind_mismatch_no_path_raises_and_rolls_back(kanban_home
         assert root.status == "triage"
 
 
-def test_decompose_legacy_worktree_root_null_path_resolves_board_default(kanban_home, monkeypatch):
+def test_decompose_legacy_worktree_root_null_path_resolves_board_default(kanban_home, monkeypatch, tmp_path):
     """Regression (Codex P2): a pre-existing triage root with
     workspace_kind='worktree' and a NULL workspace_path is NOT necessarily
     un-spawnable — resolve_workspace can anchor a worktree on the board's
     default_workdir at dispatch. The decompose guard must therefore resolve
     the board default before raising, so upgrading does not strand legitimate
-    legacy triage cards. Children inheriting the legacy root inherit the
-    board-default path instead of rolling back the whole decomposition.
+    legacy triage cards. The worktree child is created (not rolled back), but
+    keeps its workspace_path NULL so dispatch anchors a per-task worktree at
+    ``<repo>/.worktrees/<id>`` rather than running in the shared default dir
+    (see Codex P2b below).
     """
-    kb.create_board("legacy-wt-board", default_workdir="/srv/project")
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("legacy-wt-board", default_workdir=str(repo))
     # The dispatcher pins the worker's board via HERMES_KANBAN_BOARD; decompose
     # runs on that active board, so get_current_board() resolves it.
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "legacy-wt-board")
@@ -349,6 +364,87 @@ def test_decompose_legacy_worktree_root_null_path_resolves_board_default(kanban_
     with kb.connect(board="legacy-wt-board") as conn:
         inh = kb.get_task(conn, child_ids[0])
     assert inh.workspace_kind == "worktree"
-    # Resolved from the board default rather than rolled back.
-    assert inh.workspace_path == "/srv/project"
+    # Resolved (not rolled back), but path stays NULL so dispatch anchors a
+    # per-task worktree under the board-default repo.
+    assert inh.workspace_path is None
+    with kb.connect(board="legacy-wt-board") as conn:
+        ws = kb.resolve_workspace(inh, board="legacy-wt-board")
+    assert ws == repo / ".worktrees" / inh.id
+
+
+def test_decompose_worktree_child_subdir_default_keeps_null_path(kanban_home, monkeypatch, tmp_path):
+    """Regression (Codex P2b): when a legacy triage root is worktree kind +
+    NULL path and the board default_workdir points at a SUBDIR inside the repo,
+    the decompose fallback must NOT persist that subdir as the child's explicit
+    workspace_path. If it did, dispatch's _resolve_worktree_workspace would
+    treat the subdir as the requested worktree target and run the child in the
+    SHARED checkout subdir instead of an isolated ``<repo>/.worktrees/<id>``.
+    The path must stay NULL so dispatch anchors per-task at the repo root.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subdir = repo / "packages" / "core"
+    subdir.mkdir(parents=True)
+    kb.create_board("subdir-wt-board", default_workdir=str(subdir))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "subdir-wt-board")
+    with kb.connect(board="subdir-wt-board") as conn:
+        tid = kb.create_task(
+            conn, title="root", assignee="worker", triage=True,
+            workspace_kind="scratch", board="subdir-wt-board",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'worktree', "
+                "workspace_path = NULL WHERE id = ?",
+                (tid,),
+            )
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "inherit"}],
+            author="decomposer",
+        )
+    assert child_ids is not None
+    with kb.connect(board="subdir-wt-board") as conn:
+        inh = kb.get_task(conn, child_ids[0])
+        assert inh.workspace_kind == "worktree"
+        # NOT the raw subdir default — NULL, so dispatch anchors per-task.
+        assert inh.workspace_path is None
+        ws = kb.resolve_workspace(inh, board="subdir-wt-board")
+    # Isolated per-task worktree under the repo ROOT, not the shared subdir.
+    assert ws == repo / ".worktrees" / inh.id
+    assert ws != subdir
+
+
+def test_decompose_dir_child_subdir_default_persists_path(kanban_home, monkeypatch, tmp_path):
+    """Control for P2b: a 'dir' child (not worktree) with no path legitimately
+    inherits the board default_workdir verbatim — dir tasks run in-place, so
+    persisting the subdir is correct. Only the worktree branch keeps NULL.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subdir = repo / "packages" / "core"
+    subdir.mkdir(parents=True)
+    kb.create_board("subdir-dir-board", default_workdir=str(subdir))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "subdir-dir-board")
+    with kb.connect(board="subdir-dir-board") as conn:
+        tid = kb.create_task(
+            conn, title="root", assignee="worker", triage=True,
+            workspace_kind="scratch", board="subdir-dir-board",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'dir', "
+                "workspace_path = NULL WHERE id = ?",
+                (tid,),
+            )
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "inherit"}],
+            author="decomposer",
+        )
+    assert child_ids is not None
+    with kb.connect(board="subdir-dir-board") as conn:
+        inh = kb.get_task(conn, child_ids[0])
+    assert inh.workspace_kind == "dir"
+    assert inh.workspace_path == str(subdir)
 
