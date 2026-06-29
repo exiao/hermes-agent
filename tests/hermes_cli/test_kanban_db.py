@@ -254,9 +254,12 @@ def test_create_strips_worktree_scheme_from_workspace_path(kanban_home, tmp_path
             workspace_path=f"worktree:{repo}",
         )
         task = kb.get_task(conn, tid)
+    assert task is not None
     assert task.workspace_kind == "worktree"
-    assert task.workspace_path == str(repo)
-    assert not task.workspace_path.startswith("worktree:")
+    workspace_path = task.workspace_path
+    assert workspace_path is not None
+    assert workspace_path == str(repo)
+    assert not workspace_path.startswith("worktree:")
 
 
 def test_create_strips_dir_scheme_from_workspace_path(kanban_home):
@@ -265,6 +268,7 @@ def test_create_strips_dir_scheme_from_workspace_path(kanban_home):
             conn, title="dir scheme", workspace_path="dir:/abs/work/dir"
         )
         task = kb.get_task(conn, tid)
+    assert task is not None
     assert task.workspace_kind == "dir"
     assert task.workspace_path == "/abs/work/dir"
 
@@ -279,6 +283,7 @@ def test_create_explicit_kind_not_overridden_by_stray_prefix(kanban_home):
             workspace_path="dir:/abs/keep",
         )
         task = kb.get_task(conn, tid)
+    assert task is not None
     assert task.workspace_kind == "dir"
     assert task.workspace_path == "/abs/keep"
 
