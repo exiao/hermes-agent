@@ -543,8 +543,18 @@ DANGEROUS_PATTERNS = [
     # sibling PATH wrappers at ~/.local/bin/{gh,git} and ~/.claude/guard.sh
     # and the ~/.hermes/plugins/block-dangerous-merges/ plugin for parallel
     # enforcement at the shell and Claude-Code tool layers.
-    (r'\bgit\s+push\b\s+\S+\s+(?:\S+:)?(\+?main|\+?master)(?:\s|$)', "git push to main/master (bypasses PR review)"),
-    (r'\bgit\s+push\b\s+\S+\s+HEAD:(main|master)(?:\s|$)', "git push HEAD to main/master (bypasses PR review)"),
+    # Match a push whose refspec targets main/master in any of the standard
+    # forms: bare `main`, `+main`, `HEAD:main`, `main:main`, `feature:main`,
+    # `*:main`, AND the fully-qualified `refs/heads/main` / `HEAD:refs/heads/main`
+    # (the `+`/colon force forms too). The `main`/`master` token is anchored on
+    # a REQUIRED preceding refspec-boundary char (the space after the remote, or
+    # `/`/`:`/`+` inside the refspec) so `refs/heads/main` and
+    # `HEAD:refs/heads/main` are caught, while a branch that merely contains the
+    # word (`mainline`, `my-main`, `main-event`) is NOT: a `-`-joined name has no
+    # boundary char immediately before `main`, and the trailing `(?:\s|$)` rejects
+    # a trailing suffix. Mirrors the shell guard at ~/.local/bin/git.
+    (r'\bgit\s+push\b\s+\S+\s+\S*[/:+\s](main|master)(?:\s|$|[\'"`])', "git push to main/master (bypasses PR review)"),
+    (r'\bgit\s+push\b\s+\S+\s+(main|master)(?:\s|$|[\'"`])', "git push to main/master (bypasses PR review)"),
     (r'\bgit\s+push\b.*--force-with-lease\b', "git force-with-lease push (rewrites remote history)"),
     (r'\bgh\s+pr\s+merge\b', "gh pr merge (bypasses PR review — Eric merges)"),
     (r'\bgh\s+(release|repo|workflow)\s+delete\b', "gh delete destructive resource"),
@@ -859,9 +869,14 @@ _SHORT_FORCE_FLAG_RE = re.compile(r'(?<![\w-])-[a-z]*f[a-z]*(?![\w-])')
 _FORCE_WITH_LEASE_RE = re.compile(r'--force-with-lease(?:=\S*)?(?![\w])')
 # Refspec/target forms that would rewrite the default branch — mirrors the
 # shell guard's main/master enumeration (`+main`, `HEAD:main`, `*:main`,
-# `main:main`, a bare `main`/`master` push target, the `+`/colon force forms).
+# `main:main`, a bare `main`/`master` push target, the `+`/colon force forms),
+# AND the fully-qualified `refs/heads/main` / `HEAD:refs/heads/main` forms.
+# Anchor `main`/`master` on a preceding refspec-boundary char (`/`, `:`, `+`,
+# or whitespace / start) so a `heads/`-prefixed or colon-RHS-qualified ref is
+# caught, while a branch that merely CONTAINS the word (`mainline`, `my-main`,
+# `main-event`) is not — the trailing `(?:\s|$)` keeps those un-gated.
 _DEFAULT_BRANCH_PUSH_RE = re.compile(
-    r'(?:^|\s)(?:\+?main|\+?master|head:main|head:master|\S*:main|\S*:master)(?:\s|$)'
+    r'(?:^|[/:+\s])(?:main|master)(?:\s|$|[\'"`])'
 )
 
 
@@ -876,7 +891,14 @@ def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
         safety belt, so it stays gated),
       - a push that ALSO carries a bare `--force`/`-f` (the bare force could
         still clobber regardless of the lease intent),
-      - a push whose refspec/target is the default branch (main/master).
+      - a `--all`/`--mirror` push (pushes EVERY local ref, incl. main/master —
+        a single explicit destination ref cannot be reasoned about),
+      - a push with NO explicit destination refspec (an omitted refspec follows
+        push.default and may push the current branch — which could be main),
+      - a refspec carrying a leading `+` (git documents `+<src>:<dst>` as the
+        same forced update as `--force`, with NO lease safety belt),
+      - a push whose refspec/target is the default branch (main/master), in any
+        form incl. `refs/heads/main` / `HEAD:refs/heads/main`.
     """
     if not re.search(r'\bgit\s+push\b', command_lower):
         return False
@@ -889,7 +911,27 @@ def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
     without_lease = _FORCE_WITH_LEASE_RE.sub(' ', command_lower)
     if _BARE_FORCE_FLAG_RE.search(without_lease) or _SHORT_FORCE_FLAG_RE.search(without_lease):
         return False
-    # Reject if the refspec/target is the default branch — let the main/master
+    # Reject a broadcast push: `--all`/`--mirror` push every local ref (incl.
+    # main/master), so a "no main token in the args" check cannot vouch for them.
+    if re.search(r'(?<![\w-])--(?:all|mirror)(?![\w-])', without_lease):
+        return False
+    # Require an EXPLICIT destination refspec. An omitted refspec resolves via
+    # push.default and may push the current branch (which could be main), so a
+    # bare `git push --force-with-lease [origin]` must keep prompting. Strip the
+    # `git push` verb, the lease flag, any other --flags, and a single remote
+    # token; what remains must contain at least one refspec argument.
+    args = without_lease
+    args = re.sub(r'\bgit\s+push\b', ' ', args)
+    args = re.sub(r'(?<![\w-])--?[a-z][\w-]*(?:=\S*)?', ' ', args)  # drop flags
+    tokens = args.split()
+    # First surviving token is the remote; a refspec must follow it.
+    if len(tokens) < 2:
+        return False
+    refspecs = tokens[1:]
+    # Reject a leading-`+` refspec (forced update, no lease guarantee).
+    if any(rs.startswith('+') or ':+' in rs for rs in refspecs):
+        return False
+    # Reject if any refspec/target is the default branch — let the main/master
     # patterns (and this guard's refusal) handle it via the normal prompt.
     if _DEFAULT_BRANCH_PUSH_RE.search(command_lower):
         return False

@@ -1356,6 +1356,9 @@ class TestGitDestructiveOps:
             "git push origin HEAD:main",
             "git push origin main:main",
             "git push upstream master",
+            "git push origin refs/heads/main",
+            "git push origin refs/heads/master",
+            "git push origin HEAD:refs/heads/main",
         ):
             dangerous, _, desc = detect_dangerous_command(cmd)
             assert dangerous is True, f"expected block, got allow for: {cmd}"
@@ -1374,13 +1377,25 @@ class TestGitDestructiveOps:
     def test_git_push_force_with_lease_to_main_still_flagged(self):
         """A force-with-lease whose refspec targets the DEFAULT branch could
         rewrite main/master and MUST still be flagged (mirrors the shell guard's
-        main/master refspec enumeration)."""
+        main/master refspec enumeration). Covers the bare, `+`, `HEAD:`, and
+        colon-RHS forms AND the fully-qualified `refs/heads/` /
+        `HEAD:refs/heads/` forms for both main and master."""
         for cmd in (
             "git push --force-with-lease origin main",
             "git push --force-with-lease origin master",
             "git push --force-with-lease origin HEAD:main",
+            "git push --force-with-lease origin HEAD:master",
             "git push --force-with-lease origin feature:main",
             "git push --force-with-lease origin +main",
+            # Fully-qualified refspec forms (the carve-out hole this loop guards):
+            "git push --force-with-lease origin refs/heads/main",
+            "git push --force-with-lease origin refs/heads/master",
+            "git push --force-with-lease origin HEAD:refs/heads/main",
+            "git push --force-with-lease origin HEAD:refs/heads/master",
+            # Wildcard LHS clobbering main (minor finding — plausible clobber),
+            # both unquoted and shell-quoted (the quote must not defeat the gate):
+            "git push --force-with-lease origin *:main",
+            "git push --force-with-lease origin '*:main'",
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is True, f"expected block, got allow for: {cmd}"
@@ -1394,6 +1409,27 @@ class TestGitDestructiveOps:
             "git push --force",
             # bare force AND lease together: the bare force could still clobber
             "git push --force --force-with-lease origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_git_push_lease_carveout_only_for_explicit_single_feature_ref(self):
+        """The lease carve-out auto-approves ONLY an explicit, non-`+`,
+        single-destination feature-ref push. A leading-`+` refspec (a forced
+        update with no lease guarantee), a `--all`/`--mirror` broadcast (pushes
+        every local ref incl. main), and an omitted refspec (resolves via
+        push.default — may push the current branch, which could be main) must
+        all keep prompting."""
+        for cmd in (
+            # leading-`+` refspec = forced update, bypasses the lease belt
+            "git push --force-with-lease origin +feature",
+            "git push --force-with-lease origin +refs/heads/feature",
+            # broadcast pushes touch every ref incl. main/master
+            "git push --force-with-lease --all origin",
+            "git push --force-with-lease --mirror origin",
+            # no explicit destination refspec
+            "git push --force-with-lease origin",
+            "git push --force-with-lease",
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is True, f"expected block, got allow for: {cmd}"
@@ -1436,6 +1472,19 @@ class TestGitDestructiveOps:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, f"expected allow, got block for: {cmd}"
 
+    def test_git_push_force_with_lease_to_qualified_feature_branch_not_flagged(self):
+        """A fully-qualified `refs/heads/<feature>` lease push must still
+        auto-allow — the boundary anchor only fires when the final ref
+        component is exactly main/master, not for a feature ref under
+        refs/heads/."""
+        for cmd in (
+            "git push --force-with-lease origin refs/heads/feature",
+            "git push --force-with-lease origin HEAD:refs/heads/my-feature",
+            "git push --force-with-lease origin refs/heads/mainline",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
     def test_git_push_to_branches_containing_main_not_flagged(self):
         """Branch names that *contain* 'main' must not trigger the main/master rule."""
         for cmd in (
@@ -1443,6 +1492,8 @@ class TestGitDestructiveOps:
             "git push origin my-main",
             "git push origin mainline",
             "git push origin master-key",
+            "git push origin refs/heads/mainline",
+            "git push origin refs/heads/my-main",
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, f"expected allow, got block for: {cmd}"
