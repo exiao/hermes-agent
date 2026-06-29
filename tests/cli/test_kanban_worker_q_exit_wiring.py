@@ -189,6 +189,10 @@ def _drive_non_quiet_q(monkeypatch, *, failure_reason, kanban_task):
     else:
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    # cli.py is imported at collection time, before the hermetic HOME fixture
+    # rewrites config paths; never let a developer's real worktree setting make
+    # these main-path tests create git worktrees before FakeCLI is constructed.
+    monkeypatch.setitem(cli_mod.CLI_CONFIG, "worktree", False)
 
     # The kanban image-ref enrichment block is best-effort; force it to bail
     # fast and deterministically (it's wrapped in try/except in main()).
