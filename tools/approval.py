@@ -899,6 +899,11 @@ _PROTECTED_BRANCHES = frozenset({"main", "master", "live-config"})
 # positional (the remote/refspec).
 _VALUE_FLAGS = frozenset({
     "-o", "--push-option", "--repo", "--receive-pack", "--exec",
+    # `--recurse-submodules <check|on-demand|no>` consumes the next word in its
+    # space form; if we don't drop the value it survives token-splitting and
+    # gets miscounted as the remote/refspec (`--recurse-submodules on-demand
+    # origin` → `origin` read as a refspec).
+    "--recurse-submodules",
 })
 
 # A destination that names exactly one ordinary branch under refs/heads — the
@@ -989,7 +994,11 @@ def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
         return False
     # Reject a broadcast push: `--all`/`--mirror` push every local ref (incl.
     # main/master), so a "no main token in the args" check cannot vouch for them.
-    if re.search(r'(?<![\w-])--(?:all|mirror)(?![\w-])', without_lease):
+    # `--tags` (no short form) ALSO pushes tags alongside the named refspec — a
+    # leased `--force-with-lease=refs/tags/v1:<old>` can rewrite a tag while the
+    # visible refspec looks like a routine feature push, so the branch-only
+    # carve-out must keep prompting for it.
+    if re.search(r'(?<![\w-])--(?:all|mirror|tags)(?![\w-])', without_lease):
         return False
     # Reject a DELETE push (`--delete` / `-d`): it removes the remote ref
     # entirely (just as destructive as a force rewrite), and the flag-strip
@@ -1012,7 +1021,12 @@ def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
     value_flag_alt = '|'.join(re.escape(f) for f in _VALUE_FLAGS)
     args = re.sub(rf'(?<![\w-])(?:{value_flag_alt})(?:=\S+|\s+\S+)', ' ', args)
     # Drop the remaining standalone `--flag=value` / bare `--flag` / `-f` flags.
-    args = re.sub(r'(?<![\w-])--?[a-z][\w-]*(?:=\S*)?', ' ', args)
+    # The leading char after the dash(es) may be a letter (`--repo`, `-q`) OR a
+    # digit — git push documents numeric short flags `-4`/`-6` (IPv4/IPv6), and
+    # if we only matched `[a-z]` they'd survive and be miscounted as a refspec
+    # (`git push --force-with-lease -4 origin` → `origin` read as a destination).
+    # A remote/refspec never starts with a dash, so this only eats flags.
+    args = re.sub(r'(?<![\w-])--?[a-z0-9][\w-]*(?:=\S*)?', ' ', args)
     tokens = args.split()
     # First surviving token is the remote; a refspec must follow it.
     if len(tokens) < 2:

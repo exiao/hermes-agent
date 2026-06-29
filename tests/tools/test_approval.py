@@ -1567,6 +1567,62 @@ class TestGitDestructiveOps:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, f"expected allow, got block for: {cmd}"
 
+    def test_git_push_lease_carveout_rejects_tag_pushes(self):
+        """`--tags` pushes tags alongside the named refspec, so a leased
+        `--force-with-lease=refs/tags/v1:<old> --tags origin feature` can
+        force-update a tag while the visible refspec looks like a routine
+        feature push. The branch-only carve-out must keep prompting; an
+        ordinary feature push without `--tags` still carves out."""
+        for cmd in (
+            "git push --force-with-lease --tags origin feature",
+            "git push --force-with-lease=refs/tags/v1:old --tags origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin feature"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_consumes_recurse_submodules_value(self):
+        """`--recurse-submodules <check|on-demand|no>` consumes the next word in
+        its space form. Without dropping the value, `--recurse-submodules
+        on-demand origin` leaves `origin` miscounted as a refspec and would
+        carve out an omitted-refspec push (which follows push.default → could be
+        main). Must keep prompting; the `=value` form plus a real refspec still
+        carves out."""
+        for cmd in (
+            "git push --force-with-lease --recurse-submodules on-demand origin",
+            "git push --force-with-lease --recurse-submodules check origin",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        for cmd in (
+            "git push --force-with-lease --recurse-submodules=on-demand origin feature",
+            "git push --force-with-lease --recurse-submodules on-demand origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
+    def test_git_push_lease_carveout_strips_numeric_short_flags(self):
+        """Numeric short flags `-4`/`-6` (IPv4/IPv6) take no value but the
+        generic flag-strip used to only match letter-first flags, leaving `-4`
+        to be miscounted as a refspec so `git push --force-with-lease -4 origin`
+        (omitted refspec) wrongly carved out. Must keep prompting; a numeric
+        flag alongside a REAL feature refspec still carves out."""
+        for cmd in (
+            "git push --force-with-lease -4 origin",
+            "git push --force-with-lease -6 origin",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        for cmd in (
+            "git push --force-with-lease -4 origin feature",
+            "git push --force-with-lease -6 origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
     def test_gh_pr_merge_flagged(self):
         """`gh pr merge` bypasses PR review and MUST be flagged."""
         for cmd in ("gh pr merge 42 --squash", "gh pr merge 42", "gh pr merge"):
