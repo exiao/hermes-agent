@@ -241,18 +241,20 @@ def test_decompose_per_child_workspace_override(kanban_home):
     assert inh.workspace_path == proj
 
 
-def test_decompose_strips_scheme_prefix_from_child_override(kanban_home):
+def test_decompose_strips_scheme_prefix_from_child_override(kanban_home, tmp_path):
     """A child workspace override carrying a '<scheme>:<path>' prefix must be
     self-healed before the direct INSERT, just like create_task does. Codex P2:
     decompose_triage_task bypassed the create-path guard, so a child passing
     workspace_path='worktree:/repo' (or inheriting a prefixed legacy root)
     landed as scratch + 'worktree:/repo' — a newly malformed row."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="root", assignee="worker", triage=True)
         child_ids = kb.decompose_triage_task(
             conn, tid, root_assignee="orchestrator",
             children=[
-                {"title": "wt-prefix", "workspace_path": "worktree:/abs/repo"},
+                {"title": "wt-prefix", "workspace_path": f"worktree:{repo}"},
                 {"title": "dir-prefix", "workspace_path": "dir:/abs/dir"},
             ],
             author="decomposer",
@@ -261,16 +263,20 @@ def test_decompose_strips_scheme_prefix_from_child_override(kanban_home):
     with kb.connect() as conn:
         wt = kb.get_task(conn, child_ids[0])
         dr = kb.get_task(conn, child_ids[1])
+    assert wt is not None
+    assert dr is not None
     # Scheme promoted to kind, path stored bare (no prefix).
     assert wt.workspace_kind == "worktree"
-    assert wt.workspace_path == "/abs/repo"
+    assert wt.workspace_path == str(repo)
     assert dr.workspace_kind == "dir"
     assert dr.workspace_path == "/abs/dir"
 
 
-def test_decompose_strips_prefix_from_inherited_legacy_root(kanban_home):
+def test_decompose_strips_prefix_from_inherited_legacy_root(kanban_home, tmp_path):
     """When the root itself carries a legacy prefixed path, an inheriting child
     (no explicit override) must not copy the malformed value verbatim."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="root", assignee="worker", triage=True)
         # Force a malformed persisted root path (bypass create guard).
@@ -278,7 +284,7 @@ def test_decompose_strips_prefix_from_inherited_legacy_root(kanban_home):
             conn.execute(
                 "UPDATE tasks SET workspace_kind = 'scratch', "
                 "workspace_path = ? WHERE id = ?",
-                ("worktree:/abs/legacy", tid),
+                (f"worktree:{repo}", tid),
             )
         child_ids = kb.decompose_triage_task(
             conn, tid, root_assignee="orchestrator",
@@ -288,8 +294,37 @@ def test_decompose_strips_prefix_from_inherited_legacy_root(kanban_home):
     assert child_ids is not None
     with kb.connect() as conn:
         inh = kb.get_task(conn, child_ids[0])
+    assert inh is not None
     assert inh.workspace_kind == "worktree"
-    assert inh.workspace_path == "/abs/legacy"
+    assert inh.workspace_path == str(repo)
+
+
+def test_decompose_rejects_unresolvable_worktree_child_path(kanban_home, tmp_path):
+    """A direct child INSERT must not bypass the create-time worktree guard."""
+    not_repo = tmp_path / "not-repo"
+    not_repo.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="root", assignee="worker", triage=True)
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="not inside a git repo"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[
+                    {
+                        "title": "bad worktree child",
+                        "workspace_kind": "worktree",
+                        "workspace_path": str(not_repo),
+                    }
+                ],
+                author="decomposer",
+            )
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        root = kb.get_task(conn, tid)
+    assert after == before
+    assert root is not None
+    assert root.status == "triage"
 
 
 def test_decompose_child_kind_mismatch_no_path_raises_and_rolls_back(kanban_home):

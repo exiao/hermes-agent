@@ -5288,6 +5288,12 @@ def decompose_triage_task(
                     read_board_metadata(get_current_board()).get("default_workdir")
                 )
                 if board_default and child_ws_kind == "worktree":
+                    default_anchor = Path(str(board_default)).expanduser()
+                    if not default_anchor.is_absolute() or _git_toplevel(default_anchor) is None:
+                        raise ValueError(
+                            f"decompose child[{idx}] {title!r}: workspace_kind='worktree' "
+                            f"board default_workdir {board_default!r} is not inside a git repo"
+                        )
                     # A worktree child with no path is anchored per-task by
                     # dispatch at ``<repo>/.worktrees/<task-id>`` via
                     # _resolve_worktree_workspace's no-path branch (which derives
@@ -5314,6 +5320,16 @@ def decompose_triage_task(
                         f"so it can inherit the root path, or set a board "
                         f"default_workdir."
                     )
+            if (
+                child_ws_kind == "worktree"
+                and child_ws_path
+                and not _worktree_path_resolvable(str(child_ws_path))
+            ):
+                raise ValueError(
+                    f"decompose child[{idx}] {title!r}: workspace_kind='worktree' "
+                    f"path {child_ws_path!r} is not inside a git repo and does not "
+                    "point at a git repo root"
+                )
             # Direct INSERT bypasses create_task's spec-less guard too: a
             # malformed decomposer result (e.g. {"title":"dev task","body":"",
             # "assignee":"dev"}) would otherwise land as 'todo' and be promoted
