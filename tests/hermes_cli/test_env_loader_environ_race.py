@@ -16,9 +16,11 @@ code the second pass raises ``KeyError``; after the fix
 dotenv the frozen copy, so no later pass can observe the deletion.
 """
 
+from collections.abc import MutableMapping
 import os
+import threading
 
-import dotenv.main as dotenv_main
+from dotenv import load_dotenv as dotenv_load_dotenv
 
 import hermes_cli.env_loader as env_loader
 
@@ -107,6 +109,15 @@ class _RacingEnviron:
         return out
 
 
+class _InitialSnapshotRaceEnviron(_RacingEnviron):
+    """Drops the volatile key during the initial snapshot's keys/get window."""
+
+    def keys(self):
+        self._enumerations += 1
+        self._dropped = True
+        return self._all_keys()
+
+
 def _write_interpolating_env(tmp_path):
     """A .env with >=2 interpolated lines.
 
@@ -131,14 +142,14 @@ def test_pre_fix_environ_race_raises_keyerror(tmp_path, monkeypatch):
         {"PATH": "/usr/bin"}, "HERMES_KANBAN_BOARD", "main"
     )
     # dotenv reads the module-global ``os.environ``; point it at the racer.
-    monkeypatch.setattr(dotenv_main.os, "environ", racing)
+    monkeypatch.setattr(os, "environ", racing)
 
     # Call python-dotenv directly (the UNFIXED reader path) and prove it
     # raises -- this is the bug, and it guards against a future change that
     # silently makes the snapshot a no-op.
     raised = False
     try:
-        dotenv_main.load_dotenv(dotenv_path=env_file, override=True, encoding="utf-8")
+        dotenv_load_dotenv(dotenv_path=env_file, override=True, encoding="utf-8")
     except KeyError as exc:
         raised = "HERMES_KANBAN_BOARD" in str(exc)
     assert raised, "expected the os.environ mutation race to raise KeyError pre-fix"
@@ -153,7 +164,6 @@ def test_loader_snapshots_environ_and_survives_race(tmp_path, monkeypatch):
     # Both dotenv's module and the loader resolve ``os.environ`` through the
     # ``os`` module; patch it there so the loader snapshots the racer.
     monkeypatch.setattr(os, "environ", racing)
-    monkeypatch.setattr(dotenv_main.os, "environ", racing)
 
     # Must NOT raise. The loader snapshots os.environ before handing it to
     # python-dotenv, so the volatile key is stable for every per-line pass.
@@ -164,3 +174,63 @@ def test_loader_snapshots_environ_and_survives_race(tmp_path, monkeypatch):
     assert racing.get("FOO") == "alpha-main"
     assert racing.get("BAR") == "beta-main"
     assert racing.get("BAZ") == "gamma"
+
+
+def test_stable_environ_is_mutable_mapping_with_snapshot_copy():
+    """Mapping helpers should stay coherent through MutableMapping methods."""
+    real = {"EXISTING": "old"}
+    stable = env_loader._StableEnviron(real)
+
+    assert isinstance(stable, MutableMapping)
+    assert stable.copy() == {"EXISTING": "old"}
+
+    stable.update({"NEW": "value"})
+    assert real["NEW"] == "value"
+    assert stable["NEW"] == "value"
+
+    copied = stable.copy()
+    real["EXISTING"] = "mutated-outside-snapshot"
+    assert copied["EXISTING"] == "old"
+    assert stable["EXISTING"] == "old"
+
+
+def test_loader_tolerates_key_deleted_during_initial_snapshot(tmp_path, monkeypatch):
+    """The first stable snapshot must not reintroduce the same TOCTOU crash."""
+    env_file = _write_interpolating_env(tmp_path)
+    racing = _InitialSnapshotRaceEnviron(
+        {"PATH": "/usr/bin"}, "HERMES_KANBAN_BOARD", "main"
+    )
+    monkeypatch.setattr(os, "environ", racing)
+
+    env_loader._load_dotenv_with_fallback(env_file, override=True)
+
+    assert racing.get("FOO") == "alpha-"
+    assert racing.get("BAR") == "beta-"
+    assert racing.get("BAZ") == "gamma"
+
+
+def test_load_dotenv_swap_is_serialized_by_process_lock(tmp_path, monkeypatch):
+    """Concurrent loads should wait for the process-wide os.environ swap lock."""
+    env_file = _write_interpolating_env(tmp_path)
+    entered = threading.Event()
+
+    def fake_load_dotenv(**_kwargs):
+        entered.set()
+        return True
+
+    monkeypatch.setattr(env_loader, "load_dotenv", fake_load_dotenv)
+
+    env_loader._ENV_LOAD_LOCK.acquire()
+    worker = threading.Thread(
+        target=env_loader._load_dotenv_with_fallback,
+        kwargs={"path": env_file, "override": True},
+    )
+    worker.start()
+    try:
+        assert not entered.wait(0.05)
+    finally:
+        env_loader._ENV_LOAD_LOCK.release()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert entered.is_set()

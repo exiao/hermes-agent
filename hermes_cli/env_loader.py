@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 import os
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -37,6 +39,11 @@ _SECRET_SOURCES: dict[str, str] = {}
 # in-process cache prevents redundant network calls, but the print, the
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
+
+# ``os.environ`` is process-global. The stable-environ swap in
+# ``_load_dotenv_with_fallback`` must be stack-safe when concurrent gateway
+# turns reload dotenv at the same time.
+_ENV_LOAD_LOCK = threading.RLock()
 
 
 def get_secret_source(env_var: str) -> str | None:
@@ -143,7 +150,21 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
-class _StableEnviron:
+def _snapshot_environ(real_environ) -> dict[str, str]:
+    """Copy an environment mapping while tolerating concurrent key deletion."""
+    snapshot: dict[str, str] = {}
+    for key in list(real_environ.keys()):
+        try:
+            snapshot[key] = real_environ[key]
+        except KeyError:
+            # A concurrent unpin may delete a key after ``keys()`` listed it.
+            # Skip that transient key rather than failing before the stable
+            # wrapper is even installed.
+            continue
+    return snapshot
+
+
+class _StableEnviron(MutableMapping):
     """Write-through snapshot of ``os.environ`` for use during ``load_dotenv``.
 
     python-dotenv's ``resolve_variables`` interpolates each ``.env`` line by
@@ -167,7 +188,7 @@ class _StableEnviron:
 
     def __init__(self, real_environ):
         self._real = real_environ
-        self._snapshot = dict(real_environ)
+        self._snapshot = _snapshot_environ(real_environ)
 
     # --- reads: served from the frozen snapshot ---
     def __getitem__(self, key):
@@ -193,6 +214,9 @@ class _StableEnviron:
 
     def get(self, key, default=None):
         return self._snapshot.get(key, default)
+
+    def copy(self):
+        return self._snapshot.copy()
 
     # --- writes: pass through to the real os.environ AND keep the snapshot
     # coherent so a later read in the same load sees what was just written ---
@@ -227,16 +251,17 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     # can delete a key between enumerate and get, raising KeyError mid-load.
     # The write-through snapshot gives dotenv a stable view for reads while its
     # writes still land on the real environment. Restored in finally.
-    stable = _StableEnviron(os.environ)
-    real_environ = os.environ
-    os.environ = stable  # type: ignore[assignment]
-    try:
+    with _ENV_LOAD_LOCK:
+        stable = _StableEnviron(os.environ)
+        real_environ = os.environ
+        setattr(os, "environ", stable)
         try:
-            load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
-        except UnicodeDecodeError:
-            load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
-    finally:
-        os.environ = real_environ  # type: ignore[assignment]
+            try:
+                load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+            except UnicodeDecodeError:
+                load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        finally:
+            setattr(os, "environ", real_environ)
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
