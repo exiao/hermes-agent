@@ -313,3 +313,42 @@ def test_decompose_child_kind_mismatch_no_path_raises_and_rolls_back(kanban_home
         # Root untouched — still in triage, not flipped to todo.
         root = kb.get_task(conn, tid)
         assert root.status == "triage"
+
+
+def test_decompose_legacy_worktree_root_null_path_resolves_board_default(kanban_home, monkeypatch):
+    """Regression (Codex P2): a pre-existing triage root with
+    workspace_kind='worktree' and a NULL workspace_path is NOT necessarily
+    un-spawnable — resolve_workspace can anchor a worktree on the board's
+    default_workdir at dispatch. The decompose guard must therefore resolve
+    the board default before raising, so upgrading does not strand legitimate
+    legacy triage cards. Children inheriting the legacy root inherit the
+    board-default path instead of rolling back the whole decomposition.
+    """
+    kb.create_board("legacy-wt-board", default_workdir="/srv/project")
+    # The dispatcher pins the worker's board via HERMES_KANBAN_BOARD; decompose
+    # runs on that active board, so get_current_board() resolves it.
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "legacy-wt-board")
+    with kb.connect(board="legacy-wt-board") as conn:
+        tid = kb.create_task(
+            conn, title="root", assignee="worker", triage=True,
+            workspace_kind="scratch", board="legacy-wt-board",
+        )
+        # Simulate a pre-fix legacy root: worktree kind, NULL path.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'worktree', "
+                "workspace_path = NULL WHERE id = ?",
+                (tid,),
+            )
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "inherit"}],
+            author="decomposer",
+        )
+    assert child_ids is not None
+    with kb.connect(board="legacy-wt-board") as conn:
+        inh = kb.get_task(conn, child_ids[0])
+    assert inh.workspace_kind == "worktree"
+    # Resolved from the board default rather than rolled back.
+    assert inh.workspace_path == "/srv/project"
+

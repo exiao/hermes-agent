@@ -2462,6 +2462,29 @@ def test_worktree_explicit_path_succeeds_control(kanban_home, tmp_path):
     assert task.workspace_path == str(repo)
 
 
+def test_worktree_no_path_non_current_board_default_succeeds(kanban_home, tmp_path, monkeypatch):
+    """Regression (Codex P2): create_task(board='target', workspace_kind='worktree')
+    on a board with a default_workdir must NOT falsely raise just because the
+    *active* board differs from the target board. The board-default lookup must
+    consult the explicitly-passed ``board``, not get_current_board()."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("target-board", default_workdir=str(repo))
+    # Pin the ACTIVE board to a different board with NO default_workdir, so a
+    # get_current_board()-based lookup would resolve nothing and falsely raise.
+    kb.create_board("other-active-board")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "other-active-board")
+    with kb.connect(board="target-board") as conn:
+        tid = kb.create_task(
+            conn, title="ship", workspace_kind="worktree", board="target-board"
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workspace_kind == "worktree"
+    # Anchored on the target board's default_workdir, not raised.
+    assert task.workspace_path == str(repo)
+
+
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
