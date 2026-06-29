@@ -1660,12 +1660,52 @@ class TestGitDestructiveOps:
         for cmd in (
             "git push --force-with-lease origin tag v1",
             "git push --force-with-lease=refs/tags/v1:old origin tag v1",
+            # The `tag <name>` shorthand may also trail other refspecs.
+            "git push --force-with-lease origin feature tag v1",
+            "git push --force-with-lease=refs/tags/v1:old origin feature tag v1",
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is True, f"expected block, got allow for: {cmd}"
         # A lone branch named "tag" is a normal feature push.
         dangerous, _, _ = detect_dangerous_command(
             "git push --force-with-lease origin tag"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_rejects_packed_numeric_delete_bundle(self):
+        """A packed short bundle like `-4d` is IPv4 + a delete (`-d`), but the
+        delete guard used to only allow letters around `d`, so `-4d` slipped
+        past and the generic flag-strip erased it — a leased push then read like
+        a routine feature rebase and the remote branch was deleted without
+        approval. Must keep prompting; a packed bundle without `d`/`f` carves
+        out."""
+        for cmd in (
+            "git push --force-with-lease -4d origin feature",
+            "git push --force-with-lease -6d origin feature",
+            "git push --force-with-lease -d4 origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease -uq origin feature"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_handles_quoted_option_value(self):
+        """A QUOTED option value carrying whitespace (`--push-option 'ci skip'`)
+        is a single shell argument, so the value must be consumed whole — a
+        plain whitespace split would leak `skip` as a phantom refspec and carve
+        out an omitted-refspec push (push.default → could be main). Must keep
+        prompting; the same quoted value alongside a REAL feature refspec still
+        carves out."""
+        for cmd in (
+            "git push --force-with-lease --push-option 'ci skip' origin",
+            "git push --force-with-lease -o 'ci skip' origin",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease --push-option 'ci skip' origin feature"
         )
         assert dangerous is False
 

@@ -14,6 +14,7 @@ import functools
 import logging
 import os
 import re
+import shlex
 import sys
 import threading
 import time
@@ -1013,8 +1014,10 @@ def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
     # entirely (just as destructive as a force rewrite), and the flag-strip
     # below would erase the `--delete` token and leave the branch reading like a
     # routine rebase target. A deletion is never the carve-out's "rebase a
-    # feature branch" intent, so keep prompting.
-    if re.search(r'(?<![\w-])(?:--delete|-[a-z]*d[a-z]*)(?![\w-])', without_lease):
+    # feature branch" intent, so keep prompting. The packed short form may carry
+    # DIGITS too (`-4d` = IPv4 + delete), so match `[a-z0-9]` around `d` — same
+    # reasoning as the packed numeric force bundle above.
+    if re.search(r'(?<![\w-])(?:--delete|-[a-z0-9]*d[a-z0-9]*)(?![\w-])', without_lease):
         return False
     # Require an EXPLICIT destination refspec. An omitted refspec resolves via
     # push.default and may push the current branch (which could be main), so a
@@ -1023,32 +1026,47 @@ def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
     # Strip EVERYTHING up to and including the `git push` verb so a shell prefix
     # (`cd repo && git push …`) does not survive as a phantom remote/refspec.
     args = re.sub(r'^.*?\bgit\s+push\b', ' ', without_lease)
-    # Drop the VALUE of space-separated value-flags FIRST (`-o ci.skip`,
-    # `--push-option ci.skip`, `--repo url`). If we stripped the flag alone, its
-    # value would survive token-splitting and be miscounted as the remote or a
-    # refspec. Handle both the `<flag> <value>` and `<flag>=<value>` forms.
-    value_flag_alt = '|'.join(re.escape(f) for f in _VALUE_FLAGS)
-    args = re.sub(rf'(?<![\w-])(?:{value_flag_alt})(?:=\S+|\s+\S+)', ' ', args)
-    # Drop the remaining standalone `--flag=value` / bare `--flag` / `-f` flags.
-    # The leading char after the dash(es) may be a letter (`--repo`, `-q`) OR a
-    # digit — git push documents numeric short flags `-4`/`-6` (IPv4/IPv6), and
-    # if we only matched `[a-z]` they'd survive and be miscounted as a refspec
-    # (`git push --force-with-lease -4 origin` → `origin` read as a destination).
-    # A remote/refspec never starts with a dash, so this only eats flags.
-    args = re.sub(r'(?<![\w-])--?[a-z0-9][\w-]*(?:=\S*)?', ' ', args)
-    tokens = args.split()
+    # Tokenize with shlex so a QUOTED value carrying whitespace (`--push-option
+    # 'ci skip'`) collapses to a single token instead of leaking its tail
+    # (`skip`) as a phantom remote/refspec. Fall back to a plain split if the
+    # command has unbalanced quotes shlex can't parse (keep prompting on the
+    # safe side rather than raising).
+    try:
+        tokens = shlex.split(args)
+    except ValueError:
+        return False
+    # Drop value-flags AND the token they consume (`-o ci.skip`,
+    # `--push-option 'ci skip'`, `--repo url`). The `--flag=value` form is one
+    # token already, handled by the bare-flag strip below.
+    pruned: list[str] = []
+    skip_next = False
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _VALUE_FLAGS:
+            skip_next = True  # consume this flag's value token
+            continue
+        pruned.append(tok)
+    # Drop the remaining standalone `--flag` / `--flag=value` / `-f` flag tokens.
+    # A short flag's leading char may be a letter (`--repo`, `-q`) OR a digit —
+    # git push documents numeric short flags `-4`/`-6` (IPv4/IPv6); without the
+    # digit they'd survive and be miscounted as a refspec. A remote/refspec
+    # never starts with a dash, so this only drops flags.
+    tokens = [t for t in pruned if not re.match(r'--?[a-z0-9]', t)]
     # First surviving token is the remote; a refspec must follow it.
     if len(tokens) < 2:
         return False
     refspecs = tokens[1:]
-    # Reject the `git push <remote> tag <name>` shorthand: git documents `tag
-    # <tag>` as sugar for `refs/tags/<tag>:refs/tags/<tag>`, so a leased
-    # `--force-with-lease=refs/tags/v1:<old> origin tag v1` force-updates a TAG
-    # while the tokens (`tag`, `v1`) look like two ordinary branch refspecs. The
-    # shorthand needs the literal `tag` keyword FOLLOWED by a name, so only
-    # reject when a name trails it (a lone `tag` is an ordinary branch named
-    # "tag", validated as a normal destination below). Keep prompting otherwise.
-    if len(refspecs) >= 2 and refspecs[0] == 'tag':
+    # Reject the `git push <remote> ... tag <name>` shorthand: git documents
+    # `tag <tag>` as sugar for `refs/tags/<tag>:refs/tags/<tag>`, and it may
+    # appear at ANY refspec position (`origin tag v1`, `origin feature tag v1`),
+    # so a leased `--force-with-lease=refs/tags/v1:<old> origin feature tag v1`
+    # force-updates a TAG while the `tag`/`v1` tokens look like ordinary branch
+    # refspecs. The shorthand is the literal `tag` keyword FOLLOWED by a name,
+    # so reject whenever a `tag` token has another token after it (a lone
+    # trailing `tag` is an ordinary branch named "tag", validated below).
+    if any(rs == 'tag' and i + 1 < len(refspecs) for i, rs in enumerate(refspecs)):
         return False
     # Reject a leading-`+` refspec (forced update, no lease guarantee).
     if any(rs.startswith('+') or ':+' in rs for rs in refspecs):
