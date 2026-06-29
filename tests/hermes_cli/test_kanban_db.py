@@ -2426,6 +2426,36 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
     assert ws != repo  # not the shared default verbatim
 
 
+def test_worktree_no_path_subdir_board_default_keeps_null_anchor(
+    kanban_home, tmp_path
+):
+    """A board default_workdir may be a package/subdir inside the repo.
+
+    Persisting that subdir as the explicit worktree target would be rejected as
+    an existing non-worktree directory and would bypass the no-path resolver
+    branch that correctly anchors at ``<repo>/.worktrees/<id>``.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subdir = repo / "packages" / "core"
+    subdir.mkdir(parents=True)
+    kb.create_board("wt-subdir-default-board", default_workdir=str(subdir))
+    with kb.connect(board="wt-subdir-default-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            board="wt-subdir-default-board",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path is None
+    ws = kb.resolve_workspace(task, board="wt-subdir-default-board")
+    assert ws == repo / ".worktrees" / tid
+    assert ws != subdir
+
+
 def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
     """A worktree task with neither an explicit workspace_path nor a board
     default_workdir is un-spawnable, so create_task must fail LOUDLY at create
