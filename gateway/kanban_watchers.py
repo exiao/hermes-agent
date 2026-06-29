@@ -210,8 +210,9 @@ _DECISION_HINTS = (
     "should i ", "should we ", "do i ", "do we ", "or roll back",
     "roll back or", "reach a decision", "make a decision", "need a decision",
     "needs a decision", "need a call", "your call", "decide ", "decide?",
-    "without input", "without a decision", "need input", "need guidance",
-    "human decision", "judgment call", "judgement call",
+    "decide:", "decide,", "to decide", "without input", "without a decision",
+    "need input", "need guidance", "human decision", "judgment call",
+    "judgement call",
 )
 _ROUTING_HINTS = (
     "no access", "no creds", "no credential", "not authorized", "unauthorized",
@@ -225,18 +226,18 @@ _RETRY_HINTS = (
     "transient", "try again", "temporarily", "connection reset",
     "may clear", "retry",
 )
-# A retry word reached through a negation ("do not retry", "don't try again",
-# "should not retry", "must not retry", "not safe to retry until credentials
-# exist", "no retry") is NOT transient — it's an operator instruction that the
-# work needs routing, not a "may clear on its own" signal. We strip these
-# negated retry phrases out of the text before scanning for positive retry
-# evidence so finding-4 credential blocks defer to their hard access wording.
-# The negator may be a bare/contracted "not" or a modal negation (should/must/
-# can/will/would/do + n't), optionally followed by a short qualifier span
-# ("safe to", "able to", "ok to", "going to", "supposed to") before the retry
-# token. ``rate limit`` / ``timed out`` / ``flaky`` (state-of-the-world
-# observations, not imperatives) are intentionally NOT negation-gated here.
-_NEGATED_RETRY_RE = re.compile(
+# A transient word reached through a negation ("do not retry", "don't try
+# again", "should not retry", "not safe to retry until credentials exist",
+# "not transient", "won't clear on its own", "no retry") is NOT transient — it's
+# an operator instruction that the work needs routing, not a "may clear on its
+# own" signal. We strip these negated phrases out of the text before scanning
+# for positive transient evidence so credential/access blocks defer to their
+# hard access wording. The negator may be a bare/contracted "not" or a modal
+# negation (should/must/can/will/would/do + n't), optionally followed by a short
+# qualifier span ("safe to", "able to", "going to", "supposed to") before the
+# transient token. The transient tokens scrubbed here mirror the positive
+# evidence words in _RETRY_HINTS so a negated form of ANY of them defers.
+_NEGATED_TRANSIENT_RE = re.compile(
     r"\b(?:"
     r"(?:do(?:es)?|should|must|can|could|will|would|shall|may|might|is|are|was|were|be)"
     r"\s*n[o']?t"  # do/should/must/… not  +  is/are not
@@ -245,7 +246,8 @@ _NEGATED_RETRY_RE = re.compile(
     r")\s+"
     r"(?:(?:ever|safe|able|ok|okay|going|meant|supposed|wise|advisable)\s+)?"
     r"(?:to\s+)?"
-    r"(?:retry|retrying|try\s+again|trying\s+again)\b"
+    r"(?:retry|retrying|try\s+again|trying\s+again|transient|temporary|"
+    r"temporarily|flaky|clear(?:\s+(?:up|on\s+its\s+own))?)\b"
 )
 
 # HTTP status codes are strong signals, but a bare ``403``/``429`` substring
@@ -263,24 +265,34 @@ _NEGATED_RETRY_RE = re.compile(
 # ``_has_status_code``) so a ticket slug like ``HERMES-429`` never triggers.
 _ROUTING_STATUS_CODES = ("401", "403")
 _RETRY_STATUS_CODES = ("408", "429", "502", "503", "504")
-# Strip explicit non-HTTP references (``#403``, ``pr 403``, ``issue 429``,
-# ``gh-502``, ``HERMES-429``, ``.../issues/429``) before looking for a code.
-# The ``<word>-NNN`` arm must NOT eat a genuine hyphenated HTTP-status marker
-# (``http-429``, ``https-503``, ``status-503``, ``code-500``, ``error-502``):
-# stripping ``http-429`` whole would hide the ``429`` from ``_has_status_code``
-# and let a real transient status fall through to the default DECISION header.
-# A negative lookahead exempts those status-marker prefixes from the
-# ``<word>-NNN`` arm so the numeric code survives and is seen as a status code.
-_ISSUE_REF_RE = re.compile(
-    r"(?:#|\b(?:pr|issue|issues|ticket|gh)[\s#/-]*"
-    r"|\b(?!(?:https?|status|code|error)-)[a-z]+-)\d{1,4}\b"
+# HTTP/error context words. A bare 3-digit code only counts as a status code
+# when one of these appears in the reason (so ``deploy API returned 403``
+# classifies but ``Finished 401 of the rows`` does not). This set is the SINGLE
+# SOURCE OF TRUTH for "what reads as HTTP context": it drives both the
+# context gate (``_HTTP_CONTEXT_RE``) AND the hyphenated-marker exemption in the
+# issue-ref strip below, so a hyphenated token like ``api-429``/``gateway-504``
+# whose prefix the context regex accepts is NEVER stripped before the code is
+# seen (that mismatch was the recurring "hyphenated marker" bug class).
+_HTTP_CONTEXT_WORDS = (
+    "http", "https", "status", "code", "error", "errored", "returned",
+    "responded", "response", "got", "gave", "api", "server", "endpoint",
+    "request", "forbidden", "unauthorized", "gateway", "upstream", "edge",
+    "get", "post", "put", "patch", "delete",
 )
-# An HTTP/error context token must appear in the reason for a bare code to count
-# as a status code (vs. an arbitrary 3-digit number).
 _HTTP_CONTEXT_RE = re.compile(
-    r"\b(?:http|https|status|code|error|errored|returned|responded|response|"
-    r"got|gave|api|server|endpoint|request|rate[\s-]?limit|forbidden|"
-    r"unauthorized|gateway|get|post|put|patch|delete)\b"
+    r"\b(?:" + "|".join(_HTTP_CONTEXT_WORDS) + r"|rate[\s-]?limit)\b"
+)
+# Strip explicit non-HTTP references before looking for a code: a leading
+# ``#NNN``; a ``pr``/``issue``/``ticket``/``gh``/``pull`` keyword ref
+# (``pr 403``, ``issue 429``, ``/issues/429``, ``/pull/429``); a project ticket
+# slug (``HERMES-429``); but NOT a hyphenated HTTP-status marker whose prefix is
+# an HTTP-context word (``http-429``, ``status-503``, ``api-429``,
+# ``gateway-504``) — those must survive so ``_has_status_code`` sees the number.
+# The ``<word>-NNN`` arm therefore carries a negative lookahead built from the
+# same ``_HTTP_CONTEXT_WORDS`` set that defines HTTP context.
+_ISSUE_REF_RE = re.compile(
+    r"(?:#|\b(?:pr|issue|issues|ticket|gh|pull)[\s#/-]*"
+    r"|\b(?!(?:" + "|".join(_HTTP_CONTEXT_WORDS) + r")-)[a-z]+-)\d{1,4}\b"
 )
 
 
@@ -301,17 +313,17 @@ def _has_status_code(text: str, codes: tuple) -> bool:
     return any(re.search(rf"\b{code}\b", stripped) for code in codes)
 
 
-def _has_positive_retry_evidence(text: str) -> bool:
+def _has_positive_transient_evidence(text: str) -> bool:
     """True when ``text`` carries genuine "may clear on its own" evidence.
 
-    Retry/try-again wording counts only when it is NOT negated — a negated
-    instruction (``do not retry``/``don't try again``) is an operator routing
-    action, not a transient signal, so it is stripped out before the hint scan
-    (finding 4). State-of-the-world transient phrases (``rate limit``,
-    ``timed out``, ``flaky``, ``transient`` …) and HTTP-context transient
-    status codes are positive evidence on their own.
+    Transient wording counts only when it is NOT negated — a negated instruction
+    (``do not retry``/``not transient``/``won't clear``) is an operator routing
+    action, so the whole class of transient words is scrubbed (via
+    ``_NEGATED_TRANSIENT_RE``) before the hint scan. Surviving positive
+    transient phrases (``rate limit``, ``timed out``, ``flaky``, ``try again``
+    …) and HTTP-context transient status codes are positive evidence.
     """
-    scrubbed = _NEGATED_RETRY_RE.sub(" ", text)
+    scrubbed = _NEGATED_TRANSIENT_RE.sub(" ", text)
     if any(h in scrubbed for h in _RETRY_HINTS):
         return True
     return _has_status_code(text, _RETRY_STATUS_CODES)
@@ -348,7 +360,7 @@ def _infer_block_header(reason_detail: str) -> Optional[str]:
     if any(h in text for h in _DECISION_HINTS) or text.endswith("?"):
         return _BLOCK_KIND_NOTIFY["needs_input"]
     # 2. Genuine (non-negated) transient evidence.
-    if _has_positive_retry_evidence(text):
+    if _has_positive_transient_evidence(text):
         return _BLOCK_KIND_NOTIFY["transient"]
     # 3. Hard access/lane wall.
     if any(h in text for h in _ROUTING_HINTS) or _has_status_code(

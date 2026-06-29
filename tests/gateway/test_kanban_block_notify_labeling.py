@@ -262,6 +262,58 @@ def test_infer_common_status_codes_bucket_correctly():
     assert _infer_block_header("Finished 401 of the rows") == "🔴 DECISION NEEDED"
 
 
+def test_infer_pull_url_number_is_not_a_status_code():
+    # Round-3 finding: a GitHub PR URL whose number equals a status code
+    # (``/pull/429``, ``/pull/403``) must NOT be read as a status code even
+    # though the ``https`` token gives HTTP context. It's a review handoff →
+    # default 🔴 DECISION NEEDED.
+    assert (
+        _infer_block_header("Need review on https://github.com/org/repo/pull/429")
+        == "🔴 DECISION NEEDED"
+    )
+    assert (
+        _infer_block_header("Need review on https://github.com/org/repo/pull/403")
+        == "🔴 DECISION NEEDED"
+    )
+
+
+def test_infer_negated_transient_word_defers_to_access():
+    # Round-3 finding: the negation strip must cover the whole transient class,
+    # not just retry. ``not transient`` / ``won't clear on its own`` is the
+    # OPPOSITE of transient, so an access block worded that way must route.
+    assert (
+        _infer_block_header("No vault access; not transient — missing API key")
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header("Missing api key; this won't clear on its own")
+        == "🟠 ROUTING"
+    )
+    # A POSITIVE transient word still classifies 🟡 RETRY.
+    assert (
+        _infer_block_header("search API returned 429, transient")
+        == "🟡 RETRY"
+    )
+
+
+def test_infer_decide_colon_is_a_decision():
+    # Round-3 finding: punctuation-delimited decision wording (``decide:``) must
+    # win over a retry option, like ``decide ``/``decide?`` already do.
+    assert (
+        _infer_block_header("Need Eric to decide: retry the migration or revert")
+        == "🔴 DECISION NEEDED"
+    )
+
+
+def test_infer_hyphenated_api_gateway_status_marker_is_transient():
+    # Round-3 finding: the hyphenated-marker exemption must cover EVERY prefix
+    # the HTTP-context regex accepts (``api-429``, ``gateway-504``), not only
+    # http/status/code/error — otherwise the issue-ref strip eats the token and
+    # the transient status falls through to DECISION.
+    assert _infer_block_header("API-429 from upstream") == "🟡 RETRY"
+    assert _infer_block_header("gateway-504 from the edge") == "🟡 RETRY"
+
+
 def test_infer_empty_reason_has_no_header():
     assert _infer_block_header("") is None
     assert _infer_block_header("   ") is None
