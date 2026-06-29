@@ -229,6 +229,29 @@ def _done_column(payload):
     return next(c for c in payload["columns"] if c["name"] == "done")
 
 
+def _seed_done_tasks_for(client, n, assignee, *, base_completed_at=1_000_000):
+    """Create ``n`` done tasks owned by ``assignee`` with increasing
+    completed_at. Returns the task ids (oldest → newest)."""
+    ids = []
+    for i in range(n):
+        tid = client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"{assignee}-done-{i}", "assignee": assignee},
+        ).json()["task"]["id"]
+        ids.append(tid)
+    conn = kb.connect()
+    try:
+        with conn:
+            for i, tid in enumerate(ids):
+                conn.execute(
+                    "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+                    (base_completed_at + i, tid),
+                )
+    finally:
+        conn.close()
+    return ids
+
+
 def test_board_caps_done_column_at_default(client):
     """Default board load windows the done column to the server default (50),
     not the full history, and reports total + has_more."""
@@ -300,6 +323,44 @@ def test_board_done_since_date_range(client):
     returned = set(t["id"] for t in done["tasks"])
     assert returned == set(ids[6:]), "done_since window mismatch"
     assert data["done_window"]["since"] == since
+
+
+def test_board_assignee_filters_done_before_windowing(client):
+    """An assignee filter must be applied to the done column BEFORE the
+    recent-tail window is chosen, not after.
+
+    Regression for the bug where ``/board`` fetched the unfiltered done tail
+    and let the client filter it: when the selected assignee's completed cards
+    are older than the default window, the unfiltered tail is full of OTHER
+    assignees' recent cards, the window drops the target assignee's cards, and
+    the client then shows an empty/partial done column until "Load all". With
+    server-side filtering the window is scoped to the assignee first, so their
+    completed work is always returned.
+    """
+    # 60 recent done cards for "noise" (newer), then 3 OLDER done cards for
+    # "alice". Without server-side filtering, the default window of 50 would be
+    # entirely "noise" cards and alice's 3 (oldest) would never ship.
+    alice_ids = _seed_done_tasks_for(client, 3, "alice", base_completed_at=1_000)
+    _seed_done_tasks_for(client, 60, "noise", base_completed_at=2_000)
+
+    # Sanity: an unfiltered default load drops alice's old cards entirely.
+    unfiltered = _done_column(client.get("/api/plugins/kanban/board").json())
+    assert not (set(alice_ids) & {t["id"] for t in unfiltered["tasks"]}), (
+        "precondition: alice's old done cards fall outside the unfiltered window"
+    )
+
+    data = client.get("/api/plugins/kanban/board?assignee=alice").json()
+    done = _done_column(data)
+    returned = {t["id"] for t in done["tasks"]}
+    assert returned == set(alice_ids), (
+        "assignee filter must scope the done window to that assignee's cards"
+    )
+    assert done["total"] == 3, "total must reflect the assignee-scoped count"
+    assert done["has_more"] is False
+    # Live columns are also scoped: no other assignee leaks through.
+    for col in data["columns"]:
+        for t in col["tasks"]:
+            assert t["assignee"] == "alice"
 
 
 def test_archived_window_uses_archive_timestamp_not_completion_timestamp(client):
@@ -389,6 +450,7 @@ def test_board_aggregate_queries_are_scoped_to_returned_cards(kanban_home, monke
 
     payload = module.get_board(
         tenant=None,
+        assignee=None,
         workflow_template_id=None,
         current_step_key=None,
         done_limit=0,
@@ -454,6 +516,7 @@ def test_board_chunks_returned_task_id_queries(client, monkeypatch):
 
     payload = module.get_board(
         tenant=None,
+        assignee=None,
         workflow_template_id=None,
         current_step_key=None,
         done_limit=100000,

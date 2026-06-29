@@ -626,6 +626,7 @@
     const loadBoard = useCallback(() => {
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
+      if (assigneeFilter) qs.set("assignee", assigneeFilter);
       if (includeArchived) qs.set("include_archived", "true");
       // A bumped doneLimit fetches more (or all) of the done/archived tail;
       // unset leaves the server default in place. A very large value acts as
@@ -642,7 +643,7 @@
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setLoading(false); });
-    }, [tenantFilter, includeArchived, doneLimit, board]);
+    }, [tenantFilter, assigneeFilter, includeArchived, doneLimit, board]);
 
     // Expand the done/archived window on demand. Passing no arg ("load all")
     // bumps past the current total so the server returns the full tail (up

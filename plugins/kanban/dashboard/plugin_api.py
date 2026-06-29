@@ -411,6 +411,7 @@ def _windowed_terminal_tasks(
     status: str,
     *,
     tenant: Optional[str],
+    assignee: Optional[str],
     workflow_template_id: Optional[str],
     current_step_key: Optional[str],
     done_limit: int,
@@ -433,6 +434,9 @@ def _windowed_terminal_tasks(
     if tenant is not None:
         where.append("tenant = ?")
         params.append(tenant)
+    if assignee is not None:
+        where.append("assignee = ?")
+        params.append(kanban_db._canonical_assignee(assignee))
     if workflow_template_id is not None:
         where.append("workflow_template_id = ?")
         params.append(workflow_template_id)
@@ -470,6 +474,15 @@ def _windowed_terminal_tasks(
 @router.get("/board")
 def get_board(
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
+    assignee: Optional[str] = Query(
+        None,
+        description=(
+            "Filter to a single assignee. Applied server-side BEFORE the "
+            "done/archived window is chosen, so a filtered done column shows "
+            "that assignee's recent completions rather than an unfiltered tail "
+            "the client would later empty out."
+        ),
+    ),
     include_archived: bool = Query(False),
     board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
     workflow_template_id: Optional[str] = Query(
@@ -526,6 +539,7 @@ def get_board(
         live_tasks = kanban_db.list_tasks(
             conn,
             tenant=tenant,
+            assignee=assignee,
             include_archived=False,
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
@@ -543,6 +557,7 @@ def get_board(
                 conn,
                 st,
                 tenant=tenant,
+                assignee=assignee,
                 workflow_template_id=workflow_template_id,
                 current_step_key=current_step_key,
                 done_limit=done_limit,
