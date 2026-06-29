@@ -55,7 +55,7 @@ plugin_api = _load_plugin_module()
 
 def _make_board_db(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
-    home.mkdir()
+    home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     db_path = tmp_path / "kanban.db"
@@ -254,17 +254,20 @@ def test_board_load_handles_invalid_block_cycle_window_config(tmp_path, monkeypa
     diagnostics pass before the per-rule error guard gets a chance to run."""
     from hermes_cli import config as hermes_config
 
-    monkeypatch.setattr(
-        hermes_config,
-        "load_config",
-        lambda: {"kanban": {"diagnostics": {"block_cycle_window_seconds": None}}},
-    )
-    conn = _make_board_db(tmp_path, monkeypatch)
-    blocked = kb.create_task(conn, title="blocked", assignee="x",
-                             initial_status="blocked")
-    _emit_event(conn, blocked, "completion_blocked_hallucination",
-                {"phantom_cards": ["t_ghost1"]})
+    for invalid_window in (None, "inf"):
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config",
+            lambda value=invalid_window: {
+                "kanban": {"diagnostics": {"block_cycle_window_seconds": value}},
+            },
+        )
+        conn = _make_board_db(tmp_path / str(invalid_window), monkeypatch)
+        blocked = kb.create_task(conn, title="blocked", assignee="x",
+                                 initial_status="blocked")
+        _emit_event(conn, blocked, "completion_blocked_hallucination",
+                    {"phantom_cards": ["t_ghost1"]})
 
-    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+        diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
 
-    assert blocked in diags, "bad block-cycle config crashed board diagnostics"
+        assert blocked in diags, "bad block-cycle config crashed diagnostics"

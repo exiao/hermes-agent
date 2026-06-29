@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import asdict
@@ -353,6 +354,8 @@ def _compute_task_diagnostics(
                 diag_config.get("block_cycle_window_seconds", 24 * 3600),
             )
         except (TypeError, ValueError):
+            block_cycle_window_seconds = 24 * 3600
+        if not math.isfinite(block_cycle_window_seconds):
             block_cycle_window_seconds = 24 * 3600
         block_cycle_cutoff = int(
             time.time() - block_cycle_window_seconds,
