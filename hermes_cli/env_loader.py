@@ -258,12 +258,29 @@ class _StableEnviron(MutableMapping[str, str]):
         self._snapshot_keys[self._encode_key(key)] = snapshot_key
 
     def __delitem__(self, key: str) -> None:
-        del self._real[key]
         snapshot_key = self._snapshot_key(key)
-        self._writes.pop(snapshot_key, None)
-        self._deleted_keys.add(self._encode_key(key))
-        if snapshot_key not in self._snapshot:
-            self._snapshot_keys.pop(self._encode_key(key), None)
+        encoded_key = self._encode_key(key)
+        try:
+            del self._real[key]
+        finally:
+            self._writes.pop(snapshot_key, None)
+            self._deleted_keys.add(encoded_key)
+            if snapshot_key not in self._snapshot:
+                self._snapshot_keys.pop(encoded_key, None)
+
+    def pop(self, key: str, *args: Any) -> str:
+        if self._encode_key(key) in self._deleted_keys:
+            if args:
+                return args[0]
+            raise KeyError(key)
+        value = self[key]
+        try:
+            self.__delitem__(key)
+        except KeyError:
+            if args:
+                return args[0]
+            raise
+        return value
 
     def __getattr__(self, name):
         # Anything we didn't explicitly model (e.g. encodekey) falls through
