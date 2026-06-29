@@ -157,6 +157,17 @@ BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
 
+# Terminal columns: a card here is finished. Almost no diagnostic rule can fire
+# on one — the status-gated rules need triage/blocked/ready, and the unified
+# failure/crash counters are broken by the successful run that put the card
+# here. The two exceptions are the event-signal warnings in
+# ``_WARNING_EVENT_KINDS`` (a blocked completion / a phantom-ref advisory),
+# which the board-load pass re-includes terminal cards for explicitly. So the
+# board-load diagnostics pass scopes itself to non-terminal cards PLUS the
+# (tiny) set of terminal cards carrying such an event — never the full done
+# column, whose event history grows every day and otherwise yields zero badges.
+_DIAGNOSTIC_TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "archived"})
+
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -279,8 +290,29 @@ def _compute_task_diagnostics(
             tuple(task_ids),
         ).fetchall()
     else:
+        # Board-load path. Two rules can fire on a card that is NOT live/stuck:
+        # ``hallucinated_cards`` (a blocked completion leaves the card in its
+        # prior state) and ``prose_phantom_refs`` (an advisory that fires on a
+        # *successful* completion, so it legitimately surfaces on a ``done``
+        # card). Both key off the ``_WARNING_EVENT_KINDS`` events. Every other
+        # rule requires a live/stuck status. So the candidate set is:
+        #   (a) all non-terminal cards, PLUS
+        #   (b) terminal (done/archived) cards that carry one of those warning
+        #       events.
+        # This drops the per-card event/run scan over the entire done column
+        # (hundreds of cards, ~15K-and-growing events, zero badges) — the
+        # actual hotspot — while preserving every diagnostic that can fire.
+        # Set (b) is a tiny indexed lookup, not a full-column slurp.
+        terminal = tuple(sorted(_DIAGNOSTIC_TERMINAL_STATUSES))
+        status_ph = ",".join(["?"] * len(terminal))
+        kind_ph = ",".join(["?"] * len(_WARNING_EVENT_KINDS))
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'",
+            f"SELECT * FROM tasks WHERE status NOT IN ({status_ph}) "
+            f"UNION "
+            f"SELECT t.* FROM tasks t WHERE t.status IN ({status_ph}) "
+            f"AND t.id IN (SELECT DISTINCT task_id FROM task_events "
+            f"             WHERE kind IN ({kind_ph}))",
+            terminal + terminal + tuple(_WARNING_EVENT_KINDS),
         ).fetchall()
 
     if not rows:

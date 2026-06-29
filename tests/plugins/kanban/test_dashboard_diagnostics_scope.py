@@ -1,0 +1,144 @@
+"""Tests for the kanban dashboard board-load diagnostics scoping.
+
+``plugin_api._compute_task_diagnostics(conn, task_ids=None)`` runs on every
+board load. The board-load path must NOT scan the full ``done`` column's event
+history (the hotspot: hundreds of finished cards, ~15K-and-growing events, zero
+badges). It scopes to:
+
+  (a) every non-terminal card, PLUS
+  (b) the small set of terminal (done/archived) cards that carry an active
+      ``_WARNING_EVENT_KINDS`` event — because ``hallucinated_cards`` and the
+      ``prose_phantom_refs`` advisory legitimately fire on those.
+
+A plain ``done`` card with no warning event must be excluded. The explicit
+``task_ids=[...]`` path (drawer open) must stay unscoped.
+
+These tests build a real on-disk board DB via ``kanban_db`` (sqlite3.Row
+factory, matching what the dashboard hands the rule engine).
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+
+
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py as a module.
+
+    Mirrors the loader in test_kanban_dashboard_plugin.py — the dashboard
+    plugin dir is not an importable package, so we load it by file path.
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+    assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
+    spec = importlib.util.spec_from_file_location(
+        "hermes_dashboard_plugin_kanban_diag_test", plugin_file,
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+plugin_api = _load_plugin_module()
+
+
+@pytest.fixture
+def board_db(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = tmp_path / "kanban.db"
+    conn = kb.connect(db_path=db_path)
+    return conn
+
+
+def _set_status(conn, task_id, status):
+    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    conn.commit()
+
+
+def _emit_event(conn, task_id, kind, payload, *, after=False):
+    """Insert a task_events row. ``after`` bumps created_at so it sorts last
+    (the rule engine treats a warning event as active only when no clean
+    completed/edited event follows it)."""
+    conn.execute(
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+        "VALUES (?, NULL, ?, ?, ?)",
+        (task_id, kind, json.dumps(payload), int(time.time()) + (10 if after else 0)),
+    )
+    conn.commit()
+
+
+def test_board_load_skips_plain_done_card_but_keeps_live(board_db):
+    conn = board_db
+    # Live blocked card with an active hallucination signal — must be flagged.
+    blocked = kb.create_task(conn, title="blocked", assignee="x",
+                             initial_status="blocked")
+    _emit_event(conn, blocked, "completion_blocked_hallucination",
+                {"phantom_cards": ["t_ghost1"]})
+
+    # A plain done card with NO warning event — must NOT be scanned/flagged.
+    done_plain = kb.create_task(conn, title="done plain", assignee="x")
+    _set_status(conn, done_plain, "done")
+
+    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+
+    assert blocked in diags, "live blocked card lost its diagnostic badge"
+    assert done_plain not in diags, "plain done card was flagged on board load"
+
+
+def test_board_load_keeps_done_card_with_phantom_ref_advisory(board_db):
+    """A ``done`` card whose completion summary referenced an unresolved id
+    carries an active ``suspected_hallucinated_references`` event AFTER its
+    ``completed`` event. ``prose_phantom_refs`` fires on it, and the board-load
+    pass must still surface that advisory (don't regress the feature)."""
+    conn = board_db
+    done = kb.create_task(conn, title="done w/ phantom ref", assignee="x")
+    _set_status(conn, done, "done")
+    # completed first, then the advisory after it (so it stays active).
+    _emit_event(conn, done, "completed", {})
+    _emit_event(conn, done, "suspected_hallucinated_references",
+                {"phantom_refs": ["t_deadbeef1234"]}, after=True)
+
+    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+
+    assert done in diags, "done card lost its prose_phantom_refs advisory"
+    kinds = {d["kind"] for d in diags[done]}
+    assert "prose_phantom_refs" in kinds
+
+
+def test_board_load_excludes_archived_without_signal(board_db):
+    conn = board_db
+    archived = kb.create_task(conn, title="archived", assignee="x")
+    _set_status(conn, archived, "archived")
+    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+    assert archived not in diags
+
+
+def test_drawer_path_unscoped(board_db):
+    """The explicit task_ids path (drawer open) still computes whatever id it's
+    handed, including a plain done card — it does not apply the board-load
+    status/event scoping."""
+    conn = board_db
+    done = kb.create_task(conn, title="done", assignee="x")
+    _set_status(conn, done, "done")
+    result = plugin_api._compute_task_diagnostics(conn, task_ids=[done])
+    assert isinstance(result, dict)
+
+
+def test_terminal_status_set_invariant():
+    """Invariant: the terminal set is exactly the two finished columns. Guards
+    that adding a new terminal column forces the board-load scope to be
+    reconsidered."""
+    assert plugin_api._DIAGNOSTIC_TERMINAL_STATUSES == frozenset({"done", "archived"})
