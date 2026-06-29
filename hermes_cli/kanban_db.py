@@ -2078,12 +2078,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     terminal_ts = "CASE WHEN status = 'archived' THEN COALESCE(archived_at, completed_at) ELSE completed_at END"
     terminal_index_cols = {"status", "archived_at", "completed_at", "created_at"}
     if terminal_index_cols <= cols:
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_terminal_window "
+        terminal_index_body = (
+            "idx_tasks_terminal_window "
             "ON tasks(status, "
             f"({terminal_ts} IS NULL), "
             f"{terminal_ts} DESC, created_at DESC)"
         )
+        terminal_index_sql = f"CREATE INDEX {terminal_index_body}"
+        existing_terminal_index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("idx_tasks_terminal_window",),
+        ).fetchone()
+        if (
+            existing_terminal_index is not None
+            and existing_terminal_index["sql"] != terminal_index_sql
+        ):
+            conn.execute("DROP INDEX idx_tasks_terminal_window")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {terminal_index_body}")
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
