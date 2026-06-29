@@ -165,8 +165,11 @@ BOARD_COLUMNS: list[str] = [
 # ``done`` cards get a narrow re-inclusion: the event-signal warnings in
 # ``_WARNING_EVENT_KINDS`` (a blocked completion / a phantom-ref advisory) do
 # fire on a successfully-completed card, so the pass re-admits the (tiny) set of
-# ``done`` cards carrying such an event — never the full done column, whose
-# event history grows every day and otherwise yields zero badges.
+# ``done`` cards carrying such an event that is still *active* (no
+# ``completed``/``edited`` event arrived after it) — never the full done
+# column, whose event history grows every day and otherwise yields zero badges,
+# and never a done card whose warning was later cleared by a subsequent
+# completion/edit (it would yield no badge, so scanning its history is wasted).
 #
 # ``archived`` is excluded outright, matching the prior fleet query
 # (``status != 'archived'``): the default ``task_ids=None`` diagnostics (and the
@@ -320,6 +323,16 @@ def _compute_task_diagnostics(
         # drive the ``idx_events_task`` index (leading column ``task_id``) and
         # probe only the small set of done cards. ``UNION ALL`` (not ``UNION``)
         # because the two branches are disjoint by status — no dedup needed.
+        #
+        # The re-include predicate matches the rule engine's
+        # ``_active_hallucination_events``: a warning event counts only when no
+        # ``completed``/``edited`` event arrives *strictly after* it (greater
+        # ``id``). A done card whose warning was later cleared by a subsequent
+        # completion/edit yields zero badges, so re-including it would just
+        # re-materialise its (potentially large) event/run history on every
+        # board load for nothing — the inner ``NOT EXISTS`` excludes it. Both
+        # correlated subqueries filter on ``e.task_id = t.id``, so each rides
+        # the ``idx_events_task`` index rather than scanning the event log.
         terminal = tuple(sorted(_DIAGNOSTIC_TERMINAL_STATUSES))
         reinclude = tuple(sorted(_DIAGNOSTIC_WARNING_REINCLUDE_STATUSES))
         status_ph = ",".join(["?"] * len(terminal))
@@ -330,7 +343,11 @@ def _compute_task_diagnostics(
             f"UNION ALL "
             f"SELECT t.* FROM tasks t WHERE t.status IN ({reinclude_ph}) "
             f"AND EXISTS (SELECT 1 FROM task_events e "
-            f"            WHERE e.task_id = t.id AND e.kind IN ({kind_ph}))",
+            f"            WHERE e.task_id = t.id AND e.kind IN ({kind_ph}) "
+            f"            AND NOT EXISTS (SELECT 1 FROM task_events c "
+            f"                WHERE c.task_id = t.id "
+            f"                AND c.kind IN ('completed', 'edited') "
+            f"                AND c.id > e.id))",
             terminal + reinclude + tuple(_WARNING_EVENT_KINDS),
         ).fetchall()
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -154,3 +155,62 @@ def test_board_load_excludes_archived_with_warning_event(board_db):
     diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
 
     assert archived not in diags, "archived card surfaced in default diagnostics"
+
+
+def _scanned_task_ids(conn):
+    """Return the set of task ids whose event/run history the board-load pass
+    materialises. Uses sqlite3's ``set_trace_callback`` to capture executed
+    statements, then reads the ids bound into the ``task_events WHERE task_id
+    IN (...)`` scan — those are exactly the candidate ``row_ids`` the pass
+    materialises, i.e. the hotspot the scoping is meant to bound.
+    """
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        plugin_api._compute_task_diagnostics(conn, task_ids=None)
+    finally:
+        conn.set_trace_callback(None)
+
+    captured: set[str] = set()
+    for stmt in statements:
+        if "FROM task_events WHERE task_id IN" in stmt:
+            # sqlite3 expands bound params into the traced statement text;
+            # the ids are the quoted 't_<hex>' literals in the IN clause.
+            captured.update(re.findall(r"'(t_[0-9a-f]+)'", stmt))
+    return captured
+
+
+def test_board_load_skips_done_card_whose_warning_was_cleared(board_db):
+    """A ``done`` card that once hit ``completion_blocked_hallucination`` but was
+    then completed/edited (clearing the warning, per the rule engine's
+    ``_active_hallucination_events``) yields no badge. Re-including it would just
+    re-materialise its event/run history on every board load for nothing, so the
+    pass must NOT pull it into the candidate scan — it stays excluded just like a
+    plain done card.
+    """
+    conn = board_db
+    # Done card: blocked-completion warning, THEN a clean completed event after
+    # it (greater id) — the warning is no longer active.
+    cleared = kb.create_task(conn, title="done, warning cleared", assignee="x")
+    _set_status(conn, cleared, "done")
+    _emit_event(conn, cleared, "completion_blocked_hallucination",
+                {"phantom_cards": ["t_ghost1"]})
+    _emit_event(conn, cleared, "completed", {}, after=True)
+
+    # Control: a done card whose advisory is still active (completed first, then
+    # the warning after) — must stay in scope.
+    active = kb.create_task(conn, title="done, warning active", assignee="x")
+    _set_status(conn, active, "done")
+    _emit_event(conn, active, "completed", {})
+    _emit_event(conn, active, "suspected_hallucinated_references",
+                {"phantom_refs": ["t_deadbeef1234"]}, after=True)
+
+    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+    assert cleared not in diags, "cleared done card was flagged on board load"
+    assert active in diags, "active-warning done card lost its advisory"
+
+    scanned = _scanned_task_ids(conn)
+    assert cleared not in scanned, (
+        "cleared done card's history was materialised on board load"
+    )
+    assert active in scanned, "active-warning done card was dropped from the scan"
