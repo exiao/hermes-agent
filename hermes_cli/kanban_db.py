@@ -5644,7 +5644,6 @@ def _worktree_path_resolvable(workspace_path: str) -> bool:
     return _repo_root_for_worktree_target(requested.parent) is not None
 
 
-
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
