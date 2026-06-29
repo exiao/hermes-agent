@@ -209,10 +209,10 @@ _BLOCK_KIND_NOTIFY = {
 _DECISION_HINTS = (
     "should i ", "should we ", "do i ", "do we ", "or roll back",
     "roll back or", "reach a decision", "make a decision", "need a decision",
-    "needs a decision", "need a call", "your call", "decide ", "decide?",
-    "decide:", "decide,", "to decide", "without input", "without a decision",
-    "need input", "need guidance", "human decision", "judgment call",
-    "judgement call",
+    "needs a decision", "need a call", "needs a call", "your call", "decide ",
+    "decide?", "decide:", "decide,", "to decide", "without input",
+    "without a decision", "need input", "needs input", "need guidance",
+    "needs guidance", "human decision", "judgment call", "judgement call",
 )
 _ROUTING_HINTS = (
     "no access", "no creds", "no credential", "not authorized", "unauthorized",
@@ -220,10 +220,12 @@ _ROUTING_HINTS = (
     "can't reach a service", "wrong lane",
     "no vault", "missing token", "missing key", "missing api key",
     "forbidden", "not provisioned", "no permission",
+    "can't access", "cannot access", "can't get access", "cannot get access",
+    "no access to", "missing credential",
 )
 _RETRY_HINTS = (
     "rate limit", "rate-limit", "timeout", "timed out", "flaky",
-    "transient", "try again", "temporarily", "connection reset",
+    "transient", "temporary", "try again", "temporarily", "connection reset",
     "may clear", "retry",
 )
 # A transient word reached through a negation ("do not retry", "don't try
@@ -255,6 +257,21 @@ _NEGATED_TRANSIENT_RE = re.compile(
     r"(?:retry|retrying|retryable|try\s+again|trying\s+again|transient|"
     r"temporary|temporarily|flaky|recoverable|clear(?:\s+(?:up|on\s+its\s+own))?)\b"
 )
+# A retry that is GATED on operator access-restoration is not transient either:
+# ``retry after the key is provisioned`` / ``try again once credentials exist``
+# cannot clear on its own until someone provisions access, so it's a routing
+# wall. We scrub a ``retry|try again`` token followed by ``after|until|once|
+# when|as soon as`` and an access/provision word, so the access hints win. A
+# bare unconditional ``try again`` (no access-restoration clause) is NOT
+# scrubbed and stays positive transient evidence (e.g. a momentary timeout).
+_CONDITIONAL_RETRY_RE = re.compile(
+    r"\b(?:retry|retrying|try\s+again|trying\s+again)\b"
+    r"[^.;:\n]*?"
+    r"\b(?:after|until|once|when|as\s+soon\s+as)\b"
+    r"[^.;:\n]*?"
+    r"\b(?:provision|provisioned|credential|credentials|key|keys|token|access|"
+    r"grant|granted|rotate|rotated|exist|exists|available|restored)\b"
+)
 
 # HTTP status codes are strong signals, but a bare ``403``/``429`` substring
 # also matches an unrelated ticket reference like ``merge PR #403?``, a ticket
@@ -279,10 +296,15 @@ _RETRY_STATUS_CODES = ("408", "429", "502", "503", "504")
 # issue-ref strip below, so a hyphenated token like ``api-429``/``gateway-504``
 # whose prefix the context regex accepts is NEVER stripped before the code is
 # seen (that mismatch was the recurring "hyphenated marker" bug class).
+# Only STRONG HTTP markers belong here: bare generic verbs like ``got``/``gave``
+# are excluded because they make ordinary counts read as status codes (``Got 504
+# failing tests`` must stay DECISION, not RETRY). ``returned``/``responded`` ARE
+# kept — they are HTTP-specific enough in this context that ``API returned 504``
+# is unambiguous, and the strong noun (``api``/``server``) usually co-occurs.
 _HTTP_CONTEXT_WORDS = (
     "http", "https", "status", "code", "error", "errored", "returned",
-    "responded", "response", "got", "gave", "api", "server", "endpoint",
-    "request", "forbidden", "unauthorized", "gateway", "upstream", "edge",
+    "responded", "response", "api", "server", "endpoint",
+    "request", "forbidden", "unauthorized", "gateway", "upstream",
     "get", "post", "put", "patch", "delete",
 )
 _HTTP_CONTEXT_RE = re.compile(
@@ -300,13 +322,20 @@ _ISSUE_REF_RE = re.compile(
     r"(?:#|\b(?:pr|issue|issues|ticket|gh|pull)[\s#/-]*"
     r"|\b(?!(?:" + "|".join(_HTTP_CONTEXT_WORDS) + r")-)[a-z]+-)\d{1,4}\b"
 )
-# A full URL is never status-code evidence: its scheme/host words (``http``,
-# ``https``, ``api``…) would otherwise satisfy the whole-message HTTP-context
-# gate while a numeric path segment (``/actions/runs/504``, ``/pull/429``) reads
-# as a status code. Strip whole URLs from BOTH the context check and the code
-# scan so a pure "review this <url>" handoff stays 🔴 DECISION NEEDED — only
-# inline status wording (``API returned 504``) counts.
-_URL_RE = re.compile(r"\bhttps?://\S+", re.IGNORECASE)
+# A URL is never status-code evidence: its scheme/host words (``http``, ``api``…)
+# would otherwise satisfy the whole-message HTTP-context gate while a numeric
+# path segment (``/actions/runs/504``, ``/pull/429``) reads as a status code.
+# Strip both scheme-qualified (``https://…``) AND schemeless host/path URLs
+# (``api.github.com/repos/org/repo/actions/runs/504``) from BOTH the context
+# check and the code scan, so a pure "review this <url>" handoff stays
+# 🔴 DECISION NEEDED — only inline status wording (``API returned 504``) counts.
+_URL_RE = re.compile(
+    r"\bhttps?://\S+"                       # scheme-qualified URL
+    r"|\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"   # schemeless: host label
+    r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+"  # .domain.tld (≥1 dot)
+    r"/\S*",                                # …followed by a /path
+    re.IGNORECASE,
+)
 
 
 def _has_status_code(text: str, codes: tuple) -> bool:
@@ -332,14 +361,24 @@ def _has_status_code(text: str, codes: tuple) -> bool:
 def _has_positive_transient_evidence(text: str) -> bool:
     """True when ``text`` carries genuine "may clear on its own" evidence.
 
-    Transient wording counts only when it is NOT negated — a negated instruction
-    (``do not retry``/``not transient``/``won't clear``) is an operator routing
-    action, so the whole class of transient words is scrubbed (via
-    ``_NEGATED_TRANSIENT_RE``) before the hint scan. Surviving positive
-    transient phrases (``rate limit``, ``timed out``, ``flaky``, ``try again``
-    …) and HTTP-context transient status codes are positive evidence.
+    Transient wording counts only when it is neither negated nor
+    operator-gated. Two scrubs run before the hint scan:
+
+    * ``_NEGATED_TRANSIENT_RE`` removes negated forms (``do not retry``/``not
+      transient``/``won't clear``) — an operator routing action, not transient.
+    * ``_CONDITIONAL_RETRY_RE`` removes a retry that is gated on operator access
+      restoration (``retry after the key is provisioned``/``try again once
+      credentials exist``) — it cannot clear on its own until someone provisions
+      access, so it is a routing wall, not a transient signal.
+
+    Surviving positive transient phrases (``rate limit``, ``timed out``,
+    ``flaky``, an unconditional ``try again`` …) and HTTP-context transient
+    status codes are positive evidence. A genuine status code (``429``/``503``)
+    still counts even alongside an access phrase, so a true rate-limit
+    (``no access right now: 429 rate limit``) stays 🟡 RETRY.
     """
-    scrubbed = _NEGATED_TRANSIENT_RE.sub(" ", text)
+    scrubbed = _CONDITIONAL_RETRY_RE.sub(" ", text)
+    scrubbed = _NEGATED_TRANSIENT_RE.sub(" ", scrubbed)
     if any(h in scrubbed for h in _RETRY_HINTS):
         return True
     return _has_status_code(text, _RETRY_STATUS_CODES)

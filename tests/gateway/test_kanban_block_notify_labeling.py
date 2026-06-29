@@ -350,6 +350,75 @@ def test_infer_determiner_negated_transient_defers_to_access():
     )
 
 
+def test_infer_plural_needs_wording_is_a_decision():
+    # Round-5 finding: plural "Needs input:" / "Needs guidance:" must match the
+    # decision rung like the singular forms do, not fall through to RETRY.
+    assert (
+        _infer_block_header("Needs input: retry the migration or revert")
+        == "🔴 DECISION NEEDED"
+    )
+    assert (
+        _infer_block_header("Needs guidance: retry the migration or revert")
+        == "🔴 DECISION NEEDED"
+    )
+
+
+def test_infer_generic_count_is_not_a_status_code():
+    # Round-5 finding: a bare count that equals a status code must NOT be read as
+    # one just because a generic verb (got/gave) is nearby. Those weak verbs are
+    # no longer HTTP context, so "Got 504 failing tests" stays DECISION.
+    assert _infer_block_header("Got 504 failing tests; need triage") == "🔴 DECISION NEEDED"
+    assert _infer_block_header("gave 429 rows back to the caller") == "🔴 DECISION NEEDED"
+    # A genuine status code with strong context still classifies.
+    assert _infer_block_header("server gave 408") == "🟡 RETRY"
+
+
+def test_infer_cannot_access_is_routing():
+    # Round-5 finding: "Can't access" / "Cannot access" hard walls must route,
+    # not only the "no access" phrasing.
+    assert (
+        _infer_block_header("Can't access the prod vault to rotate the token")
+        == "🟠 ROUTING"
+    )
+    assert _infer_block_header("Cannot access the credentials") == "🟠 ROUTING"
+
+
+def test_infer_temporary_adjective_is_transient():
+    # Round-5 finding: the adjective "temporary" (not only "temporarily") is a
+    # plainly transient self-description.
+    assert _infer_block_header("Temporary outage in the upstream API") == "🟡 RETRY"
+
+
+def test_infer_access_gated_retry_is_routing():
+    # Round-5 finding: a retry GATED on operator access-restoration can't clear
+    # on its own, so it routes. ("retry after key is provisioned" / "try again
+    # once credentials exist".) An unconditional momentary retry stays RETRY.
+    assert (
+        _infer_block_header("Missing API key; retry after key is provisioned")
+        == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header("No vault access; try again once credentials exist")
+        == "🟠 ROUTING"
+    )
+    # A genuine rate-limit with a status code is still transient.
+    assert (
+        _infer_block_header("No access to the API right now: 429 rate limit")
+        == "🟡 RETRY"
+    )
+
+
+def test_infer_schemeless_url_path_id_is_not_a_status_code():
+    # Round-5 finding: a schemeless host/path link (no http(s)://) must be
+    # stripped too, so its numeric path id isn't read as a status code.
+    assert (
+        _infer_block_header(
+            "review api.github.com/repos/org/repo/actions/runs/504"
+        )
+        == "🔴 DECISION NEEDED"
+    )
+
+
 def test_infer_empty_reason_has_no_header():
     assert _infer_block_header("") is None
     assert _infer_block_header("   ") is None
