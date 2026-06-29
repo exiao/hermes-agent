@@ -2514,6 +2514,15 @@ def create_task(
         workspace_kind, workspace_path
     )
     workspace_kind = _healed_kind or "scratch"
+    # Normalise a blank/whitespace-only workspace_path to None up front, before
+    # the project-repo and board-default resolution (both of which only fire on
+    # ``workspace_path is None``) and before the fail-fast guard. A JSON/tool
+    # caller that sends ``workspace_path: ""`` with a persistent kind would
+    # otherwise (1) skip the board-default fallback and (2) be rejected by the
+    # guard, even though dispatch's ``_resolve_worktree_workspace`` treats a
+    # blank stored path as "no path" and resolves it from the board default.
+    if workspace_path is not None and not workspace_path.strip():
+        workspace_path = None
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -2715,6 +2724,24 @@ def create_task(
                             )
                         except Exception:
                             branch_name = None
+
+                # Fail-fast: a persistent-workspace task (dir/worktree) with no
+                # resolvable path is an un-spawnable zombie. By this point the
+                # board-default and project-worktree resolution have both run,
+                # so a still-NULL path is genuinely unresolvable. Raising inside
+                # the txn aborts cleanly (no orphan row) rather than storing a
+                # 'ready' row that burns its retries on spawn_failed at dispatch.
+                if workspace_kind in {"dir", "worktree"} and not (
+                    workspace_path and workspace_path.strip()
+                ):
+                    raise ValueError(
+                        f"workspace_kind={workspace_kind!r} requires a workspace_path, "
+                        f"but none could be resolved. Fix one of: "
+                        f"(1) pass --workspace {workspace_kind}:<abs-repo-path>, "
+                        f"(2) set a board default_workdir "
+                        f"(hermes kanban boards set-default-workdir <board> <abs-path>), or "
+                        f"(3) link the task to a project (--project <slug>)."
+                    )
 
                 conn.execute(
                     """
@@ -5220,6 +5247,47 @@ def decompose_triage_task(
                 child_ws_kind, child_ws_path
             )
             child_ws_kind = child_ws_kind or "scratch"
+            # A child that inherits (or is given) a persistent kind but ends
+            # with no path is a candidate un-spawnable zombie. Before treating
+            # it as one, mirror create_task's board-default resolution: a
+            # 'dir'/'worktree' child with no stored path can still be resolved
+            # from the board's default_workdir at dispatch (e.g. a legacy
+            # triage root that carried a NULL path). Only raise if even the
+            # board default can't supply a path — otherwise persist the board
+            # default here so the stored row is self-describing.
+            if child_ws_kind in {"dir", "worktree"} and not (
+                child_ws_path and child_ws_path.strip()
+            ):
+                board_default = (
+                    read_board_metadata(get_current_board()).get("default_workdir")
+                )
+                if board_default and child_ws_kind == "worktree":
+                    # A worktree child with no path is anchored per-task by
+                    # dispatch at ``<repo>/.worktrees/<task-id>`` via
+                    # _resolve_worktree_workspace's no-path branch (which derives
+                    # the repo root from the board default). Persisting the raw
+                    # default_workdir here would make dispatch treat it as the
+                    # explicit worktree target — and when it points at a SUBDIR
+                    # inside the repo (not the repo root) the child runs in the
+                    # shared checkout instead of an isolated worktree. Keep the
+                    # path NULL so dispatch does the per-task anchoring; we only
+                    # needed the default to confirm the child IS resolvable.
+                    child_ws_path = None
+                elif board_default:
+                    child_ws_path = str(board_default)
+                else:
+                    # Genuinely unresolvable — raise inside the txn so the WHOLE
+                    # decomposition rolls back (no orphan children) rather than
+                    # minting a child that burns its retries on spawn_failed.
+                    raise ValueError(
+                        f"decompose child[{idx}] {title!r}: workspace_kind="
+                        f"{child_ws_kind!r} requires a workspace_path, but none could "
+                        f"be resolved (root workspace_kind="
+                        f"{root_ws_kind!r}, path={root_ws_path!r}). Give the child an "
+                        f"explicit workspace_path, a kind that matches the root's "
+                        f"so it can inherit the root path, or set a board "
+                        f"default_workdir."
+                    )
             # Direct INSERT bypasses create_task's spec-less guard too: a
             # malformed decomposer result (e.g. {"title":"dev task","body":"",
             # "assignee":"dev"}) would otherwise land as 'todo' and be promoted
