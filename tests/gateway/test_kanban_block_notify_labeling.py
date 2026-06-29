@@ -314,6 +314,42 @@ def test_infer_hyphenated_api_gateway_status_marker_is_transient():
     assert _infer_block_header("gateway-504 from the edge") == "🟡 RETRY"
 
 
+def test_infer_numeric_url_path_id_is_not_a_status_code():
+    # Round-4 finding: a numeric id in any URL path (a GitHub Actions run URL,
+    # not just /pull/ or /issues/) must NOT be read as a status code, even
+    # though the URL's https scheme would satisfy the whole-message context
+    # gate. URLs are stripped before matching → review handoff stays DECISION.
+    assert (
+        _infer_block_header(
+            "Need review on https://github.com/org/repo/actions/runs/504"
+        )
+        == "🔴 DECISION NEEDED"
+    )
+    assert (
+        _infer_block_header(
+            "Please review https://github.com/o/r/actions/runs/403"
+        )
+        == "🔴 DECISION NEEDED"
+    )
+
+
+def test_infer_determiner_negated_transient_defers_to_access():
+    # Round-4 finding: determiner/adjective negation forms ("not a retry issue",
+    # "not a transient issue", "not retryable") must also be scrubbed so the
+    # access block routes, not RETRY.
+    assert _infer_block_header("Missing API key; not a retry issue") == "🟠 ROUTING"
+    assert (
+        _infer_block_header("No vault access; not a transient issue") == "🟠 ROUTING"
+    )
+    assert (
+        _infer_block_header("missing api key, this is not retryable") == "🟠 ROUTING"
+    )
+    # A POSITIVE "retryable" status is still transient.
+    assert (
+        _infer_block_header("This is a retryable 503 from the gateway") == "🟡 RETRY"
+    )
+
+
 def test_infer_empty_reason_has_no_header():
     assert _infer_block_header("") is None
     assert _infer_block_header("   ") is None

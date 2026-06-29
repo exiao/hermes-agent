@@ -244,10 +244,16 @@ _NEGATED_TRANSIENT_RE = re.compile(
     r"|don'?t|doesn'?t|shouldn'?t|mustn'?t|can'?t|cannot|couldn'?t|won'?t|wouldn'?t|"
     r"shan'?t|isn'?t|aren'?t|wasn'?t|weren'?t|never|not|no"
     r")\s+"
-    r"(?:(?:ever|safe|able|ok|okay|going|meant|supposed|wise|advisable)\s+)?"
+    # optional determiner ("not A retry issue") and/or qualifier span
+    # ("not SAFE TO retry", "not GOING TO retry")
+    r"(?:(?:a|an|the|any)\s+)?"
+    r"(?:(?:ever|safe|able|ok|okay|going|meant|supposed|wise|advisable|longer)\s+)?"
     r"(?:to\s+)?"
-    r"(?:retry|retrying|try\s+again|trying\s+again|transient|temporary|"
-    r"temporarily|flaky|clear(?:\s+(?:up|on\s+its\s+own))?)\b"
+    # the transient token itself (incl. adjective forms ``retryable``,
+    # ``recoverable``); a trailing noun like ``issue``/``problem`` is fine and
+    # need not be matched.
+    r"(?:retry|retrying|retryable|try\s+again|trying\s+again|transient|"
+    r"temporary|temporarily|flaky|recoverable|clear(?:\s+(?:up|on\s+its\s+own))?)\b"
 )
 
 # HTTP status codes are strong signals, but a bare ``403``/``429`` substring
@@ -294,19 +300,29 @@ _ISSUE_REF_RE = re.compile(
     r"(?:#|\b(?:pr|issue|issues|ticket|gh|pull)[\s#/-]*"
     r"|\b(?!(?:" + "|".join(_HTTP_CONTEXT_WORDS) + r")-)[a-z]+-)\d{1,4}\b"
 )
+# A full URL is never status-code evidence: its scheme/host words (``http``,
+# ``https``, ``api``…) would otherwise satisfy the whole-message HTTP-context
+# gate while a numeric path segment (``/actions/runs/504``, ``/pull/429``) reads
+# as a status code. Strip whole URLs from BOTH the context check and the code
+# scan so a pure "review this <url>" handoff stays 🔴 DECISION NEEDED — only
+# inline status wording (``API returned 504``) counts.
+_URL_RE = re.compile(r"\bhttps?://\S+", re.IGNORECASE)
 
 
 def _has_status_code(text: str, codes: tuple) -> bool:
     """True when ``text`` cites one of ``codes`` as a bare HTTP status code.
 
-    A code only counts when (a) it is a standalone ``\\bNNN\\b`` token whose
-    match span is not part of an issue/PR/ticket/URL reference (those are
-    stripped first) AND (b) the reason carries explicit HTTP/error context, so
-    ``deploy API returned 403`` classifies while ``Should I close HERMES-429?``
-    or ``.../issues/429`` does not. Hyphenated HTTP-status markers
-    (``http-429``, ``status-503``) are preserved by the issue-ref regex so the
-    numeric code survives and is recognised.
+    URLs are stripped first (a numeric URL path id is never a status code, and a
+    URL's scheme/host must not satisfy the HTTP-context gate). Then a code only
+    counts when (a) it is a standalone ``\\bNNN\\b`` token whose match span is
+    not part of an issue/PR/ticket reference (stripped next) AND (b) the
+    URL-free text carries explicit HTTP/error context, so ``deploy API returned
+    403`` classifies while ``Should I close HERMES-429?`` or ``review .../pull/
+    403`` or ``.../actions/runs/504`` does not. Hyphenated HTTP-status markers
+    (``http-429``, ``api-429``, ``gateway-504``) survive the issue-ref strip so
+    the numeric code is recognised.
     """
+    text = _URL_RE.sub(" ", text)
     if not _HTTP_CONTEXT_RE.search(text):
         return False
     stripped = _ISSUE_REF_RE.sub(" ", text)
