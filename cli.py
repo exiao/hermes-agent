@@ -1136,6 +1136,33 @@ def _finalize_single_query(cli) -> None:
         cli._release_active_session()
 
 
+def _kanban_worker_rate_limit_exit_code(failure_reason, *, is_kanban_worker):
+    """Map a classified run-failure reason to the EX_TEMPFAIL sentinel.
+
+    A kanban worker that died purely because the provider rate-limited /
+    exhausted quota must NOT be counted as a task crash: returning the
+    EX_TEMPFAIL sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``) makes the
+    dispatcher's reap classifier release the task back to ``ready`` WITHOUT
+    incrementing ``consecutive_failures`` — so a transient throttle storm can
+    never trip the circuit breaker and block a healthy card.
+
+    Returns the sentinel exit code when ``is_kanban_worker`` is truthy and
+    ``failure_reason`` is a quota wall (``rate_limit`` / ``billing``);
+    otherwise ``None`` (caller keeps its normal exit code). A real task
+    defect (any other ``failure_reason``, or a non-worker run) returns
+    ``None`` so the crash still counts.
+    """
+    if not is_kanban_worker:
+        return None
+    if failure_reason not in ("rate_limit", "billing"):
+        return None
+    try:
+        from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE
+    except Exception:
+        _RL_CODE = 75
+    return _RL_CODE
+
+
 def _reset_terminal_input_modes_on_exit() -> None:
     """Best-effort: disable focus reporting + mouse tracking on TUI exit so they
     don't leak into the next shell session sharing the tab.
@@ -11982,6 +12009,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Get the final response
             response = result.get("final_response", "") if result else ""
 
+            # Stash the classified failure reason so non-quiet single-query
+            # callers (notably the kanban worker `-q` path, which does NOT go
+            # through the `--quiet` branch and so never sees the result dict)
+            # can map a transient provider rate-limit / billing wall to the
+            # EX_TEMPFAIL exit sentinel instead of a generic crash. ``None``
+            # for a clean or non-rate-limit turn.
+            self._last_failure_reason = (
+                result.get("failure_reason")
+                if (result and result.get("failed"))
+                else None
+            )
+
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
                 try:
@@ -15405,6 +15444,10 @@ def main(
     if query or image:
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
+        # Deferred EX_TEMPFAIL exit for a rate-limited kanban worker (set in
+        # the non-quiet `-q` branch below, applied after the ``finally`` so
+        # session finalize runs exactly once). ``None`` = normal 0 exit.
+        _kanban_rate_limit_exit_code = None
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
@@ -15583,16 +15626,14 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
+                            _rl_code = _kanban_worker_rate_limit_exit_code(
+                                result.get("failure_reason"),
+                                is_kanban_worker=bool(
+                                    os.environ.get("HERMES_KANBAN_TASK")
+                                ),
+                            )
+                            if _rl_code is not None:
+                                _exit_code = _rl_code
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
@@ -15619,8 +15660,28 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary()
+
+                # Kanban workers run THIS non-quiet `-q` branch (the spawn in
+                # kanban_db._default_spawn invokes `chat -q`, never `--quiet`),
+                # so the rate-limit→EX_TEMPFAIL carve-out in the quiet branch
+                # above never applied to them. Mirror it here: when the run
+                # failed purely because the provider rate-limited / exhausted
+                # quota (not a real task defect), exit with the EX_TEMPFAIL
+                # sentinel so the dispatcher's reap classifier releases the
+                # task back to ``ready`` WITHOUT counting a failure — a
+                # transient throttle must never trip the circuit breaker and
+                # block a healthy card. Non-kanban runs keep the plain 0 exit.
+                # Defer the actual exit until after the ``finally`` block so
+                # ``_finalize_single_query`` runs exactly once (it releases the
+                # active-session lease — calling it twice double-releases).
+                _kanban_rate_limit_exit_code = _kanban_worker_rate_limit_exit_code(
+                    getattr(cli, "_last_failure_reason", None),
+                    is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
+                )
         finally:
             _finalize_single_query(cli)
+        if _kanban_rate_limit_exit_code is not None:
+            sys.exit(_kanban_rate_limit_exit_code)
         return
     
     # Run interactive mode
