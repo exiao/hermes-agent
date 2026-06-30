@@ -163,6 +163,36 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
 
 
+def test_terminal_window_index_is_rebuilt_when_expression_changes(tmp_path, monkeypatch):
+    """Legacy boards that saw the old terminal-window expression must not keep it.
+
+    ``CREATE INDEX IF NOT EXISTS`` alone would leave the stale
+    ``COALESCE(archived_at, completed_at)`` index in place after the dashboard
+    query switched to the status-sensitive CASE expression, forcing SQLite back
+    to a temp sort for done-column first paint.
+    """
+    db_path = _setup_home(tmp_path, monkeypatch)
+
+    with kb.connect(db_path) as conn:
+        conn.execute("DROP INDEX idx_tasks_terminal_window")
+        conn.execute(
+            "CREATE INDEX idx_tasks_terminal_window "
+            "ON tasks(status, "
+            "(COALESCE(archived_at, completed_at) IS NULL), "
+            "COALESCE(archived_at, completed_at) DESC, created_at DESC)"
+        )
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_tasks_terminal_window'"
+        ).fetchone()["sql"]
+
+    assert "CASE WHEN status = 'archived'" in sql
+    assert "COALESCE(archived_at, completed_at) IS NULL" not in sql
+
+
 def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
     """The crash that motivated #35096 — ``int(None)`` on a NULL cursor — is
     gone after migration; the notifier query returns an integer cursor."""

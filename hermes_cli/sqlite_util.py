@@ -9,6 +9,17 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
+from collections.abc import Iterator, Sequence
+
+DEFAULT_SQLITE_IN_CHUNK_SIZE = 500
+
+
+def chunked_sqlite_params(
+    values: Sequence[str], size: int = DEFAULT_SQLITE_IN_CHUNK_SIZE
+) -> Iterator[Sequence[str]]:
+    """Yield SQLite-host-parameter-safe chunks for large ``IN`` lists."""
+    for i in range(0, len(values), size):
+        yield values[i : i + size]
 
 
 def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> bool:

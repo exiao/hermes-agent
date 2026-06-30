@@ -89,6 +89,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.sqlite_util import chunked_sqlite_params as _sqlite_chunks
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+_SQLITE_IN_CHUNK_SIZE = 500
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1147,6 +1149,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
     completed_at         INTEGER,
+    -- Timestamp of the latest archive event. Separate from completed_at so
+    -- archiving/re-archiving a previously done card moves it to the front of
+    -- archived windows without rewriting its original completion time.
+    archived_at          INTEGER,
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
@@ -1902,6 +1908,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
+    if "archived_at" not in cols:
+        _add_column_if_missing(conn, "tasks", "archived_at", "archived_at INTEGER")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
@@ -1920,6 +1928,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # initial snapshot did not. Re-snapshot here so the legacy-column migration
     # below is truly idempotent and never re-adds columns that already exist.
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if {"id", "status", "archived_at"} <= cols:
+        events_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_events'"
+        ).fetchone()
+        if events_table is not None:
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET archived_at = (
+                       SELECT MAX(created_at)
+                         FROM task_events
+                        WHERE task_events.task_id = tasks.id
+                          AND task_events.kind = 'archived'
+                   )
+                 WHERE status = 'archived'
+                   AND archived_at IS NULL
+                   AND EXISTS (
+                       SELECT 1
+                         FROM task_events
+                        WHERE task_events.task_id = tasks.id
+                          AND task_events.kind = 'archived'
+                   )
+                """
+            )
 
     # Legacy column migration: ``spawn_failures`` → ``consecutive_failures``
     # and ``last_spawn_error`` → ``last_failure_error``.
@@ -2043,6 +2075,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    terminal_ts = "CASE WHEN status = 'archived' THEN COALESCE(archived_at, completed_at) ELSE completed_at END"
+    terminal_index_cols = {"status", "archived_at", "completed_at", "created_at"}
+    if terminal_index_cols <= cols:
+        terminal_index_body = (
+            "idx_tasks_terminal_window "
+            "ON tasks(status, "
+            f"({terminal_ts} IS NULL), "
+            f"{terminal_ts} DESC, created_at DESC, id DESC)"
+        )
+        terminal_index_sql = f"CREATE INDEX {terminal_index_body}"
+        existing_terminal_index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("idx_tasks_terminal_window",),
+        ).fetchone()
+        if (
+            existing_terminal_index is not None
+            and existing_terminal_index["sql"] != terminal_index_sql
+        ):
+            conn.execute("DROP INDEX idx_tasks_terminal_window")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {terminal_index_body}")
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2882,9 +2934,17 @@ def list_tasks(
     order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    exclude_statuses: Optional[Iterable[str]] = None,
 ) -> list[Task]:
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
+    if exclude_statuses:
+        excluded = sorted(set(exclude_statuses))
+        bad = [s for s in excluded if s not in VALID_STATUSES]
+        if bad:
+            raise ValueError(f"exclude_statuses must be subset of {sorted(VALID_STATUSES)}")
+        query += f" AND status NOT IN ({','.join('?' for _ in excluded)})"
+        params.extend(excluded)
     if assignee is not None:
         query += " AND assignee = ?"
         params.append(_canonical_assignee(assignee))
@@ -5447,7 +5507,12 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            # Keep completion time semantically stable while stamping the
+            # latest archive event for archived-window ordering. Re-archiving a
+            # reopened card intentionally refreshes archived_at.
+            "    archived_at = CAST(strftime('%s','now') AS INTEGER), "
+            "    completed_at = COALESCE(completed_at, CAST(strftime('%s','now') AS INTEGER)) "
             "WHERE id = ? AND status != 'archived'",
             (task_id,),
         )
@@ -9241,20 +9306,23 @@ def latest_summaries(
     ids = list(task_ids)
     if not ids:
         return {}
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"""
-        SELECT task_id, summary FROM (
-            SELECT task_id, summary,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY task_id
-                       ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
-                   ) AS rn
-              FROM task_runs
-             WHERE task_id IN ({placeholders})
-               AND summary IS NOT NULL AND summary != ''
-        ) WHERE rn = 1
-        """,
-        ids,
-    ).fetchall()
-    return {r["task_id"]: r["summary"] for r in rows}
+    out: dict[str, str] = {}
+    for chunk in _sqlite_chunks(ids, _SQLITE_IN_CHUNK_SIZE):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT task_id, summary FROM (
+                SELECT task_id, summary,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id
+                           ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+                       ) AS rn
+                  FROM task_runs
+                 WHERE task_id IN ({placeholders})
+                   AND summary IS NOT NULL AND summary != ''
+            ) WHERE rn = 1
+            """,
+            chunk,
+        ).fetchall()
+        out.update({r["task_id"]: r["summary"] for r in rows})
+    return out
