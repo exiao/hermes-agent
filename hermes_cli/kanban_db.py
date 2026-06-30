@@ -2387,15 +2387,26 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 
 def _slug_from_git_remote(workspace_path: Optional[str]) -> Optional[str]:
     """Resolve a checkout/worktree path to its ``owner/repo`` GitHub slug via the
-    git ``origin`` remote. Returns ``None`` when the path is empty, not a git
-    repo, or the remote URL doesn't parse. Mirrors ``_slug_from_worktree`` in
-    ``~/.hermes/scripts/babysit-pr-detector.py``.
+    git ``origin`` remote. Returns ``None`` when the path is empty, has no
+    existing git-repo ancestor, or the remote URL doesn't parse. Mirrors
+    ``_slug_from_worktree`` in ``~/.hermes/scripts/babysit-pr-detector.py``.
+
+    The path may be a not-yet-created worktree target such as
+    ``<repo>/.worktrees/pr70`` (the common pr-babysitter project-worktree
+    form): we resolve the nearest existing ancestor up to its git toplevel and
+    read the remote from there, so a supported-but-pending worktree path still
+    yields the repo's slug. We avoid spawning ``git`` against a path with no
+    existing git-repo ancestor (``_repo_root_for_worktree_target`` returns None
+    without running the expensive remote-read subprocess).
     """
-    if not workspace_path or not os.path.isdir(workspace_path):
+    if not workspace_path:
+        return None
+    repo_root = _repo_root_for_worktree_target(Path(workspace_path).expanduser())
+    if repo_root is None:
         return None
     try:
         p = subprocess.run(
-            ["git", "-C", workspace_path, "remote", "get-url", "origin"],
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
             capture_output=True,
             text=True,
             timeout=10,

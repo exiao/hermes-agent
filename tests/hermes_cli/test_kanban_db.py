@@ -2599,8 +2599,9 @@ def test_babysit_dedups_via_board_default_workdir(kanban_home, tmp_path):
 
 
 def test_slug_from_git_remote_skips_missing_path(tmp_path):
-    """``_slug_from_git_remote`` returns None without spawning a git subprocess
-    when the path does not exist or is not a directory (gemini high finding)."""
+    """``_slug_from_git_remote`` returns None without reading a remote when the
+    path has no existing git-repo ancestor or is not a directory (gemini high
+    finding — avoid a guaranteed-to-fail subprocess)."""
     missing = tmp_path / "does-not-exist"
     assert kb._slug_from_git_remote(str(missing)) is None
     a_file = tmp_path / "afile"
@@ -2608,6 +2609,51 @@ def test_slug_from_git_remote_skips_missing_path(tmp_path):
     assert kb._slug_from_git_remote(str(a_file)) is None
     assert kb._slug_from_git_remote(None) is None
     assert kb._slug_from_git_remote("") is None
+
+
+def test_slug_from_git_remote_resolves_pending_worktree_target(tmp_path):
+    """A not-yet-created worktree target under a real repo
+    (``<repo>/.worktrees/pr70``) still resolves the repo slug by walking to the
+    nearest existing git ancestor (Codex P2 — pending worktree forms must not
+    bypass dedup)."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    pending = repo / ".worktrees" / "pr70"  # does not exist on disk yet
+    assert not pending.exists()
+    assert kb._slug_from_git_remote(str(pending)) == "exiao/hermes-agent"
+
+
+def test_babysit_pending_worktree_target_dedups(kanban_home, tmp_path):
+    """Two pr-babysitter creates for the same PR whose ``workspace_path`` is a
+    pending ``<repo>/.worktrees/<x>`` target (not yet materialized) still dedup
+    to one row — the slug resolves from the parent repo's remote."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo / ".worktrees" / "a"),
+        )
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo / ".worktrees" / "b"),
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
 
 
 def test_babysit_blank_idempotency_key_still_dedups(kanban_home, tmp_path):
