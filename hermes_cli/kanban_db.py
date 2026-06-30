@@ -2513,8 +2513,9 @@ def _derive_babysit_idempotency_key(
     #   1. a github pull URL in the TITLE (fully unambiguous, card's own),
     #   2. a TITLE ``owner/repo#<n>`` ref,
     #   3. an explicit ``PR #<n>`` in the TITLE + the workspace remote slug,
-    #   4. a bare ``#<n>`` in the TITLE + the workspace slug,
-    #   5. a github pull URL in the BODY (the anchor-in-body handoff shape),
+    #   4. a github pull URL in the BODY (unambiguous slug+PR — outranks a bare
+    #      title ``#<n>`` which may be an ISSUE number, not the PR),
+    #   5. a bare ``#<n>`` in the TITLE + the workspace slug,
     #   6. an explicit ``PR #<n>`` in the BODY + the workspace slug,
     #   7. a BODY ``owner/repo#<n>`` shorthand (last resort).
     slug: Optional[str] = None
@@ -2525,10 +2526,10 @@ def _derive_babysit_idempotency_key(
         slug, pr = title_ref.group(1), int(title_ref.group(2))
     elif title_pr is not None and workspace_slug:
         slug, pr = workspace_slug, int(title_pr.group(1))
-    elif title_bare is not None and workspace_slug:
-        slug, pr = workspace_slug, int(title_bare.group(1))
     elif body_url is not None:
         slug, pr = body_url.group(1), int(body_url.group(2))
+    elif title_bare is not None and workspace_slug:
+        slug, pr = workspace_slug, int(title_bare.group(1))
     elif body_pr is not None and workspace_slug:
         slug, pr = workspace_slug, int(body_pr.group(1))
     elif body_ref is not None:

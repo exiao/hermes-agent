@@ -2919,6 +2919,33 @@ def test_babysit_title_pr_anchor_outranks_body_pull_url(tmp_path):
     assert key2 == "babysit:exiao/hermes-agent#70"
 
 
+def test_babysit_body_pull_url_outranks_bare_title_number(tmp_path):
+    """A full github pull URL in the BODY outranks a BARE ``#<n>`` in the title:
+    a bare title number may be an ISSUE reference (``Babysit fix #123``), while
+    the pull URL unambiguously pins both the slug and the PR. An explicit
+    ``PR #<n>`` in the title still wins (it names the card's own PR), but a bare
+    ``#<n>`` does not.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    # Bare title #123 (likely an issue) + a body pull URL for PR #70 → key on
+    # the URL's PR, not the ambiguous bare title number.
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit fix #123",
+        "the PR is https://github.com/org/repo/pull/70",
+        str(repo),
+    )
+    assert key == "babysit:org/repo#70"
+    # But an explicit title ``PR #<n>`` still outranks a body URL.
+    key2 = kb._derive_babysit_idempotency_key(
+        "Babysit PR #70",
+        "compare against https://github.com/org/repo/pull/5",
+        str(repo),
+    )
+    assert key2 == "babysit:exiao/hermes-agent#70"
+
+
 def test_babysit_scratch_owner_repo_handoff_dedups(kanban_home):
     """Two scratch pr-babysitter creates that name the PR as ``owner/repo#<n>``
     (no workspace_path) dedup to one row — the ref form alone keys them."""
