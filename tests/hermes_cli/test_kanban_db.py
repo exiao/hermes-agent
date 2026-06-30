@@ -2557,6 +2557,59 @@ def test_babysit_same_pr_same_repo_dedups(kanban_home, tmp_path):
     assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
 
 
+def test_babysit_dedups_via_board_default_workdir(kanban_home, tmp_path):
+    """Two pr-babysitter worktree creates for the same PR that supply NO
+    explicit ``workspace_path`` and rely on the board ``default_workdir`` to
+    anchor the repo still dedup to ONE row.
+
+    This is the common ``workspace_kind='worktree'`` + board-default create
+    path. The babysit key must be derived AFTER the board default resolves the
+    repo path — otherwise ``workspace_path`` is None at derive time, the key is
+    left unset, and the two creates insert two non-idempotent rows.
+
+    Fails before the move (key derived too early → 2 rows).
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    kb.create_board("babysit-default-board", default_workdir=str(repo))
+    with kb.connect(board="babysit-default-board") as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            board="babysit-default-board",
+        )
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check the flaky CI",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            board="babysit-default-board",
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
+def test_slug_from_git_remote_skips_missing_path(tmp_path):
+    """``_slug_from_git_remote`` returns None without spawning a git subprocess
+    when the path does not exist or is not a directory (gemini high finding)."""
+    missing = tmp_path / "does-not-exist"
+    assert kb._slug_from_git_remote(str(missing)) is None
+    a_file = tmp_path / "afile"
+    a_file.write_text("x", encoding="utf-8")
+    assert kb._slug_from_git_remote(str(a_file)) is None
+    assert kb._slug_from_git_remote(None) is None
+    assert kb._slug_from_git_remote("") is None
+
+
 def test_babysit_same_pr_different_repos_no_cross_dedup(kanban_home, tmp_path):
     """The SAME PR number #70 in two DIFFERENT repos creates two distinct
     tasks — PR numbers collide across repos, so a repo-less key must never

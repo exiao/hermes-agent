@@ -2391,7 +2391,7 @@ def _slug_from_git_remote(workspace_path: Optional[str]) -> Optional[str]:
     repo, or the remote URL doesn't parse. Mirrors ``_slug_from_worktree`` in
     ``~/.hermes/scripts/babysit-pr-detector.py``.
     """
-    if not workspace_path:
+    if not workspace_path or not os.path.isdir(workspace_path):
         return None
     try:
         p = subprocess.run(
@@ -2698,14 +2698,52 @@ def create_task(
             )
         skills_list = cleaned
 
+    # Resolve workspace_path from board-level default_workdir when the
+    # caller did not specify one explicitly. Board defaults represent
+    # persistent project checkouts, so only persistent workspace kinds may
+    # inherit them. Scratch workspaces are auto-deleted on completion and
+    # must stay under the per-board scratch root created by
+    # ``resolve_workspace``; inheriting ``default_workdir`` for a scratch
+    # task would point cleanup at the user's source tree (#28818). The
+    # containment guard in ``_cleanup_workspace`` is the safety rail, but
+    # we also stop the bad state from being created in the first place.
+    #
+    # This runs BEFORE the babysit-key derivation below so that a
+    # pr-babysitter task relying on a board ``default_workdir`` (the common
+    # ``workspace_kind='worktree'`` + board-default create path) has its
+    # repo path resolved in time to derive the canonical babysit key from
+    # the git remote — otherwise ``workspace_path`` is still ``None`` at
+    # derive time, the key is left unset, and two creates for the same PR
+    # insert two non-idempotent rows.
+    if (
+        workspace_path is None
+        and project_repo is None
+        and workspace_kind in {"dir", "worktree"}
+    ):
+        board_slug = board if board else get_current_board()
+        board_meta = read_board_metadata(board_slug)
+        board_default = board_meta.get("default_workdir")
+        if board_default:
+            if workspace_kind == "worktree":
+                default_anchor = Path(str(board_default)).expanduser()
+                if default_anchor.is_absolute():
+                    default_repo = _git_toplevel(default_anchor)
+                    if default_repo is not None:
+                        workspace_path = str(default_repo)
+            else:
+                workspace_path = str(board_default)
+
     # Auto-derive a canonical babysit idempotency key so EVERY pr-babysitter
     # creation path dedups against the same PR, not just the detector cron that
     # sets its own key. Done AFTER _canonical_assignee (so a pr-babysitter alias
     # is still caught) and only when the caller passed no explicit key — when the
     # key can't be derived it stays None and behavior is identical to today.
+    # ``workspace_path or project_repo`` feeds the git-remote slug fallback both
+    # the board-default-resolved path (above) and a project-linked task's primary
+    # repo, so the key resolves for every persistent-workspace babysitter create.
     if idempotency_key is None and assignee == "pr-babysitter":
         idempotency_key = _derive_babysit_idempotency_key(
-            title, body, workspace_path
+            title, body, workspace_path or project_repo
         )
 
     # Idempotency check — return the existing task instead of creating a
@@ -2724,33 +2762,6 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
-
-    # Resolve workspace_path from board-level default_workdir when the
-    # caller did not specify one explicitly. Board defaults represent
-    # persistent project checkouts, so only persistent workspace kinds may
-    # inherit them. Scratch workspaces are auto-deleted on completion and
-    # must stay under the per-board scratch root created by
-    # ``resolve_workspace``; inheriting ``default_workdir`` for a scratch
-    # task would point cleanup at the user's source tree (#28818). The
-    # containment guard in ``_cleanup_workspace`` is the safety rail, but
-    # we also stop the bad state from being created in the first place.
-    if (
-        workspace_path is None
-        and project_repo is None
-        and workspace_kind in {"dir", "worktree"}
-    ):
-        board_slug = board if board else get_current_board()
-        board_meta = read_board_metadata(board_slug)
-        board_default = board_meta.get("default_workdir")
-        if board_default:
-            if workspace_kind == "worktree":
-                default_anchor = Path(str(board_default)).expanduser()
-                if default_anchor.is_absolute():
-                    default_repo = _git_toplevel(default_anchor)
-                    if default_repo is not None:
-                        workspace_path = str(default_repo)
-            else:
-                workspace_path = str(board_default)
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
