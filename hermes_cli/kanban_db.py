@@ -2488,10 +2488,14 @@ def _derive_babysit_idempotency_key(
     # "related to o/r#5") that must NOT override the card's own PR, or retries
     # for the real PR won't dedup and could collide with an unrelated card.
     #
-    # Host-anchored so a look-alike host (``notgithub.com``) can't pose as
-    # ``github.com``; ``.git`` stripped so a ``Org/Repo.git/pull/70`` URL
-    # canonicalizes to the SAME slug ``_slug_from_git_remote`` produces.
-    _url_re = r"(?:^|[/@.\s])github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/pull/(\d+)"
+    # Host-anchored so a look-alike host (``notgithub.com``) OR a github
+    # subdomain (``ghe.github.com`` GitHub Enterprise) can't pose as public
+    # ``github.com`` and derive a colliding key. The char before ``github.com``
+    # must be a path/scheme boundary (``/``, ``@``, whitespace) or string start
+    # — NOT ``.`` (which would let a subdomain through). ``.git`` stripped so a
+    # ``Org/Repo.git/pull/70`` URL canonicalizes to the SAME slug
+    # ``_slug_from_git_remote`` produces.
+    _url_re = r"(?:^|[/@\s])github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/pull/(\d+)"
     # A bare ``owner/repo#<n>`` reference (the documented babysit anchor form,
     # e.g. ``exiao/hermes-agent#73``). Mirrors ``_RESPAWN_GUARD_PR_REF_RE``.
     _ref_re = r"(?<![\w./-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)"

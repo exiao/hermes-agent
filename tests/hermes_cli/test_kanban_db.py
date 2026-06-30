@@ -2788,6 +2788,14 @@ def test_babysit_pull_url_host_anchored_and_git_suffix_stripped():
         )
         is None
     )
+    # A github SUBDOMAIN (e.g. GitHub Enterprise ghe.github.com) must NOT match
+    # either — it would derive the same key as the public repo and collide.
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "see https://ghe.github.com/org/repo/pull/70", None
+        )
+        is None
+    )
     # A real github.com URL still works.
     assert (
         kb._derive_babysit_idempotency_key(
