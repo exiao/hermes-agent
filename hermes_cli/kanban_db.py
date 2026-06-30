@@ -2517,8 +2517,14 @@ def _derive_babysit_idempotency_key(
         # Prefer an explicit ``PR #<n>`` mention (the detector's title
         # convention) over the first bare ``#<n>``, so a title that names another
         # ref first — e.g. ``Babysit issue #123 for PR #70`` — keys on the PR
-        # (#70), not the leading issue ref (#123).
-        pm = re.search(r"\bPR\s*#?(\d+)", title, re.IGNORECASE)
+        # (#70), not the leading issue ref (#123). Search the full title+body
+        # haystack for the explicit ``PR #<n>`` form: an orchestrator handoff
+        # often carries a short title (``Babysit PR``) with the anchor in the
+        # body (``Please watch PR #70``), and missing it leaves the key unset so
+        # repeated creates insert duplicate rows. The generic bare ``#<n>``
+        # fallback stays title-only — a bare ``#<n>`` anywhere in free-form body
+        # prose is too likely to be an unrelated reference to key on.
+        pm = re.search(r"\bPR\s*#?(\d+)", haystack, re.IGNORECASE)
         if pm:
             pr = int(pm.group(1))
         else:

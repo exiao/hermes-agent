@@ -2766,6 +2766,32 @@ def test_babysit_owner_repo_ref_form_derives_key():
     assert key3 == "babysit:org/repo#70"
 
 
+def test_babysit_pr_number_in_body_with_workspace_slug_derives_key(tmp_path):
+    """An orchestrator handoff with a short title (``Babysit PR``) and the
+    ``PR #<n>`` anchor in the BODY, with the slug supplied by the workspace git
+    remote, still derives a key. Without searching the body for ``PR #<n>`` the
+    key would stay None and repeated creates would insert duplicate rows.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit PR",
+        "Please watch PR #70 and keep it green.",
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+    # A bare ``#<n>`` in free-form body prose (no ``PR`` prefix) must NOT be
+    # keyed on — too likely an unrelated reference — so the title-only bare
+    # fallback leaves the key None when the title has no number.
+    none_key = kb._derive_babysit_idempotency_key(
+        "Babysit the thing",
+        "unrelated note mentioning #999 somewhere",
+        str(repo),
+    )
+    assert none_key is None
+
+
 def test_babysit_scratch_owner_repo_handoff_dedups(kanban_home):
     """Two scratch pr-babysitter creates that name the PR as ``owner/repo#<n>``
     (no workspace_path) dedup to one row — the ref form alone keys them."""
