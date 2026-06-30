@@ -2513,16 +2513,18 @@ def _derive_babysit_idempotency_key(
     # Resolution precedence — first complete (slug, pr) wins. A slug-bearing
     # source pins BOTH pieces together so we never pair one source's slug with
     # another's number (keying on the wrong PR / a cross-PR collision). Every
-    # TITLE source (the card's own subject) outranks every BODY source:
+    # EXPLICIT signal (a pull URL, an ``owner/repo#<n>`` ref, or an explicit
+    # ``PR #<n>``) outranks the one AMBIGUOUS signal — a bare title ``#<n>``,
+    # which may be an issue number rather than the PR — so the bare title number
+    # is strictly LAST. Within the explicit tier, the card's own TITLE outranks
+    # its BODY:
     #   1. a github pull URL in the TITLE (fully unambiguous, card's own),
     #   2. a TITLE ``owner/repo#<n>`` ref,
     #   3. an explicit ``PR #<n>`` in the TITLE + the workspace remote slug,
-    #   4. a github pull URL in the BODY (unambiguous slug+PR — outranks a bare
-    #      title ``#<n>`` which may be an ISSUE number, not the PR),
-    #   5. an explicit ``PR #<n>`` in the BODY + the workspace slug (also
-    #      unambiguous — outranks a bare title ``#<n>``),
-    #   6. a bare ``#<n>`` in the TITLE + the workspace slug,
-    #   7. a BODY ``owner/repo#<n>`` shorthand (last resort).
+    #   4. a github pull URL in the BODY,
+    #   5. an explicit ``PR #<n>`` in the BODY + the workspace slug,
+    #   6. a BODY ``owner/repo#<n>`` ref,
+    #   7. a bare ``#<n>`` in the TITLE + the workspace slug (last — ambiguous).
     slug: Optional[str] = None
     pr: Optional[int] = None
     if title_url is not None:
@@ -2535,10 +2537,10 @@ def _derive_babysit_idempotency_key(
         slug, pr = body_url.group(1), int(body_url.group(2))
     elif body_pr is not None and workspace_slug:
         slug, pr = workspace_slug, int(body_pr.group(1))
-    elif title_bare is not None and workspace_slug:
-        slug, pr = workspace_slug, int(title_bare.group(1))
     elif body_ref is not None:
         slug, pr = body_ref.group(1), int(body_ref.group(2))
+    elif title_bare is not None and workspace_slug:
+        slug, pr = workspace_slug, int(title_bare.group(1))
 
     if pr is None or not slug:
         return None

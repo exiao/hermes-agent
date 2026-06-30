@@ -2970,6 +2970,23 @@ def test_babysit_body_pr_number_outranks_bare_title_number(tmp_path):
     assert key == "babysit:exiao/hermes-agent#70"
 
 
+def test_babysit_body_owner_repo_ref_outranks_bare_title_number(tmp_path):
+    """A BODY ``owner/repo#<n>`` ref (explicit, pins both pieces) outranks a
+    BARE ``#<n>`` in the title (which may be an issue number): the bare title
+    number is the ONLY ambiguous signal, so it is strictly last — every explicit
+    signal, title or body, wins over it.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit fix #123",
+        "anchored to other/project#70",
+        str(repo),
+    )
+    assert key == "babysit:other/project#70"
+
+
 def test_babysit_default_assignee_derives_key_and_dedups(kanban_home, tmp_path, monkeypatch):
     """A card created WITHOUT an explicit assignee under
     ``kanban.default_assignee = pr-babysitter`` (the dispatcher applies the
