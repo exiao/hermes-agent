@@ -2650,6 +2650,37 @@ def test_slug_from_git_remote_ignores_non_github_remotes(tmp_path):
     assert kb._slug_from_git_remote(str(gh)) == "exiao/hermes-agent"
 
 
+def test_slug_from_git_remote_accepts_authenticated_https(tmp_path):
+    """An authenticated HTTPS origin carrying userinfo before the host (the
+    ``https://x-access-token:TOKEN@github.com/owner/repo.git`` form used by the
+    CI/private-repo push path) still resolves the slug — otherwise a
+    ``PR #<n>``-only babysit task in that setup never gets its canonical key and
+    duplicate tickets slip through.
+    """
+    for url in (
+        "https://x-access-token:ghs_SECRET@github.com/exiao/hermes-agent.git",
+        "https://exiao:ghp_TOKEN@github.com/exiao/hermes-agent.git",
+        "ssh://git@github.com/exiao/hermes-agent.git",
+    ):
+        repo = tmp_path / url.replace("/", "_").replace(":", "_").replace("@", "_")
+        _init_git_repo(repo)
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", url],
+            check=True, capture_output=True, text=True,
+        )
+        assert kb._slug_from_git_remote(str(repo)) == "exiao/hermes-agent"
+    # Userinfo must not loosen the host check — an authenticated NON-github
+    # remote still yields no slug.
+    other = tmp_path / "authed_gitlab"
+    _init_git_repo(other)
+    subprocess.run(
+        ["git", "-C", str(other), "remote", "add", "origin",
+         "https://x-access-token:SECRET@gitlab.com/exiao/hermes-agent.git"],
+        check=True, capture_output=True, text=True,
+    )
+    assert kb._slug_from_git_remote(str(other)) is None
+
+
 def test_babysit_pending_worktree_target_dedups(kanban_home, tmp_path):
     """Two pr-babysitter creates for the same PR whose ``workspace_path`` is a
     pending ``<repo>/.worktrees/<x>`` target (not yet materialized) still dedup

@@ -2439,11 +2439,17 @@ def _slug_from_git_remote(workspace_path: Optional[str]) -> Optional[str]:
     # GitHub-specific (the detector resolves PRs via ``gh``). A non-GitHub origin
     # (gitlab.com, bitbucket.org, a self-hosted host) must NOT yield a slug, or a
     # ``gitlab.com/owner/repo`` would wrongly cross-dedup a ``github.com`` repo of
-    # the same owner/name. Match both the ``https://github.com/owner/repo`` and
-    # the ``git@github.com:owner/repo`` (scp-style) remote forms.
+    # the same owner/name. Match the ``https://github.com/owner/repo`` and the
+    # ``git@github.com:owner/repo`` (scp-style) forms, AND authenticated HTTPS
+    # remotes that carry userinfo before the host
+    # (``https://x-access-token:TOKEN@github.com/owner/repo.git`` — the form the
+    # CI/private-repo push path uses); without the optional userinfo those
+    # remotes wouldn't match and a ``PR #<n>``-only babysit task would never get
+    # its canonical key.
     remote = p.stdout.strip()
     m = re.search(
-        r"(?:https?://|git@|ssh://git@)github\.com[:/]([^/:]+/[^/]+?)(?:\.git)?/?$",
+        r"(?:https?://(?:[^/@]+@)?|ssh://(?:[^/@]+@)?|git@)"
+        r"github\.com[:/]([^/:]+/[^/]+?)(?:\.git)?/?$",
         remote,
     )
     return m.group(1) if m else None
