@@ -2446,10 +2446,19 @@ def _derive_babysit_idempotency_key(
         url_slug = um.group(1)
         url_pr = int(um.group(2))
 
-    # PR number: prefer the bare ``#<n>`` in the title (the detector's title
-    # convention), fall back to the pull-URL number.
-    tm = re.search(r"#(\d+)", title)
-    pr = int(tm.group(1)) if tm else url_pr
+    # PR number: when a pull URL is present it is authoritative for BOTH the
+    # repo slug and the PR number, so use its number — pairing the URL's slug
+    # with a different ``#<n>`` from the title (e.g. an issue ref like
+    # ``Babysit fix #123`` whose body links ``.../pull/70``) would key on the
+    # wrong PR (#123), miss dedup for the real PR (#70), and risk colliding
+    # with an unrelated PR #123 in the same repo. Fall back to the bare
+    # ``#<n>`` in the title (the detector's title convention) only when there
+    # is no pull URL.
+    if url_pr is not None:
+        pr: Optional[int] = url_pr
+    else:
+        tm = re.search(r"#(\d+)", title)
+        pr = int(tm.group(1)) if tm else None
     if pr is None:
         return None
 

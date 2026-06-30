@@ -2610,6 +2610,24 @@ def test_slug_from_git_remote_skips_missing_path(tmp_path):
     assert kb._slug_from_git_remote("") is None
 
 
+def test_babysit_pull_url_number_wins_over_title_ref():
+    """When a pull URL is present, its PR number is authoritative for the key —
+    a stray ``#<n>`` (e.g. an issue ref) in the title must NOT override it and
+    pair the URL's slug with the wrong PR number."""
+    # Title carries an issue-style ``#123`` but the body links PR #70; the key
+    # must be the URL's owner/repo#70, not owner/repo#123.
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit fix #123",
+        "see https://github.com/org/repo/pull/70 for the change",
+        None,
+    )
+    assert key == "babysit:org/repo#70"
+    # No URL → fall back to the title ``#<n>`` (detector convention) using the
+    # workspace git remote for the slug. Covered elsewhere; here assert the
+    # no-URL/no-title case still returns None.
+    assert kb._derive_babysit_idempotency_key("no pr ref", "", None) is None
+
+
 def test_babysit_same_pr_different_repos_no_cross_dedup(kanban_home, tmp_path):
     """The SAME PR number #70 in two DIFFERENT repos creates two distinct
     tasks — PR numbers collide across repos, so a repo-less key must never
