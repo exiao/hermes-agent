@@ -2954,6 +2954,55 @@ def test_babysit_body_pull_url_outranks_bare_title_number(tmp_path):
     assert key2 == "babysit:exiao/hermes-agent#70"
 
 
+def test_babysit_body_pr_number_outranks_bare_title_number(tmp_path):
+    """An explicit ``PR #<n>`` in the BODY outranks a BARE ``#<n>`` in the title
+    (same reasoning as the body-URL case): the body ``PR #70`` is an explicit PR
+    signal, while a bare title ``#123`` may be an issue ref. Key on the body PR.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit fix #123",
+        "the actual PR #70 needs watching",
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_default_assignee_derives_key_and_dedups(kanban_home, tmp_path, monkeypatch):
+    """A card created WITHOUT an explicit assignee under
+    ``kanban.default_assignee = pr-babysitter`` (the dispatcher applies the
+    default later) is still keyed at create time, so two such creates for the
+    same PR dedup to one row instead of both inserting keyless and recreating
+    the duplicate-ticket path.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    # Operator default routes unassigned cards to pr-babysitter.
+    monkeypatch.setattr(kb, "_default_assignee", lambda: "pr-babysitter")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit PR #70",
+            assignee=None,
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        second = kb.create_task(
+            conn,
+            title="re-check PR #70",
+            assignee=None,
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        assert second == first
+        task = kb.get_task(conn, first)
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
 def test_babysit_scratch_owner_repo_handoff_dedups(kanban_home):
     """Two scratch pr-babysitter creates that name the PR as ``owner/repo#<n>``
     (no workspace_path) dedup to one row — the ref form alone keys them."""

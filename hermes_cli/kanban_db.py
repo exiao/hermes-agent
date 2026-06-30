@@ -2519,8 +2519,9 @@ def _derive_babysit_idempotency_key(
     #   3. an explicit ``PR #<n>`` in the TITLE + the workspace remote slug,
     #   4. a github pull URL in the BODY (unambiguous slug+PR — outranks a bare
     #      title ``#<n>`` which may be an ISSUE number, not the PR),
-    #   5. a bare ``#<n>`` in the TITLE + the workspace slug,
-    #   6. an explicit ``PR #<n>`` in the BODY + the workspace slug,
+    #   5. an explicit ``PR #<n>`` in the BODY + the workspace slug (also
+    #      unambiguous — outranks a bare title ``#<n>``),
+    #   6. a bare ``#<n>`` in the TITLE + the workspace slug,
     #   7. a BODY ``owner/repo#<n>`` shorthand (last resort).
     slug: Optional[str] = None
     pr: Optional[int] = None
@@ -2532,10 +2533,10 @@ def _derive_babysit_idempotency_key(
         slug, pr = workspace_slug, int(title_pr.group(1))
     elif body_url is not None:
         slug, pr = body_url.group(1), int(body_url.group(2))
-    elif title_bare is not None and workspace_slug:
-        slug, pr = workspace_slug, int(title_bare.group(1))
     elif body_pr is not None and workspace_slug:
         slug, pr = workspace_slug, int(body_pr.group(1))
+    elif title_bare is not None and workspace_slug:
+        slug, pr = workspace_slug, int(title_bare.group(1))
     elif body_ref is not None:
         slug, pr = body_ref.group(1), int(body_ref.group(2))
 
@@ -2860,7 +2861,13 @@ def create_task(
     # ``workspace_path or project_repo`` feeds the git-remote slug fallback both
     # the board-default-resolved path (above) and a project-linked task's primary
     # repo, so the key resolves for every persistent-workspace babysitter create.
-    if idempotency_key is None and assignee == "pr-babysitter":
+    # Use the EFFECTIVE assignee (explicit, else the operator's
+    # ``kanban.default_assignee`` the dispatcher will apply) so a card created
+    # WITHOUT an explicit assignee under ``default_assignee = pr-babysitter``
+    # still gets keyed — otherwise two such creates both insert keyless and
+    # recreate the duplicate-ticket path this is meant to close.
+    effective_assignee = _canonical_assignee(assignee or _default_assignee())
+    if idempotency_key is None and effective_assignee == "pr-babysitter":
         idempotency_key = _derive_babysit_idempotency_key(
             title, body, workspace_path or project_repo
         )
