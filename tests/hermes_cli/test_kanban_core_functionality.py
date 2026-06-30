@@ -2649,13 +2649,12 @@ def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
     """Worktree paths also must be absolute when explicitly set."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(
-            conn, title="wt", assignee="worker",
-            workspace_kind="worktree",
-            workspace_path="../escape",
-        )
-        with pytest.raises(ValueError, match=r"non-absolute"):
-            kb.resolve_workspace(kb.get_task(conn, tid))
+        with pytest.raises(ValueError, match=r"not .*inside a git repo"):
+            kb.create_task(
+                conn, title="wt", assignee="worker",
+                workspace_kind="worktree",
+                workspace_path="../escape",
+            )
     finally:
         conn.close()
 

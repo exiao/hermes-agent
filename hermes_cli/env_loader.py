@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 import os
 import sys
+import threading
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from utils import atomic_replace, fast_safe_load
@@ -37,6 +40,11 @@ _SECRET_SOURCES: dict[str, str] = {}
 # in-process cache prevents redundant network calls, but the print, the
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
+
+# ``os.environ`` is process-global. The stable-environ swap in
+# ``_load_dotenv_with_fallback`` must be stack-safe when concurrent gateway
+# turns reload dotenv at the same time.
+_ENV_LOAD_LOCK = threading.RLock()
 
 
 def get_secret_source(env_var: str) -> str | None:
@@ -143,11 +151,168 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
+def _snapshot_environ(real_environ: Any) -> dict[str, str]:
+    """Copy an environment mapping while tolerating concurrent key deletion."""
+    snapshot: dict[str, str] = {}
+    for key in list(real_environ.keys()):
+        try:
+            snapshot[key] = real_environ[key]
+        except KeyError:
+            # A concurrent unpin may delete a key after ``keys()`` listed it.
+            # Skip that transient key rather than failing before the stable
+            # wrapper is even installed.
+            continue
+    return snapshot
+
+
+class _StableEnviron(MutableMapping[str, str]):
+    """Write-through snapshot of ``os.environ`` for use during ``load_dotenv``.
+
+    python-dotenv's ``resolve_variables`` interpolates each ``.env`` line by
+    doing ``env.update(os.environ)`` — which enumerates ``os.environ``'s keys
+    then fetches each by key. ``os.environ`` is a live, shared, mutable
+    mapping; Hermes pins/unpins env vars (notably ``HERMES_KANBAN_BOARD``,
+    set in ``hermes_cli/main.py`` and pinned/restored in
+    ``gateway/kanban_watchers.py``) on the fly from other threads. When a
+    concurrent unpin deletes a key *between* the enumerate and the get, dotenv
+    raises ``KeyError`` and crashes the load (observed 2026-06-29: a chat turn
+    died with ``KeyError: HERMES_KANBAN_BOARD``).
+
+    This wrapper presents a **frozen snapshot** of the environment for all
+    *reads* (so no concurrent deletion can race the enumerate-then-get) while
+    *writes* pass through to the real ``os.environ`` (so the load still takes
+    effect). Swapping ``os.environ`` for an instance of this across the
+    ``load_dotenv`` call fixes the whole class of concurrently-mutated env
+    vars, not just the board pin — with no change to interpolation or override
+    semantics.
+    """
+
+    def __init__(self, real_environ: Any):
+        self._real = real_environ
+        self._snapshot = _snapshot_environ(real_environ)
+        self._writes: dict[str, str] = {}
+        self._deleted_keys: set[Any] = set()
+        self._snapshot_keys = {self._encode_key(key): key for key in self._snapshot}
+
+    def _encode_key(self, key: Any) -> Any:
+        encode_key = getattr(self._real, "encodekey", None)
+        if encode_key is None:
+            return key
+        try:
+            return encode_key(key)
+        except Exception:  # noqa: BLE001 - match os._Environ's fail-open reads
+            return key
+
+    def _snapshot_key(self, key: Any) -> Any:
+        return self._snapshot_keys.get(self._encode_key(key), key)
+
+    def _read_view(self) -> dict[str, str]:
+        return self._snapshot.copy()
+
+    # --- reads: served from the frozen snapshot ---
+    def __getitem__(self, key: str) -> str:
+        snapshot_key = self._snapshot_key(key)
+        if snapshot_key in self._writes:
+            return self._writes[snapshot_key]
+        return self._snapshot[snapshot_key]
+
+    def __iter__(self):
+        return iter(self._read_view())
+
+    def __len__(self) -> int:
+        return len(self._read_view())
+
+    def __contains__(self, key: object) -> bool:
+        snapshot_key = self._snapshot_key(key)
+        if self._encode_key(key) in self._deleted_keys:
+            return False
+        return snapshot_key in self._snapshot or snapshot_key in self._writes
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if self._encode_key(key) in self._deleted_keys:
+            return default
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def keys(self):
+        return self._read_view().keys()
+
+    def items(self):
+        return self._read_view().items()
+
+    def values(self):
+        return self._read_view().values()
+
+    def copy(self) -> dict[str, str]:
+        copied = {
+            key: value
+            for key, value in self._snapshot.items()
+            if self._encode_key(key) not in self._deleted_keys
+        }
+        copied.update(self._writes)
+        return copied
+
+    # --- writes: pass through to the real os.environ AND keep the snapshot
+    # coherent so a later read in the same load sees what was just written ---
+    def __setitem__(self, key: str, value: str) -> None:
+        self._real[key] = value
+        snapshot_key = self._snapshot_key(key)
+        self._writes[snapshot_key] = value
+        self._deleted_keys.discard(self._encode_key(key))
+        self._snapshot_keys[self._encode_key(key)] = snapshot_key
+
+    def __delitem__(self, key: str) -> None:
+        snapshot_key = self._snapshot_key(key)
+        encoded_key = self._encode_key(key)
+        try:
+            del self._real[key]
+        finally:
+            self._writes.pop(snapshot_key, None)
+            self._deleted_keys.add(encoded_key)
+            if snapshot_key not in self._snapshot:
+                self._snapshot_keys.pop(encoded_key, None)
+
+    def pop(self, key: str, *args: Any) -> str:
+        if self._encode_key(key) in self._deleted_keys:
+            if args:
+                return args[0]
+            raise KeyError(key)
+        value = self[key]
+        try:
+            self.__delitem__(key)
+        except KeyError:
+            if args:
+                return args[0]
+            raise
+        return value
+
+    def __getattr__(self, name):
+        # Anything we didn't explicitly model (e.g. encodekey) falls through
+        # to the real os._Environ.
+        return getattr(self._real, name)
+
+
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
-    try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+    # Snapshot os.environ for the duration of the dotenv load. python-dotenv
+    # reads the live ``os.environ`` while interpolating (env.update(os.environ)
+    # once per .env line); a concurrent mutation of that shared mapping —
+    # Hermes pins/unpins HERMES_KANBAN_BOARD on os.environ from other threads —
+    # can delete a key between enumerate and get, raising KeyError mid-load.
+    # The write-through snapshot gives dotenv a stable view for reads while its
+    # writes still land on the real environment. Restored in finally.
+    with _ENV_LOAD_LOCK:
+        stable = _StableEnviron(os.environ)
+        real_environ = os.environ
+        setattr(os, "environ", stable)
+        try:
+            try:
+                load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+            except UnicodeDecodeError:
+                load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        finally:
+            setattr(os, "environ", real_environ)
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars

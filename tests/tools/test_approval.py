@@ -1378,16 +1378,397 @@ class TestGitDestructiveOps:
             "git push origin HEAD:main",
             "git push origin main:main",
             "git push upstream master",
+            "git push origin refs/heads/main",
+            "git push origin refs/heads/master",
+            "git push origin HEAD:refs/heads/main",
         ):
             dangerous, _, desc = detect_dangerous_command(cmd)
             assert dangerous is True, f"expected block, got allow for: {cmd}"
             assert "main/master" in (desc or ""), f"wrong reason for: {cmd} -> {desc}"
 
-    def test_git_push_force_with_lease_flagged(self):
-        """--force-with-lease still rewrites history and MUST be flagged."""
+    def test_git_push_force_with_lease_to_feature_branch_not_flagged(self):
+        """A force-WITH-LEASE push to a NON-default branch is the routine
+        PR-rebase case the shell git-guard (~/.local/bin/git) already allows.
+        The lease is the safety belt (it refuses if the remote moved), so this
+        auto-approves headless instead of stalling for an operator prompt.
+        """
         cmd = "git push --force-with-lease origin feature"
         dangerous, _, _ = detect_dangerous_command(cmd)
-        assert dangerous is True
+        assert dangerous is False
+
+    def test_git_push_force_with_lease_to_main_still_flagged(self):
+        """A force-with-lease whose refspec targets the DEFAULT branch could
+        rewrite main/master and MUST still be flagged (mirrors the shell guard's
+        main/master refspec enumeration). Covers the bare, `+`, `HEAD:`, and
+        colon-RHS forms AND the fully-qualified `refs/heads/` /
+        `HEAD:refs/heads/` forms for both main and master."""
+        for cmd in (
+            "git push --force-with-lease origin main",
+            "git push --force-with-lease origin master",
+            "git push --force-with-lease origin HEAD:main",
+            "git push --force-with-lease origin HEAD:master",
+            "git push --force-with-lease origin feature:main",
+            "git push --force-with-lease origin +main",
+            # Fully-qualified refspec forms (the carve-out hole this loop guards):
+            "git push --force-with-lease origin refs/heads/main",
+            "git push --force-with-lease origin refs/heads/master",
+            "git push --force-with-lease origin HEAD:refs/heads/main",
+            "git push --force-with-lease origin HEAD:refs/heads/master",
+            # Wildcard LHS clobbering main (minor finding — plausible clobber),
+            # both unquoted and shell-quoted (the quote must not defeat the gate):
+            "git push --force-with-lease origin *:main",
+            "git push --force-with-lease origin '*:main'",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_git_push_bare_force_still_flagged_even_on_feature_branch(self):
+        """A BARE force (no lease) has no safety belt, so it keeps prompting
+        regardless of target branch — only the lease form is carved out."""
+        for cmd in (
+            "git push --force origin feature",
+            "git push -f origin feature",
+            "git push --force",
+            # bare force AND lease together: the bare force could still clobber
+            "git push --force --force-with-lease origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_git_push_lease_carveout_only_for_explicit_single_feature_ref(self):
+        """The lease carve-out auto-approves ONLY an explicit, non-`+`,
+        single-destination feature-ref push. A leading-`+` refspec (a forced
+        update with no lease guarantee), a `--all`/`--mirror` broadcast (pushes
+        every local ref incl. main), and an omitted refspec (resolves via
+        push.default — may push the current branch, which could be main) must
+        all keep prompting."""
+        for cmd in (
+            # leading-`+` refspec = forced update, bypasses the lease belt
+            "git push --force-with-lease origin +feature",
+            "git push --force-with-lease origin +refs/heads/feature",
+            # broadcast pushes touch every ref incl. main/master
+            "git push --force-with-lease --all origin",
+            "git push --force-with-lease --mirror origin",
+            # no explicit destination refspec
+            "git push --force-with-lease origin",
+            "git push --force-with-lease",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_force_with_lease_re_excludes_trailing_hyphen_flag(self):
+        """`_FORCE_WITH_LEASE_RE` must match the real lease flag (bare and the
+        `=<expected>` value form) but NOT a different flag that merely starts
+        with the same string, e.g. `--force-with-lease-foo`. The trailing-hyphen
+        exclusion (`(?![\\w-])`) is what draws that boundary."""
+        rx = approval_module._FORCE_WITH_LEASE_RE
+        assert rx.search("--force-with-lease")
+        assert rx.search("--force-with-lease=origin/main")
+        assert rx.search("--force-with-lease=expected-sha")
+        assert not rx.search("--force-with-lease-foo")
+
+    def test_git_push_lease_carveout_excludes_protected_integration_branches(self):
+        """A leased force-push to a long-lived integration branch the gateway
+        tracks (live-config) must NOT be carved out — auto-approving it
+        headlessly would bypass the PR-to-self review flow. Same posture as
+        main/master, in bare, refs/heads, and HEAD: forms."""
+        for cmd in (
+            "git push --force-with-lease origin live-config",
+            "git push --force-with-lease origin refs/heads/live-config",
+            "git push --force-with-lease origin HEAD:live-config",
+            "git push --force-with-lease origin feature:live-config",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_git_push_lease_carveout_rejects_non_branch_destinations(self):
+        """The carve-out is for refs/heads branch pushes ONLY. A leased rewrite
+        of a tag (or any non-refs/heads namespace) must keep prompting — a
+        forced tag move is just as destructive as a branch rewrite."""
+        for cmd in (
+            "git push --force-with-lease origin refs/tags/v1.0",
+            "git push --force-with-lease origin feature:refs/tags/v1.0",
+            "git push --force-with-lease origin refs/notes/commits",
+            "git push --force-with-lease origin refs/remotes/origin/x",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_git_push_lease_carveout_rejects_ambiguous_refspec_shorthands(self):
+        """Refspec shorthands that don't name a single explicit non-default
+        branch must keep prompting: `HEAD` (resolves to the current checkout,
+        which may be main), the bare `:` matching-refspec, and the
+        `refs/heads/*:refs/heads/*` wildcard (touches every branch incl. main)."""
+        for cmd in (
+            "git push --force-with-lease origin HEAD",
+            "git push --force-with-lease origin :",
+            "git push --force-with-lease origin refs/heads/*:refs/heads/*",
+            "git push --force-with-lease origin 'refs/heads/*'",
+            "git push --force-with-lease origin feature:",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_git_push_lease_carveout_does_not_miscount_flag_values_or_prefix(self):
+        """The explicit-destination check must not be fooled by a `-o/
+        --push-option <value>` value or a pre-`git` shell prefix being
+        miscounted as a refspec. `-o ci.skip origin` (no real refspec) and
+        `cd repo && git push --force-with-lease` (omitted refspec) must keep
+        prompting; a value-flag alongside a REAL refspec still carves out."""
+        for cmd in (
+            "git push --force-with-lease -o ci.skip origin",
+            "git push --force-with-lease --push-option ci.skip origin",
+            "cd repo && git push --force-with-lease",
+            "cd repo && git push --force-with-lease origin",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        # A value-flag PLUS a genuine feature refspec is still safe to carve out.
+        for cmd in (
+            "git push --force-with-lease -o ci.skip origin feature",
+            "git push --force-with-lease --push-option=ci.skip origin feature",
+            "cd repo && git push --force-with-lease origin feature",
+            "cd main && git push --force-with-lease origin feature",
+            "cd /tmp/master && git push --force-with-lease origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
+    def test_git_push_lease_carveout_allows_ordinary_feature_branches(self):
+        """Branches that merely contain 'main'/'master' or a 'head' path
+        segment are ordinary feature branches and must still carve out — the
+        protected-branch and HEAD checks must not over-match."""
+        for cmd in (
+            "git push --force-with-lease origin mainline",
+            "git push --force-with-lease origin my-main",
+            "git push --force-with-lease origin feature/head",
+            "git push --force-with-lease origin refs/heads/feature",
+            "git push --force-with-lease origin HEAD:refs/heads/feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
+    def test_git_push_lease_carveout_rejects_unqualified_colon_destinations(self):
+        """A colon-form refspec writes the RHS destination. If that RHS is
+        unqualified, Git may expand it against an existing remote tag/other ref
+        (`HEAD:v1` can update `refs/tags/v1` when such a tag exists). The
+        branch-only carve-out cannot resolve remote namespaces, so colon-form
+        destinations must be explicit `refs/heads/<branch>` refs. Bare
+        source-only branch pushes (`origin feature`) remain allowed above."""
+        for cmd in (
+            "git push --force-with-lease=refs/tags/v1:old origin HEAD:v1",
+            "git push --force-with-lease origin HEAD:feature",
+            "git push --force-with-lease origin feature:v1",
+            "git push --force-with-lease origin refs/heads/feature:v1",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin HEAD:refs/heads/feature"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_rejects_delete_pushes(self):
+        """A leased DELETE push removes the remote ref — just as destructive as
+        a force rewrite. Both the `--delete` / `-d` flag forms AND the
+        colon-prefix `:branch` shorthand (`git push origin :feature`) must keep
+        prompting regardless of branch — the flag-strip / RHS-parse would
+        otherwise leave them reading like a routine feature rebase."""
+        for cmd in (
+            "git push --force-with-lease --delete origin feature",
+            "git push --force-with-lease -d origin feature",
+            "git push --force-with-lease --delete origin main",
+            # Colon-prefix delete shorthand: empty SOURCE in `src:dst`.
+            "git push --force-with-lease origin :feature",
+            "git push --force-with-lease origin :refs/heads/feature",
+            "git push --force-with-lease origin :main",
+            "git push --force-with-lease origin :live-config",
+            "git push --force-with-lease origin :'feature'",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+
+    def test_git_push_lease_carveout_normalizes_quoted_protected_destination(self):
+        """A shell-quoted protected destination (`HEAD:'main'`, `'master'`) must
+        still be caught — the carve-out validates the bare branch name after
+        stripping surrounding quotes. A quoted bare source-only feature branch
+        still carves out; quoted colon-form destinations stay gated unless the
+        RHS is fully-qualified as refs/heads (covered above)."""
+        for cmd in (
+            "git push --force-with-lease origin HEAD:'main'",
+            "git push --force-with-lease origin HEAD:'feature'",
+            "git push --force-with-lease origin 'master'",
+            "git push --force-with-lease origin 'live-config'",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin 'feature'"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_boolean_flags_do_not_eat_refspec(self):
+        """A boolean push flag like `--force-if-includes` takes no value, so it
+        must NOT consume the following positional. A feature push carrying one
+        still carves out (the refspec is intact)."""
+        for cmd in (
+            "git push --force-with-lease --force-if-includes origin feature",
+            "git push --force-with-lease -q origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
+    def test_git_push_lease_carveout_rejects_tag_pushes(self):
+        """`--tags` pushes tags alongside the named refspec, so a leased
+        `--force-with-lease=refs/tags/v1:<old> --tags origin feature` can
+        force-update a tag while the visible refspec looks like a routine
+        feature push. The branch-only carve-out must keep prompting; an
+        ordinary feature push without `--tags` still carves out."""
+        for cmd in (
+            "git push --force-with-lease --tags origin feature",
+            "git push --force-with-lease=refs/tags/v1:old --tags origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin feature"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_consumes_recurse_submodules_value(self):
+        """`--recurse-submodules <check|on-demand|no>` consumes the next word in
+        its space form. Without dropping the value, `--recurse-submodules
+        on-demand origin` leaves `origin` miscounted as a refspec and would
+        carve out an omitted-refspec push (which follows push.default → could be
+        main). Must keep prompting; the `=value` form plus a real refspec still
+        carves out."""
+        for cmd in (
+            "git push --force-with-lease --recurse-submodules on-demand origin",
+            "git push --force-with-lease --recurse-submodules check origin",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        for cmd in (
+            "git push --force-with-lease --recurse-submodules=on-demand origin feature",
+            "git push --force-with-lease --recurse-submodules on-demand origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
+    def test_git_push_lease_carveout_strips_numeric_short_flags(self):
+        """Numeric short flags `-4`/`-6` (IPv4/IPv6) take no value but the
+        generic flag-strip used to only match letter-first flags, leaving `-4`
+        to be miscounted as a refspec so `git push --force-with-lease -4 origin`
+        (omitted refspec) wrongly carved out. Must keep prompting; a numeric
+        flag alongside a REAL feature refspec still carves out."""
+        for cmd in (
+            "git push --force-with-lease -4 origin",
+            "git push --force-with-lease -6 origin",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        for cmd in (
+            "git push --force-with-lease -4 origin feature",
+            "git push --force-with-lease -6 origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
+    def test_git_push_lease_carveout_rejects_packed_numeric_force_bundle(self):
+        """A packed short bundle like `-4f` is IPv4 + a BARE `--force` (no lease
+        safety belt), but the short-force regex used to only allow letters
+        around `f`, so `-4f`/`-6f` slipped past the bare-force check and the
+        generic flag-strip then erased the whole token. A leased push carrying a
+        packed numeric force bundle must keep prompting; a packed all-letter
+        bundle without `f` (e.g. `-uq`) still carves out."""
+        for cmd in (
+            "git push --force-with-lease -4f origin feature",
+            "git push --force-with-lease -6f origin feature",
+            "git push --force-with-lease -f4 origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        # A packed bundle WITHOUT a force `f` is a normal feature push.
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease -uq origin feature"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_rejects_tag_shorthand(self):
+        """The `git push <remote> tag <name>` shorthand expands to a tag
+        refspec (`refs/tags/<name>`), so a leased `--force-with-lease=refs/
+        tags/v1:<old> origin tag v1` force-updates a TAG while the tokens
+        (`tag`, `v1`) look like two ordinary branch refspecs. Must keep
+        prompting. A branch literally named `tag` (lone token) is still an
+        ordinary feature push and carves out."""
+        for cmd in (
+            "git push --force-with-lease origin tag v1",
+            "git push --force-with-lease=refs/tags/v1:old origin tag v1",
+            # The `tag <name>` shorthand may also trail other refspecs.
+            "git push --force-with-lease origin feature tag v1",
+            "git push --force-with-lease=refs/tags/v1:old origin feature tag v1",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        # A lone branch named "tag" is a normal feature push.
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin tag"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_rejects_packed_numeric_delete_bundle(self):
+        """A packed short bundle like `-4d` is IPv4 + a delete (`-d`), but the
+        delete guard used to only allow letters around `d`, so `-4d` slipped
+        past and the generic flag-strip erased it — a leased push then read like
+        a routine feature rebase and the remote branch was deleted without
+        approval. Must keep prompting; a packed bundle without `d`/`f` carves
+        out."""
+        for cmd in (
+            "git push --force-with-lease -4d origin feature",
+            "git push --force-with-lease -6d origin feature",
+            "git push --force-with-lease -d4 origin feature",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease -uq origin feature"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_handles_quoted_option_value(self):
+        """A QUOTED option value carrying whitespace (`--push-option 'ci skip'`)
+        is a single shell argument, so the value must be consumed whole — a
+        plain whitespace split would leak `skip` as a phantom refspec and carve
+        out an omitted-refspec push (push.default → could be main). Must keep
+        prompting; the same quoted value alongside a REAL feature refspec still
+        carves out."""
+        for cmd in (
+            "git push --force-with-lease --push-option 'ci skip' origin",
+            "git push --force-with-lease -o 'ci skip' origin",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease --push-option 'ci skip' origin feature"
+        )
+        assert dangerous is False
+
+    def test_git_push_lease_carveout_rejects_bare_option_terminator(self):
+        """The bare `--` option terminator is not a refspec — git treats
+        `git push --force-with-lease origin --` as an OMITTED-refspec push
+        (push.default → could be main). It must not be counted as proof of an
+        explicit destination, so the carve-out keeps prompting. A real feature
+        refspec after `--` still carves out."""
+        for cmd in (
+            "git push --force-with-lease origin --",
+            "git push --force-with-lease -- origin",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, f"expected block, got allow for: {cmd}"
+        dangerous, _, _ = detect_dangerous_command(
+            "git push --force-with-lease origin -- feature"
+        )
+        assert dangerous is False
 
     def test_gh_pr_merge_flagged(self):
         """`gh pr merge` bypasses PR review and MUST be flagged."""
@@ -1427,6 +1808,19 @@ class TestGitDestructiveOps:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, f"expected allow, got block for: {cmd}"
 
+    def test_git_push_force_with_lease_to_qualified_feature_branch_not_flagged(self):
+        """A fully-qualified `refs/heads/<feature>` lease push must still
+        auto-allow — the boundary anchor only fires when the final ref
+        component is exactly main/master, not for a feature ref under
+        refs/heads/."""
+        for cmd in (
+            "git push --force-with-lease origin refs/heads/feature",
+            "git push --force-with-lease origin HEAD:refs/heads/my-feature",
+            "git push --force-with-lease origin refs/heads/mainline",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, f"expected allow, got block for: {cmd}"
+
     def test_git_push_to_branches_containing_main_not_flagged(self):
         """Branch names that *contain* 'main' must not trigger the main/master rule."""
         for cmd in (
@@ -1434,6 +1828,8 @@ class TestGitDestructiveOps:
             "git push origin my-main",
             "git push origin mainline",
             "git push origin master-key",
+            "git push origin refs/heads/mainline",
+            "git push origin refs/heads/my-main",
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, f"expected allow, got block for: {cmd}"

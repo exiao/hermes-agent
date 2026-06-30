@@ -14,6 +14,7 @@ import functools
 import logging
 import os
 import re
+import shlex
 import sys
 import threading
 import time
@@ -543,8 +544,18 @@ DANGEROUS_PATTERNS = [
     # sibling PATH wrappers at ~/.local/bin/{gh,git} and ~/.claude/guard.sh
     # and the ~/.hermes/plugins/block-dangerous-merges/ plugin for parallel
     # enforcement at the shell and Claude-Code tool layers.
-    (r'\bgit\s+push\b\s+\S+\s+(?:\S+:)?(\+?main|\+?master)(?:\s|$)', "git push to main/master (bypasses PR review)"),
-    (r'\bgit\s+push\b\s+\S+\s+HEAD:(main|master)(?:\s|$)', "git push HEAD to main/master (bypasses PR review)"),
+    # Match a push whose refspec targets main/master in any of the standard
+    # forms: bare `main`, `+main`, `HEAD:main`, `main:main`, `feature:main`,
+    # `*:main`, AND the fully-qualified `refs/heads/main` / `HEAD:refs/heads/main`
+    # (the `+`/colon force forms too). The `main`/`master` token is anchored on
+    # a REQUIRED preceding refspec-boundary char (the space after the remote, or
+    # `/`/`:`/`+` inside the refspec) so `refs/heads/main` and
+    # `HEAD:refs/heads/main` are caught, while a branch that merely contains the
+    # word (`mainline`, `my-main`, `main-event`) is NOT: a `-`-joined name has no
+    # boundary char immediately before `main`, and the trailing `(?:\s|$)` rejects
+    # a trailing suffix. Mirrors the shell guard at ~/.local/bin/git.
+    (r'\bgit\s+push\b\s+\S+\s+\S*[/:+\s](main|master)(?:\s|$|[\'"`])', "git push to main/master (bypasses PR review)"),
+    (r'\bgit\s+push\b\s+\S+\s+(main|master)(?:\s|$|[\'"`])', "git push to main/master (bypasses PR review)"),
     (r'\bgit\s+push\b.*--force-with-lease\b', "git force-with-lease push (rewrites remote history)"),
     (r'\bgh\s+pr\s+merge\b', "gh pr merge (bypasses PR review — Eric merges)"),
     (r'\bgh\s+(release|repo|workflow)\s+delete\b', "gh delete destructive resource"),
@@ -820,6 +831,282 @@ def _build_self_term_scan_view(command_lower: str) -> str:
     return view
 
 
+# =========================================================================
+# Force-push carve-out (mirror the shell git-guard at ~/.local/bin/git)
+# =========================================================================
+# The shell PATH wrapper (~/.local/bin/git) already encodes the safe rule:
+# force-pushing a FEATURE branch (rebasing your own PR) is allowed; it only
+# blocks a force-push that could rewrite the default branch (main/master) —
+# either via a main/master-targeting refspec or a bare force while standing on
+# a main/master checkout. A force-WITH-LEASE to a feature branch sails through.
+#
+# The three force-push DANGEROUS_PATTERNS entries below do not make that
+# distinction — they flag EVERY force push for an operator prompt, which stalls
+# routine PR-rebase work headless. This carve-out narrows them to match the
+# shell guard: a force-WITH-LEASE push whose target ref is NOT the default
+# branch is auto-allowed; everything else (a bare force, any force whose refspec
+# targets main/master) still prompts. The lease is the safety belt — it refuses
+# if the remote moved since the last fetch, so even on a shared worktree branch
+# the second pusher's lease bounces instead of clobbering. A bare force is NOT
+# covered (no lease = no safety belt), so it keeps prompting.
+#
+# The main/master refspec forms here are the SAME ones the shell guard
+# enumerates (lines ~49-62 of ~/.local/bin/git) so the two layers cannot
+# disagree. The main/master push patterns in DANGEROUS_PATTERNS stay active as
+# an independent backstop.
+_FORCE_PUSH_DESCRIPTIONS = frozenset({
+    "git force push (rewrites remote history)",
+    "git force push short flag (rewrites remote history)",
+    "git force-with-lease push (rewrites remote history)",
+})
+
+# A bare --force flag (NOT the --force-with-lease form). `--force-with-lease`
+# contains the substring `--force`, so require a word boundary that the lease
+# suffix does not satisfy: --force/--force=… followed by end or a non-hyphen.
+_BARE_FORCE_FLAG_RE = re.compile(r'--force(?![\w-])')
+# Short force flag: -f, or packed combos like -uf / -fv (a flag token that
+# contains an `f`). Excludes long flags (already handled above). The other
+# chars in the bundle may be letters OR digits — git push has numeric short
+# flags `-4`/`-6` (IPv4/IPv6), so a packed `-4f` is IPv4 + a BARE force (which
+# overrides the lease with no safety belt). Matching `[a-z0-9]` around `f`
+# ensures `-4f`/`-6f` are caught as a bare force instead of slipping through.
+_SHORT_FORCE_FLAG_RE = re.compile(r'(?<![\w-])-[a-z0-9]*f[a-z0-9]*(?![\w-])')
+# Exclude a trailing hyphen too (`(?![\w-])`) so a different flag that merely
+# starts with this string (e.g. `--force-with-lease-foo`) is not misread as the
+# lease form — matches the boundary convention used by the bare-force regexes.
+_FORCE_WITH_LEASE_RE = re.compile(r'--force-with-lease(?:=\S*)?(?![\w-])')
+# Refspec/target forms that would rewrite the default branch — mirrors the
+# shell guard's main/master enumeration (`+main`, `HEAD:main`, `*:main`,
+# `main:main`, a bare `main`/`master` push target, the `+`/colon force forms),
+# AND the fully-qualified `refs/heads/main` / `HEAD:refs/heads/main` forms.
+# Anchor `main`/`master` on a preceding refspec-boundary char (`/`, `:`, `+`,
+# or whitespace / start) so a `heads/`-prefixed or colon-RHS-qualified ref is
+# caught, while a branch that merely CONTAINS the word (`mainline`, `my-main`,
+# `main-event`) is not — the trailing `(?:\s|$)` keeps those un-gated.
+_DEFAULT_BRANCH_PUSH_RE = re.compile(
+    r'(?:^|[/:+\s])(?:main|master)(?:\s|$|[\'"`])'
+)
+
+# Long-lived integration branches the running gateway / deploy flow tracks
+# directly. Auto-approving a headless leased force-push to one of these would
+# bypass the PR-to-self review flow (AGENTS.md: `live-config` is the branch the
+# live gateway checks out), so they are NEVER carved out — same posture as
+# main/master. Lowercased; matched against the parsed destination branch name.
+_PROTECTED_BRANCHES = frozenset({"main", "master", "live-config"})
+
+# Push flags that consume the NEXT token as a value (space-separated form). If
+# we don't drop the value too it survives token-splitting and gets miscounted
+# as the remote or a refspec (`-o ci.skip origin` → `ci.skip` read as remote,
+# `origin` read as a refspec). The `--flag=value` forms are already handled by
+# the generic flag-strip, so only the space-separated short/long names matter.
+# Only genuinely value-taking flags belong here — boolean flags like
+# `--force-if-includes` must NOT be listed or they would wrongly eat the next
+# positional (the remote/refspec).
+_VALUE_FLAGS = frozenset({
+    "-o", "--push-option", "--repo", "--receive-pack", "--exec",
+    # `--recurse-submodules <check|on-demand|no>` consumes the next word in its
+    # space form; if we don't drop the value it survives token-splitting and
+    # gets miscounted as the remote/refspec (`--recurse-submodules on-demand
+    # origin` → `origin` read as a refspec).
+    "--recurse-submodules",
+})
+
+# A destination that names exactly one ordinary branch under refs/heads — the
+# only shape we auto-approve. Accepts a bare `feature`, `refs/heads/feature`, or
+# the `src:dst` form (we validate the RHS destination). Rejects wildcards (`*`),
+# tag/other-namespace refs (`refs/tags/…`, `refs/notes/…`), the `HEAD`
+# shorthand, the bare `:` matching-refspec, and empty destinations.
+_VALID_BRANCH_NAME_RE = re.compile(r'^[\w./-]+$')
+
+
+def _refspec_destination(refspec: str) -> Optional[str]:
+    """Return the lowercased destination BRANCH NAME a push refspec writes to,
+    or ``None`` if the refspec is not a single, ordinary ``refs/heads`` branch
+    target this carve-out is willing to reason about.
+
+    Handles `src:dst` (uses the RHS), bare `branch` / `refs/heads/branch`, and
+    rejects: wildcards (`*`), `HEAD` (resolves to the current checkout — may be
+    main), the bare `:` matching-refspec, an empty RHS (`src:` = delete), an
+    empty SOURCE (`:dst` = the colon-prefix delete shorthand), and any ref
+    outside `refs/heads/` (`refs/tags/…`, `refs/notes/…`, etc. — a leased tag
+    rewrite must NOT slip through).
+    """
+    rs = refspec.strip()
+    # Strip surrounding shell quotes the detection view may still carry (the
+    # normalizer only removes EMPTY '' / "" literals). A quoted destination
+    # like HEAD:'main' or 'feature' must validate on its bare branch name so a
+    # quoted protected branch is still caught and a quoted feature branch still
+    # carves out.
+    rs = rs.strip('\'"`')
+    if not rs or '*' in rs:
+        return None
+    # `src:dst` — the written ref is the RHS. A bare `:` (matching refspec) or a
+    # `src:` (delete) leaves an empty dst → reject. An empty SOURCE (`:dst`) is
+    # the colon-prefix DELETE shorthand (`git push origin :feature` removes the
+    # remote ref) — just as destructive as `--delete`, so reject it too.
+    #
+    # In colon form, require the RHS destination to be fully qualified as
+    # `refs/heads/<branch>`. Git resolves an unqualified RHS against the remote
+    # namespace, so `HEAD:v1` can update an existing remote tag `refs/tags/v1`;
+    # without remote ref resolution, the branch-only carve-out cannot safely
+    # accept unqualified colon destinations. Bare source-only pushes like
+    # `git push origin feature` are handled by the `else` branch and remain the
+    # ordinary feature-branch convenience this carve-out exists to allow.
+    colon_form = ':' in rs
+    if colon_form:
+        src, dst = rs.split(':', 1)
+        if not src.strip('\'"`'):
+            return None
+    else:
+        dst = rs
+    dst = dst.strip('\'"`')
+    if not dst:
+        return None
+    # `HEAD` resolves to whatever branch is checked out — could be main.
+    if dst == 'head':
+        return None
+    # Qualified refs: only refs/heads/<branch> is a branch push; refs/tags/…,
+    # refs/notes/…, refs/remotes/… and any other namespace are not carved out.
+    # In colon form, an unqualified destination is also not carved out because
+    # Git may expand it to an existing non-branch remote ref.
+    if colon_form and not dst.startswith('refs/heads/'):
+        return None
+    if dst.startswith('refs/'):
+        if not dst.startswith('refs/heads/'):
+            return None
+        dst = dst[len('refs/heads/'):]
+    if not dst or not _VALID_BRANCH_NAME_RE.match(dst):
+        return None
+    return dst
+
+
+def _is_safe_lease_push_to_feature_branch(command_lower: str) -> bool:
+    """True iff *command_lower* is a force-WITH-LEASE git push to a single,
+    ordinary, NON-protected branch — the exact case the shell git-guard
+    auto-allows.
+
+    *command_lower* is the already-normalized + lowercased command (same view
+    the dangerous-pattern loop scans). Returns False (→ keep prompting) for:
+      - anything that is not a `git push`,
+      - a push with no `--force-with-lease` (a bare `--force`/`-f` has no lease
+        safety belt, so it stays gated),
+      - a push that ALSO carries a bare `--force`/`-f` (the bare force could
+        still clobber regardless of the lease intent),
+      - a `--all`/`--mirror` push (pushes EVERY local ref, incl. main/master —
+        a single explicit destination ref cannot be reasoned about),
+      - a push with NO explicit destination refspec (an omitted refspec follows
+        push.default and may push the current branch — which could be main),
+      - a refspec carrying a leading `+` (git documents `+<src>:<dst>` as the
+        same forced update as `--force`, with NO lease safety belt),
+      - a destination that is not a single `refs/heads/<branch>` target: the
+        `HEAD` shorthand, the bare `:` matching-refspec, a wildcard
+        (`refs/heads/*:refs/heads/*`), or a non-branch ref (`refs/tags/…`),
+      - a push to a PROTECTED branch (main/master/live-config), in any form
+        incl. `refs/heads/main` / `HEAD:refs/heads/main`.
+    """
+    if not re.search(r'\bgit\s+push\b', command_lower):
+        return False
+    # Require the lease form — the safety belt that makes auto-approve safe.
+    if not _FORCE_WITH_LEASE_RE.search(command_lower):
+        return False
+    # Reject if a BARE force is also present (e.g. `--force --force-with-lease`
+    # or `-f`). Strip the lease token first so its `--force` substring and any
+    # `=<expected>` value don't read as a bare force.
+    without_lease = _FORCE_WITH_LEASE_RE.sub(' ', command_lower)
+    if _BARE_FORCE_FLAG_RE.search(without_lease) or _SHORT_FORCE_FLAG_RE.search(without_lease):
+        return False
+    # Reject a broadcast push: `--all`/`--mirror` push every local ref (incl.
+    # main/master), so a "no main token in the args" check cannot vouch for them.
+    # `--tags` (no short form) ALSO pushes tags alongside the named refspec — a
+    # leased `--force-with-lease=refs/tags/v1:<old>` can rewrite a tag while the
+    # visible refspec looks like a routine feature push, so the branch-only
+    # carve-out must keep prompting for it.
+    if re.search(r'(?<![\w-])--(?:all|mirror|tags)(?![\w-])', without_lease):
+        return False
+    # Reject a DELETE push (`--delete` / `-d`): it removes the remote ref
+    # entirely (just as destructive as a force rewrite), and the flag-strip
+    # below would erase the `--delete` token and leave the branch reading like a
+    # routine rebase target. A deletion is never the carve-out's "rebase a
+    # feature branch" intent, so keep prompting. The packed short form may carry
+    # DIGITS too (`-4d` = IPv4 + delete), so match `[a-z0-9]` around `d` — same
+    # reasoning as the packed numeric force bundle above.
+    if re.search(r'(?<![\w-])(?:--delete|-[a-z0-9]*d[a-z0-9]*)(?![\w-])', without_lease):
+        return False
+    # Require an EXPLICIT destination refspec. An omitted refspec resolves via
+    # push.default and may push the current branch (which could be main), so a
+    # bare `git push --force-with-lease [origin]` must keep prompting.
+    #
+    # Strip EVERYTHING up to and including the `git push` verb so a shell prefix
+    # (`cd repo && git push …`) does not survive as a phantom remote/refspec.
+    args = re.sub(r'^.*?\bgit\s+push\b', ' ', without_lease)
+    # Tokenize with shlex so a QUOTED value carrying whitespace (`--push-option
+    # 'ci skip'`) collapses to a single token instead of leaking its tail
+    # (`skip`) as a phantom remote/refspec. Fall back to a plain split if the
+    # command has unbalanced quotes shlex can't parse (keep prompting on the
+    # safe side rather than raising).
+    try:
+        tokens = shlex.split(args)
+    except ValueError:
+        return False
+    # Drop value-flags AND the token they consume (`-o ci.skip`,
+    # `--push-option 'ci skip'`, `--repo url`). The `--flag=value` form is one
+    # token already, handled by the bare-flag strip below.
+    pruned: list[str] = []
+    skip_next = False
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _VALUE_FLAGS:
+            skip_next = True  # consume this flag's value token
+            continue
+        pruned.append(tok)
+    # Drop the remaining standalone `--flag` / `--flag=value` / `-f` flag tokens.
+    # A short flag's leading char may be a letter (`--repo`, `-q`) OR a digit —
+    # git push documents numeric short flags `-4`/`-6` (IPv4/IPv6); without the
+    # digit they'd survive and be miscounted as a refspec. A remote/refspec
+    # never starts with a dash, so this only drops flags. Also drop the bare `--`
+    # option terminator: git does not treat it as a refspec (`git push origin --`
+    # is an omitted-refspec push), so it must not count toward the explicit-
+    # destination check below.
+    tokens = [
+        t for t in pruned if t != '--' and not re.match(r'--?[a-z0-9]', t)
+    ]
+    # First surviving token is the remote; a refspec must follow it.
+    if len(tokens) < 2:
+        return False
+    refspecs = tokens[1:]
+    # Reject the `git push <remote> ... tag <name>` shorthand: git documents
+    # `tag <tag>` as sugar for `refs/tags/<tag>:refs/tags/<tag>`, and it may
+    # appear at ANY refspec position (`origin tag v1`, `origin feature tag v1`),
+    # so a leased `--force-with-lease=refs/tags/v1:<old> origin feature tag v1`
+    # force-updates a TAG while the `tag`/`v1` tokens look like ordinary branch
+    # refspecs. The shorthand is the literal `tag` keyword FOLLOWED by a name,
+    # so reject whenever a `tag` token has another token after it (a lone
+    # trailing `tag` is an ordinary branch named "tag", validated below).
+    if any(rs == 'tag' and i + 1 < len(refspecs) for i, rs in enumerate(refspecs)):
+        return False
+    # Reject a leading-`+` refspec (forced update, no lease guarantee).
+    if any(rs.startswith('+') or ':+' in rs for rs in refspecs):
+        return False
+    # Every refspec must name a single ordinary branch under refs/heads, and
+    # NONE of them may target a protected branch. A refspec we can't parse to a
+    # clean branch destination (tag ref, HEAD, `:`, wildcard) fails the push.
+    for rs in refspecs:
+        dst = _refspec_destination(rs)
+        if dst is None:
+            return False
+        if dst in _PROTECTED_BRANCHES:
+            return False
+    # Final backstop: the main/master refspec patterns (catches forms the parse
+    # above might normalize differently). Limit this to the parsed push refspecs
+    # so an unrelated shell prefix/path like `cd main && git push ... feature`
+    # does not defeat the safe feature-branch carve-out.
+    if _DEFAULT_BRANCH_PUSH_RE.search(' '.join(refspecs)):
+        return False
+    return True
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
@@ -832,7 +1119,14 @@ def detect_dangerous_command(command: str) -> tuple:
     # obfuscated/redirected self-kills are still caught while redirect targets
     # with a self keyword are not false positives.
     self_term_view = _build_self_term_scan_view(command_lower)
+    # Branch-aware force-push carve-out: a force-with-lease push to a non-default
+    # branch is safe (mirrors ~/.local/bin/git), so suppress the three blanket
+    # force-push patterns for it. All other patterns (incl. the main/master push
+    # backstop) still apply.
+    skip_force_push = _is_safe_lease_push_to_feature_branch(command_lower)
     for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+        if skip_force_push and description in _FORCE_PUSH_DESCRIPTIONS:
+            continue
         target = self_term_view if description in _SELF_TERM_DESCRIPTIONS else command_lower
         if pattern_re.search(target):
             pattern_key = description

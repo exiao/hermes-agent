@@ -99,7 +99,14 @@ def test_run_slash_create_and_list(kanban_home):
 
 
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
-    target = tmp_path / ".worktrees" / "t6-wire"
+    # Anchor the worktree target inside a real git repo so it clears the
+    # create-time repo-root guard; the target dir itself need not exist yet.
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    target = repo / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()
     out = kc.run_slash(
         f"create 'ship worktree' --workspace worktree:{target_arg} --branch wt/t6-wire"
