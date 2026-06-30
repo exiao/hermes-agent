@@ -2560,28 +2560,6 @@ DEFAULT_CONFIG = {
         # the adapter's send-format id (e.g. Signal group: "group:<base64>").
         # Empty list = feature off (default).
         "default_notify": [],
-        # On-completion reaction. When ``enabled: true``, EVERY task that
-        # completes auto-spawns one decision card parented to it, assigned to
-        # the orchestrator lane (``kanban.orchestrator_profile``, default
-        # ``orchestrator``), and posts a short progress line to ``notify`` (the
-        # "Kanban Master" chat). The orchestrator reads the completion handoff
-        # and ~/.hermes/constitution.md and decides the follow-up (review,
-        # babysit a PR, verify a feature, or nothing) — routing policy lives in
-        # the constitution, not here. The only completion that does NOT trigger
-        # is a decision card this automation itself spawned (marker in body) —
-        # the loop guard. Read fresh each tick — editing this takes effect on
-        # the next tick, no restart. ``enabled: false`` (default) = feature off.
-        "on_complete_review": {
-            "enabled": False,
-            # Where the progress line goes. ``chat_id`` is the adapter's
-            # send-format id (Signal: "group:<base64>"). Leave platform/chat_id
-            # blank to spawn decision cards silently (board only).
-            "notify": {
-                "platform": "",
-                "chat_id": "",
-                "thread_id": "",
-            },
-        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
