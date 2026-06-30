@@ -2429,12 +2429,13 @@ def _derive_babysit_idempotency_key(
     ``kanban_create`` tool, sibling handoffs) dedups against the same PR — not
     just the detector that already sets its own key.
 
-    Extraction precedence (most reliable first), per the patch note:
-      * PR number: first ``#(\\d+)`` in ``title``, else a
-        ``github.com/.../pull/(\\d+)`` url in ``title``/``body``.
-      * Repo slug: a ``github.com/<owner>/<repo>/pull/...`` url in title/body
-        (most authoritative), else the workspace git remote resolved to
-        ``owner/repo``.
+    Extraction precedence (most reliable first):
+      * A ``github.com/<owner>/<repo>/pull/(\\d+)`` url in title/body — pins
+        both the slug and the PR number.
+      * A bare ``<owner>/<repo>#<n>`` reference (the documented babysit anchor
+        form, e.g. ``exiao/hermes-agent#73``) — also pins both pieces.
+      * Otherwise the bare ``#(\\d+)`` in ``title`` for the number, paired with
+        the workspace git remote resolved to ``owner/repo`` for the slug.
 
     Returns the key only when BOTH a slug and a PR number resolve; otherwise
     ``None`` — a wrong key is worse than none (PR numbers collide across repos,
@@ -2444,39 +2445,51 @@ def _derive_babysit_idempotency_key(
     """
     title = title or ""
     body = body or ""
+    haystack = f"{title}\n{body}"
 
-    # PR number + repo slug from a github pull-request URL anywhere in the
-    # title/body (authoritative for both pieces when present).
+    # Source 1 — github pull-request URL anywhere in title/body. Authoritative
+    # for BOTH the slug and the PR number when present.
     url_pr: Optional[int] = None
     url_slug: Optional[str] = None
     um = re.search(
         r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)",
-        f"{title}\n{body}",
+        haystack,
     )
     if um:
         url_slug = um.group(1)
         url_pr = int(um.group(2))
 
-    # PR number: when a pull URL is present it is authoritative for BOTH the
-    # repo slug and the PR number, so use its number — pairing the URL's slug
-    # with a different ``#<n>`` from the title (e.g. an issue ref like
-    # ``Babysit fix #123`` whose body links ``.../pull/70``) would key on the
-    # wrong PR (#123), miss dedup for the real PR (#70), and risk colliding
-    # with an unrelated PR #123 in the same repo. Fall back to the bare
-    # ``#<n>`` in the title (the detector's title convention) only when there
-    # is no pull URL.
-    if url_pr is not None:
+    # Source 2 — a bare ``owner/repo#<n>`` reference (the documented babysit /
+    # re-verify anchor form, e.g. ``exiao/hermes-agent#73``). Also authoritative
+    # for both pieces. A scratch ``kanban_create`` handoff that names the PR this
+    # way has no workspace remote and no pull URL, so without this it would leave
+    # the key unset and insert duplicate babysitter rows. Mirrors the
+    # owner/repo alternative of ``_RESPAWN_GUARD_PR_REF_RE``.
+    ref_slug: Optional[str] = None
+    ref_pr: Optional[int] = None
+    rm = re.search(r"(?<![\w./-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)", haystack)
+    if rm:
+        ref_slug = rm.group(1)
+        ref_pr = int(rm.group(2))
+
+    # Slug + PR number: a slug-bearing source pins BOTH pieces together so we
+    # never pair one source's slug with another source's number (which would key
+    # on the wrong PR and risk a cross-PR collision). Precedence: pull URL, then
+    # the ``owner/repo#<n>`` ref. Otherwise fall back to the bare ``#<n>`` in the
+    # title (the detector's title convention) paired with the workspace git
+    # remote's slug.
+    if url_slug is not None:
+        slug: Optional[str] = url_slug
         pr: Optional[int] = url_pr
+    elif ref_slug is not None:
+        slug = ref_slug
+        pr = ref_pr
     else:
         tm = re.search(r"#(\d+)", title)
         pr = int(tm.group(1)) if tm else None
-    if pr is None:
-        return None
+        slug = _slug_from_git_remote(workspace_path)
 
-    # Repo slug: the pull URL is the most authoritative; otherwise resolve the
-    # workspace git remote.
-    slug = url_slug or _slug_from_git_remote(workspace_path)
-    if not slug:
+    if pr is None or not slug:
         return None
 
     return f"babysit:{slug}#{pr}"

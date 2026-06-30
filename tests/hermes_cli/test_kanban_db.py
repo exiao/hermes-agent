@@ -2713,6 +2713,57 @@ def test_babysit_pull_url_number_wins_over_title_ref():
     assert kb._derive_babysit_idempotency_key("no pr ref", "", None) is None
 
 
+def test_babysit_owner_repo_ref_form_derives_key():
+    """A bare ``owner/repo#<n>`` reference (the documented babysit anchor form,
+    and a scratch ``kanban_create`` handoff's only PR signal) pins both the slug
+    and the PR number — no workspace remote or pull URL needed."""
+    # Title-only ref, no workspace path (scratch handoff).
+    key = kb._derive_babysit_idempotency_key(
+        "exiao/hermes-agent#73: fix(kanban): auto-derive babysit key",
+        None,
+        None,
+    )
+    assert key == "babysit:exiao/hermes-agent#73"
+    # Ref in the body works too.
+    key2 = kb._derive_babysit_idempotency_key(
+        "Re-verify the babysit PR",
+        "anchored to cpe-research/research-agent#801",
+        None,
+    )
+    assert key2 == "babysit:cpe-research/research-agent#801"
+    # A pull URL still wins over a stray owner/repo#n elsewhere.
+    key3 = kb._derive_babysit_idempotency_key(
+        "owner/other#5 mention",
+        "real PR https://github.com/org/repo/pull/70",
+        None,
+    )
+    assert key3 == "babysit:org/repo#70"
+
+
+def test_babysit_scratch_owner_repo_handoff_dedups(kanban_home):
+    """Two scratch pr-babysitter creates that name the PR as ``owner/repo#<n>``
+    (no workspace_path) dedup to one row — the ref form alone keys them."""
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="exiao/hermes-agent#73: fix babysit key",
+            assignee="pr-babysitter",
+        )
+        second = kb.create_task(
+            conn,
+            title="re-check exiao/hermes-agent#73",
+            assignee="pr-babysitter",
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#73"
+
+
 def test_babysit_same_pr_different_repos_no_cross_dedup(kanban_home, tmp_path):
     """The SAME PR number #70 in two DIFFERENT repos creates two distinct
     tasks — PR numbers collide across repos, so a repo-less key must never
