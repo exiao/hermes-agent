@@ -2764,6 +2764,31 @@ def test_babysit_scratch_owner_repo_handoff_dedups(kanban_home):
     assert task.idempotency_key == "babysit:exiao/hermes-agent#73"
 
 
+def test_babysit_slug_case_insensitive_dedups(kanban_home):
+    """Two scratch pr-babysitter creates naming the same PR with different
+    owner/repo casing dedup to one row — GitHub slugs are case-insensitive, so
+    the key lowercases the slug."""
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit NousResearch/hermes-agent#70",
+            assignee="pr-babysitter",
+        )
+        second = kb.create_task(
+            conn,
+            title="re-check nousresearch/hermes-agent#70",
+            assignee="pr-babysitter",
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:nousresearch/hermes-agent#70"
+
+
 def test_babysit_same_pr_different_repos_no_cross_dedup(kanban_home, tmp_path):
     """The SAME PR number #70 in two DIFFERENT repos creates two distinct
     tasks — PR numbers collide across repos, so a repo-less key must never

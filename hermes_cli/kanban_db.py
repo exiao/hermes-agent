@@ -2492,7 +2492,12 @@ def _derive_babysit_idempotency_key(
     if pr is None or not slug:
         return None
 
-    return f"babysit:{slug}#{pr}"
+    # Canonicalize the slug to lowercase: GitHub owner/repo names are
+    # case-insensitive, so ``NousResearch/hermes-agent`` and
+    # ``nousresearch/hermes-agent`` are the same repo and must produce the same
+    # key — otherwise two creators referring to one PR with different casing
+    # would still insert parallel pr-babysitter rows.
+    return f"babysit:{slug.lower()}#{pr}"
 
 
 # Bare placeholder titles that carry no spec on their own. A task whose title is
