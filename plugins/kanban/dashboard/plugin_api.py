@@ -587,9 +587,15 @@ def _windowed_terminal_tasks(
     # Newest terminal-event first; archived_at wins for archived cards so
     # re-archiving a previously done card moves it back into the first window
     # without rewriting its original completion time. NULLs sort last so any
-    # not-yet-stamped terminal rows don't crowd out real recent ones.
+    # not-yet-stamped terminal rows don't crowd out real recent ones. ``id
+    # DESC`` is the final UNIQUE tiebreaker: without it, cards sharing the same
+    # terminal_ts AND created_at (realistic for bulk completions in the same
+    # second) split arbitrarily at the LIMIT boundary, so a boundary card could
+    # appear in one board refresh and vanish in the next. ``id`` is monotonic
+    # and unique, making the window deterministic.
     order = (
-        f"ORDER BY ({terminal_ts} IS NULL), {terminal_ts} DESC, created_at DESC"
+        f"ORDER BY ({terminal_ts} IS NULL), {terminal_ts} DESC, "
+        "created_at DESC, id DESC"
     )
     rows = conn.execute(
         f"SELECT * FROM tasks WHERE {where_sql} {order} LIMIT ?",

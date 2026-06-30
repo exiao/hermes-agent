@@ -2082,7 +2082,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "idx_tasks_terminal_window "
             "ON tasks(status, "
             f"({terminal_ts} IS NULL), "
-            f"{terminal_ts} DESC, created_at DESC)"
+            f"{terminal_ts} DESC, created_at DESC, id DESC)"
         )
         terminal_index_sql = f"CREATE INDEX {terminal_index_body}"
         existing_terminal_index = conn.execute(

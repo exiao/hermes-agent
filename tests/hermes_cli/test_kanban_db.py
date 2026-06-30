@@ -74,7 +74,7 @@ def test_terminal_window_index_matches_board_order(kanban_home):
             "ELSE completed_at END IS NULL), "
             "CASE WHEN status = 'archived' "
             "THEN COALESCE(archived_at, completed_at) "
-            "ELSE completed_at END DESC, created_at DESC "
+            "ELSE completed_at END DESC, created_at DESC, id DESC "
             "LIMIT ?",
             ("done", 50),
         ).fetchall()

@@ -269,6 +269,47 @@ def test_board_caps_done_column_at_default(client):
     assert ids[0] not in returned
 
 
+def test_board_done_window_stable_at_tie_boundary(client):
+    """Cards sharing the SAME completed_at AND created_at must page
+    deterministically at the LIMIT boundary — the window partitions cleanly
+    (no card both shown and dropped, none lost), and two identical loads return
+    the same set. Without a unique final tiebreaker (id) SQLite splits the tie
+    group arbitrarily at LIMIT, so a boundary card could flicker in and out.
+    """
+    ids = _seed_done_tasks(client, 10)
+    # Collapse the whole column onto a single (completed_at, created_at) so the
+    # only thing separating cards is the id tiebreaker.
+    conn = kb.connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET completed_at=5_000_000, created_at=5_000_000 "
+                "WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                ids,
+            )
+    finally:
+        conn.close()
+
+    first = _done_column(client.get("/api/plugins/kanban/board?done_limit=6").json())
+    second = _done_column(client.get("/api/plugins/kanban/board?done_limit=6").json())
+    window_a = [t["id"] for t in first["tasks"]]
+    window_b = [t["id"] for t in second["tasks"]]
+    assert len(window_a) == 6
+    # Deterministic: identical loads return the identical ordered window.
+    assert window_a == window_b
+    assert first["total"] == 10 and first["has_more"] is True
+
+    # The window partitions cleanly against the full expand — the 6 shown plus
+    # the remaining 4 cover every card with no overlap.
+    full = _done_column(
+        client.get("/api/plugins/kanban/board?done_limit=100").json()
+    )
+    full_order = [t["id"] for t in full["tasks"]]
+    assert set(full_order) == set(ids)
+    # The windowed page is exactly the deterministic prefix of the full order.
+    assert full_order[:6] == window_a
+
+
 def test_board_done_limit_expand_returns_older(client):
     """A larger done_limit fetches the older done cards on demand; none are
     permanently unreachable."""
