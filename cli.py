@@ -15335,8 +15335,19 @@ def main(
             task_id=cli.session_id,
         )
         if missing_skills:
+            # Soft-fail: a force-loaded skill that can't be resolved is a
+            # degraded run, not an unusable invocation. Warn and continue
+            # starting the agent WITHOUT it rather than exiting 1 — an agent
+            # that starts can still do the work or block intelligently, whereas
+            # an exit-1 just thrashes the dispatcher into burning its whole
+            # retry budget on the identical wall (see kanban t_d85833c1).
             missing_display = ", ".join(missing_skills)
-            raise ValueError(f"Unknown skill(s): {missing_display}")
+            print(
+                f"\033[33m⚠ Skipping unknown force-loaded skill(s): "
+                f"{missing_display} — continuing without them.\033[0m",
+                file=sys.stderr,
+                flush=True,
+            )
         if skills_prompt:
             cli.system_prompt = "\n\n".join(
                 part for part in (cli.system_prompt, skills_prompt) if part

@@ -92,18 +92,38 @@ def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     assert cli_obj.preloaded_skills == ["hermes-agent-dev", "github-auth"]
 
 
-def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
+def test_main_warns_for_unknown_preloaded_skill_does_not_raise(monkeypatch, capsys):
+    """A missing force-loaded skill must NOT exit-1/raise — it degrades the run.
+
+    Soft-fail: warn to stderr and keep starting the agent without the skill, so
+    a dispatched worker can still do the work or block intelligently rather than
+    thrashing the dispatcher with an identical exit-1 on every retry (kanban
+    t_d85833c1 / observed t_b04f835d ads-optimizer nano-banana-pro).
+    """
     import cli as cli_mod
 
-    monkeypatch.setattr(cli_mod, "HermesCLI", lambda **kwargs: _DummyCLI(**kwargs))
+    created = {}
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
         lambda skills, task_id=None: ("", [], ["missing-skill"]),
     )
 
-    with pytest.raises(ValueError, match=r"Unknown skill\(s\): missing-skill"):
+    # list_tools=True short-circuits before the agent actually runs (SystemExit
+    # from show_tools path), proving we got PAST the skill resolution without
+    # raising ValueError.
+    with pytest.raises(SystemExit):
         cli_mod.main(skills="missing-skill", list_tools=True)
+
+    err = capsys.readouterr().err
+    assert "missing-skill" in err
+    assert "Skipping unknown force-loaded skill" in err
 
 
 def test_show_banner_does_not_print_skills():
