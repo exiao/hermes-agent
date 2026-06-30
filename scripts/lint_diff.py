@@ -82,7 +82,7 @@ def _normalize_ty(entries: list[dict]) -> list[dict]:
     return out
 
 
-_TY_UNION_OMISSION_RE = re.compile(r"\.\.\. omitted \d+ union elements")
+_TY_UNION_OMISSION_RE = re.compile(r"\.\.\. omitted \d+ union elements?")
 
 
 def _stable_message(message: str) -> str:

@@ -39,3 +39,32 @@ def test_ty_omitted_union_count_is_not_part_of_diff_identity():
     assert new == []
     assert fixed == []
     assert unchanged == head
+
+
+def test_ty_omitted_union_count_normalizes_singular_and_plural():
+    """A 1<->2 count flip crosses ty's singular/plural boundary ("1 union
+    element" vs "2 union elements"); both must normalize to the same key so the
+    diagnostic is not spuriously reported as fixed+new."""
+    lint_diff = _load_lint_diff_module()
+    base = [
+        {
+            "path": "hermes_cli/config.py",
+            "rule": "unresolved-attribute",
+            "line": 10,
+            "message": "Attribute `x` in union `Unknown | ... omitted 1 union element`",
+        }
+    ]
+    head = [
+        {
+            "path": "hermes_cli/config.py",
+            "rule": "unresolved-attribute",
+            "line": 12,
+            "message": "Attribute `x` in union `Unknown | ... omitted 2 union elements`",
+        }
+    ]
+
+    new, fixed, unchanged = lint_diff._diff(base, head)
+
+    assert new == []
+    assert fixed == []
+    assert unchanged == head
