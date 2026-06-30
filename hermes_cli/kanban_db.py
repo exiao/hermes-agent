@@ -2481,8 +2481,14 @@ def _derive_babysit_idempotency_key(
     # for BOTH the slug and the PR number when present.
     url_pr: Optional[int] = None
     url_slug: Optional[str] = None
+    # Host-anchored so a look-alike host (``notgithub.com``, ``evilgithub.com``)
+    # can't pose as ``github.com`` and cross-dedup a non-GitHub repo against a
+    # real one. Strip a trailing ``.git`` from the captured slug so a
+    # ``github.com/Org/Repo.git/pull/70`` URL canonicalizes to the SAME slug the
+    # remote-derived path produces (``_slug_from_git_remote`` also strips
+    # ``.git``) — otherwise the URL and remote keys would diverge for one repo.
     um = re.search(
-        r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)",
+        r"(?:^|[/@.\s])github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/pull/(\d+)",
         haystack,
     )
     if um:

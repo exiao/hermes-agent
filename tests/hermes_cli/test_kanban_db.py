@@ -2739,6 +2739,41 @@ def test_babysit_pull_url_number_wins_over_title_ref():
     assert kb._derive_babysit_idempotency_key("no pr ref", "", None) is None
 
 
+def test_babysit_pull_url_host_anchored_and_git_suffix_stripped():
+    """The pull-URL slug source is GitHub-host-anchored and ``.git``-stripped so
+    it (a) can't be spoofed by a look-alike host and (b) canonicalizes to the
+    same slug the remote-derived path produces for one repo.
+    """
+    # Look-alike host must NOT match — no other PR signal, so no key derives.
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "see https://notgithub.com/org/repo/pull/70", None
+        )
+        is None
+    )
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "see https://evilgithub.com/org/repo/pull/70", None
+        )
+        is None
+    )
+    # A real github.com URL still works.
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "https://github.com/org/repo/pull/70", None
+        )
+        == "babysit:org/repo#70"
+    )
+    # A ``.git``-bearing URL canonicalizes to the SAME slug as the bare form, so
+    # it dedups against the remote-derived key for the same repo.
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "https://github.com/Org/Repo.git/pull/70", None
+        )
+        == "babysit:org/repo#70"
+    )
+
+
 def test_babysit_owner_repo_ref_form_derives_key():
     """A bare ``owner/repo#<n>`` reference (the documented babysit anchor form,
     and a scratch ``kanban_create`` handoff's only PR signal) pins both the slug
