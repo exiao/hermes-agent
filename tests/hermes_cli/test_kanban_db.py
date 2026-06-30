@@ -2508,6 +2508,124 @@ def test_worktree_explicit_path_succeeds_control(kanban_home, tmp_path):
     assert task.workspace_path == str(repo)
 
 
+# ---------------------------------------------------------------------------
+# Auto-derived babysit idempotency key (stop duplicate pr-babysitter tickets)
+# ---------------------------------------------------------------------------
+
+def _set_origin_remote(repo: Path, slug: str) -> None:
+    """Point ``repo``'s origin remote at a github ``owner/repo`` slug so
+    ``_slug_from_git_remote`` can resolve it."""
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin",
+         f"https://github.com/{slug}.git"],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_babysit_same_pr_same_repo_dedups(kanban_home, tmp_path):
+    """Two pr-babysitter creates for the same PR #70 in the same repo with NO
+    explicit key dedup to ONE row — the second returns the first task's id.
+
+    Fails before the auto-derive change (two distinct rows).
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check the flaky CI",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+    assert rows == 1
+    with kb.connect() as conn:
+        task = kb.get_task(conn, first)
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_same_pr_different_repos_no_cross_dedup(kanban_home, tmp_path):
+    """The SAME PR number #70 in two DIFFERENT repos creates two distinct
+    tasks — PR numbers collide across repos, so a repo-less key must never
+    cross-dedup."""
+    repo_a = tmp_path / "hermes-agent"
+    _init_git_repo(repo_a)
+    _set_origin_remote(repo_a, "exiao/hermes-agent")
+    repo_b = tmp_path / "research-agent"
+    _init_git_repo(repo_b)
+    _set_origin_remote(repo_b, "cpe-research/research-agent")
+    with kb.connect() as conn:
+        a = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo_a),
+        )
+        b = kb.create_task(
+            conn,
+            title="Babysit research-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo_b),
+        )
+        assert a != b
+        ta = kb.get_task(conn, a)
+        tb = kb.get_task(conn, b)
+    assert ta is not None and tb is not None
+    assert ta.idempotency_key == "babysit:exiao/hermes-agent#70"
+    assert tb.idempotency_key == "babysit:cpe-research/research-agent#70"
+
+
+def test_babysit_explicit_key_respected_unchanged(kanban_home, tmp_path):
+    """An explicit idempotency_key passed by the caller (e.g. the detector
+    cron) is stored verbatim and the auto-derive does NOT override it."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            idempotency_key="babysit:explicit/override#999",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.idempotency_key == "babysit:explicit/override#999"
+
+
+def test_babysit_unresolvable_leaves_key_none(kanban_home, tmp_path):
+    """A pr-babysitter task whose title/body/workspace yield no (slug, pr)
+    pair leaves the key None and still creates the task (no regression)."""
+    # No PR number in the title and no resolvable repo slug (scratch workspace,
+    # no git remote) → key cannot be derived.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Babysit something with no PR reference",
+            assignee="pr-babysitter",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.idempotency_key is None
+
+
 def test_worktree_explicit_non_repo_path_raises_at_create(kanban_home, tmp_path, monkeypatch):
     """Fail-fast (t_f19db0e0): a ``worktree`` task whose explicit path is a real
     directory that is NOT a git repo (e.g. an umbrella dir like

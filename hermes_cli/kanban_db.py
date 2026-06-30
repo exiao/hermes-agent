@@ -2385,6 +2385,83 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _slug_from_git_remote(workspace_path: Optional[str]) -> Optional[str]:
+    """Resolve a checkout/worktree path to its ``owner/repo`` GitHub slug via the
+    git ``origin`` remote. Returns ``None`` when the path is empty, not a git
+    repo, or the remote URL doesn't parse. Mirrors ``_slug_from_worktree`` in
+    ``~/.hermes/scripts/babysit-pr-detector.py``.
+    """
+    if not workspace_path:
+        return None
+    try:
+        p = subprocess.run(
+            ["git", "-C", workspace_path, "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if p.returncode != 0:
+        return None
+    m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$", p.stdout.strip())
+    return m.group(1) if m else None
+
+
+def _derive_babysit_idempotency_key(
+    title: Optional[str],
+    body: Optional[str],
+    workspace_path: Optional[str],
+) -> Optional[str]:
+    """Derive a canonical ``babysit:<owner>/<repo>#<pr>`` idempotency key for a
+    pr-babysitter task, so EVERY creation path (the detector cron, the
+    ``kanban_create`` tool, sibling handoffs) dedups against the same PR — not
+    just the detector that already sets its own key.
+
+    Extraction precedence (most reliable first), per the patch note:
+      * PR number: first ``#(\\d+)`` in ``title``, else a
+        ``github.com/.../pull/(\\d+)`` url in ``title``/``body``.
+      * Repo slug: a ``github.com/<owner>/<repo>/pull/...`` url in title/body
+        (most authoritative), else the workspace git remote resolved to
+        ``owner/repo``.
+
+    Returns the key only when BOTH a slug and a PR number resolve; otherwise
+    ``None`` — a wrong key is worse than none (PR numbers collide across repos,
+    so a repo-less key would wrongly cross-dedup #70 in one repo against #70 in
+    another). When this returns ``None`` the caller leaves the key unset and
+    behavior is identical to today (no dedup, task still creates).
+    """
+    title = title or ""
+    body = body or ""
+
+    # PR number + repo slug from a github pull-request URL anywhere in the
+    # title/body (authoritative for both pieces when present).
+    url_pr: Optional[int] = None
+    url_slug: Optional[str] = None
+    um = re.search(
+        r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)",
+        f"{title}\n{body}",
+    )
+    if um:
+        url_slug = um.group(1)
+        url_pr = int(um.group(2))
+
+    # PR number: prefer the bare ``#<n>`` in the title (the detector's title
+    # convention), fall back to the pull-URL number.
+    tm = re.search(r"#(\d+)", title)
+    pr = int(tm.group(1)) if tm else url_pr
+    if pr is None:
+        return None
+
+    # Repo slug: the pull URL is the most authoritative; otherwise resolve the
+    # workspace git remote.
+    slug = url_slug or _slug_from_git_remote(workspace_path)
+    if not slug:
+        return None
+
+    return f"babysit:{slug}#{pr}"
+
+
 # Bare placeholder titles that carry no spec on their own. A task whose title is
 # one of these (or the literal "<assignee> task" / the assignee name itself) AND
 # whose body is empty has no work in it — it must never reach a worker lane in
@@ -2620,6 +2697,16 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+
+    # Auto-derive a canonical babysit idempotency key so EVERY pr-babysitter
+    # creation path dedups against the same PR, not just the detector cron that
+    # sets its own key. Done AFTER _canonical_assignee (so a pr-babysitter alias
+    # is still caught) and only when the caller passed no explicit key — when the
+    # key can't be derived it stays None and behavior is identical to today.
+    if idempotency_key is None and assignee == "pr-babysitter":
+        idempotency_key = _derive_babysit_idempotency_key(
+            title, body, workspace_path
+        )
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
