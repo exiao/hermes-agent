@@ -2827,6 +2827,32 @@ def test_babysit_pr_number_in_body_with_workspace_slug_derives_key(tmp_path):
     assert none_key is None
 
 
+def test_babysit_title_workspace_pr_outranks_body_shorthand_ref(tmp_path):
+    """A card with a real title (``Babysit PR #70``) + a workspace remote keys
+    on ITS OWN PR (#70 in the workspace repo), even when the body mentions an
+    unrelated ``owner/repo#5`` shorthand. The body ref must not override the
+    card's title/workspace signal, or retries for the real PR would not dedup
+    and could collide with an unrelated babysitter card.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit PR #70",
+        "context: related to other/project#5 from last week",
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+    # A body ``owner/repo#<n>`` ref is still honored as the LAST resort when the
+    # card carries no title/workspace PR signal of its own.
+    fallback = kb._derive_babysit_idempotency_key(
+        "Re-verify the babysit task",
+        "anchored to cpe-research/research-agent#801",
+        None,
+    )
+    assert fallback == "babysit:cpe-research/research-agent#801"
+
+
 def test_babysit_scratch_owner_repo_handoff_dedups(kanban_home):
     """Two scratch pr-babysitter creates that name the PR as ``owner/repo#<n>``
     (no workspace_path) dedup to one row — the ref form alone keys them."""

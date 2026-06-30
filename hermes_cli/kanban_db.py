@@ -2496,47 +2496,47 @@ def _derive_babysit_idempotency_key(
         url_pr = int(um.group(2))
 
     # Source 2 — a bare ``owner/repo#<n>`` reference (the documented babysit /
-    # re-verify anchor form, e.g. ``exiao/hermes-agent#73``). Also authoritative
-    # for both pieces. A scratch ``kanban_create`` handoff that names the PR this
-    # way has no workspace remote and no pull URL, so without this it would leave
-    # the key unset and insert duplicate babysitter rows. Mirrors the
-    # owner/repo alternative of ``_RESPAWN_GUARD_PR_REF_RE``.
-    ref_slug: Optional[str] = None
-    ref_pr: Optional[int] = None
-    rm = re.search(r"(?<![\w./-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)", haystack)
-    if rm:
-        ref_slug = rm.group(1)
-        ref_pr = int(rm.group(2))
+    # re-verify anchor form, e.g. ``exiao/hermes-agent#73``). Authoritative for
+    # both pieces, but scoped to title vs body separately: a TITLE ref names the
+    # card's own subject, while a ref buried in the BODY may be a secondary
+    # mention (e.g. "related to owner/repo#5") that must NOT override the card's
+    # actual title/workspace PR signal. Mirrors the owner/repo alternative of
+    # ``_RESPAWN_GUARD_PR_REF_RE``.
+    _ref_re = r"(?<![\w./-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)"
+    title_ref = re.search(_ref_re, title)
+    body_ref = re.search(_ref_re, body)
 
-    # Slug + PR number: a slug-bearing source pins BOTH pieces together so we
-    # never pair one source's slug with another source's number (which would key
-    # on the wrong PR and risk a cross-PR collision). Precedence: pull URL, then
-    # the ``owner/repo#<n>`` ref. Otherwise fall back to the title's PR number
-    # paired with the workspace git remote's slug.
+    # Resolution precedence — first complete (slug, pr) wins. A slug-bearing
+    # source pins BOTH pieces together so we never pair one source's slug with
+    # another's number (which would key on the wrong PR and risk a cross-PR
+    # collision). Ordered so the card's OWN subject (title + workspace) always
+    # outranks a secondary ``owner/repo#<n>`` shorthand sitting in the body:
+    #   1. a github pull URL anywhere (fully unambiguous),
+    #   2. a TITLE ``owner/repo#<n>`` ref (the card's explicit anchor),
+    #   3. an explicit ``PR #<n>`` in the TITLE + the workspace remote slug,
+    #   4. an explicit ``PR #<n>`` in the BODY + the workspace slug (the
+    #      short-title ``Babysit PR`` / anchor-in-body handoff shape),
+    #   5. a bare ``#<n>`` in the TITLE + the workspace slug,
+    #   6. a BODY ``owner/repo#<n>`` shorthand (last — only when nothing above
+    #      identified the card's own PR).
+    slug: Optional[str] = None
+    pr: Optional[int] = None
+    workspace_slug = _slug_from_git_remote(workspace_path)
+    title_pr = re.search(r"\bPR\s*#?(\d+)", title, re.IGNORECASE)
+    body_pr = re.search(r"\bPR\s*#?(\d+)", body, re.IGNORECASE)
+    title_bare = re.search(r"#(\d+)", title)
     if url_slug is not None:
-        slug: Optional[str] = url_slug
-        pr: Optional[int] = url_pr
-    elif ref_slug is not None:
-        slug = ref_slug
-        pr = ref_pr
-    else:
-        # Prefer an explicit ``PR #<n>`` mention (the detector's title
-        # convention) over the first bare ``#<n>``, so a title that names another
-        # ref first — e.g. ``Babysit issue #123 for PR #70`` — keys on the PR
-        # (#70), not the leading issue ref (#123). Search the full title+body
-        # haystack for the explicit ``PR #<n>`` form: an orchestrator handoff
-        # often carries a short title (``Babysit PR``) with the anchor in the
-        # body (``Please watch PR #70``), and missing it leaves the key unset so
-        # repeated creates insert duplicate rows. The generic bare ``#<n>``
-        # fallback stays title-only — a bare ``#<n>`` anywhere in free-form body
-        # prose is too likely to be an unrelated reference to key on.
-        pm = re.search(r"\bPR\s*#?(\d+)", haystack, re.IGNORECASE)
-        if pm:
-            pr = int(pm.group(1))
-        else:
-            tm = re.search(r"#(\d+)", title)
-            pr = int(tm.group(1)) if tm else None
-        slug = _slug_from_git_remote(workspace_path)
+        slug, pr = url_slug, url_pr
+    elif title_ref is not None:
+        slug, pr = title_ref.group(1), int(title_ref.group(2))
+    elif title_pr is not None and workspace_slug:
+        slug, pr = workspace_slug, int(title_pr.group(1))
+    elif body_pr is not None and workspace_slug:
+        slug, pr = workspace_slug, int(body_pr.group(1))
+    elif title_bare is not None and workspace_slug:
+        slug, pr = workspace_slug, int(title_bare.group(1))
+    elif body_ref is not None:
+        slug, pr = body_ref.group(1), int(body_ref.group(2))
 
     if pr is None or not slug:
         return None
