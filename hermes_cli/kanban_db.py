@@ -2475,9 +2475,8 @@ def _derive_babysit_idempotency_key(
     # Slug + PR number: a slug-bearing source pins BOTH pieces together so we
     # never pair one source's slug with another source's number (which would key
     # on the wrong PR and risk a cross-PR collision). Precedence: pull URL, then
-    # the ``owner/repo#<n>`` ref. Otherwise fall back to the bare ``#<n>`` in the
-    # title (the detector's title convention) paired with the workspace git
-    # remote's slug.
+    # the ``owner/repo#<n>`` ref. Otherwise fall back to the title's PR number
+    # paired with the workspace git remote's slug.
     if url_slug is not None:
         slug: Optional[str] = url_slug
         pr: Optional[int] = url_pr
@@ -2485,19 +2484,48 @@ def _derive_babysit_idempotency_key(
         slug = ref_slug
         pr = ref_pr
     else:
-        tm = re.search(r"#(\d+)", title)
-        pr = int(tm.group(1)) if tm else None
+        # Prefer an explicit ``PR #<n>`` mention (the detector's title
+        # convention) over the first bare ``#<n>``, so a title that names another
+        # ref first — e.g. ``Babysit issue #123 for PR #70`` — keys on the PR
+        # (#70), not the leading issue ref (#123).
+        pm = re.search(r"\bPR\s*#?(\d+)", title, re.IGNORECASE)
+        if pm:
+            pr = int(pm.group(1))
+        else:
+            tm = re.search(r"#(\d+)", title)
+            pr = int(tm.group(1)) if tm else None
         slug = _slug_from_git_remote(workspace_path)
 
     if pr is None or not slug:
         return None
 
-    # Canonicalize the slug to lowercase: GitHub owner/repo names are
-    # case-insensitive, so ``NousResearch/hermes-agent`` and
-    # ``nousresearch/hermes-agent`` are the same repo and must produce the same
-    # key — otherwise two creators referring to one PR with different casing
-    # would still insert parallel pr-babysitter rows.
+    return _canonical_babysit_key(slug, pr)
+
+
+def _canonical_babysit_key(slug: str, pr: int) -> str:
+    """Build a canonical ``babysit:<owner>/<repo>#<pr>`` key with the slug
+    lowercased. GitHub owner/repo names are case-insensitive, so
+    ``NousResearch/hermes-agent`` and ``nousresearch/hermes-agent`` must yield
+    the same key for the same PR.
+    """
     return f"babysit:{slug.lower()}#{pr}"
+
+
+def _canonicalize_babysit_key(key: Optional[str]) -> Optional[str]:
+    """Normalize a caller-provided ``babysit:<owner>/<repo>#<n>`` key so an
+    explicit key (e.g. from the detector, built from a mixed-case git remote)
+    canonicalizes to the SAME value the auto-derivation produces. Without this a
+    detector row keyed ``babysit:NousResearch/hermes-agent#70`` would not match a
+    tool-derived ``babysit:nousresearch/hermes-agent#70`` for the same PR, and
+    the two rows would coexist. Non-babysit keys (and unparseable ones) pass
+    through verbatim.
+    """
+    if not key:
+        return key
+    m = re.fullmatch(r"babysit:([^/]+/[^#]+)#(\d+)", key)
+    if not m:
+        return key
+    return _canonical_babysit_key(m.group(1), int(m.group(2)))
 
 
 # Bare placeholder titles that carry no spec on their own. A task whose title is
@@ -2793,6 +2821,11 @@ def create_task(
         idempotency_key = _derive_babysit_idempotency_key(
             title, body, workspace_path or project_repo
         )
+    # Canonicalize a ``babysit:<owner>/<repo>#<n>`` key — explicit (e.g. the
+    # detector's, built from a possibly mixed-case git remote) or derived — so a
+    # case-only slug difference can't split one PR across two rows. Idempotent on
+    # the already-canonical derived key; a no-op on non-babysit keys.
+    idempotency_key = _canonicalize_babysit_key(idempotency_key)
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast

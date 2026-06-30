@@ -2789,6 +2789,68 @@ def test_babysit_slug_case_insensitive_dedups(kanban_home):
     assert task.idempotency_key == "babysit:nousresearch/hermes-agent#70"
 
 
+def test_babysit_explicit_mixed_case_key_canonicalized():
+    """An explicit ``babysit:<Owner>/<Repo>#<n>`` key (e.g. the detector's,
+    built from a mixed-case git remote) is canonicalized to a lowercase slug so
+    it matches a later auto-derived key for the same PR."""
+    assert (
+        kb._canonicalize_babysit_key("babysit:NousResearch/hermes-agent#70")
+        == "babysit:nousresearch/hermes-agent#70"
+    )
+    # Non-babysit keys and unparseable values pass through verbatim.
+    assert kb._canonicalize_babysit_key("custom:thing#1") == "custom:thing#1"
+    assert kb._canonicalize_babysit_key("babysit:noslug#1") == "babysit:noslug#1"
+    assert kb._canonicalize_babysit_key(None) is None
+
+
+def test_babysit_explicit_and_derived_key_dedup_across_case(kanban_home, tmp_path):
+    """A detector row keyed with an explicit mixed-case slug and a later
+    tool-derived create for the same PR (lowercased) dedup to one row."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            idempotency_key="babysit:Exiao/Hermes-Agent#70",
+        )
+        # Auto-derived from the git remote → lowercase exiao/hermes-agent#70.
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_prefers_pr_ref_over_leading_issue_ref(tmp_path):
+    """When a no-URL title names another ref before the PR (e.g. ``Babysit issue
+    #123 for PR #70``), the key uses the ``PR #<n>`` number, not the leading
+    bare ``#123``."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit issue #123 for PR #70",
+        None,
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+
+
 def test_babysit_same_pr_different_repos_no_cross_dedup(kanban_home, tmp_path):
     """The SAME PR number #70 in two DIFFERENT repos creates two distinct
     tasks — PR numbers collide across repos, so a repo-less key must never
