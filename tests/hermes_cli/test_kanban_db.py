@@ -2610,6 +2610,45 @@ def test_slug_from_git_remote_skips_missing_path(tmp_path):
     assert kb._slug_from_git_remote("") is None
 
 
+def test_babysit_blank_idempotency_key_still_dedups(kanban_home, tmp_path):
+    """A caller that passes ``idempotency_key=""`` (blank/whitespace) for a
+    pr-babysitter task must NOT bypass the auto-derive + dedup: the blank key is
+    normalized to None, the key is derived, and two creates for the same PR
+    collapse to one row.
+
+    Fails before normalization (blank key skips derive, falsy key skips dedup
+    lookup → 2 rows).
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            idempotency_key="   ",
+        )
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            idempotency_key="",
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
 def test_babysit_pull_url_number_wins_over_title_ref():
     """When a pull URL is present, its PR number is authoritative for the key —
     a stray ``#<n>`` (e.g. an issue ref) in the title must NOT override it and

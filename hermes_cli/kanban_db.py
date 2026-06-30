@@ -2619,6 +2619,16 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    # Normalize a blank/whitespace idempotency_key to None. A JSON/tool caller
+    # that sends ``idempotency_key: ""`` would otherwise slip past the
+    # ``is None`` guard on the babysit auto-derivation (skipping it) while the
+    # later ``if idempotency_key:`` dedup lookup treats the empty string as no
+    # key — so two creates for the same PR insert separate un-deduped rows. A
+    # blank key carries no usable value, so collapse it to None up front and let
+    # the auto-derivation fill it in.
+    if idempotency_key is not None and not str(idempotency_key).strip():
+        idempotency_key = None
+
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
     # can be named deterministically (project slug + task id) instead of the
