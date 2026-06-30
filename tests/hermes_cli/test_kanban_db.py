@@ -2792,13 +2792,22 @@ def test_babysit_owner_repo_ref_form_derives_key():
         None,
     )
     assert key2 == "babysit:cpe-research/research-agent#801"
-    # A pull URL still wins over a stray owner/repo#n elsewhere.
+    # A TITLE owner/repo#n anchor (the card's own subject) outranks a pull URL
+    # that sits only in the BODY — a body link is a secondary/related mention
+    # and must not override the card's own PR (else retries wouldn't dedup).
     key3 = kb._derive_babysit_idempotency_key(
         "owner/other#5 mention",
+        "related PR https://github.com/org/repo/pull/70",
+        None,
+    )
+    assert key3 == "babysit:owner/other#5"
+    # With NO title anchor, a body pull URL is honored.
+    key4 = kb._derive_babysit_idempotency_key(
+        "Babysit the PR",
         "real PR https://github.com/org/repo/pull/70",
         None,
     )
-    assert key3 == "babysit:org/repo#70"
+    assert key4 == "babysit:org/repo#70"
 
 
 def test_babysit_pr_number_in_body_with_workspace_slug_derives_key(tmp_path):
@@ -2851,6 +2860,32 @@ def test_babysit_title_workspace_pr_outranks_body_shorthand_ref(tmp_path):
         None,
     )
     assert fallback == "babysit:cpe-research/research-agent#801"
+
+
+def test_babysit_title_pr_anchor_outranks_body_pull_url(tmp_path):
+    """A card whose TITLE names its own PR (``Babysit PR #70`` + workspace
+    remote, or ``owner/repo#70`` in the title) keys on that PR even when the
+    BODY contains a github pull URL for a related/different PR. A body link is a
+    secondary mention and must not override the card's own subject, or retries
+    for the real PR won't dedup and could return an unrelated existing task.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    # Title PR #70 + workspace slug, body links a DIFFERENT repo's PR.
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit PR #70",
+        "see also https://github.com/other/project/pull/5 for context",
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+    # Title owner/repo#70 anchor, body links a different PR.
+    key2 = kb._derive_babysit_idempotency_key(
+        "Babysit exiao/hermes-agent#70",
+        "related: https://github.com/other/project/pull/5",
+        None,
+    )
+    assert key2 == "babysit:exiao/hermes-agent#70"
 
 
 def test_babysit_scratch_owner_repo_handoff_dedups(kanban_home):

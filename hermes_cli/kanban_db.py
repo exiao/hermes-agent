@@ -2475,66 +2475,56 @@ def _derive_babysit_idempotency_key(
     """
     title = title or ""
     body = body or ""
-    haystack = f"{title}\n{body}"
 
-    # Source 1 — github pull-request URL anywhere in title/body. Authoritative
-    # for BOTH the slug and the PR number when present.
-    url_pr: Optional[int] = None
-    url_slug: Optional[str] = None
-    # Host-anchored so a look-alike host (``notgithub.com``, ``evilgithub.com``)
-    # can't pose as ``github.com`` and cross-dedup a non-GitHub repo against a
-    # real one. Strip a trailing ``.git`` from the captured slug so a
-    # ``github.com/Org/Repo.git/pull/70`` URL canonicalizes to the SAME slug the
-    # remote-derived path produces (``_slug_from_git_remote`` also strips
-    # ``.git``) — otherwise the URL and remote keys would diverge for one repo.
-    um = re.search(
-        r"(?:^|[/@.\s])github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/pull/(\d+)",
-        haystack,
-    )
-    if um:
-        url_slug = um.group(1)
-        url_pr = int(um.group(2))
-
-    # Source 2 — a bare ``owner/repo#<n>`` reference (the documented babysit /
-    # re-verify anchor form, e.g. ``exiao/hermes-agent#73``). Authoritative for
-    # both pieces, but scoped to title vs body separately: a TITLE ref names the
-    # card's own subject, while a ref buried in the BODY may be a secondary
-    # mention (e.g. "related to owner/repo#5") that must NOT override the card's
-    # actual title/workspace PR signal. Mirrors the owner/repo alternative of
-    # ``_RESPAWN_GUARD_PR_REF_RE``.
+    # Each source is matched against title and body SEPARATELY. The card's own
+    # subject lives in the TITLE (plus its workspace remote); anything in the
+    # BODY may be a secondary/related mention ("see github.com/o/r/pull/5",
+    # "related to o/r#5") that must NOT override the card's own PR, or retries
+    # for the real PR won't dedup and could collide with an unrelated card.
+    #
+    # Host-anchored so a look-alike host (``notgithub.com``) can't pose as
+    # ``github.com``; ``.git`` stripped so a ``Org/Repo.git/pull/70`` URL
+    # canonicalizes to the SAME slug ``_slug_from_git_remote`` produces.
+    _url_re = r"(?:^|[/@.\s])github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/pull/(\d+)"
+    # A bare ``owner/repo#<n>`` reference (the documented babysit anchor form,
+    # e.g. ``exiao/hermes-agent#73``). Mirrors ``_RESPAWN_GUARD_PR_REF_RE``.
     _ref_re = r"(?<![\w./-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)"
+    _pr_re = r"\bPR\s*#?(\d+)"
+
+    title_url = re.search(_url_re, title)
+    body_url = re.search(_url_re, body)
     title_ref = re.search(_ref_re, title)
     body_ref = re.search(_ref_re, body)
+    title_pr = re.search(_pr_re, title, re.IGNORECASE)
+    body_pr = re.search(_pr_re, body, re.IGNORECASE)
+    title_bare = re.search(r"#(\d+)", title)
+    workspace_slug = _slug_from_git_remote(workspace_path)
 
     # Resolution precedence — first complete (slug, pr) wins. A slug-bearing
     # source pins BOTH pieces together so we never pair one source's slug with
-    # another's number (which would key on the wrong PR and risk a cross-PR
-    # collision). Ordered so the card's OWN subject (title + workspace) always
-    # outranks a secondary ``owner/repo#<n>`` shorthand sitting in the body:
-    #   1. a github pull URL anywhere (fully unambiguous),
-    #   2. a TITLE ``owner/repo#<n>`` ref (the card's explicit anchor),
+    # another's number (keying on the wrong PR / a cross-PR collision). Every
+    # TITLE source (the card's own subject) outranks every BODY source:
+    #   1. a github pull URL in the TITLE (fully unambiguous, card's own),
+    #   2. a TITLE ``owner/repo#<n>`` ref,
     #   3. an explicit ``PR #<n>`` in the TITLE + the workspace remote slug,
-    #   4. an explicit ``PR #<n>`` in the BODY + the workspace slug (the
-    #      short-title ``Babysit PR`` / anchor-in-body handoff shape),
-    #   5. a bare ``#<n>`` in the TITLE + the workspace slug,
-    #   6. a BODY ``owner/repo#<n>`` shorthand (last — only when nothing above
-    #      identified the card's own PR).
+    #   4. a bare ``#<n>`` in the TITLE + the workspace slug,
+    #   5. a github pull URL in the BODY (the anchor-in-body handoff shape),
+    #   6. an explicit ``PR #<n>`` in the BODY + the workspace slug,
+    #   7. a BODY ``owner/repo#<n>`` shorthand (last resort).
     slug: Optional[str] = None
     pr: Optional[int] = None
-    workspace_slug = _slug_from_git_remote(workspace_path)
-    title_pr = re.search(r"\bPR\s*#?(\d+)", title, re.IGNORECASE)
-    body_pr = re.search(r"\bPR\s*#?(\d+)", body, re.IGNORECASE)
-    title_bare = re.search(r"#(\d+)", title)
-    if url_slug is not None:
-        slug, pr = url_slug, url_pr
+    if title_url is not None:
+        slug, pr = title_url.group(1), int(title_url.group(2))
     elif title_ref is not None:
         slug, pr = title_ref.group(1), int(title_ref.group(2))
     elif title_pr is not None and workspace_slug:
         slug, pr = workspace_slug, int(title_pr.group(1))
-    elif body_pr is not None and workspace_slug:
-        slug, pr = workspace_slug, int(body_pr.group(1))
     elif title_bare is not None and workspace_slug:
         slug, pr = workspace_slug, int(title_bare.group(1))
+    elif body_url is not None:
+        slug, pr = body_url.group(1), int(body_url.group(2))
+    elif body_pr is not None and workspace_slug:
+        slug, pr = workspace_slug, int(body_pr.group(1))
     elif body_ref is not None:
         slug, pr = body_ref.group(1), int(body_ref.group(2))
 
