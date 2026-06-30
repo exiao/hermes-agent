@@ -2140,6 +2140,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    # One-shot canonicalization of legacy babysit idempotency keys. Rows
+    # created before ``create_task`` started lowercasing the slug can carry a
+    # mixed-case key (e.g. ``babysit:NousResearch/hermes-agent#70``), which the
+    # byte-for-byte ``WHERE idempotency_key = ?`` dedup lookup would never match
+    # against a freshly-derived ``babysit:nousresearch/hermes-agent#70`` — so a
+    # second create for the same PR would insert a duplicate babysitter row.
+    # Normalize the stored keys in-place to the canonical form so both sides of
+    # the comparison agree. Idempotent: after this pass no row carries a
+    # non-canonical babysit key, so the UPDATE matches nothing on re-run.
+    for row in conn.execute(
+        "SELECT id, idempotency_key FROM tasks "
+        "WHERE idempotency_key LIKE 'babysit:%'"
+    ).fetchall():
+        canonical = _canonicalize_babysit_key(row["idempotency_key"])
+        if canonical and canonical != row["idempotency_key"]:
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+                (canonical, row["id"]),
+            )
+
     _rebuild_drifted_tables(conn)
 
 

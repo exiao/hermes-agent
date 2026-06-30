@@ -2862,6 +2862,52 @@ def test_babysit_explicit_and_derived_key_dedup_across_case(kanban_home, tmp_pat
     assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
 
 
+def test_legacy_mixed_case_babysit_key_migrated_and_dedups(kanban_home):
+    """A row stored BEFORE slug-lowercasing (mixed-case key) is canonicalized
+    by the migration pass so a later derived create for the same PR dedups to
+    it instead of inserting a duplicate babysitter row.
+
+    Reproduces the pre-existing-row case: the dedup lookup compares
+    ``idempotency_key`` byte-for-byte, so without migrating the stored key a
+    legacy ``babysit:NousResearch/hermes-agent#70`` row would never match a
+    freshly-derived ``babysit:nousresearch/hermes-agent#70``.
+    """
+    # Seed a legacy row with a mixed-case key directly, bypassing create_task's
+    # canonicalization (simulating a row written by an older version).
+    with kb.connect() as conn:
+        legacy = kb.create_task(
+            conn,
+            title="Babysit legacy PR",
+            assignee="pr-babysitter",
+        )
+        conn.execute(
+            "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+            ("babysit:NousResearch/hermes-agent#70", legacy),
+        )
+        conn.commit()
+
+    # Re-run the migration pass over the existing DB.
+    kb.init_db()
+
+    with kb.connect() as conn:
+        migrated = conn.execute(
+            "SELECT idempotency_key FROM tasks WHERE id = ?", (legacy,)
+        ).fetchone()[0]
+        assert migrated == "babysit:nousresearch/hermes-agent#70"
+
+        # A later derived create for the same PR now finds the migrated row.
+        second = kb.create_task(
+            conn,
+            title="re-check nousresearch/hermes-agent#70",
+            assignee="pr-babysitter",
+        )
+        assert second == legacy
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+    assert rows == 1
+
+
 def test_babysit_prefers_pr_ref_over_leading_issue_ref(tmp_path):
     """When a no-URL title names another ref before the PR (e.g. ``Babysit issue
     #123 for PR #70``), the key uses the ``PR #<n>`` number, not the leading
