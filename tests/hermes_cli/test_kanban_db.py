@@ -2624,6 +2624,32 @@ def test_slug_from_git_remote_resolves_pending_worktree_target(tmp_path):
     assert kb._slug_from_git_remote(str(pending)) == "exiao/hermes-agent"
 
 
+def test_slug_from_git_remote_ignores_non_github_remotes(tmp_path):
+    """A non-GitHub origin (gitlab/bitbucket/self-hosted) yields no slug — the
+    host-less ``babysit:`` key is GitHub-specific, so a gitlab ``owner/repo``
+    must not be allowed to cross-dedup a github repo of the same name."""
+    for url in (
+        "https://gitlab.com/Owner/Repo.git",
+        "git@bitbucket.org:owner/repo.git",
+        "https://git.example.com/owner/repo.git",
+    ):
+        repo = tmp_path / url.replace("/", "_").replace(":", "_")
+        _init_git_repo(repo)
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", url],
+            check=True, capture_output=True, text=True,
+        )
+        assert kb._slug_from_git_remote(str(repo)) is None
+    # An scp-style GitHub remote still resolves.
+    gh = tmp_path / "gh"
+    _init_git_repo(gh)
+    subprocess.run(
+        ["git", "-C", str(gh), "remote", "add", "origin", "git@github.com:exiao/hermes-agent.git"],
+        check=True, capture_output=True, text=True,
+    )
+    assert kb._slug_from_git_remote(str(gh)) == "exiao/hermes-agent"
+
+
 def test_babysit_pending_worktree_target_dedups(kanban_home, tmp_path):
     """Two pr-babysitter creates for the same PR whose ``workspace_path`` is a
     pending ``<repo>/.worktrees/<x>`` target (not yet materialized) still dedup
