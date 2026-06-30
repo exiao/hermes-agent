@@ -2192,6 +2192,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    # One-shot canonicalization of legacy babysit idempotency keys. Rows
+    # created before ``create_task`` started lowercasing the slug can carry a
+    # mixed-case key (e.g. ``babysit:NousResearch/hermes-agent#70``), which the
+    # byte-for-byte ``WHERE idempotency_key = ?`` dedup lookup would never match
+    # against a freshly-derived ``babysit:nousresearch/hermes-agent#70`` — so a
+    # second create for the same PR would insert a duplicate babysitter row.
+    # Normalize the stored keys in-place to the canonical form so both sides of
+    # the comparison agree. Idempotent: after this pass no row carries a
+    # non-canonical babysit key, so the UPDATE matches nothing on re-run.
+    for row in conn.execute(
+        "SELECT id, idempotency_key FROM tasks "
+        "WHERE idempotency_key LIKE 'babysit:%'"
+    ).fetchall():
+        canonical = _canonicalize_babysit_key(row["idempotency_key"])
+        if canonical and canonical != row["idempotency_key"]:
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+                (canonical, row["id"]),
+            )
+
     _rebuild_drifted_tables(conn)
 
 
@@ -2437,6 +2457,175 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _slug_from_git_remote(workspace_path: Optional[str]) -> Optional[str]:
+    """Resolve a checkout/worktree path to its ``owner/repo`` GitHub slug via the
+    git ``origin`` remote. Returns ``None`` when the path is empty, has no
+    existing git-repo ancestor, or the remote URL doesn't parse. Mirrors
+    ``_slug_from_worktree`` in ``~/.hermes/scripts/babysit-pr-detector.py``.
+
+    The path may be a not-yet-created worktree target such as
+    ``<repo>/.worktrees/pr70`` (the common pr-babysitter project-worktree
+    form): we resolve the nearest existing ancestor up to its git toplevel and
+    read the remote from there, so a supported-but-pending worktree path still
+    yields the repo's slug. We avoid spawning ``git`` against a path with no
+    existing git-repo ancestor (``_repo_root_for_worktree_target`` returns None
+    without running the expensive remote-read subprocess).
+    """
+    if not workspace_path:
+        return None
+    repo_root = _repo_root_for_worktree_target(Path(workspace_path).expanduser())
+    if repo_root is None:
+        return None
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if p.returncode != 0:
+        return None
+    # GitHub-only: the ``babysit:<owner>/<repo>#<n>`` key format is host-less and
+    # GitHub-specific (the detector resolves PRs via ``gh``). A non-GitHub origin
+    # (gitlab.com, bitbucket.org, a self-hosted host) must NOT yield a slug, or a
+    # ``gitlab.com/owner/repo`` would wrongly cross-dedup a ``github.com`` repo of
+    # the same owner/name. Match the ``https://github.com/owner/repo`` and the
+    # ``git@github.com:owner/repo`` (scp-style) forms, AND authenticated HTTPS
+    # remotes that carry userinfo before the host
+    # (``https://x-access-token:TOKEN@github.com/owner/repo.git`` — the form the
+    # CI/private-repo push path uses); without the optional userinfo those
+    # remotes wouldn't match and a ``PR #<n>``-only babysit task would never get
+    # its canonical key.
+    remote = p.stdout.strip()
+    m = re.search(
+        r"(?:https?://(?:[^/@]+@)?|ssh://(?:[^/@]+@)?|git@)"
+        r"github\.com[:/]([^/:]+/[^/]+?)(?:\.git)?/?$",
+        remote,
+    )
+    return m.group(1) if m else None
+
+
+def _derive_babysit_idempotency_key(
+    title: Optional[str],
+    body: Optional[str],
+    workspace_path: Optional[str],
+) -> Optional[str]:
+    """Derive a canonical ``babysit:<owner>/<repo>#<pr>`` idempotency key for a
+    pr-babysitter task, so EVERY creation path (the detector cron, the
+    ``kanban_create`` tool, sibling handoffs) dedups against the same PR — not
+    just the detector that already sets its own key.
+
+    Extraction precedence (most reliable first):
+      * A ``github.com/<owner>/<repo>/pull/(\\d+)`` url in title/body — pins
+        both the slug and the PR number.
+      * A bare ``<owner>/<repo>#<n>`` reference (the documented babysit anchor
+        form, e.g. ``exiao/hermes-agent#73``) — also pins both pieces.
+      * Otherwise the bare ``#(\\d+)`` in ``title`` for the number, paired with
+        the workspace git remote resolved to ``owner/repo`` for the slug.
+
+    Returns the key only when BOTH a slug and a PR number resolve; otherwise
+    ``None`` — a wrong key is worse than none (PR numbers collide across repos,
+    so a repo-less key would wrongly cross-dedup #70 in one repo against #70 in
+    another). When this returns ``None`` the caller leaves the key unset and
+    behavior is identical to today (no dedup, task still creates).
+    """
+    title = title or ""
+    body = body or ""
+
+    # Each source is matched against title and body SEPARATELY. The card's own
+    # subject lives in the TITLE (plus its workspace remote); anything in the
+    # BODY may be a secondary/related mention ("see github.com/o/r/pull/5",
+    # "related to o/r#5") that must NOT override the card's own PR, or retries
+    # for the real PR won't dedup and could collide with an unrelated card.
+    #
+    # Host-anchored so a look-alike host (``notgithub.com``) OR a github
+    # subdomain (``ghe.github.com`` GitHub Enterprise) can't pose as public
+    # ``github.com`` and derive a colliding key. The char before ``github.com``
+    # must be a path/scheme boundary (``/``, ``@``, whitespace) or string start
+    # — NOT ``.`` (which would let a subdomain through). ``.git`` stripped so a
+    # ``Org/Repo.git/pull/70`` URL canonicalizes to the SAME slug
+    # ``_slug_from_git_remote`` produces.
+    _url_re = r"(?:^|[/@\s])github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/pull/(\d+)"
+    # A bare ``owner/repo#<n>`` reference (the documented babysit anchor form,
+    # e.g. ``exiao/hermes-agent#73``). Mirrors ``_RESPAWN_GUARD_PR_REF_RE``.
+    _ref_re = r"(?<![\w./-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)"
+    _pr_re = r"\bPR\s*#?(\d+)"
+
+    title_url = re.search(_url_re, title)
+    body_url = re.search(_url_re, body)
+    title_ref = re.search(_ref_re, title)
+    body_ref = re.search(_ref_re, body)
+    title_pr = re.search(_pr_re, title, re.IGNORECASE)
+    body_pr = re.search(_pr_re, body, re.IGNORECASE)
+    title_bare = re.search(r"#(\d+)", title)
+    workspace_slug = _slug_from_git_remote(workspace_path)
+
+    # Resolution precedence — first complete (slug, pr) wins. A slug-bearing
+    # source pins BOTH pieces together so we never pair one source's slug with
+    # another's number (keying on the wrong PR / a cross-PR collision). Every
+    # EXPLICIT signal (a pull URL, an ``owner/repo#<n>`` ref, or an explicit
+    # ``PR #<n>``) outranks the one AMBIGUOUS signal — a bare title ``#<n>``,
+    # which may be an issue number rather than the PR — so the bare title number
+    # is strictly LAST. Within the explicit tier, the card's own TITLE outranks
+    # its BODY:
+    #   1. a github pull URL in the TITLE (fully unambiguous, card's own),
+    #   2. a TITLE ``owner/repo#<n>`` ref,
+    #   3. an explicit ``PR #<n>`` in the TITLE + the workspace remote slug,
+    #   4. a github pull URL in the BODY,
+    #   5. an explicit ``PR #<n>`` in the BODY + the workspace slug,
+    #   6. a BODY ``owner/repo#<n>`` ref,
+    #   7. a bare ``#<n>`` in the TITLE + the workspace slug (last — ambiguous).
+    slug: Optional[str] = None
+    pr: Optional[int] = None
+    if title_url is not None:
+        slug, pr = title_url.group(1), int(title_url.group(2))
+    elif title_ref is not None:
+        slug, pr = title_ref.group(1), int(title_ref.group(2))
+    elif title_pr is not None and workspace_slug:
+        slug, pr = workspace_slug, int(title_pr.group(1))
+    elif body_url is not None:
+        slug, pr = body_url.group(1), int(body_url.group(2))
+    elif body_pr is not None and workspace_slug:
+        slug, pr = workspace_slug, int(body_pr.group(1))
+    elif body_ref is not None:
+        slug, pr = body_ref.group(1), int(body_ref.group(2))
+    elif title_bare is not None and workspace_slug:
+        slug, pr = workspace_slug, int(title_bare.group(1))
+
+    if pr is None or not slug:
+        return None
+
+    return _canonical_babysit_key(slug, pr)
+
+
+def _canonical_babysit_key(slug: str, pr: int) -> str:
+    """Build a canonical ``babysit:<owner>/<repo>#<pr>`` key with the slug
+    lowercased. GitHub owner/repo names are case-insensitive, so
+    ``NousResearch/hermes-agent`` and ``nousresearch/hermes-agent`` must yield
+    the same key for the same PR.
+    """
+    return f"babysit:{slug.lower()}#{pr}"
+
+
+def _canonicalize_babysit_key(key: Optional[str]) -> Optional[str]:
+    """Normalize a caller-provided ``babysit:<owner>/<repo>#<n>`` key so an
+    explicit key (e.g. from the detector, built from a mixed-case git remote)
+    canonicalizes to the SAME value the auto-derivation produces. Without this a
+    detector row keyed ``babysit:NousResearch/hermes-agent#70`` would not match a
+    tool-derived ``babysit:nousresearch/hermes-agent#70`` for the same PR, and
+    the two rows would coexist. Non-babysit keys (and unparseable ones) pass
+    through verbatim.
+    """
+    if not key:
+        return key
+    m = re.fullmatch(r"babysit:([^/]+/[^#]+)#(\d+)", key)
+    if not m:
+        return key
+    return _canonical_babysit_key(m.group(1), int(m.group(2)))
+
+
 # Bare placeholder titles that carry no spec on their own. A task whose title is
 # one of these (or the literal "<assignee> task" / the assignee name itself) AND
 # whose body is empty has no work in it — it must never reach a worker lane in
@@ -2585,6 +2774,16 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    # Normalize a blank/whitespace idempotency_key to None. A JSON/tool caller
+    # that sends ``idempotency_key: ""`` would otherwise slip past the
+    # ``is None`` guard on the babysit auto-derivation (skipping it) while the
+    # later ``if idempotency_key:`` dedup lookup treats the empty string as no
+    # key — so two creates for the same PR insert separate un-deduped rows. A
+    # blank key carries no usable value, so collapse it to None up front and let
+    # the auto-derivation fill it in.
+    if idempotency_key is not None and not str(idempotency_key).strip():
+        idempotency_key = None
+
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
     # can be named deterministically (project slug + task id) instead of the
@@ -2673,23 +2872,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
-    now = int(time.time())
-
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
     # persistent project checkouts, so only persistent workspace kinds may
@@ -2699,6 +2881,14 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
+    #
+    # This runs BEFORE the babysit-key derivation below so that a
+    # pr-babysitter task relying on a board ``default_workdir`` (the common
+    # ``workspace_kind='worktree'`` + board-default create path) has its
+    # repo path resolved in time to derive the canonical babysit key from
+    # the git remote — otherwise ``workspace_path`` is still ``None`` at
+    # derive time, the key is left unset, and two creates for the same PR
+    # insert two non-idempotent rows.
     if (
         workspace_path is None
         and project_repo is None
@@ -2716,6 +2906,47 @@ def create_task(
                         workspace_path = str(default_repo)
             else:
                 workspace_path = str(board_default)
+
+    # Auto-derive a canonical babysit idempotency key so EVERY pr-babysitter
+    # creation path dedups against the same PR, not just the detector cron that
+    # sets its own key. Done AFTER _canonical_assignee (so a pr-babysitter alias
+    # is still caught) and only when the caller passed no explicit key — when the
+    # key can't be derived it stays None and behavior is identical to today.
+    # ``workspace_path or project_repo`` feeds the git-remote slug fallback both
+    # the board-default-resolved path (above) and a project-linked task's primary
+    # repo, so the key resolves for every persistent-workspace babysitter create.
+    # Use the EFFECTIVE assignee (explicit, else the operator's
+    # ``kanban.default_assignee`` the dispatcher will apply) so a card created
+    # WITHOUT an explicit assignee under ``default_assignee = pr-babysitter``
+    # still gets keyed — otherwise two such creates both insert keyless and
+    # recreate the duplicate-ticket path this is meant to close.
+    effective_assignee = _canonical_assignee(assignee or _default_assignee())
+    if idempotency_key is None and effective_assignee == "pr-babysitter":
+        idempotency_key = _derive_babysit_idempotency_key(
+            title, body, workspace_path or project_repo
+        )
+    # Canonicalize a ``babysit:<owner>/<repo>#<n>`` key — explicit (e.g. the
+    # detector's, built from a possibly mixed-case git remote) or derived — so a
+    # case-only slug difference can't split one PR across two rows. Idempotent on
+    # the already-canonical derived key; a no-op on non-babysit keys.
+    idempotency_key = _canonicalize_babysit_key(idempotency_key)
+
+    # Idempotency check — return the existing task instead of creating a
+    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
+    # and to avoid holding a write lock during the lookup. Race is
+    # acceptable: two concurrent creators with the same key might both
+    # insert, at which point both rows exist but the next lookup stabilises.
+    if idempotency_key:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if row:
+            return row["id"]
+
+    now = int(time.time())
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):

@@ -2600,6 +2600,744 @@ def test_worktree_explicit_path_succeeds_control(kanban_home, tmp_path):
     assert task.workspace_path == str(repo)
 
 
+# ---------------------------------------------------------------------------
+# Auto-derived babysit idempotency key (stop duplicate pr-babysitter tickets)
+# ---------------------------------------------------------------------------
+
+def _set_origin_remote(repo: Path, slug: str) -> None:
+    """Point ``repo``'s origin remote at a github ``owner/repo`` slug so
+    ``_slug_from_git_remote`` can resolve it."""
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin",
+         f"https://github.com/{slug}.git"],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_babysit_same_pr_same_repo_dedups(kanban_home, tmp_path):
+    """Two pr-babysitter creates for the same PR #70 in the same repo with NO
+    explicit key dedup to ONE row — the second returns the first task's id.
+
+    Fails before the auto-derive change (two distinct rows).
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check the flaky CI",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+    assert rows == 1
+    with kb.connect() as conn:
+        task = kb.get_task(conn, first)
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_dedups_via_board_default_workdir(kanban_home, tmp_path):
+    """Two pr-babysitter worktree creates for the same PR that supply NO
+    explicit ``workspace_path`` and rely on the board ``default_workdir`` to
+    anchor the repo still dedup to ONE row.
+
+    This is the common ``workspace_kind='worktree'`` + board-default create
+    path. The babysit key must be derived AFTER the board default resolves the
+    repo path — otherwise ``workspace_path`` is None at derive time, the key is
+    left unset, and the two creates insert two non-idempotent rows.
+
+    Fails before the move (key derived too early → 2 rows).
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    kb.create_board("babysit-default-board", default_workdir=str(repo))
+    with kb.connect(board="babysit-default-board") as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            board="babysit-default-board",
+        )
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check the flaky CI",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            board="babysit-default-board",
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
+def test_slug_from_git_remote_skips_missing_path(tmp_path):
+    """``_slug_from_git_remote`` returns None without reading a remote when the
+    path has no existing git-repo ancestor or is not a directory (gemini high
+    finding — avoid a guaranteed-to-fail subprocess)."""
+    missing = tmp_path / "does-not-exist"
+    assert kb._slug_from_git_remote(str(missing)) is None
+    a_file = tmp_path / "afile"
+    a_file.write_text("x", encoding="utf-8")
+    assert kb._slug_from_git_remote(str(a_file)) is None
+    assert kb._slug_from_git_remote(None) is None
+    assert kb._slug_from_git_remote("") is None
+
+
+def test_slug_from_git_remote_resolves_pending_worktree_target(tmp_path):
+    """A not-yet-created worktree target under a real repo
+    (``<repo>/.worktrees/pr70``) still resolves the repo slug by walking to the
+    nearest existing git ancestor (Codex P2 — pending worktree forms must not
+    bypass dedup)."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    pending = repo / ".worktrees" / "pr70"  # does not exist on disk yet
+    assert not pending.exists()
+    assert kb._slug_from_git_remote(str(pending)) == "exiao/hermes-agent"
+
+
+def test_slug_from_git_remote_ignores_non_github_remotes(tmp_path):
+    """A non-GitHub origin (gitlab/bitbucket/self-hosted) yields no slug — the
+    host-less ``babysit:`` key is GitHub-specific, so a gitlab ``owner/repo``
+    must not be allowed to cross-dedup a github repo of the same name."""
+    for url in (
+        "https://gitlab.com/Owner/Repo.git",
+        "git@bitbucket.org:owner/repo.git",
+        "https://git.example.com/owner/repo.git",
+    ):
+        repo = tmp_path / url.replace("/", "_").replace(":", "_")
+        _init_git_repo(repo)
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", url],
+            check=True, capture_output=True, text=True,
+        )
+        assert kb._slug_from_git_remote(str(repo)) is None
+    # An scp-style GitHub remote still resolves.
+    gh = tmp_path / "gh"
+    _init_git_repo(gh)
+    subprocess.run(
+        ["git", "-C", str(gh), "remote", "add", "origin", "git@github.com:exiao/hermes-agent.git"],
+        check=True, capture_output=True, text=True,
+    )
+    assert kb._slug_from_git_remote(str(gh)) == "exiao/hermes-agent"
+
+
+def test_slug_from_git_remote_accepts_authenticated_https(tmp_path):
+    """An authenticated HTTPS origin carrying userinfo before the host (the
+    ``https://x-access-token:TOKEN@github.com/owner/repo.git`` form used by the
+    CI/private-repo push path) still resolves the slug — otherwise a
+    ``PR #<n>``-only babysit task in that setup never gets its canonical key and
+    duplicate tickets slip through.
+    """
+    for url in (
+        "https://x-access-token:ghs_SECRET@github.com/exiao/hermes-agent.git",
+        "https://exiao:ghp_TOKEN@github.com/exiao/hermes-agent.git",
+        "ssh://git@github.com/exiao/hermes-agent.git",
+    ):
+        repo = tmp_path / url.replace("/", "_").replace(":", "_").replace("@", "_")
+        _init_git_repo(repo)
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", url],
+            check=True, capture_output=True, text=True,
+        )
+        assert kb._slug_from_git_remote(str(repo)) == "exiao/hermes-agent"
+    # Userinfo must not loosen the host check — an authenticated NON-github
+    # remote still yields no slug.
+    other = tmp_path / "authed_gitlab"
+    _init_git_repo(other)
+    subprocess.run(
+        ["git", "-C", str(other), "remote", "add", "origin",
+         "https://x-access-token:SECRET@gitlab.com/exiao/hermes-agent.git"],
+        check=True, capture_output=True, text=True,
+    )
+    assert kb._slug_from_git_remote(str(other)) is None
+
+
+def test_babysit_pending_worktree_target_dedups(kanban_home, tmp_path):
+    """Two pr-babysitter creates for the same PR whose ``workspace_path`` is a
+    pending ``<repo>/.worktrees/<x>`` target (not yet materialized) still dedup
+    to one row — the slug resolves from the parent repo's remote."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo / ".worktrees" / "a"),
+        )
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo / ".worktrees" / "b"),
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_blank_idempotency_key_still_dedups(kanban_home, tmp_path):
+    """A caller that passes ``idempotency_key=""`` (blank/whitespace) for a
+    pr-babysitter task must NOT bypass the auto-derive + dedup: the blank key is
+    normalized to None, the key is derived, and two creates for the same PR
+    collapse to one row.
+
+    Fails before normalization (blank key skips derive, falsy key skips dedup
+    lookup → 2 rows).
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            idempotency_key="   ",
+        )
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            idempotency_key="",
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_pull_url_number_wins_over_title_ref():
+    """When a pull URL is present, its PR number is authoritative for the key —
+    a stray ``#<n>`` (e.g. an issue ref) in the title must NOT override it and
+    pair the URL's slug with the wrong PR number."""
+    # Title carries an issue-style ``#123`` but the body links PR #70; the key
+    # must be the URL's owner/repo#70, not owner/repo#123.
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit fix #123",
+        "see https://github.com/org/repo/pull/70 for the change",
+        None,
+    )
+    assert key == "babysit:org/repo#70"
+    # No URL → fall back to the title ``#<n>`` (detector convention) using the
+    # workspace git remote for the slug. Covered elsewhere; here assert the
+    # no-URL/no-title case still returns None.
+    assert kb._derive_babysit_idempotency_key("no pr ref", "", None) is None
+
+
+def test_babysit_pull_url_host_anchored_and_git_suffix_stripped():
+    """The pull-URL slug source is GitHub-host-anchored and ``.git``-stripped so
+    it (a) can't be spoofed by a look-alike host and (b) canonicalizes to the
+    same slug the remote-derived path produces for one repo.
+    """
+    # Look-alike host must NOT match — no other PR signal, so no key derives.
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "see https://notgithub.com/org/repo/pull/70", None
+        )
+        is None
+    )
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "see https://evilgithub.com/org/repo/pull/70", None
+        )
+        is None
+    )
+    # A github SUBDOMAIN (e.g. GitHub Enterprise ghe.github.com) must NOT match
+    # either — it would derive the same key as the public repo and collide.
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "see https://ghe.github.com/org/repo/pull/70", None
+        )
+        is None
+    )
+    # A real github.com URL still works.
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "https://github.com/org/repo/pull/70", None
+        )
+        == "babysit:org/repo#70"
+    )
+    # A ``.git``-bearing URL canonicalizes to the SAME slug as the bare form, so
+    # it dedups against the remote-derived key for the same repo.
+    assert (
+        kb._derive_babysit_idempotency_key(
+            "babysit", "https://github.com/Org/Repo.git/pull/70", None
+        )
+        == "babysit:org/repo#70"
+    )
+
+
+def test_babysit_owner_repo_ref_form_derives_key():
+    """A bare ``owner/repo#<n>`` reference (the documented babysit anchor form,
+    and a scratch ``kanban_create`` handoff's only PR signal) pins both the slug
+    and the PR number — no workspace remote or pull URL needed."""
+    # Title-only ref, no workspace path (scratch handoff).
+    key = kb._derive_babysit_idempotency_key(
+        "exiao/hermes-agent#73: fix(kanban): auto-derive babysit key",
+        None,
+        None,
+    )
+    assert key == "babysit:exiao/hermes-agent#73"
+    # Ref in the body works too.
+    key2 = kb._derive_babysit_idempotency_key(
+        "Re-verify the babysit PR",
+        "anchored to cpe-research/research-agent#801",
+        None,
+    )
+    assert key2 == "babysit:cpe-research/research-agent#801"
+    # A TITLE owner/repo#n anchor (the card's own subject) outranks a pull URL
+    # that sits only in the BODY — a body link is a secondary/related mention
+    # and must not override the card's own PR (else retries wouldn't dedup).
+    key3 = kb._derive_babysit_idempotency_key(
+        "owner/other#5 mention",
+        "related PR https://github.com/org/repo/pull/70",
+        None,
+    )
+    assert key3 == "babysit:owner/other#5"
+    # With NO title anchor, a body pull URL is honored.
+    key4 = kb._derive_babysit_idempotency_key(
+        "Babysit the PR",
+        "real PR https://github.com/org/repo/pull/70",
+        None,
+    )
+    assert key4 == "babysit:org/repo#70"
+
+
+def test_babysit_pr_number_in_body_with_workspace_slug_derives_key(tmp_path):
+    """An orchestrator handoff with a short title (``Babysit PR``) and the
+    ``PR #<n>`` anchor in the BODY, with the slug supplied by the workspace git
+    remote, still derives a key. Without searching the body for ``PR #<n>`` the
+    key would stay None and repeated creates would insert duplicate rows.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit PR",
+        "Please watch PR #70 and keep it green.",
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+    # A bare ``#<n>`` in free-form body prose (no ``PR`` prefix) must NOT be
+    # keyed on — too likely an unrelated reference — so the title-only bare
+    # fallback leaves the key None when the title has no number.
+    none_key = kb._derive_babysit_idempotency_key(
+        "Babysit the thing",
+        "unrelated note mentioning #999 somewhere",
+        str(repo),
+    )
+    assert none_key is None
+
+
+def test_babysit_title_workspace_pr_outranks_body_shorthand_ref(tmp_path):
+    """A card with a real title (``Babysit PR #70``) + a workspace remote keys
+    on ITS OWN PR (#70 in the workspace repo), even when the body mentions an
+    unrelated ``owner/repo#5`` shorthand. The body ref must not override the
+    card's title/workspace signal, or retries for the real PR would not dedup
+    and could collide with an unrelated babysitter card.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit PR #70",
+        "context: related to other/project#5 from last week",
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+    # A body ``owner/repo#<n>`` ref is still honored as the LAST resort when the
+    # card carries no title/workspace PR signal of its own.
+    fallback = kb._derive_babysit_idempotency_key(
+        "Re-verify the babysit task",
+        "anchored to cpe-research/research-agent#801",
+        None,
+    )
+    assert fallback == "babysit:cpe-research/research-agent#801"
+
+
+def test_babysit_title_pr_anchor_outranks_body_pull_url(tmp_path):
+    """A card whose TITLE names its own PR (``Babysit PR #70`` + workspace
+    remote, or ``owner/repo#70`` in the title) keys on that PR even when the
+    BODY contains a github pull URL for a related/different PR. A body link is a
+    secondary mention and must not override the card's own subject, or retries
+    for the real PR won't dedup and could return an unrelated existing task.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    # Title PR #70 + workspace slug, body links a DIFFERENT repo's PR.
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit PR #70",
+        "see also https://github.com/other/project/pull/5 for context",
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+    # Title owner/repo#70 anchor, body links a different PR.
+    key2 = kb._derive_babysit_idempotency_key(
+        "Babysit exiao/hermes-agent#70",
+        "related: https://github.com/other/project/pull/5",
+        None,
+    )
+    assert key2 == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_body_pull_url_outranks_bare_title_number(tmp_path):
+    """A full github pull URL in the BODY outranks a BARE ``#<n>`` in the title:
+    a bare title number may be an ISSUE reference (``Babysit fix #123``), while
+    the pull URL unambiguously pins both the slug and the PR. An explicit
+    ``PR #<n>`` in the title still wins (it names the card's own PR), but a bare
+    ``#<n>`` does not.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    # Bare title #123 (likely an issue) + a body pull URL for PR #70 → key on
+    # the URL's PR, not the ambiguous bare title number.
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit fix #123",
+        "the PR is https://github.com/org/repo/pull/70",
+        str(repo),
+    )
+    assert key == "babysit:org/repo#70"
+    # But an explicit title ``PR #<n>`` still outranks a body URL.
+    key2 = kb._derive_babysit_idempotency_key(
+        "Babysit PR #70",
+        "compare against https://github.com/org/repo/pull/5",
+        str(repo),
+    )
+    assert key2 == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_body_pr_number_outranks_bare_title_number(tmp_path):
+    """An explicit ``PR #<n>`` in the BODY outranks a BARE ``#<n>`` in the title
+    (same reasoning as the body-URL case): the body ``PR #70`` is an explicit PR
+    signal, while a bare title ``#123`` may be an issue ref. Key on the body PR.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit fix #123",
+        "the actual PR #70 needs watching",
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_body_owner_repo_ref_outranks_bare_title_number(tmp_path):
+    """A BODY ``owner/repo#<n>`` ref (explicit, pins both pieces) outranks a
+    BARE ``#<n>`` in the title (which may be an issue number): the bare title
+    number is the ONLY ambiguous signal, so it is strictly last — every explicit
+    signal, title or body, wins over it.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit fix #123",
+        "anchored to other/project#70",
+        str(repo),
+    )
+    assert key == "babysit:other/project#70"
+
+
+def test_babysit_default_assignee_derives_key_and_dedups(kanban_home, tmp_path, monkeypatch):
+    """A card created WITHOUT an explicit assignee under
+    ``kanban.default_assignee = pr-babysitter`` (the dispatcher applies the
+    default later) is still keyed at create time, so two such creates for the
+    same PR dedup to one row instead of both inserting keyless and recreating
+    the duplicate-ticket path.
+    """
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    # Operator default routes unassigned cards to pr-babysitter.
+    monkeypatch.setattr(kb, "_default_assignee", lambda: "pr-babysitter")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit PR #70",
+            assignee=None,
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        second = kb.create_task(
+            conn,
+            title="re-check PR #70",
+            assignee=None,
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        assert second == first
+        task = kb.get_task(conn, first)
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_scratch_owner_repo_handoff_dedups(kanban_home):
+    """Two scratch pr-babysitter creates that name the PR as ``owner/repo#<n>``
+    (no workspace_path) dedup to one row — the ref form alone keys them."""
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="exiao/hermes-agent#73: fix babysit key",
+            assignee="pr-babysitter",
+        )
+        second = kb.create_task(
+            conn,
+            title="re-check exiao/hermes-agent#73",
+            assignee="pr-babysitter",
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#73"
+
+
+def test_babysit_slug_case_insensitive_dedups(kanban_home):
+    """Two scratch pr-babysitter creates naming the same PR with different
+    owner/repo casing dedup to one row — GitHub slugs are case-insensitive, so
+    the key lowercases the slug."""
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit NousResearch/hermes-agent#70",
+            assignee="pr-babysitter",
+        )
+        second = kb.create_task(
+            conn,
+            title="re-check nousresearch/hermes-agent#70",
+            assignee="pr-babysitter",
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:nousresearch/hermes-agent#70"
+
+
+def test_babysit_explicit_mixed_case_key_canonicalized():
+    """An explicit ``babysit:<Owner>/<Repo>#<n>`` key (e.g. the detector's,
+    built from a mixed-case git remote) is canonicalized to a lowercase slug so
+    it matches a later auto-derived key for the same PR."""
+    assert (
+        kb._canonicalize_babysit_key("babysit:NousResearch/hermes-agent#70")
+        == "babysit:nousresearch/hermes-agent#70"
+    )
+    # Non-babysit keys and unparseable values pass through verbatim.
+    assert kb._canonicalize_babysit_key("custom:thing#1") == "custom:thing#1"
+    assert kb._canonicalize_babysit_key("babysit:noslug#1") == "babysit:noslug#1"
+    assert kb._canonicalize_babysit_key(None) is None
+
+
+def test_babysit_explicit_and_derived_key_dedup_across_case(kanban_home, tmp_path):
+    """A detector row keyed with an explicit mixed-case slug and a later
+    tool-derived create for the same PR (lowercased) dedup to one row."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            idempotency_key="babysit:Exiao/Hermes-Agent#70",
+        )
+        # Auto-derived from the git remote → lowercase exiao/hermes-agent#70.
+        second = kb.create_task(
+            conn,
+            title="hermes-agent#70: re-check",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        assert second == first
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+        task = kb.get_task(conn, first)
+    assert rows == 1
+    assert task is not None
+    assert task.idempotency_key == "babysit:exiao/hermes-agent#70"
+
+
+def test_legacy_mixed_case_babysit_key_migrated_and_dedups(kanban_home):
+    """A row stored BEFORE slug-lowercasing (mixed-case key) is canonicalized
+    by the migration pass so a later derived create for the same PR dedups to
+    it instead of inserting a duplicate babysitter row.
+
+    Reproduces the pre-existing-row case: the dedup lookup compares
+    ``idempotency_key`` byte-for-byte, so without migrating the stored key a
+    legacy ``babysit:NousResearch/hermes-agent#70`` row would never match a
+    freshly-derived ``babysit:nousresearch/hermes-agent#70``.
+    """
+    # Seed a legacy row with a mixed-case key directly, bypassing create_task's
+    # canonicalization (simulating a row written by an older version).
+    with kb.connect() as conn:
+        legacy = kb.create_task(
+            conn,
+            title="Babysit legacy PR",
+            assignee="pr-babysitter",
+        )
+        conn.execute(
+            "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+            ("babysit:NousResearch/hermes-agent#70", legacy),
+        )
+        conn.commit()
+
+    # Re-run the migration pass over the existing DB.
+    kb.init_db()
+
+    with kb.connect() as conn:
+        migrated = conn.execute(
+            "SELECT idempotency_key FROM tasks WHERE id = ?", (legacy,)
+        ).fetchone()[0]
+        assert migrated == "babysit:nousresearch/hermes-agent#70"
+
+        # A later derived create for the same PR now finds the migrated row.
+        second = kb.create_task(
+            conn,
+            title="re-check nousresearch/hermes-agent#70",
+            assignee="pr-babysitter",
+        )
+        assert second == legacy
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE assignee = 'pr-babysitter'"
+        ).fetchone()[0]
+    assert rows == 1
+
+
+def test_babysit_prefers_pr_ref_over_leading_issue_ref(tmp_path):
+    """When a no-URL title names another ref before the PR (e.g. ``Babysit issue
+    #123 for PR #70``), the key uses the ``PR #<n>`` number, not the leading
+    bare ``#123``."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    key = kb._derive_babysit_idempotency_key(
+        "Babysit issue #123 for PR #70",
+        None,
+        str(repo),
+    )
+    assert key == "babysit:exiao/hermes-agent#70"
+
+
+def test_babysit_same_pr_different_repos_no_cross_dedup(kanban_home, tmp_path):
+    """The SAME PR number #70 in two DIFFERENT repos creates two distinct
+    tasks — PR numbers collide across repos, so a repo-less key must never
+    cross-dedup."""
+    repo_a = tmp_path / "hermes-agent"
+    _init_git_repo(repo_a)
+    _set_origin_remote(repo_a, "exiao/hermes-agent")
+    repo_b = tmp_path / "research-agent"
+    _init_git_repo(repo_b)
+    _set_origin_remote(repo_b, "cpe-research/research-agent")
+    with kb.connect() as conn:
+        a = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo_a),
+        )
+        b = kb.create_task(
+            conn,
+            title="Babysit research-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo_b),
+        )
+        assert a != b
+        ta = kb.get_task(conn, a)
+        tb = kb.get_task(conn, b)
+    assert ta is not None and tb is not None
+    assert ta.idempotency_key == "babysit:exiao/hermes-agent#70"
+    assert tb.idempotency_key == "babysit:cpe-research/research-agent#70"
+
+
+def test_babysit_explicit_key_respected_unchanged(kanban_home, tmp_path):
+    """An explicit idempotency_key passed by the caller (e.g. the detector
+    cron) is stored verbatim and the auto-derive does NOT override it."""
+    repo = tmp_path / "hermes-agent"
+    _init_git_repo(repo)
+    _set_origin_remote(repo, "exiao/hermes-agent")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Babysit hermes-agent PR #70",
+            assignee="pr-babysitter",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            idempotency_key="babysit:explicit/override#999",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.idempotency_key == "babysit:explicit/override#999"
+
+
+def test_babysit_unresolvable_leaves_key_none(kanban_home, tmp_path):
+    """A pr-babysitter task whose title/body/workspace yield no (slug, pr)
+    pair leaves the key None and still creates the task (no regression)."""
+    # No PR number in the title and no resolvable repo slug (scratch workspace,
+    # no git remote) → key cannot be derived.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Babysit something with no PR reference",
+            assignee="pr-babysitter",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.idempotency_key is None
+
+
 def test_worktree_explicit_non_repo_path_raises_at_create(kanban_home, tmp_path, monkeypatch):
     """Fail-fast (t_f19db0e0): a ``worktree`` task whose explicit path is a real
     directory that is NOT a git repo (e.g. an umbrella dir like
