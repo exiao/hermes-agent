@@ -283,9 +283,9 @@ def test_board_done_window_stable_at_tie_boundary(client):
     try:
         with conn:
             conn.execute(
-                "UPDATE tasks SET completed_at=5_000_000, created_at=5_000_000 "
+                "UPDATE tasks SET completed_at=?, created_at=? "
                 "WHERE id IN (%s)" % ",".join("?" * len(ids)),
-                ids,
+                (5000000, 5000000, *ids),
             )
     finally:
         conn.close()
