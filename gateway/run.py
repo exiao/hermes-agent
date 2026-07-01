@@ -16388,6 +16388,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         serves every profile via the ``/p/<profile>/`` prefix. So for those
         platforms a profile-stamped source correctly falls back to the shared
         default adapter rather than being dropped.
+
+        Unknown / removed secondary stamps: a persisted session origin can name
+        a non-default profile that is no longer served — it was removed/renamed,
+        or its secondary startup failed before registering in
+        ``_profile_adapters``. Such a stamp has no correct account (the profile
+        that owned it is gone), so we must NOT fall back to the default adapter —
+        sending a reply/restore notice from the DEFAULT account is the same
+        cross-profile leak this helper prevents. Only the *active* profile stamp
+        (whose adapters legitimately live in ``self.adapters`` and is
+        intentionally never in ``_profile_adapters``) and unstamped sources fall
+        back to the default; any other non-served stamp resolves to None (drop).
         """
         if source is None:
             return None
@@ -16400,6 +16411,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Served secondary profile: use ITS adapter for this platform,
                 # never the default one (return None if it has none).
                 return profile_map[profile].get(platform)
+            # Stamp names a profile that is NOT a served secondary. If it is the
+            # active profile (whose adapters live in self.adapters), fall back;
+            # otherwise it is a removed/renamed/never-started secondary with no
+            # correct account — drop rather than leak from the default account.
+            if profile != self._active_profile_name():
+                return None
         adapters = getattr(self, "adapters", None)
         if not adapters:
             return None
