@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
+from agent.secret_scope import get_secret
 from utils import env_int, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -1399,22 +1400,28 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         )
     
     # Signal
-    signal_url = os.getenv("SIGNAL_HTTP_URL")
-    signal_account = os.getenv("SIGNAL_ACCOUNT")
+    # Credential reads go through get_secret (not os.getenv) so a multiplexed
+    # gateway resolves the ACTIVE profile scope's Signal account, not whichever
+    # value happens to sit in the process-global os.environ (the default
+    # profile's). Without this, a secondary profile's config would inherit the
+    # default's SIGNAL_ACCOUNT, collide on the same signal-cli credential, and
+    # get its adapter silently refused by the duplicate-poll guard.
+    signal_url = get_secret("SIGNAL_HTTP_URL")
+    signal_account = get_secret("SIGNAL_ACCOUNT")
     if signal_url and signal_account:
         signal_config = _enable_from_env(Platform.SIGNAL)
         signal_config.extra.update({
             "http_url": signal_url,
             "account": signal_account,
-            "ignore_stories": os.getenv("SIGNAL_IGNORE_STORIES", "true").lower() in {"true", "1", "yes"},
+            "ignore_stories": (get_secret("SIGNAL_IGNORE_STORIES", "true") or "true").lower() in {"true", "1", "yes"},
         })
-    signal_home = os.getenv("SIGNAL_HOME_CHANNEL")
+    signal_home = get_secret("SIGNAL_HOME_CHANNEL")
     if signal_home and Platform.SIGNAL in config.platforms:
         config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
             platform=Platform.SIGNAL,
             chat_id=signal_home,
-            name=os.getenv("SIGNAL_HOME_CHANNEL_NAME", "Home"),
-            thread_id=os.getenv("SIGNAL_HOME_CHANNEL_THREAD_ID") or None,
+            name=get_secret("SIGNAL_HOME_CHANNEL_NAME", "Home") or "Home",
+            thread_id=get_secret("SIGNAL_HOME_CHANNEL_THREAD_ID") or None,
         )
 
     # Mattermost
