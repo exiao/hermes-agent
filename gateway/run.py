@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import functools
 import inspect
 import json
 import logging
@@ -10490,7 +10491,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is speaking, without needing a separate tool call.
         # -----------------------------------------------------------------
         if source.platform == Platform.DISCORD:
-            adapter = self.adapters.get(Platform.DISCORD)
+            adapter = self._adapter_for_source(source)
             guild_id = self._get_guild_id(event)
             if guild_id and adapter and hasattr(adapter, "get_voice_channel_context"):
                 vc_context = adapter.get_voice_channel_context(guild_id)
@@ -11757,11 +11758,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "You need to be in a voice channel first."
 
         # Wire callbacks BEFORE join so voice input arriving immediately
-        # after connection is not lost.
+        # after connection is not lost. Bind THIS adapter into the callbacks:
+        # a multiplexed secondary profile stores _voice_text_channels/
+        # _voice_sources on its own adapter, so the callback must read from the
+        # adapter that joined — not the default-profile adapter.
         if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = self._handle_voice_channel_input
+            adapter._voice_input_callback = functools.partial(
+                self._handle_voice_channel_input, adapter=adapter
+            )
         if hasattr(adapter, "_on_voice_disconnect"):
-            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+            adapter._on_voice_disconnect = functools.partial(
+                self._handle_voice_timeout_cleanup, adapter=adapter
+            )
         # Let the adapter's inactivity timer see the live voice-reply mode so it
         # doesn't disconnect a deliberately text-only (/voice off) session.
         if hasattr(adapter, "_voice_mode_getter"):
@@ -11820,14 +11828,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_input_callback = None
         return "Left voice channel."
 
-    def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
+    def _handle_voice_timeout_cleanup(self, chat_id: str, adapter=None) -> None:
         """Called by the adapter when a voice channel times out.
 
         Cleans up runner-side voice_mode state that the adapter cannot reach.
+        ``adapter`` is bound to the adapter that joined (see
+        ``_handle_voice_channel_join``) so a multiplexed secondary profile
+        cleans up on its own adapter, not the default one.
         """
         self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
         self._save_voice_modes()
-        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
@@ -11872,14 +11884,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self, guild_id: int, user_id: int, transcript: str, adapter=None
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
         adapter's full message pipeline (session, typing, agent, TTS reply).
+
+        ``adapter`` is bound to the adapter that joined the voice channel (see
+        ``_handle_voice_channel_join``). A multiplexed secondary profile stores
+        ``_voice_text_channels``/``_voice_sources`` on ITS OWN adapter, so
+        reading them off the default adapter would find no guild_id mapping and
+        silently drop the speech.
         """
-        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
         if not adapter:
             return
 
@@ -16553,7 +16572,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _voice_ack_fired = [False]
         _voice_ack_guild: List[Optional[int]] = [None]
         if source.platform == Platform.DISCORD:
-            _va = self.adapters.get(Platform.DISCORD)
+            _va = self._adapter_for_source(source)
             # source.chat_id is the linked text channel; resolve the guild whose
             # voice connection is bound to it (mirrors DiscordAdapter.play_tts).
             _vtc = getattr(_va, "_voice_text_channels", None)
@@ -16571,7 +16590,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not _run_still_current():
                 return
             _voice_ack_fired[0] = True
-            _adapter = self.adapters.get(Platform.DISCORD)
+            _adapter = self._adapter_for_source(source)
             if _adapter is None or not hasattr(_adapter, "play_ack_in_voice"):
                 return
             try:

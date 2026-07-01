@@ -1054,6 +1054,102 @@ class TestVoiceChannelCommands:
         mock_adapter.handle_message.assert_called_once()
         mock_channel.send.assert_called_once()
 
+    # -- multiplexed secondary profile: callbacks must use the joined adapter --
+
+    @pytest.mark.asyncio
+    async def test_join_binds_secondary_adapter_into_callbacks(self, runner):
+        """Join on a secondary profile wires callbacks bound to ITS adapter.
+
+        Regression for #79 P2: the join stores _voice_text_channels/_voice_sources
+        on the secondary profile's own adapter; the installed voice-input and
+        disconnect callbacks must resolve back to that same adapter, not the
+        default one, or voice capture finds no guild_id mapping.
+        """
+        from gateway.config import Platform
+
+        default_adapter = AsyncMock()
+        default_adapter._voice_text_channels = {}
+        default_adapter._voice_sources = {}
+
+        mock_channel = MagicMock()
+        mock_channel.name = "Secondary VC"
+        secondary_adapter = AsyncMock()
+        secondary_adapter.join_voice_channel = AsyncMock(return_value=True)
+        secondary_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        secondary_adapter._voice_text_channels = {}
+        secondary_adapter._voice_sources = {}
+        secondary_adapter._voice_input_callback = None
+        secondary_adapter._on_voice_disconnect = None
+        secondary_adapter.handle_message = AsyncMock()
+        secondary_adapter._client = MagicMock()
+        secondary_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+
+        runner.adapters[Platform.DISCORD] = default_adapter
+        runner._profile_adapters = {"analyst": {Platform.DISCORD: secondary_adapter}}
+
+        event = self._make_discord_event()
+        event.source.platform = Platform.DISCORD
+        event.source.profile = "analyst"
+        event.source.chat_type = "channel"
+
+        result = await runner._handle_voice_channel_join(event)
+        assert "joined" in result.lower()
+        # State landed on the secondary adapter, not the default one.
+        assert secondary_adapter._voice_text_channels[111] == 123
+        assert default_adapter._voice_text_channels == {}
+
+        # The installed input callback must reach the secondary adapter's map.
+        await secondary_adapter._voice_input_callback(
+            guild_id=111, user_id=42, transcript="Hello from secondary"
+        )
+        secondary_adapter.handle_message.assert_called_once()
+        default_adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_input_uses_bound_adapter_over_default(self, runner):
+        """A bound adapter arg wins over the default Discord adapter.
+
+        When the callback carries the adapter that joined, voice input must be
+        dispatched through that adapter even if a different default adapter is
+        registered.
+        """
+        from gateway.config import Platform
+
+        default_adapter = AsyncMock()
+        default_adapter._voice_text_channels = {}
+        default_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = default_adapter
+
+        bound_adapter = AsyncMock()
+        bound_adapter._voice_text_channels = {111: 123}
+        bound_adapter._voice_sources = {}
+        bound_adapter._client = MagicMock()
+        bound_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        bound_adapter.handle_message = AsyncMock()
+
+        await runner._handle_voice_channel_input(
+            111, 42, "Hello from VC", adapter=bound_adapter
+        )
+
+        bound_adapter.handle_message.assert_called_once()
+        default_adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_timeout_cleanup_uses_bound_adapter(self, runner):
+        """Timeout cleanup disables auto-TTS on the bound (joined) adapter."""
+        from gateway.config import Platform
+
+        default_adapter = MagicMock()
+        runner.adapters[Platform.DISCORD] = default_adapter
+        runner._voice_mode["discord:999"] = "all"
+
+        bound_adapter = MagicMock()
+        with patch.object(runner, "_set_adapter_auto_tts_disabled") as mock_disable:
+            runner._handle_voice_timeout_cleanup("999", adapter=bound_adapter)
+
+        assert runner._voice_mode["discord:999"] == "off"
+        mock_disable.assert_called_once_with(bound_adapter, "999", disabled=True)
+
     # -- _get_guild_id --
 
     def test_get_guild_id_from_guild(self, runner):
