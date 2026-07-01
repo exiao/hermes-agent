@@ -599,3 +599,35 @@ async def test_shutdown_notice_unstamped_source_uses_default_adapter():
     assert len(default_adapter.sent_calls) == 1
     _chat_id, message, _metadata = default_adapter.sent_calls[0]
     assert "Gateway" in message
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notice_dedup_keeps_distinct_profiles_separate():
+    """P2 (#79 review): two sessions on the same platform/chat/thread but
+    different profiles route to different accounts, so both must receive the
+    notice — the dedup key includes the profile and must not collapse them."""
+    from tests.gateway.restart_test_helpers import RestartTestAdapter
+
+    runner, default_adapter = make_restart_runner()
+    profile_adapter = RestartTestAdapter()
+    runner._profile_adapters = {"equity-analyst": {Platform.TELEGRAM: profile_adapter}}
+
+    # Same chat_id + thread_id, different profile → distinct delivery targets.
+    default_source = make_restart_source(chat_id="777", thread_id="42")
+    profile_source = make_restart_source(chat_id="777", thread_id="42")
+    profile_source.profile = "equity-analyst"
+
+    default_key = build_session_key(default_source, profile=default_source.profile)
+    profile_key = build_session_key(profile_source, profile=profile_source.profile)
+    assert default_key != profile_key  # distinct sessions, distinct namespaces
+    runner._running_agents = {default_key: MagicMock(), profile_key: MagicMock()}
+    runner._cache_session_source(default_key, default_source)
+    runner._cache_session_source(profile_key, profile_source)
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    # Each account got exactly one notice — the profile session was NOT deduped
+    # away against the default session sharing the same chat/thread.
+    assert len(default_adapter.sent_calls) == 1
+    assert len(profile_adapter.sent_calls) == 1
+

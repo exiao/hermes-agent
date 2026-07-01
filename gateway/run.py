@@ -5171,7 +5171,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
-        notified: set[tuple[str, str, Optional[str]]] = set()
+        notified: set[tuple[str, str, str, Optional[str]]] = set()
         for session_key in active:
             source = None
             try:
@@ -5205,8 +5205,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Deduplicate only identical delivery targets. Thread/topic-aware
             # platforms can share a parent chat while still routing to distinct
-            # destinations via metadata.
-            dedup_key = (platform_str, chat_id, str(thread_id) if thread_id else None)
+            # destinations via metadata. The profile is part of the identity:
+            # two sessions on the same platform/chat/thread but different
+            # profiles route to different accounts, so each is a distinct
+            # delivery target and must not dedup against the other.
+            profile_str = (getattr(source, "profile", None) or "") if source is not None else ""
+            dedup_key = (profile_str, platform_str, chat_id, str(thread_id) if thread_id else None)
             if dedup_key in notified:
                 continue
 
@@ -5236,10 +5240,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
                 if reply_to_message_id is None and restart_source is not None:
                     try:
+                        restart_profile = getattr(restart_source, "profile", None) or ""
                         restart_platform = restart_source.platform.value
                         restart_chat_id = str(restart_source.chat_id)
                         restart_thread_id = str(restart_source.thread_id) if restart_source.thread_id else None
-                        if (restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
+                        if (restart_profile, restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
                             reply_to_message_id = getattr(restart_source, "message_id", None)
                     except Exception:
                         pass
@@ -5296,7 +5301,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            dedup_key = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            # Home-channel notices go out the default adapters (self.adapters),
+            # so their profile slot is "" — matching a default-profile active
+            # session on the same target, distinct from a secondary profile's.
+            dedup_key = ("", str(platform.value), str(home.chat_id), str(home.thread_id) if home.thread_id else None)
             if dedup_key in notified:
                 continue
 
@@ -16391,12 +16399,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         this helper exists to prevent. So a stamped profile that is a known
         served secondary resolves to its own adapter or to None (defer/drop);
         only unstamped / default / not-served stamps fall back to the default.
+
+        Exception: shared *listener* platforms (``_PORT_BINDING_PLATFORM_VALUES``
+        — webhook, api_server, feishu, …) are default-owned by design; a
+        secondary profile can never bind its own (``_start_one_profile_adapters``
+        raises ``MultiplexConfigError`` for them), and the single default adapter
+        serves every profile via the ``/p/<profile>/`` prefix. So for those
+        platforms a profile-stamped source correctly falls back to the shared
+        default adapter rather than being dropped.
         """
         if source is None:
             return None
         platform = source.platform
         profile = (getattr(source, "profile", None) or "").strip()
-        if profile:
+        _shared_listener = getattr(platform, "value", platform) in _PORT_BINDING_PLATFORM_VALUES
+        if profile and not _shared_listener:
             profile_map = getattr(self, "_profile_adapters", None)
             if profile_map and profile in profile_map:
                 # Served secondary profile: use ITS adapter for this platform,
