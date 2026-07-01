@@ -219,3 +219,22 @@ class TestOutboundAdapterForSource:
         assert runner._adapter_for_source(src) is None
         assert runner._adapter_for_source(src) is not default_signal
 
+    def test_shared_listener_platform_falls_back_to_default(self):
+        """P2 (#79 review): shared listener platforms (webhook/api_server/…) are
+        default-owned — a secondary profile can never bind its own, and the
+        single default adapter serves every profile via /p/<profile>/. So a
+        profile-stamped source on such a platform must fall back to the shared
+        default adapter, NOT be dropped as a 'missing secondary adapter'."""
+        from gateway.config import Platform
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        default_webhook = _FakeAdapter(token="default-webhook")
+        runner.adapters = {Platform.WEBHOOK: default_webhook}
+        # equity-analyst is a served secondary but (correctly) owns no webhook
+        # adapter — port-binding platforms are default-owned.
+        runner._profile_adapters = {"equity-analyst": {}}
+
+        src = self._Src(Platform.WEBHOOK, profile="equity-analyst")
+        assert runner._adapter_for_source(src) is default_webhook
+
+

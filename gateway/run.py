@@ -16380,12 +16380,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         this helper exists to prevent. So a stamped profile that is a known
         served secondary resolves to its own adapter or to None (defer/drop);
         only unstamped / default / not-served stamps fall back to the default.
+
+        Exception: shared *listener* platforms (``_PORT_BINDING_PLATFORM_VALUES``
+        — webhook, api_server, feishu, …) are default-owned by design; a
+        secondary profile can never bind its own (``_start_one_profile_adapters``
+        raises ``MultiplexConfigError`` for them), and the single default adapter
+        serves every profile via the ``/p/<profile>/`` prefix. So for those
+        platforms a profile-stamped source correctly falls back to the shared
+        default adapter rather than being dropped.
         """
         if source is None:
             return None
         platform = source.platform
         profile = (getattr(source, "profile", None) or "").strip()
-        if profile:
+        _shared_listener = getattr(platform, "value", platform) in _PORT_BINDING_PLATFORM_VALUES
+        if profile and not _shared_listener:
             profile_map = getattr(self, "_profile_adapters", None)
             if profile_map and profile in profile_map:
                 # Served secondary profile: use ITS adapter for this platform,
