@@ -2873,6 +2873,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
         self._kanban_notifier_profile = self._active_profile_name()
+        # Owner (gateway-home) profile, captured ONCE at startup — outside any
+        # per-turn _profile_runtime_scope. _adapter_for_source must compare a
+        # source's profile stamp against this, NOT a live _active_profile_name()
+        # call: on the primary path _run_agent_inner runs inside
+        # _profile_runtime_scope(source.profile), so a live call would echo back
+        # the stamped profile and defeat the drop-unknown-stamp guard.
+        self._owner_profile_name = self._kanban_notifier_profile
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -16412,14 +16419,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # never the default one (return None if it has none).
                 return profile_map[profile].get(platform)
             # Stamp names a profile that is NOT a served secondary. If it is the
-            # active profile (whose adapters live in self.adapters), fall back;
-            # otherwise it is a removed/renamed/never-started secondary with no
-            # correct account — drop rather than leak from the default account.
-            # getattr fallback: a stubbed/partial GatewayRunner (tests, third-party
-            # extensions) may lack _active_profile_name — degrade to "default".
-            _active = getattr(self, "_active_profile_name", None)
-            _active_name = _active() if callable(_active) else "default"
-            if profile != _active_name:
+            # gateway's own OWNER profile (whose adapters live in self.adapters),
+            # fall back; otherwise it is a removed/renamed/never-started secondary
+            # with no correct account — drop rather than leak from the default.
+            #
+            # Compare against the startup-captured owner name, NOT a live
+            # _active_profile_name() call: the primary path runs this inside
+            # _profile_runtime_scope(source.profile), so a live call would echo
+            # back the stamped profile and never drop a removed-profile stamp.
+            # getattr fallback keeps a stubbed/partial GatewayRunner working.
+            _owner = getattr(self, "_owner_profile_name", None)
+            if _owner is None:
+                _active = getattr(self, "_active_profile_name", None)
+                _owner = _active() if callable(_active) else "default"
+            if profile != _owner:
                 return None
         adapters = getattr(self, "adapters", None)
         if not adapters:
