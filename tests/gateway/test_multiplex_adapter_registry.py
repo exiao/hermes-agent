@@ -237,4 +237,62 @@ class TestOutboundAdapterForSource:
         src = self._Src(Platform.WEBHOOK, profile="equity-analyst")
         assert runner._adapter_for_source(src) is default_webhook
 
+    def test_removed_secondary_stamp_returns_none(self):
+        """P2 (#79 follow-up): a stamp naming a non-default profile that is NOT
+        a served secondary (removed/renamed, or its startup failed before
+        registering in _profile_adapters) has no correct account. It must
+        resolve to None — never fall back to the default account and leak the
+        reply/restore notice out the operator's default credential."""
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        runner._owner_profile_name = "default"
+        # 'ghost' is not in _profile_adapters and is not the owner profile.
+        src = self._Src(Platform.SIGNAL, profile="ghost")
+        assert runner._adapter_for_source(src) is None
+        assert runner._adapter_for_source(src) is not default_signal
+
+    def test_removed_stamp_dropped_even_under_scoped_active_profile(self):
+        """Regression for the Codex P1 / claude blocker: on the primary path
+        _adapter_for_source runs inside _profile_runtime_scope(source.profile),
+        so a LIVE _active_profile_name() would echo back the stamped profile and
+        the drop would never fire. The guard compares against the startup-captured
+        owner name instead, so a removed 'ghost' stamp is still dropped even when
+        the (scoped) active-profile call returns 'ghost'."""
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        runner._owner_profile_name = "default"
+        # Simulate the in-turn scope: a live active-profile call returns the stamp.
+        runner._active_profile_name = lambda: "ghost"
+        src = self._Src(Platform.SIGNAL, profile="ghost")
+        assert runner._adapter_for_source(src) is None
+        assert runner._adapter_for_source(src) is not default_signal
+
+    def test_active_profile_stamp_falls_back_to_default(self):
+        """A stamp naming the owner profile (whose adapters live in
+        self.adapters and which is intentionally never in _profile_adapters)
+        must still fall back to the default adapter — dropping it would break
+        delivery for the gateway's own home profile."""
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        runner._owner_profile_name = "reviewer"
+        src = self._Src(Platform.SIGNAL, profile="reviewer")
+        assert runner._adapter_for_source(src) is default_signal
+
+    def test_removed_secondary_stamp_on_shared_listener_falls_back(self):
+        """A shared-listener platform is default-owned regardless of the stamp:
+        even an unknown/removed profile stamp resolves to the single default
+        adapter (the /p/<profile>/ prefix routes it), never dropped."""
+        from gateway.config import Platform
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        default_webhook = _FakeAdapter(token="default-webhook")
+        runner.adapters = {Platform.WEBHOOK: default_webhook}
+        runner._profile_adapters = {}
+        runner._owner_profile_name = "default"
+        src = self._Src(Platform.WEBHOOK, profile="ghost")
+        assert runner._adapter_for_source(src) is default_webhook
+
 
