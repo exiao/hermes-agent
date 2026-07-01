@@ -106,24 +106,6 @@ def _resolve_default_notify_targets(
     return targets
 
 
-# --------------------------------------------------------------------------
-# On-completion reaction: hand every completion to the orchestrator.
-# --------------------------------------------------------------------------
-#
-# When any task completes, spawn ONE decision card assigned to the orchestrator
-# lane. The orchestrator reads ~/.hermes/constitution.md and decides what
-# happens next (review, babysit a PR, verify a feature, or nothing) — the same
-# brain that routes new work. We do not pick the follow-up here: that keeps the
-# routing policy in one place (the constitution) instead of split between Python
-# and a reviewer's prompt.
-#
-# The ONLY thing this trigger must not do is react to its own decision card —
-# that would loop forever. Every card this automation spawns carries
-# ``_AUTO_REACTION_MARKER`` in its body; a completion whose body has the marker
-# is skipped. The marker (not an assignee allowlist) is the authoritative loop
-# guard, so a brand-new lane is covered with no code change.
-_AUTO_REACTION_MARKER = "<!-- kanban:auto-on-complete-reaction -->"
-
 # Max chars of a worker's terminal-state handoff (blocked reason / gave_up
 # error / completed summary) to inline into a delivered notification. The old
 # 160/200 slices clipped the worker's reasoning mid-sentence; these pings exist
@@ -457,94 +439,6 @@ def _format_block_notification(
     return f"⏸ {tag}Kanban {task_id} blocked{suffix}"
 
 
-def _resolve_on_complete_review_config(
-    load_config: Callable[[], Any],
-) -> "Optional[dict]":
-    """Resolve the live ``kanban.on_complete_review`` config block.
-
-    Shape in ``config.yaml``::
-
-        kanban:
-          on_complete_review:
-            enabled: true
-            # Where verdict + progress messages go (the "Kanban Master" group).
-            notify:
-              platform: signal
-              chat_id: "group:..."
-              thread_id: ""   # optional
-
-    Returns ``None`` when the feature is disabled or misconfigured (no
-    ``enabled: true``), so the caller treats a missing/garbled block as OFF.
-    On a valid+enabled block, returns a normalised dict::
-
-        {"notify": {"platform", "chat_id", "thread_id"}}  # notify may be None
-
-    Read fresh on every notifier tick (like the other resolvers here) so
-    flipping ``enabled`` takes effect on the next tick with no gateway
-    restart. Fails **safe**: any read/parse error returns ``None``.
-    """
-    try:
-        cfg = load_config()
-    except Exception:
-        return None
-    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    raw = kcfg.get("on_complete_review")
-    if not isinstance(raw, dict):
-        return None
-    if not bool(raw.get("enabled", False)):
-        return None
-    notify = None
-    n = raw.get("notify")
-    if isinstance(n, dict):
-        platform = str(n.get("platform") or "").strip().lower()
-        chat_id = str(n.get("chat_id") or "").strip()
-        if platform and chat_id:
-            notify = {
-                "platform": platform,
-                "chat_id": chat_id,
-                "thread_id": str(n.get("thread_id") or "").strip(),
-            }
-    return {"notify": notify}
-
-
-def _orchestrator_assignee(load_config: Callable[[], Any]) -> str:
-    """Resolve the lane the on-completion decision card is assigned to.
-
-    Reads ``kanban.orchestrator_profile`` (the same knob Triage decomposition
-    uses). Falls back to ``"orchestrator"`` when unset so the reaction works on
-    a stock board. The orchestrator profile is a board-write-only lane (no
-    terminal): it reads the constitution and routes, it never builds.
-    """
-    try:
-        cfg = load_config()
-        kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        name = str(kcfg.get("orchestrator_profile") or "").strip()
-        return name or "orchestrator"
-    except Exception:
-        return "orchestrator"
-
-
-def _qualifies_for_on_complete_review(task) -> "tuple[bool, str]":
-    """Decide whether a completed task should trigger the orchestrator hand-off.
-
-    Returns ``(qualifies, reason)``; ``reason`` names the gate that fired for
-    log legibility. Every completion qualifies EXCEPT a card this automation
-    itself spawned — reacting to our own decision card would loop forever. The
-    marker (stamped in the body of every spawned card) is the only gate: no
-    assignee allowlist, so a brand-new lane is covered with zero code change,
-    and the orchestrator decides per-task what (if anything) to do next.
-
-    Standalone (no instance state) so it unit-tests directly and can't raise
-    AttributeError under a mocked runner.
-    """
-    if task is None:
-        return False, "no-task"
-    body = getattr(task, "body", None) or ""
-    if _AUTO_REACTION_MARKER in body:
-        return False, "auto-spawned-card (loop-guard)"
-    return True, "completed"
-
-
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -686,9 +580,6 @@ class GatewayKanbanWatchersMixin:
                 # adding/removing a `kanban.default_notify` entry takes effect
                 # on the next tick (no gateway restart). Fails safe to [].
                 default_notify_targets = _resolve_default_notify_targets(_load_config)
-                # Resolve the on-completion review reaction config fresh each
-                # tick (None = feature off). Same live-reload semantics.
-                on_complete_review_cfg = _resolve_on_complete_review_config(_load_config)
 
                 def _collect():
                     deliveries: list[dict] = []
@@ -968,32 +859,6 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
-                                # On-completion reaction (constitution rule 2):
-                                # spawn an adversarial review parented to the
-                                # just-completed write-lane task and post
-                                # progress to the configured chat. Gated by
-                                # `kanban.on_complete_review.enabled`. Fires
-                                # inside the `completed` branch so it only ever
-                                # runs on a real completion; idempotent on the
-                                # task id so the per-chat fan-out of the same
-                                # completed event spawns at most ONE review.
-                                if on_complete_review_cfg is not None:
-                                    try:
-                                        react_fn = getattr(
-                                            self, "_maybe_react_on_complete", None
-                                        )
-                                        if react_fn is not None:
-                                            await react_fn(
-                                                task=task,
-                                                board=board_slug,
-                                                review_cfg=on_complete_review_cfg,
-                                            )
-                                    except Exception as react_exc:
-                                        logger.warning(
-                                            "kanban on-complete-review: reaction "
-                                            "for %s failed: %s",
-                                            sub["task_id"], react_exc,
-                                        )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -1219,179 +1084,6 @@ class GatewayKanbanWatchersMixin:
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
-
-    async def _maybe_react_on_complete(
-        self,
-        *,
-        task,
-        board: Optional[str],
-        review_cfg: dict,
-    ) -> None:
-        """On a qualifying ``completed`` event: spawn ONE orchestrator decision
-        card parented to the task and post a short progress line to the
-        configured Signal chat (the "Kanban Master" group).
-
-        The orchestrator (a board-write-only lane) reads the completion handoff
-        and ~/.hermes/constitution.md and decides what happens next — review,
-        babysit a PR, verify a feature, or nothing. We do NOT pick the follow-up
-        here; routing policy stays in the constitution, one source of truth.
-        The trigger's job is: fire once, parent the decision card, report it.
-
-        Idempotency: the decision card is created with an ``idempotency_key``
-        derived from the completed task id, so re-delivery of the completed
-        event (retries, multi-tick, per-chat fan-out) never spawns a duplicate.
-        The spawned card carries ``_AUTO_REACTION_MARKER`` so its own completion
-        is skipped by ``_qualifies_for_on_complete_review`` (no loop).
-        """
-        from hermes_cli import kanban_db as _kb
-        from gateway.config import Platform as _Platform
-        from hermes_cli.config import load_config as _load_config
-
-        qualifies, reason = _qualifies_for_on_complete_review(task)
-        if not qualifies:
-            logger.debug(
-                "kanban on-complete-review: skipping %s (%s)",
-                getattr(task, "id", "<?>"), reason,
-            )
-            return
-
-        task_id = task.id
-        orchestrator = _orchestrator_assignee(_load_config)
-        notify = review_cfg.get("notify") or {}
-
-        def _spawn_decision():
-            """Create the parented orchestrator decision card (idempotent)."""
-            conn = _kb.connect(board=board)
-            try:
-                # Hard idempotency: never double-spawn a decision card for the
-                # same completed task even across ticks / event redelivery.
-                idem = f"on-complete-decision:{task_id}"
-                existing = None
-                try:
-                    for child_id in _kb.child_ids(conn, task_id):
-                        child = _kb.get_task(conn, child_id)
-                        if child and _AUTO_REACTION_MARKER in (child.body or ""):
-                            existing = child_id
-                            break
-                except Exception:
-                    pass
-                if existing:
-                    return None, existing
-
-                title = f"Decide next: {(task.title or task_id)[:90]}"
-                who = (task.assignee or "?")
-                body = (
-                    f"{_AUTO_REACTION_MARKER}\n"
-                    f"# Decide what happens next for {task_id} (@{who})\n\n"
-                    "A task just completed. You are the orchestrator: read its "
-                    "handoff and ~/.hermes/constitution.md, then decide and "
-                    "route the follow-up. You don't do the work yourself; you "
-                    "spawn and assign the right cards (or none).\n\n"
-                    "## What to do\n"
-                    "1. Read the completed parent's handoff with `kanban_show` "
-                    "(summary + metadata + any PR url) and look at what it "
-                    "actually produced.\n"
-                    "2. Apply the constitution: a completed PR usually wants an "
-                    "adversarial `reviewer` card AND, once it's merge-ready, a "
-                    "`pr-babysitter` to watch CI / address threads; a feature "
-                    "that needs runtime proof wants `verifier`; a content/ads "
-                    "deliverable wants a second-producer critique; trivial or "
-                    "read-only work may want nothing. Never assign a review back "
-                    "to the lane that produced the work (self-review bias).\n"
-                    "3. Spawn each follow-up with `kanban_create`, parented to "
-                    f"{task_id}, and post a one-line note of what you routed to "
-                    "the Kanban Master Signal group (and via `kanban_comment` "
-                    "on this card).\n"
-                    "4. If nothing is needed, say so in one line and complete.\n\n"
-                    "Do NOT merge, deploy, or publish. You route; the lanes "
-                    "report; Eric merges.\n"
-                )
-                new_id = _kb.create_task(
-                    conn,
-                    title=title,
-                    body=body,
-                    assignee=orchestrator,
-                    parents=[task_id],
-                    created_by="kanban-on-complete-reaction",
-                    workspace_kind="scratch",
-                    priority=getattr(task, "priority", 0) or 0,
-                    idempotency_key=idem,
-                    goal_mode=True,
-                    goal_max_turns=20,
-                    max_runtime_seconds=1800,
-                    board=board,
-                )
-                return new_id, None
-            finally:
-                conn.close()
-
-        try:
-            new_id, existing = await asyncio.to_thread(_spawn_decision)
-        except Exception as exc:
-            logger.warning(
-                "kanban on-complete-review: failed to spawn decision card for %s: %s",
-                task_id, exc,
-            )
-            return
-
-        if existing:
-            logger.debug(
-                "kanban on-complete-review: decision card %s already exists for %s; "
-                "no progress message (idempotent)",
-                existing, task_id,
-            )
-            return
-
-        logger.info(
-            "kanban on-complete-review: spawned decision card %s (%s) parented to %s",
-            new_id, orchestrator, task_id,
-        )
-
-        # Report progress to the Kanban Master chat so Eric sees the loop move
-        # without opening the dashboard. Best-effort: a send failure here must
-        # not undo the (already-created) decision card.
-        if not notify:
-            logger.debug(
-                "kanban on-complete-review: no notify target configured; "
-                "decision card %s spawned silently", new_id,
-            )
-            return
-        try:
-            plat = _Platform(notify["platform"])
-        except ValueError:
-            logger.debug(
-                "kanban on-complete-review: unknown notify platform %s",
-                notify.get("platform"),
-            )
-            return
-        progress_adapter = self.adapters.get(plat)
-        if progress_adapter is None:
-            logger.debug(
-                "kanban on-complete-review: notify adapter %s not connected",
-                notify["platform"],
-            )
-            return
-        meta: dict[str, Any] = {}
-        if notify.get("thread_id"):
-            meta["thread_id"] = notify["thread_id"]
-        who_str = f" (@{task.assignee})" if task.assignee else ""
-        msg = (
-            f"✅ {task_id} completed{who_str} — "
-            f"{(task.title or '')[:80]}\n"
-            f"Spawned {new_id} → @{orchestrator} to decide the next step. "
-            f"Any follow-up will land here."
-        )
-        try:
-            await progress_adapter.send(notify["chat_id"], msg, metadata=meta)
-            logger.debug(
-                "kanban on-complete-review: progress posted for %s to %s/%s",
-                task_id, notify["platform"], notify["chat_id"],
-            )
-        except Exception as exc:
-            logger.warning(
-                "kanban on-complete-review: progress send failed for %s: %s",
-                task_id, exc,
-            )
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.

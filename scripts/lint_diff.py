@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -81,11 +82,25 @@ def _normalize_ty(entries: list[dict]) -> list[dict]:
     return out
 
 
+_TY_UNION_OMISSION_RE = re.compile(r"\.\.\. omitted \d+ union elements?")
+
+
+def _stable_message(message: str) -> str:
+    """Remove ty wording that changes when nearby config shape changes.
+
+    ty abbreviates long unions as ``... omitted N union elements``. The count is
+    presentation-only: unrelated additions/removals to the same inferred union
+    can change N without changing the actual diagnostic. If the diff key keeps
+    that count, a pre-existing issue appears once as "fixed" and once as "new".
+    """
+    return _TY_UNION_OMISSION_RE.sub("... omitted <N> union elements", message)
+
+
 def _key(d: dict) -> tuple[str, str, str]:
     """Stable diagnostic identity across commits: (path, rule, message)."""
     # Intentionally omit line so unrelated edits above an issue don't flag it
     # as "new". Same file + same rule + same message = same issue.
-    return (d["path"], d["rule"], d["message"])
+    return (d["path"], d["rule"], _stable_message(d["message"]))
 
 
 def _diff(base: list[dict], head: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:

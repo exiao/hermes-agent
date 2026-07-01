@@ -582,6 +582,11 @@
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
+    // Bounded window for the (append-only, unbounded) done/archived columns.
+    // null => server default (DONE_LIMIT_DEFAULT = 50). The "load more" /
+    // "load all" affordance on the done column bumps this; the rest of the
+    // board (live columns) is always returned in full regardless.
+    const [doneLimit, setDoneLimit] = useState(null);
 
     const [selectedTaskId, setSelectedTaskId] = useState(null);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
@@ -621,7 +626,12 @@
     const loadBoard = useCallback(() => {
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
+      if (assigneeFilter) qs.set("assignee", assigneeFilter);
       if (includeArchived) qs.set("include_archived", "true");
+      // A bumped doneLimit fetches more (or all) of the done/archived tail;
+      // unset leaves the server default in place. A very large value acts as
+      // "load all" (the server clamps to its DONE_LIMIT_MAX ceiling).
+      if (doneLimit != null) qs.set("done_limit", String(doneLimit));
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
@@ -633,7 +643,17 @@
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setLoading(false); });
-    }, [tenantFilter, includeArchived, board]);
+    }, [tenantFilter, assigneeFilter, includeArchived, doneLimit, board]);
+
+    // Expand the done/archived window on demand. Passing no arg ("load all")
+    // bumps past the current total so the server returns the full tail (up
+    // to its hard ceiling); a number sets an explicit larger window.
+    const loadMoreDone = useCallback(function (next) {
+      setDoneLimit(function (cur) {
+        if (typeof next === "number") return next;
+        return 100000;  // "load all" — server clamps to DONE_LIMIT_MAX
+      });
+    }, []);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -1008,6 +1028,9 @@
       setTenantFilter("");
       setAssigneeFilter("");
       setIncludeArchived(false);
+      // Reset the done window too: a "Load all" on the previous board must not
+      // force the new board to ship its whole completed history on first paint.
+      setDoneLimit(null);
       clearSelected();
     }, [board, clearSelected]);
 
@@ -1139,6 +1162,7 @@
           onDelete: deleteTask,
           onOpen: setSelectedTaskId,
           onCreate: createTask,
+          onLoadMoreDone: loadMoreDone,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }),
         selectedTaskId ? h(TaskDrawer, {
@@ -2351,6 +2375,7 @@
           onMoveSelected: props.onMoveSelected,
           onOpen: props.onOpen,
           onCreate: props.onCreate,
+          onLoadMoreDone: props.onLoadMoreDone,
           allTasks: props.allTasks,
         });
       }),
@@ -2502,6 +2527,28 @@
                 });
               }),
       ),
+      // Windowed terminal columns (done/archived) carry total + has_more.
+      // When the returned tail is partial, offer a "load all" affordance so
+      // older completed cards stay reachable on demand without shipping the
+      // whole history on first paint. Live columns omit has_more entirely.
+      props.column.has_more
+        ? h("div", { className: "hermes-kanban-column-footer" },
+            h("span", { className: "hermes-kanban-column-footer-count" },
+              tx(t, "showingNofM", "showing {n} of {m}", {
+                n: props.column.tasks.length,
+                m: props.column.total,
+              })),
+            props.onLoadMoreDone
+              ? h("button", {
+                  type: "button",
+                  className: "hermes-kanban-column-loadmore",
+                  title: tx(t, "loadAllDoneHelp",
+                    "Fetch the rest of this column's completed history"),
+                  onClick: function () { props.onLoadMoreDone(); },
+                }, tx(t, "loadAllDone", "Load all"))
+              : null,
+          )
+        : null,
     );
   }
 

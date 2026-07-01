@@ -25,8 +25,8 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py for tests."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -38,7 +38,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
 
 
 @pytest.fixture
@@ -187,6 +192,398 @@ def test_tenant_filter(client):
     r = client.get("/api/plugins/kanban/board?tenant=t2")
     total = sum(len(c["tasks"]) for c in r.json()["columns"])
     assert total == 1
+
+
+# ---------------------------------------------------------------------------
+# Done-column windowing — bounded default + expand path
+# ---------------------------------------------------------------------------
+
+
+def _seed_done_tasks(client, n, *, base_completed_at=1_000_000):
+    """Create ``n`` done tasks with strictly increasing completed_at.
+
+    Returns the list of task ids in completion order (oldest → newest).
+    We stamp completed_at directly so ordering/windowing is deterministic
+    regardless of wall-clock time during the test run.
+    """
+    ids = []
+    for i in range(n):
+        tid = client.post(
+            "/api/plugins/kanban/tasks", json={"title": f"done-{i}"}
+        ).json()["task"]["id"]
+        ids.append(tid)
+    conn = kb.connect()
+    try:
+        with conn:
+            for i, tid in enumerate(ids):
+                conn.execute(
+                    "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+                    (base_completed_at + i, tid),
+                )
+    finally:
+        conn.close()
+    return ids
+
+
+def _done_column(payload):
+    return next(c for c in payload["columns"] if c["name"] == "done")
+
+
+def _seed_done_tasks_for(client, n, assignee, *, base_completed_at=1_000_000):
+    """Create ``n`` done tasks owned by ``assignee`` with increasing
+    completed_at. Returns the task ids (oldest → newest)."""
+    ids = []
+    for i in range(n):
+        tid = client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"{assignee}-done-{i}", "assignee": assignee},
+        ).json()["task"]["id"]
+        ids.append(tid)
+    conn = kb.connect()
+    try:
+        with conn:
+            for i, tid in enumerate(ids):
+                conn.execute(
+                    "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+                    (base_completed_at + i, tid),
+                )
+    finally:
+        conn.close()
+    return ids
+
+
+def test_board_caps_done_column_at_default(client):
+    """Default board load windows the done column to the server default (50),
+    not the full history, and reports total + has_more."""
+    ids = _seed_done_tasks(client, 60)  # > default of 50
+
+    data = client.get("/api/plugins/kanban/board").json()
+    done = _done_column(data)
+    assert len(done["tasks"]) == 50, "done column not capped at default"
+    assert done["total"] == 60
+    assert done["has_more"] is True
+    # The window is the most-recently-completed tail (newest first).
+    returned = [t["id"] for t in done["tasks"]]
+    assert returned[0] == ids[-1], "newest done card should be first"
+    # The 10 oldest must be the ones dropped from the default window.
+    assert ids[0] not in returned
+
+
+def test_board_done_window_stable_at_tie_boundary(client):
+    """Cards sharing the SAME completed_at AND created_at must page
+    deterministically at the LIMIT boundary — the window partitions cleanly
+    (no card both shown and dropped, none lost), and two identical loads return
+    the same set. Without a unique final tiebreaker (id) SQLite splits the tie
+    group arbitrarily at LIMIT, so a boundary card could flicker in and out.
+    """
+    ids = _seed_done_tasks(client, 10)
+    # Collapse the whole column onto a single (completed_at, created_at) so the
+    # only thing separating cards is the id tiebreaker.
+    conn = kb.connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET completed_at=?, created_at=? "
+                "WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                (5000000, 5000000, *ids),
+            )
+    finally:
+        conn.close()
+
+    first = _done_column(client.get("/api/plugins/kanban/board?done_limit=6").json())
+    second = _done_column(client.get("/api/plugins/kanban/board?done_limit=6").json())
+    window_a = [t["id"] for t in first["tasks"]]
+    window_b = [t["id"] for t in second["tasks"]]
+    assert len(window_a) == 6
+    # Deterministic: identical loads return the identical ordered window.
+    assert window_a == window_b
+    assert first["total"] == 10 and first["has_more"] is True
+
+    # The window partitions cleanly against the full expand — the 6 shown plus
+    # the remaining 4 cover every card with no overlap.
+    full = _done_column(
+        client.get("/api/plugins/kanban/board?done_limit=100").json()
+    )
+    full_order = [t["id"] for t in full["tasks"]]
+    assert set(full_order) == set(ids)
+    # The windowed page is exactly the deterministic prefix of the full order.
+    assert full_order[:6] == window_a
+
+
+def test_board_done_limit_expand_returns_older(client):
+    """A larger done_limit fetches the older done cards on demand; none are
+    permanently unreachable."""
+    ids = _seed_done_tasks(client, 60)
+
+    data = client.get("/api/plugins/kanban/board?done_limit=100").json()
+    done = _done_column(data)
+    assert len(done["tasks"]) == 60
+    assert done["total"] == 60
+    assert done["has_more"] is False
+    returned = set(t["id"] for t in done["tasks"])
+    assert set(ids) == returned, "expand path must reach every done card"
+
+
+def test_board_done_limit_clamped_to_ceiling(client):
+    """An absurd done_limit is clamped to the DoS ceiling, never an unbounded
+    scan, but the ceiling sits well above realistic history so an explicit
+    "Load all" never drops completed cards (regression: a low ceiling made
+    older done cards permanently unreachable)."""
+    from plugins.kanban.dashboard import plugin_api
+
+    _seed_done_tasks(client, 5)
+    data = client.get("/api/plugins/kanban/board?done_limit=999_999_999").json()
+    # done_window echoes the clamped value (the DoS ceiling), which is high
+    # enough that any realistic completed column is returned in full.
+    assert data["done_window"]["limit"] == plugin_api._DONE_LIMIT_MAX
+    assert plugin_api._DONE_LIMIT_MAX >= 100_000
+
+
+def test_board_load_all_reaches_history_beyond_old_cap(client):
+    """A "Load all" request returns the entire done column even when it
+    exceeds the previous 500-card cap — no card is permanently unreachable
+    and has_more flips to False once the full tail is returned."""
+    ids = _seed_done_tasks(client, 520)  # > the old _DONE_LIMIT_MAX of 500
+
+    data = client.get("/api/plugins/kanban/board?done_limit=100000").json()
+    done = _done_column(data)
+    assert done["total"] == 520
+    assert len(done["tasks"]) == 520, "every done card must be reachable"
+    assert done["has_more"] is False
+    assert set(ids) == set(t["id"] for t in done["tasks"])
+
+
+def test_board_done_since_date_range(client):
+    """done_since restricts the done column to cards completed at-or-after a
+    given instant."""
+    ids = _seed_done_tasks(client, 10, base_completed_at=2_000_000)
+    # completed_at runs 2_000_000 .. 2_000_009; ask for the last 4.
+    since = 2_000_006
+    data = client.get(f"/api/plugins/kanban/board?done_since={since}").json()
+    done = _done_column(data)
+    returned = set(t["id"] for t in done["tasks"])
+    assert returned == set(ids[6:]), "done_since window mismatch"
+    assert data["done_window"]["since"] == since
+
+
+def test_board_assignee_filters_done_before_windowing(client):
+    """An assignee filter must be applied to the done column BEFORE the
+    recent-tail window is chosen, not after.
+
+    Regression for the bug where ``/board`` fetched the unfiltered done tail
+    and let the client filter it: when the selected assignee's completed cards
+    are older than the default window, the unfiltered tail is full of OTHER
+    assignees' recent cards, the window drops the target assignee's cards, and
+    the client then shows an empty/partial done column until "Load all". With
+    server-side filtering the window is scoped to the assignee first, so their
+    completed work is always returned.
+    """
+    # 60 recent done cards for "noise" (newer), then 3 OLDER done cards for
+    # "alice". Without server-side filtering, the default window of 50 would be
+    # entirely "noise" cards and alice's 3 (oldest) would never ship.
+    alice_ids = _seed_done_tasks_for(client, 3, "alice", base_completed_at=1_000)
+    _seed_done_tasks_for(client, 60, "noise", base_completed_at=2_000)
+
+    # Sanity: an unfiltered default load drops alice's old cards entirely.
+    unfiltered = _done_column(client.get("/api/plugins/kanban/board").json())
+    assert not (set(alice_ids) & {t["id"] for t in unfiltered["tasks"]}), (
+        "precondition: alice's old done cards fall outside the unfiltered window"
+    )
+
+    data = client.get("/api/plugins/kanban/board?assignee=alice").json()
+    done = _done_column(data)
+    returned = {t["id"] for t in done["tasks"]}
+    assert returned == set(alice_ids), (
+        "assignee filter must scope the done window to that assignee's cards"
+    )
+    assert done["total"] == 3, "total must reflect the assignee-scoped count"
+    assert done["has_more"] is False
+    # Live columns are also scoped: no other assignee leaks through.
+    for col in data["columns"]:
+        for t in col["tasks"]:
+            assert t["assignee"] == "alice"
+
+
+def test_archived_window_uses_archive_timestamp_not_completion_timestamp(client):
+    """A recently archived old done card must appear in the first archived page."""
+
+    hidden_old_archived = _seed_done_tasks(client, 55, base_completed_at=10_000)
+    conn = kb.connect()
+    try:
+        with conn:
+            for i, tid in enumerate(hidden_old_archived):
+                conn.execute(
+                    "UPDATE tasks SET status = 'archived', archived_at = ? WHERE id = ?",
+                    (10_000 + i, tid),
+                )
+
+            recent = kb.create_task(conn, title="completed long ago, archived today")
+            kb.complete_task(conn, recent)
+            conn.execute(
+                "UPDATE tasks SET completed_at = ? WHERE id = ?",
+                (1_000, recent),
+            )
+            assert kb.archive_task(conn, recent)
+    finally:
+        conn.close()
+
+    data = client.get("/api/plugins/kanban/board?include_archived=true&done_limit=50").json()
+    archived = next(c for c in data["columns"] if c["name"] == "archived")
+    returned = [t["id"] for t in archived["tasks"]]
+    assert recent in returned
+    assert returned[0] == recent
+
+
+def test_done_window_ignores_stale_archive_timestamp(client):
+    """A re-completed card should sort by completed_at, not old archived_at."""
+
+    _seed_done_tasks(client, 55, base_completed_at=10_000)
+    conn = kb.connect()
+    try:
+        with conn:
+            recent = kb.create_task(conn, title="re-completed after archive")
+            kb.complete_task(conn, recent)
+            conn.execute(
+                "UPDATE tasks SET completed_at = ?, archived_at = ? WHERE id = ?",
+                (20_000, 1_000, recent),
+            )
+    finally:
+        conn.close()
+
+    data = client.get("/api/plugins/kanban/board?done_limit=50").json()
+    done = next(c for c in data["columns"] if c["name"] == "done")
+    returned = [t["id"] for t in done["tasks"]]
+    assert recent in returned
+    assert returned[0] == recent
+
+
+def test_board_aggregate_queries_are_scoped_to_returned_cards(kanban_home, monkeypatch):
+    """Board aggregates should not scan hidden terminal-card history."""
+
+    module = _load_plugin_module()
+    conn = kb.connect()
+    parent = kb.create_task(conn, title="visible parent")
+    child = kb.create_task(conn, title="visible child", parents=[parent])
+    hidden_done = kb.create_task(conn, title="hidden done history")
+    kb.add_comment(conn, hidden_done, "user", "hidden comment")
+    conn.execute(
+        "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+        (1_000, hidden_done),
+    )
+
+    queries: list[str] = []
+
+    class TrackingConn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=()):
+            queries.append(" ".join(sql.split()))
+            return self._inner.execute(sql, params)
+
+        def close(self):
+            self._inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(module, "_conn", lambda board=None: TrackingConn(conn))
+
+    payload = module.get_board(
+        tenant=None,
+        assignee=None,
+        workflow_template_id=None,
+        current_step_key=None,
+        done_limit=0,
+        done_since=None,
+        board=None,
+    )
+    returned_ids = {
+        task["id"]
+        for column in payload["columns"]
+        for task in column["tasks"]
+    }
+    assert parent in returned_ids
+    assert child in returned_ids
+    assert hidden_done not in returned_ids
+
+    link_count_queries = [
+        q for q in queries if q.startswith("SELECT parent_id, child_id FROM task_links")
+    ]
+    assert link_count_queries
+    assert all("WHERE" in q for q in link_count_queries), link_count_queries
+
+    comment_count_queries = [
+        q for q in queries if "FROM task_comments" in q and "GROUP BY task_id" in q
+    ]
+    assert comment_count_queries
+    assert all("WHERE task_id IN" in q for q in comment_count_queries), comment_count_queries
+
+    progress_queries = [q for q in queries if "FROM task_links l JOIN tasks t" in q]
+    assert progress_queries
+    assert all("WHERE l.parent_id IN" in q for q in progress_queries), progress_queries
+
+
+def test_board_chunks_returned_task_id_queries(client, monkeypatch):
+    """Large load-all windows must not exceed SQLite's host-parameter limit."""
+
+    module = _load_plugin_module()
+    monkeypatch.setattr(module, "_SQLITE_IN_CHUNK_SIZE", 3)
+    monkeypatch.setattr(kb, "_SQLITE_IN_CHUNK_SIZE", 3)
+
+    conn = kb.connect()
+    ids = _seed_done_tasks(client, 8)
+    for left, right in zip(ids, ids[1:]):
+        kb.link_tasks(conn, left, right)
+    for tid in ids:
+        kb.add_comment(conn, tid, "tester", "comment")
+
+    class TrackingConn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=()):
+            if " IN (" in sql:
+                assert len(tuple(params)) <= 3, sql
+            return self._inner.execute(sql, params)
+
+        def close(self):
+            self._inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(module, "_conn", lambda board=None: TrackingConn(conn))
+
+    payload = module.get_board(
+        tenant=None,
+        assignee=None,
+        workflow_template_id=None,
+        current_step_key=None,
+        done_limit=100000,
+        done_since=None,
+        board=None,
+    )
+
+    done = _done_column(payload)
+    assert [t["id"] for t in done["tasks"]] == list(reversed(ids))
+    assert all(t["comment_count"] == 1 for t in done["tasks"])
+
+
+def test_board_live_columns_are_full_and_unwindowed(client):
+    """Live (non-terminal) columns are never windowed: total == len(tasks)
+    and has_more is false even with many cards."""
+    for i in range(8):
+        client.post("/api/plugins/kanban/tasks", json={"title": f"todo-{i}"})
+    data = client.get("/api/plugins/kanban/board?done_limit=2").json()
+    live_total = 0
+    for c in data["columns"]:
+        if c["name"] in ("done", "archived"):
+            continue
+        assert c["has_more"] is False, f"live column {c['name']} should not page"
+        assert c["total"] == len(c["tasks"])
+        live_total += len(c["tasks"])
+    assert live_total == 8, "all 8 live cards must stay full across live columns"
 
 
 def test_board_query_param_default_overrides_current_board_pointer(client):
