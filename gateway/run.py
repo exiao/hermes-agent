@@ -5211,7 +5211,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
-                adapter = self.adapters.get(platform)
+                # When a persisted origin is available it carries the profile
+                # stamp, so route the notice through that profile's adapter
+                # (secondary-profile sessions get the notice from their own
+                # account, not the default). The parsed-key fallback has no
+                # source, so it keeps the default adapter.
+                adapter = (
+                    self._adapter_for_source(source)
+                    if source is not None
+                    else self.adapters.get(platform)
+                )
                 if not adapter:
                     continue
 
