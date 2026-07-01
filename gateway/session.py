@@ -66,17 +66,22 @@ from .whatsapp_identity import (
 )
 from utils import atomic_replace
 
-# Session keys/ids flow into filesystem paths downstream (e.g.
+# ``session_id`` flows into filesystem paths downstream (e.g.
 # ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
-# filenames in agent_runtime_helpers). Any value that could escape the
+# filenames in agent_runtime_helpers), so any value that could escape the
 # sessions directory as a path must be rejected at the entry boundary.
 # Rejects: parent traversal (``..``), a path separator anywhere (``/`` or
 # ``\``, so a non-leading Windows separator can't slip through), and a
-# leading Windows drive letter (``C:``). Legitimate session keys are
-# colon-delimited multi-segment ids (``agent:main:<platform>:...``) and
-# never contain these, so there are no false positives in practice.
+# leading Windows drive letter (``C:``). Generated session ids are
+# ``YYYYMMDD_HHMMSS_<uuid8>`` and never contain these.
 def _is_path_unsafe(value: object) -> bool:
-    """Return True if ``value`` could traverse outside the sessions dir."""
+    """Return True if ``value`` could traverse outside the sessions dir.
+
+    Use for path-bound fields only (``session_id``). ``session_key`` is NOT
+    path-bound (see :func:`_is_key_unsafe`) — a session key legitimately
+    contains ``/`` because base64 group ids (Signal, Matrix) embed it, and
+    rejecting those drops real group sessions on load.
+    """
     if not value:
         return False
     s = str(value)
@@ -87,6 +92,22 @@ def _is_path_unsafe(value: object) -> bool:
     # separator forms are already caught above — but keep an explicit guard
     # for the drive-letter prefix in case a separator was normalized away.
     return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
+
+
+# ``session_key`` never becomes a filesystem path — it is only ever a dict key
+# in memory and a SQLite column value. It legitimately contains ``/`` because a
+# base64 group id (Signal, Matrix) embeds ``/`` and the key is built as
+# ``agent:main:<platform>:group:<base64-group-id>``. So the path guard above
+# would wrongly reject every such group session and skip it on load. Guard only
+# against the injection vectors that matter for a key that flows into logs and a
+# DB: parent-traversal sequences (defense in depth, in case a key is ever reused
+# as a path elsewhere) and NUL bytes (which truncate C strings / corrupt SQLite).
+def _is_key_unsafe(value: object) -> bool:
+    """Return True if a session *key* contains a disallowed sequence."""
+    if not value:
+        return False
+    s = str(value)
+    return ".." in s or "\x00" in s
 
 
 @dataclass
@@ -639,12 +660,19 @@ class SessionEntry:
         session_key = data["session_key"]
         session_id = data["session_id"]
 
-        # Validate path-sensitive fields to prevent directory traversal (CWE-22)
-        for _field, _val in (("session_key", session_key), ("session_id", session_id)):
-            if _is_path_unsafe(_val):
-                raise ValueError(
-                    f"Invalid {_field}: potential directory traversal detected"
-                )
+        # session_id is path-bound (becomes {session_id}.json), so it gets the
+        # strict path guard. session_key never becomes a path but legitimately
+        # contains "/" (base64 group ids), so it gets the lighter key guard —
+        # rejecting "/" here silently dropped every Signal/Matrix group session
+        # on load (CWE-22 hardening that over-reached).
+        if _is_path_unsafe(session_id):
+            raise ValueError(
+                "Invalid session_id: potential directory traversal detected"
+            )
+        if _is_key_unsafe(session_key):
+            raise ValueError(
+                "Invalid session_key: disallowed sequence"
+            )
 
         return cls(
             session_key=session_key,
