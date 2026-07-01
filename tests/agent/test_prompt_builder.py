@@ -428,6 +428,48 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_preload_all_shows_every_skill_with_description(
+        self, monkeypatch, tmp_path
+    ):
+        """skills.preload_all: true renders every in-scope skill with its
+        description instead of collapsing non-preloaded skills to category
+        counts. Read per profile from config.yaml, so a hand-selected profile
+        opts in without editing shared SKILL.md frontmatter.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        specs = [
+            ("alpha", "a-one", False),
+            ("alpha", "a-two", False),
+            ("beta", "b-one", True),  # frontmatter-preloaded → triggers two-tier collapse
+        ]
+        for cat, name, preloaded in specs:
+            d = tmp_path / "skills" / cat / name
+            d.mkdir(parents=True)
+            fm = f"---\nname: {name}\n"
+            if preloaded:
+                fm += "preloaded: true\n"
+            fm += f"description: Does {name} things\n---\n"
+            (d / "SKILL.md").write_text(fm)
+
+        # Default (flag off): only the frontmatter-preloaded skill shows a
+        # description; the rest collapse to category counts.
+        (tmp_path / "config.yaml").write_text("skills:\n  preload_all: false\n")
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        off = build_skills_system_prompt()
+        assert "Does b-one things" in off
+        assert "Does a-one things" not in off
+        assert "alpha (2 skills)" in off
+
+        # Flag on: every skill listed with its description, no browse section.
+        (tmp_path / "config.yaml").write_text("skills:\n  preload_all: true\n")
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        on = build_skills_system_prompt()
+        assert "Does a-one things" in on
+        assert "Does a-two things" in on
+        assert "Does b-one things" in on
+        assert "skills_list(category=" not in on
+
     def test_compact_categories_demoted_to_names_only(self, monkeypatch, tmp_path):
         """Posture-driven demotion keeps every skill NAME visible.
 
