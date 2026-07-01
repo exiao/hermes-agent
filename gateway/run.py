@@ -5303,7 +5303,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Home-channel notices go out the default adapters (self.adapters),
             # so their profile slot is "" — matching a default-profile active
             # session on the same target, distinct from a secondary profile's.
-            dedup_key = ("", platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            dedup_key = ("", str(platform.value), str(home.chat_id), str(home.thread_id) if home.thread_id else None)
             if dedup_key in notified:
                 continue
 
