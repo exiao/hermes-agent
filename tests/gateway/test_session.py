@@ -1144,13 +1144,37 @@ class TestSessionEntryFromDictTraversalValidation:
             SessionEntry.from_dict(self._entry(session_id="D:\\path\\to\\file"))
 
     def test_session_id_non_leading_separator_raises(self):
-        """A path separator anywhere — not just leading — must be rejected,
-        since a non-leading backslash is still a Windows traversal vector."""
+        """A path separator anywhere — not just leading — must be rejected
+        in session_id, since a non-leading backslash is still a Windows
+        traversal vector. (session_key is not path-bound; see the base64
+        group-id tests below.)"""
         from gateway.session import SessionEntry
         with pytest.raises(ValueError, match="session_id"):
             SessionEntry.from_dict(self._entry(session_id="good\\..\\bad"))
+
+    def test_session_key_base64_group_id_slash_loads(self):
+        """A Signal/Matrix group session key embeds a base64 group id whose
+        alphabet includes '/'. session_key never becomes a filesystem path, so
+        the '/' must NOT be treated as traversal — rejecting it silently
+        dropped every group session on load (the bug this fixes)."""
+        from gateway.session import SessionEntry
+        key = "agent:main:signal:group:group:rjL9qqIUwGZqjEYrm6UWIp6WGJNcoVdxvrjcKVyFk/Y="
+        entry = SessionEntry.from_dict(self._entry(session_key=key))
+        assert entry.session_key == key
+
+    def test_session_key_dotdot_still_raises(self):
+        """A traversal sequence in session_key is still rejected (defense in
+        depth), even though the key isn't path-bound."""
+        from gateway.session import SessionEntry
         with pytest.raises(ValueError, match="session_key"):
-            SessionEntry.from_dict(self._entry(session_key="agent:main:good/sub"))
+            SessionEntry.from_dict(self._entry(session_key="agent:main:../../secret"))
+
+    def test_session_key_nul_byte_raises(self):
+        """A NUL byte in session_key is rejected (truncates C strings /
+        corrupts SQLite)."""
+        from gateway.session import SessionEntry
+        with pytest.raises(ValueError, match="session_key"):
+            SessionEntry.from_dict(self._entry(session_key="agent:main:local:dm\x00evil"))
 
 
 class TestEnsureLoadedSkipsInvalidEntries:
