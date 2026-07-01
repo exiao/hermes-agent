@@ -5170,7 +5170,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
-        notified: set[tuple[str, str, Optional[str]]] = set()
+        notified: set[tuple[str, str, str, Optional[str]]] = set()
         for session_key in active:
             source = None
             try:
@@ -5204,8 +5204,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Deduplicate only identical delivery targets. Thread/topic-aware
             # platforms can share a parent chat while still routing to distinct
-            # destinations via metadata.
-            dedup_key = (platform_str, chat_id, str(thread_id) if thread_id else None)
+            # destinations via metadata. The profile is part of the identity:
+            # two sessions on the same platform/chat/thread but different
+            # profiles route to different accounts, so each is a distinct
+            # delivery target and must not dedup against the other.
+            profile_str = (getattr(source, "profile", None) or "") if source is not None else ""
+            dedup_key = (profile_str, platform_str, chat_id, str(thread_id) if thread_id else None)
             if dedup_key in notified:
                 continue
 
@@ -5235,10 +5239,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
                 if reply_to_message_id is None and restart_source is not None:
                     try:
+                        restart_profile = getattr(restart_source, "profile", None) or ""
                         restart_platform = restart_source.platform.value
                         restart_chat_id = str(restart_source.chat_id)
                         restart_thread_id = str(restart_source.thread_id) if restart_source.thread_id else None
-                        if (restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
+                        if (restart_profile, restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
                             reply_to_message_id = getattr(restart_source, "message_id", None)
                     except Exception:
                         pass
@@ -5295,7 +5300,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            dedup_key = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            # Home-channel notices go out the default adapters (self.adapters),
+            # so their profile slot is "" — matching a default-profile active
+            # session on the same target, distinct from a secondary profile's.
+            dedup_key = ("", platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
             if dedup_key in notified:
                 continue
 
