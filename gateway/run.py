@@ -16361,8 +16361,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the default profile's ``self.adapters``. A reply must go out through the
         SAME adapter (and therefore the same account/credential) the inbound
         arrived on, so we prefer the profile's own adapter and only fall back to
-        ``self.adapters`` when there is no profile stamp or no per-profile adapter
-        for this platform (the default-profile case, unchanged).
+        ``self.adapters`` when there is no profile stamp (the default-profile
+        case, unchanged).
+
+        A served *secondary* profile always has an entry in ``_profile_adapters``
+        (``_start_one_profile_adapters`` seeds it via ``setdefault`` even when a
+        credential fails to connect). For such a profile we must NOT fall back to
+        ``self.adapters`` when its platform adapter is absent — that would send
+        from the DEFAULT account and re-create the cross-profile delivery leak
+        this helper exists to prevent. So a stamped profile that is a known
+        served secondary resolves to its own adapter or to None (defer/drop);
+        only unstamped / default / not-served stamps fall back to the default.
         """
         if source is None:
             return None
@@ -16370,12 +16379,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profile = (getattr(source, "profile", None) or "").strip()
         if profile:
             profile_map = getattr(self, "_profile_adapters", None)
-            if profile_map:
-                per_profile = profile_map.get(profile)
-                if per_profile:
-                    adapter = per_profile.get(platform)
-                    if adapter is not None:
-                        return adapter
+            if profile_map and profile in profile_map:
+                # Served secondary profile: use ITS adapter for this platform,
+                # never the default one (return None if it has none).
+                return profile_map[profile].get(platform)
         adapters = getattr(self, "adapters", None)
         if not adapters:
             return None

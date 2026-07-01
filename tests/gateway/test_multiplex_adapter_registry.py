@@ -192,3 +192,30 @@ class TestOutboundAdapterForSource:
         runner = GatewayRunner.__new__(GatewayRunner)
         src = self._Src(Platform.SIGNAL, profile=None)
         assert runner._adapter_for_source(src) is None
+
+    def test_served_secondary_missing_platform_adapter_returns_none(self):
+        """P1 (#79 review): a served secondary profile whose adapter for this
+        platform is absent (e.g. its Signal adapter failed to connect) must
+        NOT fall back to the default adapter — that would leak a reply out the
+        default account. It returns None so the caller defers/drops instead."""
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        # equity-analyst is a served secondary (has a _profile_adapters entry)
+        # but has no adapter for TELEGRAM.
+        src = self._Src(Platform.TELEGRAM, profile="equity-analyst")
+        assert runner._adapter_for_source(src) is None
+        assert runner._adapter_for_source(src) is not default_signal
+
+    def test_served_secondary_with_empty_adapter_map_returns_none(self):
+        """A secondary profile whose every adapter failed to connect keeps an
+        empty _profile_adapters entry (setdefault seeds it). It must still
+        resolve to None, never the default account."""
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        runner._profile_adapters["research"] = {}  # all adapters failed
+        src = self._Src(Platform.SIGNAL, profile="research")
+        assert runner._adapter_for_source(src) is None
+        assert runner._adapter_for_source(src) is not default_signal
+
