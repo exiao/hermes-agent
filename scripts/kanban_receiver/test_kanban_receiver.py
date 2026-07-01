@@ -145,6 +145,35 @@ def test_create_card_bad_priority(monkeypatch):
     assert status == 400
 
 
+def test_create_card_none_assignee_omits_flag(monkeypatch):
+    """The `none` sentinel must NOT be forwarded as `--assignee none` (which
+    would strand the card in a nonexistent lane); the flag is omitted so the
+    card lands genuinely unassigned."""
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id": "t_1"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    status, _ = kr.create_card({"assignee": "none", "title": "triage me"})
+    assert status == 200
+    assert "--assignee" not in captured["args"]
+    assert "none" not in captured["args"]
+
+
+def test_redact_args_drops_body_value():
+    """The card body carries diligence/inbox content and must never reach the
+    exec log — both the `--body` flag AND its following value are stripped."""
+    args = ["create", "--assignee", "dev", "--body", "SECRET diligence text", "--json", "--", "title"]
+    redacted = kr._redact_args(args)
+    assert "--body" not in redacted
+    assert "SECRET diligence text" not in redacted
+    # non-sensitive args survive
+    assert "--assignee" in redacted and "dev" in redacted
+    assert "title" in redacted
+
+
 def test_create_card_cli_failure(monkeypatch):
     monkeypatch.setattr(
         kr, "_run_hermes_kanban", lambda args: _FakeProc(returncode=1, stderr="boom")

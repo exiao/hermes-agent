@@ -103,14 +103,31 @@ def _hermes_bin() -> str:
     return ""  # signals: fall back to python -m
 
 
+_REDACT_FLAGS = {"--body"}
+
+
+def _redact_args(args: list[str]) -> list[str]:
+    """Return args safe for logging: drop sensitive flag *values* (e.g. the
+    card ``--body``, which carries diligence/inbox content) so they never land
+    in the launchd stderr log. Both the flag and its following value go."""
+    out: list[str] = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in _REDACT_FLAGS:
+            skip = True
+            continue
+        out.append(a)
+    return out
+
+
 def _run_hermes_kanban(args: list[str]) -> subprocess.CompletedProcess:
     """Invoke ``hermes kanban <args>`` inheriting the environment (HERMES_HOME)."""
     hermes = _hermes_bin()
-    if hermes:
-        cmd = [hermes, "kanban", *args]
-    else:
-        cmd = [sys.executable, "-m", "hermes_cli.main", "kanban", *args]
-    LOG.info("exec: %s", " ".join(cmd[:2] + ["kanban"] + [a for a in args if not a.startswith("--body")]))
+    cmd = [hermes, "kanban", *args] if hermes else [sys.executable, "-m", "hermes_cli.main", "kanban", *args]
+    LOG.info("exec: %s", " ".join(cmd[:2] + ["kanban"] + _redact_args(args)))
     return subprocess.run(
         cmd,
         text=True,
@@ -137,7 +154,15 @@ def create_card(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     # `title` is a positional arg on `hermes kanban create`; `--body`/`--assignee`
     # are flags. Build all flags first, then append `-- <title>` LAST so a title
     # beginning with a dash can't be parsed as an option.
-    args = ["create", "--assignee", assignee, "--body", body, "--json"]
+    args = ["create", "--body", body, "--json"]
+
+    # The "none" sentinel means "unassigned / triage later". `hermes kanban
+    # create` does NOT canonicalize it the way `assign`/`reassign` do, so
+    # forwarding `--assignee none` would store the literal lane "none" and
+    # strand the card in `ready` (no dispatcher serves it). Omit the flag
+    # instead so the card lands genuinely unassigned.
+    if assignee != "none":
+        args += ["--assignee", assignee]
 
     dedupe_key = payload.get("dedupe_key")
     if dedupe_key and str(dedupe_key).strip():
