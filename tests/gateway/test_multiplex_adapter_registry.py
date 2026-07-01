@@ -134,3 +134,107 @@ class TestPortBindingHardError:
                   "wecom_callback", "bluebubbles", "sms"):
             assert p in _PORT_BINDING_PLATFORM_VALUES
 
+
+
+class TestOutboundAdapterForSource:
+    """_adapter_for_source must route a reply back through the SAME account
+    the inbound arrived on. A profile-stamped source resolves to that
+    profile's adapter (its own credential/number), not the default map."""
+
+    def _runner(self):
+        from gateway.config import Platform
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        default_signal = _FakeAdapter(token="default-number")
+        profile_signal = _FakeAdapter(token="equity-number")
+        runner.adapters = {Platform.SIGNAL: default_signal}
+        runner._profile_adapters = {
+            "equity-analyst": {Platform.SIGNAL: profile_signal},
+        }
+        return runner, default_signal, profile_signal
+
+    class _Src:
+        def __init__(self, platform, profile=None):
+            self.platform = platform
+            self.profile = profile
+
+    def test_stamped_source_uses_profile_adapter(self):
+        from gateway.config import Platform
+
+        runner, default_signal, profile_signal = self._runner()
+        src = self._Src(Platform.SIGNAL, profile="equity-analyst")
+        assert runner._adapter_for_source(src) is profile_signal
+        assert runner._adapter_for_source(src) is not default_signal
+
+    def test_unstamped_source_uses_default_adapter(self):
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        src = self._Src(Platform.SIGNAL, profile=None)
+        assert runner._adapter_for_source(src) is default_signal
+
+    def test_default_profile_stamp_falls_back_to_default(self):
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        # A profile with no per-profile adapter for this platform (e.g. the
+        # active/default profile) falls back to self.adapters, unchanged.
+        src = self._Src(Platform.SIGNAL, profile="default")
+        assert runner._adapter_for_source(src) is default_signal
+
+    def test_none_source_returns_none(self):
+        runner, _, _ = self._runner()
+        assert runner._adapter_for_source(None) is None
+
+    def test_missing_adapters_attr_returns_none(self):
+        from gateway.config import Platform
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        src = self._Src(Platform.SIGNAL, profile=None)
+        assert runner._adapter_for_source(src) is None
+
+    def test_served_secondary_missing_platform_adapter_returns_none(self):
+        """P1 (#79 review): a served secondary profile whose adapter for this
+        platform is absent (e.g. its Signal adapter failed to connect) must
+        NOT fall back to the default adapter — that would leak a reply out the
+        default account. It returns None so the caller defers/drops instead."""
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        # equity-analyst is a served secondary (has a _profile_adapters entry)
+        # but has no adapter for TELEGRAM.
+        src = self._Src(Platform.TELEGRAM, profile="equity-analyst")
+        assert runner._adapter_for_source(src) is None
+        assert runner._adapter_for_source(src) is not default_signal
+
+    def test_served_secondary_with_empty_adapter_map_returns_none(self):
+        """A secondary profile whose every adapter failed to connect keeps an
+        empty _profile_adapters entry (setdefault seeds it). It must still
+        resolve to None, never the default account."""
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        runner._profile_adapters["research"] = {}  # all adapters failed
+        src = self._Src(Platform.SIGNAL, profile="research")
+        assert runner._adapter_for_source(src) is None
+        assert runner._adapter_for_source(src) is not default_signal
+
+    def test_shared_listener_platform_falls_back_to_default(self):
+        """P2 (#79 review): shared listener platforms (webhook/api_server/…) are
+        default-owned — a secondary profile can never bind its own, and the
+        single default adapter serves every profile via /p/<profile>/. So a
+        profile-stamped source on such a platform must fall back to the shared
+        default adapter, NOT be dropped as a 'missing secondary adapter'."""
+        from gateway.config import Platform
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        default_webhook = _FakeAdapter(token="default-webhook")
+        runner.adapters = {Platform.WEBHOOK: default_webhook}
+        # equity-analyst is a served secondary but (correctly) owns no webhook
+        # adapter — port-binding platforms are default-owned.
+        runner._profile_adapters = {"equity-analyst": {}}
+
+        src = self._Src(Platform.WEBHOOK, profile="equity-analyst")
+        assert runner._adapter_for_source(src) is default_webhook
+
+
