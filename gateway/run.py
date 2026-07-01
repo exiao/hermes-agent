@@ -16415,7 +16415,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # active profile (whose adapters live in self.adapters), fall back;
             # otherwise it is a removed/renamed/never-started secondary with no
             # correct account — drop rather than leak from the default account.
-            if profile != self._active_profile_name():
+            # getattr fallback: a stubbed/partial GatewayRunner (tests, third-party
+            # extensions) may lack _active_profile_name — degrade to "default".
+            _active = getattr(self, "_active_profile_name", None)
+            _active_name = _active() if callable(_active) else "default"
+            if profile != _active_name:
                 return None
         adapters = getattr(self, "adapters", None)
         if not adapters:
