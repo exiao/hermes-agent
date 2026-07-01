@@ -155,9 +155,14 @@ def create_card(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         gmt = payload.get("goal_max_turns")
         if gmt is not None:
             try:
-                args += ["--goal-max-turns", str(int(gmt))]
+                val = int(gmt)
             except (TypeError, ValueError):
                 return 400, {"error": "goal_max_turns must be an integer"}
+            # Guard against zero/negative-turn loops: a non-positive limit is
+            # meaningless, so drop the flag and let the CLI apply its own
+            # default rather than forwarding a value that stalls the worker.
+            if val >= 1:
+                args += ["--goal-max-turns", str(val)]
 
     # Author the card as the drop's assignee-agnostic origin so the audit trail
     # shows it arrived over the wire, not from a local human.

@@ -111,6 +111,34 @@ def test_create_card_goal_flag(monkeypatch):
     assert a[a.index("--goal-max-turns") + 1] == "15"
 
 
+def test_create_card_goal_nonpositive_turns_dropped(monkeypatch):
+    """A zero/negative goal_max_turns is meaningless: drop the flag and let
+    the CLI apply its own default rather than forwarding a stall value."""
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id": "t_1"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    for bad in (0, -5):
+        captured.clear()
+        status, _ = kr.create_card(
+            {"assignee": "equity-analyst", "title": "x", "goal": True, "goal_max_turns": bad}
+        )
+        assert status == 200
+        assert "--goal" in captured["args"]
+        assert "--goal-max-turns" not in captured["args"]
+
+
+def test_create_card_goal_malformed_turns_is_400(monkeypatch):
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc())
+    status, _ = kr.create_card(
+        {"assignee": "dev", "title": "x", "goal": True, "goal_max_turns": "lots"}
+    )
+    assert status == 400
+
+
 def test_create_card_bad_priority(monkeypatch):
     monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc())
     status, body = kr.create_card({"assignee": "dev", "title": "x", "priority": "high"})
