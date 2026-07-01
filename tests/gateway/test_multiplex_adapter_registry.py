@@ -134,3 +134,61 @@ class TestPortBindingHardError:
                   "wecom_callback", "bluebubbles", "sms"):
             assert p in _PORT_BINDING_PLATFORM_VALUES
 
+
+
+class TestOutboundAdapterForSource:
+    """_adapter_for_source must route a reply back through the SAME account
+    the inbound arrived on. A profile-stamped source resolves to that
+    profile's adapter (its own credential/number), not the default map."""
+
+    def _runner(self):
+        from gateway.config import Platform
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        default_signal = _FakeAdapter(token="default-number")
+        profile_signal = _FakeAdapter(token="equity-number")
+        runner.adapters = {Platform.SIGNAL: default_signal}
+        runner._profile_adapters = {
+            "equity-analyst": {Platform.SIGNAL: profile_signal},
+        }
+        return runner, default_signal, profile_signal
+
+    class _Src:
+        def __init__(self, platform, profile=None):
+            self.platform = platform
+            self.profile = profile
+
+    def test_stamped_source_uses_profile_adapter(self):
+        from gateway.config import Platform
+
+        runner, default_signal, profile_signal = self._runner()
+        src = self._Src(Platform.SIGNAL, profile="equity-analyst")
+        assert runner._adapter_for_source(src) is profile_signal
+        assert runner._adapter_for_source(src) is not default_signal
+
+    def test_unstamped_source_uses_default_adapter(self):
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        src = self._Src(Platform.SIGNAL, profile=None)
+        assert runner._adapter_for_source(src) is default_signal
+
+    def test_default_profile_stamp_falls_back_to_default(self):
+        from gateway.config import Platform
+
+        runner, default_signal, _ = self._runner()
+        # A profile with no per-profile adapter for this platform (e.g. the
+        # active/default profile) falls back to self.adapters, unchanged.
+        src = self._Src(Platform.SIGNAL, profile="default")
+        assert runner._adapter_for_source(src) is default_signal
+
+    def test_none_source_returns_none(self):
+        runner, _, _ = self._runner()
+        assert runner._adapter_for_source(None) is None
+
+    def test_missing_adapters_attr_returns_none(self):
+        from gateway.config import Platform
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        src = self._Src(Platform.SIGNAL, profile=None)
+        assert runner._adapter_for_source(src) is None
