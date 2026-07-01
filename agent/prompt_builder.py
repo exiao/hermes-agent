@@ -21,6 +21,7 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_skills_preload_all,
     iter_skill_index_files,
     parse_frontmatter,
     skill_matches_environment,
@@ -1460,6 +1461,7 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names(_platform_hint or None)
+    preload_all = get_skills_preload_all()
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
@@ -1468,6 +1470,7 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        preload_all,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1638,7 +1641,7 @@ def build_skills_system_prompt(
                     continue
                 seen.add(name)
                 category_counts[category] = category_counts.get(category, 0) + 1
-                if preloaded:
+                if preloaded or preload_all:
                     has_any_preloaded = True
                     if desc:
                         preloaded_lines.append(f"    - {name}: {desc}")
@@ -1680,6 +1683,15 @@ def build_skills_system_prompt(
                     else:
                         index_lines.append(f"    - {name}")
             skills_block = "\n".join(index_lines)
+        elif preload_all:
+            # Every in-scope skill is shown with its description, so there is
+            # nothing category-gated left to browse. Drop the categories
+            # section to avoid a redundant "browse" pointer to skills that
+            # are already fully listed above.
+            skills_block = (
+                "  ## Pre-loaded skills (load with SkillView):\n"
+                + "\n".join(preloaded_lines)
+            )
         else:
             skills_block = (
                 "  ## Pre-loaded skills (load with SkillView):\n"

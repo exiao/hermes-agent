@@ -388,6 +388,27 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return global_disabled
 
 
+def get_skills_preload_all() -> bool:
+    """Read ``skills.preload_all`` from config.yaml.
+
+    When true, every skill in scope is rendered in the system prompt with its
+    full description (as if each carried ``preloaded: true`` in frontmatter),
+    instead of the default two-tier index where only preloaded skills show
+    descriptions and the rest collapse to category counts.
+
+    Read per active profile (config.yaml resolves through the profile path),
+    so a non-default profile with a hand-selected skill set can opt in without
+    editing shared SKILL.md frontmatter. Off by default.
+    """
+    parsed = _load_raw_config()
+    if not parsed:
+        return False
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return False
+    return bool(skills_cfg.get("preload_all", False))
+
+
 def _normalize_string_set(values) -> Set[str]:
     if values is None:
         return set()
