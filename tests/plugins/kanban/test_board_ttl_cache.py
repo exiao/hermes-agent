@@ -267,3 +267,136 @@ def test_switching_active_board_bypasses_cache_for_none_board(tmp_path, monkeypa
         for t in col["tasks"]
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Write-side invalidation (follow-up to #89): a dashboard mutation within the
+# TTL window must drop the stale entry so the next board read reflects the
+# write instead of replaying the pre-write payload.
+# ---------------------------------------------------------------------------
+
+
+def _titles(payload) -> set[str]:
+    return {
+        t["title"]
+        for col in payload["columns"]
+        for t in col["tasks"]
+    }
+
+
+def _freeze_clock(monkeypatch):
+    """Pin time.monotonic so the TTL never expires on its own — any refresh
+    across a mutation must therefore come from write invalidation, not the
+    2.5s timer. Returns the mutable clock dict."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(plugin_api.time, "monotonic", lambda: clock["t"])
+    return clock
+
+
+def test_create_within_ttl_invalidates_stale_board(tmp_path, monkeypatch):
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="first task", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    warm = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(warm) == {"first task"}
+
+    # Mutate through the dashboard route while the cache entry is still live
+    # (clock frozen → not expired). Without invalidation the next read would
+    # replay ``warm`` and never show "second task".
+    plugin_api.create_task(
+        plugin_api.CreateTaskBody(title="second task", assignee="x"),
+        board=None,
+    )
+
+    after = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert after is not warm
+    assert _titles(after) == {"first task", "second task"}
+
+
+def test_delete_within_ttl_invalidates_stale_board(tmp_path, monkeypatch):
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    tid = kb.create_task(conn, title="doomed", assignee="x")
+    kb.create_task(conn, title="survivor", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    warm = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(warm) == {"doomed", "survivor"}
+
+    plugin_api.delete_task(tid, board=None)
+
+    after = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(after) == {"survivor"}
+
+
+def test_patch_within_ttl_invalidates_stale_board(tmp_path, monkeypatch):
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    tid = kb.create_task(conn, title="old title", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    warm = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(warm) == {"old title"}
+
+    plugin_api.update_task(
+        tid, plugin_api.UpdateTaskBody(title="new title"), board=None,
+    )
+
+    after = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(after) == {"new title"}
+
+
+def test_invalidate_helper_clears_all_entries(tmp_path, monkeypatch):
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="a", assignee="alice")
+    kb.create_task(conn, title="b", assignee="bob")
+    conn.close()
+
+    # Two distinct cache keys.
+    _get_board(assignee="alice")
+    _get_board(assignee="bob")
+    assert len(plugin_api._BOARD_CACHE) == 2
+
+    plugin_api._invalidate_board_cache()
+    assert plugin_api._BOARD_CACHE == {}

@@ -551,6 +551,26 @@ _BOARD_CACHE: dict[tuple, tuple[float, dict[str, Any]]] = {}
 _BOARD_CACHE_LOCK = threading.Lock()
 
 
+def _invalidate_board_cache() -> None:
+    """Drop every memoized ``/board`` payload so the next read recomputes.
+
+    The cache is time-only otherwise (2.5s TTL): a dashboard mutation that
+    lands within the window of a prior board load would keep serving the
+    pre-write payload until the entry expired, so the frontend's
+    refresh-after-mutation (``loadBoard()``) and the ``/events`` reload could
+    both replay the stale board. Every task-mutating route calls this after a
+    successful write to force a fresh compute.
+
+    A full clear (rather than a board-scoped one) is deliberate: the cache
+    only ever holds a TTL-window's worth of entries, writes are rare next to
+    the poll-driven reads, and clearing everything is impossible to get wrong
+    — it can only force an already-correct recompute, never leak a stale or
+    cross-board entry.
+    """
+    with _BOARD_CACHE_LOCK:
+        _BOARD_CACHE.clear()
+
+
 def _windowed_terminal_tasks(
     conn: sqlite3.Connection,
     status: str,
@@ -1073,6 +1093,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             except Exception:
                 # Probe failure must never block the create itself.
                 pass
+        _invalidate_board_cache()
         return body
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1372,6 +1393,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
 
         updated = kanban_db.get_task(conn, task_id)
+        _invalidate_board_cache()
         return {"task": _task_dict(updated) if updated else None}
     finally:
         conn.close()
@@ -1389,6 +1411,7 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _invalidate_board_cache()
         return {"deleted": True, "task_id": task_id}
     finally:
         conn.close()
@@ -1540,6 +1563,7 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
         kanban_db.add_comment(
             conn, task_id, author=payload.author or "dashboard", body=payload.body,
         )
+        _invalidate_board_cache()
         return {"ok": True}
     finally:
         conn.close()
@@ -1560,6 +1584,7 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     conn = _conn(board=board)
     try:
         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
+        _invalidate_board_cache()
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1577,6 +1602,7 @@ def delete_link(
     conn = _conn(board=board)
     try:
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        _invalidate_board_cache()
         return {"ok": bool(ok)}
     finally:
         conn.close()
@@ -1690,6 +1716,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
             except Exception as e:  # defensive — one bad id shouldn't kill the batch
                 entry.update(ok=False, error=str(e))
             results.append(entry)
+        _invalidate_board_cache()
         return {"results": results}
     finally:
         conn.close()
@@ -1987,6 +2014,7 @@ def terminate_run_endpoint(
                     "longer in a reclaimable state"
                 ),
             )
+        _invalidate_board_cache()
         return {"ok": True, "run_id": run_id, "task_id": r.task_id}
     finally:
         conn.close()
@@ -2025,6 +2053,7 @@ def reclaim_task_endpoint(
                     "(not running, or unknown id)"
                 ),
             )
+        _invalidate_board_cache()
         return {"ok": True, "task_id": task_id}
     finally:
         conn.close()
@@ -2074,6 +2103,8 @@ def specify_task_endpoint(
             author=(payload.author or None),
         )
 
+    if outcome.ok:
+        _invalidate_board_cache()
     return {
         "ok": bool(outcome.ok),
         "task_id": outcome.task_id,
@@ -2118,6 +2149,7 @@ def reassign_task_endpoint(
                     "running (pass reclaim_first=true to release the claim first)"
                 ),
             )
+        _invalidate_board_cache()
         return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
     finally:
         conn.close()
@@ -2680,6 +2712,8 @@ def decompose_task_endpoint(
             author=(payload.author or None),
         )
 
+    if outcome.ok:
+        _invalidate_board_cache()
     return {
         "ok": bool(outcome.ok),
         "task_id": outcome.task_id,
