@@ -96,3 +96,23 @@ def test_cap_disabled_when_zero(worker_env, monkeypatch):
     reason = "review-required: " + ("z" * 2000)
     kt._handle_block({"reason": reason})
     assert _stored_reason(worker_env) == reason
+
+
+def test_cap_smaller_than_marker_never_overshoots(worker_env, monkeypatch):
+    """A cap smaller than the truncation marker still bounds the output.
+
+    Regression: previously ``max(0, limit - len(marker))`` clamped ``head`` to
+    empty and returned the full 47-char marker, overshooting a small ``limit``.
+    """
+    from tools import kanban_tools as kt
+
+    def _fake_cfg_get(cfg, *keys, default=None):
+        if keys == ("kanban", "block_reason_max_chars"):
+            return 10  # < len(marker) == 47
+        return default
+
+    monkeypatch.setattr(kt, "cfg_get", _fake_cfg_get)
+    reason = "review-required: " + ("q" * 500)
+    kt._handle_block({"reason": reason})
+    stored = _stored_reason(worker_env)
+    assert len(stored) <= 10

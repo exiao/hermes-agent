@@ -70,7 +70,12 @@ def _clip_block_reason(reason: str) -> str:
     if limit <= 0 or len(reason) <= limit:
         return reason
     marker = " […truncated; put detail in a kanban_comment]"
-    head = reason[: max(0, limit - len(marker))].rstrip()
+    # If the cap is smaller than the marker itself, appending the marker would
+    # overshoot the limit — hard-truncate the reason instead so the result
+    # never exceeds ``limit``.
+    if limit <= len(marker):
+        return reason[:limit].rstrip()
+    head = reason[: limit - len(marker)].rstrip()
     return head + marker
 
 
