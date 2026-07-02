@@ -247,12 +247,33 @@ def test_comment_requires_fields(monkeypatch):
 
 
 def test_comment_unknown_card_is_404(monkeypatch):
+    # The real CLI surfaces `kanban: unknown task <id>` (from add_comment's
+    # ValueError), not "not found" — the receiver must map that to 404.
     monkeypatch.setattr(
         kr, "_run_hermes_kanban",
-        lambda args: _FakeProc(returncode=1, stderr="task not found: t_x"),
+        lambda args: _FakeProc(returncode=1, stderr="kanban: unknown task t_x"),
     )
     status, body = kr.comment_card({"card_id": "t_x", "text": "hi"})
     assert status == 404
+
+
+def test_comment_real_server_fault_is_502(monkeypatch):
+    monkeypatch.setattr(
+        kr, "_run_hermes_kanban",
+        lambda args: _FakeProc(returncode=1, stderr="kanban: could not initialize database"),
+    )
+    status, _ = kr.comment_card({"card_id": "t_x", "text": "hi"})
+    assert status == 502
+
+
+def test_redact_args_drops_comment_text():
+    """The comment `text` positional carries user content and must not reach
+    the exec log; the card id (first positional) stays for debuggability."""
+    args = ["comment", "--author", "card-drop", "--", "t_abc", "SECRET inbox note"]
+    redacted = kr._redact_args(args)
+    assert "SECRET inbox note" not in redacted
+    assert "t_abc" in redacted  # card id is safe to log
+    assert "comment" in redacted
 
 
 # --------------------------------------------------------------------------

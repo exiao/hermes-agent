@@ -107,11 +107,19 @@ _REDACT_FLAGS = {"--body"}
 
 
 def _redact_args(args: list[str]) -> list[str]:
-    """Return args safe for logging: drop sensitive flag *values* (e.g. the
-    card ``--body``, which carries diligence/inbox content) so they never land
-    in the launchd stderr log. Both the flag and its following value go."""
+    """Return args safe for logging: drop user-supplied content (diligence /
+    inbox text) so it never lands in the launchd stderr log.
+
+    Two sources of sensitive content:
+    - flag values after ``--body`` (card body on ``create``);
+    - the trailing positional ``text`` on ``comment`` (``comment <id> <text>``),
+      which arrives after the ``--`` separator alongside the safe card id.
+    """
     out: list[str] = []
     skip = False
+    is_comment = bool(args) and args[0] == "comment"
+    seen_ddash = False
+    positional_after_ddash = 0
     for a in args:
         if skip:
             skip = False
@@ -119,6 +127,16 @@ def _redact_args(args: list[str]) -> list[str]:
         if a in _REDACT_FLAGS:
             skip = True
             continue
+        if a == "--":
+            seen_ddash = True
+            out.append(a)
+            continue
+        # For `comment <id> <text...>`, keep the first positional (the card id)
+        # but redact everything after it (the user-supplied comment text).
+        if is_comment and seen_ddash:
+            positional_after_ddash += 1
+            if positional_after_ddash >= 2:
+                continue
         out.append(a)
     return out
 
@@ -260,7 +278,11 @@ def comment_card(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         LOG.error("kanban comment failed rc=%s stderr=%s", proc.returncode, proc.stderr[-500:])
         detail = proc.stderr.strip()[-300:]
         # Distinguish an unknown card (client error) from a real server fault.
-        if "not found" in detail.lower() or "no such" in detail.lower():
+        # `hermes kanban comment` on a missing id surfaces the CLI's
+        # `kanban: unknown task <id>` (from add_comment's ValueError), so match
+        # that alongside the generic phrasings.
+        low = detail.lower()
+        if "unknown task" in low or "no such task" in low or "not found" in low or "no such" in low:
             return 404, {"error": "card not found", "card_id": card_id}
         return 502, {"error": "kanban comment failed", "detail": detail}
 
