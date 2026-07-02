@@ -639,6 +639,88 @@ class TestDeliverResultWrapping:
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
 
+    def test_delivery_installs_profile_secret_scope_under_multiplex(self, tmp_path, monkeypatch):
+        """Regression: under a profile multiplexer, delivery reads Signal creds via
+        ``get_secret`` (``load_gateway_config`` -> ``SIGNAL_HTTP_URL``). With no
+        secret scope installed, ``get_secret`` fails closed and every cron job's
+        delivery errors with ``UnscopedSecretError``. Cron runs per-profile, so
+        ``_deliver_result`` must install the active profile's scope around the
+        real credential read — exercised here through the ACTUAL ``get_secret``,
+        not a mocked ``load_gateway_config``."""
+        from agent import secret_scope
+        from agent.secret_scope import get_secret, current_secret_scope
+
+        # A profile home whose .env holds this profile's Signal creds.
+        profile_home = tmp_path / "profiles" / "acct2"
+        profile_home.mkdir(parents=True)
+        (profile_home / ".env").write_text("SIGNAL_HTTP_URL=http://scoped-signal:9999\n")
+        monkeypatch.setattr("cron.scheduler._get_hermes_home", lambda: profile_home)
+
+        # Turn multiplexing on so get_secret fails closed on an unscoped read.
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        assert current_secret_scope() is None
+
+        seen = {}
+
+        async def fake_send(*args, **kwargs):
+            # This runs inside the delivery body. Reading the Signal cred here
+            # must succeed (scope installed) and resolve to THIS profile's value.
+            seen["url"] = get_secret("SIGNAL_HTTP_URL")
+            seen["scope"] = current_secret_scope() is not None
+            return {"success": True}
+
+        from gateway.config import Platform
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=fake_send):
+            job = {
+                "id": "scope-job",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            # Before the fix this returned an UnscopedSecretError string.
+            err = _deliver_result(job, "Output.")
+
+        assert err is None
+        assert seen.get("scope") is True
+        assert seen.get("url") == "http://scoped-signal:9999"
+        # Scope must be torn down after delivery — no leak into the caller.
+        assert current_secret_scope() is None
+
+    def test_delivery_no_scope_when_multiplex_inactive(self, monkeypatch):
+        """Single-profile gateway (multiplex off): delivery must NOT install a
+        scope — behavior is unchanged and get_secret reads os.environ."""
+        from agent import secret_scope
+        from agent.secret_scope import current_secret_scope
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
+        seen = {}
+
+        async def fake_send(*args, **kwargs):
+            seen["scope"] = current_secret_scope() is not None
+            return {"success": True}
+
+        from gateway.config import Platform
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=fake_send):
+            job = {
+                "id": "noscope-job",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, "Output.")
+
+        assert seen.get("scope") is False
+
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
         from gateway.config import Platform

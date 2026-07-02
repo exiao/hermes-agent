@@ -11,6 +11,7 @@ runs at a time if multiple processes overlap.
 import asyncio
 import atexit
 import concurrent.futures
+import contextlib
 import contextvars
 import json
 import logging
@@ -1064,6 +1065,41 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+@contextlib.contextmanager
+def _delivery_secret_scope():
+    """Install the active profile's secret scope for the delivery path.
+
+    Cron runs per-profile: ``run_job`` executes under the profile's
+    ``HERMES_HOME`` (``_get_hermes_home``), but the delivery path reads
+    credentials (``SIGNAL_HTTP_URL`` etc. via ``load_gateway_config`` and
+    ``_send_to_platform``). Under a profile multiplexer, ``get_secret`` fails
+    closed on an unscoped read to avoid leaking another profile's value, so the
+    delivery must run inside the profile's secret scope.
+
+    No-op when multiplexing is inactive (single-profile gateway / CLI — behavior
+    unchanged) or when a scope is already installed (inbound path already wrapped
+    us). Loads the profile ``.env`` into an isolated mapping; never mutates
+    ``os.environ``.
+    """
+    from agent.secret_scope import (
+        is_multiplex_active,
+        current_secret_scope,
+        build_profile_secret_scope,
+        set_secret_scope,
+        reset_secret_scope,
+    )
+
+    if not is_multiplex_active() or current_secret_scope() is not None:
+        yield
+        return
+
+    token = set_secret_scope(build_profile_secret_scope(_get_hermes_home()))
+    try:
+        yield
+    finally:
+        reset_secret_scope(token)
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1075,6 +1111,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    with _delivery_secret_scope():
+        return _deliver_result_impl(job, content, adapters=adapters, loop=loop)
+
+
+def _deliver_result_impl(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+    """Body of :func:`_deliver_result`, run inside the profile secret scope."""
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
