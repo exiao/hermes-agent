@@ -3137,8 +3137,9 @@ def create_task(
                         f"(2) set a board default_workdir to a git repo "
                         f"(hermes kanban boards set-default-workdir <board> <abs-repo-root>), or "
                         f"(3) link the task to a project (--project <slug>). "
-                        f"Verify a candidate path first: "
-                        f"git -C <path> rev-parse --show-toplevel must print <path>."
+                        f"Verify the path first: "
+                        f"git -C {workspace_path} rev-parse --show-toplevel "
+                        f"must print {workspace_path}."
                     )
 
                 conn.execute(
@@ -5708,8 +5709,9 @@ def decompose_triage_task(
                 raise ValueError(
                     f"decompose child[{idx}] {title!r}: workspace_kind='worktree' "
                     f"path {child_ws_path!r} is not inside a git repo and does not "
-                    "point at a git repo root (give the child an absolute repo-root "
-                    "worktree anchor; verify with git -C <path> rev-parse --show-toplevel)"
+                    f"point at a git repo root (give the child an absolute repo-root "
+                    f"worktree anchor; verify with "
+                    f"git -C {child_ws_path} rev-parse --show-toplevel)"
                 )
             # Direct INSERT bypasses create_task's spec-less guard too: a
             # malformed decomposer result (e.g. {"title":"dev task","body":"",
