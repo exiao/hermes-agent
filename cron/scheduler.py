@@ -11,6 +11,7 @@ runs at a time if multiple processes overlap.
 import asyncio
 import atexit
 import concurrent.futures
+import contextlib
 import contextvars
 import json
 import logging
@@ -714,16 +715,24 @@ def _resolve_home_env_var(platform_name: str) -> str:
 
 
 def _get_home_target_chat_id(platform_name: str) -> str:
-    """Return the configured home target chat/room ID for a delivery platform."""
+    """Return the configured home target chat/room ID for a delivery platform.
+
+    Reads through ``get_secret`` so the value honors the active profile secret
+    scope under multiplexing — ``os.environ`` is process-global and races across
+    concurrent per-profile cron jobs (each ``run_job`` mutates it via
+    ``load_dotenv``), which would leak Profile A's home channel to Profile B.
+    """
+    from agent.secret_scope import get_secret
+
     env_var = _resolve_home_env_var(platform_name)
     if not env_var:
         return ""
-    value = os.getenv(env_var, "")
+    value = get_secret(env_var, "")
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(legacy, "")
-    return value
+            value = get_secret(legacy, "")
+    return value or ""
 
 
 def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
@@ -736,19 +745,24 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     the lobby reminder and drops ``reply_to_message_id`` (#24409). Pointing
     cron at a dedicated topic via this env var lets replies work as expected
     without changing the lobby invariant.
+
+    Reads through ``get_secret`` (see :func:`_get_home_target_chat_id`) so the
+    thread override honors the active profile secret scope under multiplexing.
     """
+    from agent.secret_scope import get_secret
+
     env_var = _resolve_home_env_var(platform_name)
     if not env_var:
         return None
     if platform_name.lower() == "telegram":
-        cron_thread = os.getenv("TELEGRAM_CRON_THREAD_ID", "").strip()
+        cron_thread = (get_secret("TELEGRAM_CRON_THREAD_ID", "") or "").strip()
         if cron_thread:
             return cron_thread
-    value = os.getenv(f"{env_var}_THREAD_ID", "").strip()
+    value = (get_secret(f"{env_var}_THREAD_ID", "") or "").strip()
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(f"{legacy}_THREAD_ID", "").strip()
+            value = (get_secret(f"{legacy}_THREAD_ID", "") or "").strip()
     return value or None
 
 
@@ -794,20 +808,24 @@ def cron_delivery_targets() -> list[dict]:
         logger.debug("cron_delivery_targets: gateway config unavailable", exc_info=True)
         connected = set()
 
-    for name in _iter_home_target_platforms():
-        if name not in connected:
-            continue
-        if not _is_known_delivery_platform(name):
-            continue
-        env_var = _resolve_home_env_var(name)
-        targets.append(
-            {
-                "id": name,
-                "name": name.replace("_", " ").title(),
-                "home_target_set": bool(_get_home_target_chat_id(name)),
-                "home_env_var": env_var or None,
-            }
-        )
+    # Build inside the profile secret scope: home_target_set reads home-channel
+    # secrets via get_secret, which fails closed on an unscoped read under
+    # multiplexing (no-op otherwise).
+    with _delivery_secret_scope():
+        for name in _iter_home_target_platforms():
+            if name not in connected:
+                continue
+            if not _is_known_delivery_platform(name):
+                continue
+            env_var = _resolve_home_env_var(name)
+            targets.append(
+                {
+                    "id": name,
+                    "name": name.replace("_", " ").title(),
+                    "home_target_set": bool(_get_home_target_chat_id(name)),
+                    "home_env_var": env_var or None,
+                }
+            )
     return targets
 
 
@@ -1064,6 +1082,41 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+@contextlib.contextmanager
+def _delivery_secret_scope():
+    """Install the active profile's secret scope for the delivery path.
+
+    Cron runs per-profile: ``run_job`` executes under the profile's
+    ``HERMES_HOME`` (``_get_hermes_home``), but the delivery path reads
+    credentials (``SIGNAL_HTTP_URL`` etc. via ``load_gateway_config`` and
+    ``_send_to_platform``). Under a profile multiplexer, ``get_secret`` fails
+    closed on an unscoped read to avoid leaking another profile's value, so the
+    delivery must run inside the profile's secret scope.
+
+    No-op when multiplexing is inactive (single-profile gateway / CLI — behavior
+    unchanged) or when a scope is already installed (inbound path already wrapped
+    us). Loads the profile ``.env`` into an isolated mapping; never mutates
+    ``os.environ``.
+    """
+    from agent.secret_scope import (
+        is_multiplex_active,
+        current_secret_scope,
+        build_profile_secret_scope,
+        set_secret_scope,
+        reset_secret_scope,
+    )
+
+    if not is_multiplex_active() or current_secret_scope() is not None:
+        yield
+        return
+
+    token = set_secret_scope(build_profile_secret_scope(_get_hermes_home()))
+    try:
+        yield
+    finally:
+        reset_secret_scope(token)
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1075,6 +1128,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    with _delivery_secret_scope():
+        return _deliver_result_impl(job, content, adapters=adapters, loop=loop)
+
+
+def _deliver_result_impl(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+    """Body of :func:`_deliver_result`, run inside the profile secret scope."""
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -1476,10 +1535,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # asyncio.run() checks for a running loop before awaiting the coroutine;
                 # when it raises, the original coro was never started — close it to
                 # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
-                # fresh thread that has no running loop.
+                # fresh thread that has no running loop.  ContextVars (the active
+                # profile secret scope from _delivery_secret_scope) do NOT propagate
+                # into a ThreadPoolExecutor worker automatically, so copy the current
+                # context and run under it — otherwise get_secret in _send_to_platform
+                # would fail closed / leak another profile's credentials under
+                # multiplexing.
                 coro.close()
+                ctx = contextvars.copy_context()
+
+                def _run_in_fresh_loop():
+                    return asyncio.run(
+                        _send_to_platform(
+                            platform, pconfig, chat_id, cleaned_delivery_content,
+                            thread_id=thread_id, media_files=media_files,
+                        )
+                    )
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(ctx.run, _run_in_fresh_loop)
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
@@ -2230,7 +2304,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except UnicodeDecodeError:
             load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="latin-1")
 
-        delivery_target = _resolve_delivery_target(job)
+        # Resolve the auto-delivery target inside the profile secret scope:
+        # target resolution reads per-profile home-channel secrets (via
+        # get_secret), which fails closed on an unscoped read under multiplexing.
+        with _delivery_secret_scope():
+            delivery_target = _resolve_delivery_target(job)
         if delivery_target:
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
