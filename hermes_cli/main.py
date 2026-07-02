@@ -13630,7 +13630,12 @@ def main():
         # unknown-card -> 404 mapping (keyed on returncode != 0) never fired.
         # Handlers returning None keep the implicit exit-0 behavior.
         rc = args.func(args)
-        if isinstance(rc, int):
+        # `bool` is a subclass of `int`, so a handler returning a success/failure
+        # flag (e.g. plugin CLI commands registered via
+        # PluginContext.register_cli_command) would otherwise be treated as an
+        # exit code -- sys.exit(True) exits 1, inverting a success signal.
+        # Only propagate genuine int exit codes; bools and None keep exit-0.
+        if isinstance(rc, int) and not isinstance(rc, bool):
             sys.exit(rc)
     else:
         parser.print_help()

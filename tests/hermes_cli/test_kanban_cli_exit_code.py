@@ -64,3 +64,35 @@ def test_unknown_board_exits_nonzero(isolated_home):
         f"expected non-zero exit for unknown board, got {proc.returncode}\n"
         f"stderr={proc.stderr!r}"
     )
+
+
+@pytest.mark.parametrize("retval", ["True", "False"])
+def test_bool_return_does_not_propagate_as_exit_code(isolated_home, retval):
+    """A handler returning a bool (success/failure flag) must NOT be treated as
+    an exit code. Since bool subclasses int, sys.exit(True) would exit 1 and
+    invert a success signal; the dispatch guard excludes bools so bool returns
+    fall through to the implicit exit-0 path.
+
+    Exercises the REAL main() dispatch: an inline script points an existing
+    subcommand's handler at one returning a bool, then runs main() and reports
+    the process exit code.
+    """
+    script = (
+        "import sys\n"
+        "from hermes_cli import main as m\n"
+        "_orig = m.cmd_kanban\n"
+        f"m.cmd_kanban = lambda args: {retval}\n"
+        "sys.argv = ['hermes', 'kanban', 'list']\n"
+        "m.main()\n"
+    )
+    env = dict(os.environ)
+    env["HERMES_HOME"] = isolated_home
+    proc = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True
+    )
+    assert proc.returncode == 0, (
+        f"bool return {retval} must not propagate as a failing exit code, "
+        f"got {proc.returncode}\nstdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+
