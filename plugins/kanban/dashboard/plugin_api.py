@@ -680,7 +680,14 @@ def get_board(
     Result is memoized for ``_BOARD_CACHE_TTL_SECONDS`` keyed by the full
     resolved query-param tuple — see the cache note near ``_BOARD_CACHE``.
     """
-    board = _resolve_board(board)
+    # Resolve to the *concrete* active board slug (never None) so the cache
+    # key pins the board this request actually reads. Keying on a bare ``None``
+    # would let a later request served after a board switch (CLI / another API
+    # call moves the ``current`` pointer) hit the previous board's cached entry
+    # and return its stale payload. ``get_current_board()`` walks the same
+    # resolution chain ``_conn(board=None)`` uses (env → current file → default),
+    # so the key and the read stay in lockstep.
+    board = _resolve_board(board) or kanban_db.get_current_board()
     done_limit = min(int(done_limit), _DONE_LIMIT_MAX)
     cache_key = (
         tenant,
@@ -720,6 +727,15 @@ def get_board(
 
     expires = time.monotonic() + _BOARD_CACHE_TTL_SECONDS
     with _BOARD_CACHE_LOCK:
+        # Prune expired entries before inserting so the cache stays bounded.
+        # ``done_since`` is a caller-supplied unix timestamp, so a client that
+        # polls with ``done_since=now`` mints a fresh key every request; without
+        # this sweep those dead entries would accumulate unboundedly in the
+        # long-lived gateway process. The scan is O(n) over a set that only ever
+        # holds a TTL-window's worth of distinct keys, so it stays cheap.
+        now_mono = time.monotonic()
+        for key in [k for k, v in _BOARD_CACHE.items() if v[0] <= now_mono]:
+            _BOARD_CACHE.pop(key, None)
         _BOARD_CACHE[cache_key] = (expires, payload)
     return payload
 

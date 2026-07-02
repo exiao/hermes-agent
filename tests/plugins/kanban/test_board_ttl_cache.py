@@ -210,3 +210,60 @@ def test_cache_miss_return_shape_preserved(tmp_path, monkeypatch):
     }
     assert isinstance(payload["columns"], list)
     assert set(payload["done_window"].keys()) == {"limit", "since"}
+
+
+def _setup_hermes_home(tmp_path, monkeypatch):
+    """Point HERMES_HOME (and Path.home) at a temp root WITHOUT pinning a
+    fixed db_path, so board reads/writes flow through the real resolution
+    chain (env → ``current`` file → ``default``). Unlike ``_make_board_db``
+    this lets ``get_board(board=None)`` and ``kb.connect(board=...)`` agree on
+    where each board's DB lives — required for a board-switch test that
+    asserts on payload *content*, not just cache identity."""
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+
+def test_switching_active_board_bypasses_cache_for_none_board(tmp_path, monkeypatch):
+    """A ``board=None`` request keys on the *resolved* active board, so moving
+    the ``current`` pointer between two calls returns each board's own data
+    instead of the first board's cached payload (the cross-board pollution the
+    high-severity review flagged)."""
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+
+    # Seed the default board through the resolution chain.
+    conn_default = kb.connect(board="default")
+    kb.create_task(conn_default, title="default task", assignee="x")
+    conn_default.close()
+
+    # Seed a second board.
+    kb.create_board("other")
+    conn_other = kb.connect(board="other")
+    kb.create_task(conn_other, title="other task", assignee="y")
+    conn_other.close()
+
+    kb.set_current_board("default")
+    first = _get_board(board=None)
+    assert any(
+        t["title"] == "default task"
+        for col in first["columns"]
+        for t in col["tasks"]
+    )
+
+    kb.set_current_board("other")
+    second = _get_board(board=None)
+    assert any(
+        t["title"] == "other task"
+        for col in second["columns"]
+        for t in col["tasks"]
+    )
+    # A distinct board resolved to a distinct cache key — not the stale hit.
+    assert second is not first
+    assert not any(
+        t["title"] == "default task"
+        for col in second["columns"]
+        for t in col["tasks"]
+    )
+
