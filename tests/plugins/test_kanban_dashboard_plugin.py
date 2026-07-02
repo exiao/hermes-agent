@@ -42,8 +42,16 @@ def _load_plugin_module():
 
 
 def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
-    return _load_plugin_module().router
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router.
+
+    Disables the /board short-TTL cache (TTL→0) so these integration tests,
+    which mutate then immediately re-read to assert compute correctness, always
+    see a fresh recompute. The cache's time-only staleness is exercised
+    separately in tests/plugins/kanban/test_board_ttl_cache.py.
+    """
+    mod = _load_plugin_module()
+    mod._BOARD_CACHE_TTL_SECONDS = 0
+    return mod.router
 
 
 @pytest.fixture
