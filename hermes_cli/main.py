@@ -13623,7 +13623,15 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        # Propagate a subcommand's shell-style exit code. Handlers that return
+        # an int (e.g. cmd_kanban -> kanban_command, cmd_project) mean it as an
+        # exit code; discarding it made `hermes kanban comment -- t_bogus x`
+        # exit 0 on a handled failure, so the card-drop receiver's
+        # unknown-card -> 404 mapping (keyed on returncode != 0) never fired.
+        # Handlers returning None keep the implicit exit-0 behavior.
+        rc = args.func(args)
+        if isinstance(rc, int):
+            sys.exit(rc)
     else:
         parser.print_help()
 
