@@ -400,3 +400,79 @@ def test_invalidate_helper_clears_all_entries(tmp_path, monkeypatch):
 
     plugin_api._invalidate_board_cache()
     assert plugin_api._BOARD_CACHE == {}
+
+
+def test_dispatch_non_dryrun_invalidates_board_cache(tmp_path, monkeypatch):
+    """A real (``dry_run=False``) dispatch nudge from the toolbar drops the
+    cache so the post-nudge ``loadBoard()`` shows the dispatched state instead
+    of replaying the pre-dispatch payload within the TTL. A ``dry_run=True``
+    preview must NOT invalidate (it mutates nothing)."""
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="pending task", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    # Warm the cache.
+    _get_board(board=None)
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+    # dispatch_once is exercised for real behaviour is out of scope here; we
+    # only assert the cache-invalidation contract of the endpoint, so stub it.
+    from dataclasses import dataclass
+
+    @dataclass
+    class _FakeResult:
+        spawned: int = 0
+
+    monkeypatch.setattr(
+        plugin_api.kanban_db, "dispatch_once",
+        lambda conn, dry_run, max_spawn, board: _FakeResult(),
+    )
+
+    # dry_run preview must leave the cache intact.
+    plugin_api.dispatch(dry_run=True, max_n=8, board=None)
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+    # A real nudge must clear it.
+    plugin_api.dispatch(dry_run=False, max_n=8, board=None)
+    assert plugin_api._BOARD_CACHE == {}
+
+
+def test_inflight_fill_does_not_repopulate_after_concurrent_invalidation(tmp_path, monkeypatch):
+    """A slow board fill that started before a dashboard write must NOT store
+    its pre-write payload after the write's invalidation runs. The generation
+    guard makes such a fill return its payload to its own caller but decline to
+    cache it, so the next read recomputes instead of serving stale data for the
+    rest of the TTL window."""
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="original", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    real_compute = plugin_api._compute_board
+
+    def _compute_then_invalidate(conn, **kwargs):
+        # Simulate a dashboard mutation committing + invalidating WHILE this
+        # slow board fill is in flight (i.e. after the caller snapshotted the
+        # generation at the cache miss, before it stores the result).
+        payload = real_compute(conn, **kwargs)
+        plugin_api._invalidate_board_cache()
+        return payload
+
+    monkeypatch.setattr(plugin_api, "_compute_board", _compute_then_invalidate)
+
+    result = _get_board(board=None)
+    # The caller still gets a real payload (as fresh as it could have been).
+    assert _titles(result) == {"original"}
+    # But it must NOT have been cached — the mid-flight invalidation bumped the
+    # generation, so the store was skipped and the cache stays empty.
+    assert plugin_api._BOARD_CACHE == {}
+

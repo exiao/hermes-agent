@@ -549,6 +549,12 @@ _DONE_LIMIT_MAX = 100_000
 _BOARD_CACHE_TTL_SECONDS = 2.5
 _BOARD_CACHE: dict[tuple, tuple[float, dict[str, Any]]] = {}
 _BOARD_CACHE_LOCK = threading.Lock()
+# Monotonically-increasing generation stamp, bumped on every invalidation.
+# A board read captures it before computing (outside the lock) and refuses to
+# store its payload if the stamp moved while the compute was in flight — that
+# means a write invalidated the cache mid-compute, so the just-computed payload
+# may already be stale and must not repopulate the cache with a fresh TTL.
+_BOARD_CACHE_GEN = 0
 
 
 def _invalidate_board_cache() -> None:
@@ -566,9 +572,17 @@ def _invalidate_board_cache() -> None:
     the poll-driven reads, and clearing everything is impossible to get wrong
     — it can only force an already-correct recompute, never leak a stale or
     cross-board entry.
+
+    Bumping ``_BOARD_CACHE_GEN`` under the same lock also aborts any board read
+    that started computing before this write: it captured the old generation
+    and will decline to store a payload that predates the mutation (see
+    ``get_board``), closing the in-flight-fill race where a slow ``GET`` would
+    otherwise repopulate the cache with pre-write data right after this clear.
     """
+    global _BOARD_CACHE_GEN
     with _BOARD_CACHE_LOCK:
         _BOARD_CACHE.clear()
+        _BOARD_CACHE_GEN += 1
 
 
 def _windowed_terminal_tasks(
@@ -724,6 +738,10 @@ def get_board(
         hit = _BOARD_CACHE.get(cache_key)
         if hit is not None and hit[0] > now_mono:
             return hit[1]
+        # Snapshot the generation for the store guard below. If an
+        # invalidation bumps it while we compute outside the lock, we must not
+        # store this (now-possibly-stale) payload back into the cache.
+        gen_at_miss = _BOARD_CACHE_GEN
 
     # Cache miss (or expired). Compute outside the lock so a cold cache under
     # concurrent load doesn't serialize every caller behind one another; a few
@@ -747,6 +765,14 @@ def get_board(
 
     expires = time.monotonic() + _BOARD_CACHE_TTL_SECONDS
     with _BOARD_CACHE_LOCK:
+        if _BOARD_CACHE_GEN != gen_at_miss:
+            # A dashboard mutation invalidated the cache while this board was
+            # computing. The payload predates that write, so storing it would
+            # repopulate the cache with stale data right after the clear and
+            # every loadBoard() within the TTL would see the pre-write board.
+            # Return it to *this* caller (it's as fresh as anything they could
+            # have gotten) but don't cache it — the next read recomputes.
+            return payload
         # Prune expired entries before inserting so the cache stays bounded.
         # ``done_since`` is a caller-supplied unix timestamp, so a client that
         # polls with ``done_since=now`` mints a fresh key every request; without
@@ -2435,6 +2461,11 @@ def dispatch(
         result = kanban_db.dispatch_once(
             conn, dry_run=dry_run, max_spawn=max_n, board=board,
         )
+        if not dry_run:
+            # A real dispatch nudge claims/promotes/reclaims tasks; drop the
+            # cache so the toolbar's post-nudge loadBoard() shows the new state
+            # instead of replaying the pre-dispatch payload within the TTL.
+            _invalidate_board_cache()
         # DispatchResult is a dataclass.
         try:
             return asdict(result)
