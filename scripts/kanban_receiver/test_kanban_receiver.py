@@ -131,12 +131,39 @@ def test_create_card_goal_nonpositive_turns_dropped(monkeypatch):
         assert "--goal-max-turns" not in captured["args"]
 
 
-def test_create_card_goal_malformed_turns_is_400(monkeypatch):
-    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc())
-    status, _ = kr.create_card(
-        {"assignee": "dev", "title": "x", "goal": True, "goal_max_turns": "lots"}
+def test_create_card_nonpositive_goal_max_turns(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id":"t"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    # Non-positive -> flag dropped, CLI default applies (200, no --goal-max-turns).
+    status, body = kr.create_card(
+        {"assignee": "dev", "title": "x", "goal": True, "goal_max_turns": 0}
+    )
+    assert status == 200
+    assert "--goal" in captured["args"]
+    assert "--goal-max-turns" not in captured["args"]
+    # Non-integer -> clean 400.
+    status, body = kr.create_card(
+        {"assignee": "dev", "title": "x", "goal": True, "goal_max_turns": "nope"}
     )
     assert status == 400
+
+
+def test_create_card_rejects_non_string_fields(monkeypatch):
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc(stdout='{"id":"t"}'))
+    assert kr.create_card({"assignee": 5, "title": "x"})[0] == 400
+    assert kr.create_card({"assignee": "dev", "title": 5})[0] == 400
+    assert kr.create_card({"assignee": "dev", "title": "x", "body": {"a": 1}})[0] == 400
+
+
+def test_comment_rejects_non_string_fields(monkeypatch):
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc(stdout="ok"))
+    assert kr.comment_card({"card_id": 7, "text": "hi"})[0] == 400
+    assert kr.comment_card({"card_id": "t_1", "text": {"x": 1}})[0] == 400
 
 
 def test_create_card_bad_priority(monkeypatch):

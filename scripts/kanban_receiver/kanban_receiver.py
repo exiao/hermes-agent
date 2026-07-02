@@ -137,14 +137,32 @@ def _run_hermes_kanban(args: list[str]) -> subprocess.CompletedProcess:
     )
 
 
+def _opt_str(value: Any) -> Optional[str]:
+    """Coerce a JSON field to a stripped str, or None if absent/wrong type.
+
+    A client that sends ``title: 5`` or ``body: {...}`` must get a clean 400,
+    not an uncaught AttributeError that resets the connection. Only real strings
+    (and None/missing) are accepted; numbers/objects/lists are rejected."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    return value.strip()
+
+
 def create_card(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """Handle a /kanban/card-drop payload -> hermes kanban create.
 
     Contract: {assignee, title, body, dedupe_key?, priority?, goal?,
     goal_max_turns?}. Returns (status_code, json_body)."""
-    assignee = (payload.get("assignee") or "").strip()
-    title = (payload.get("title") or "").strip()
-    body = payload.get("body") or ""
+    # Reject non-string title/assignee/body up front so a malformed JSON value
+    # (int, object, list) yields a clean 400 rather than an uncaught exception.
+    for field in ("assignee", "title", "body"):
+        if field in payload and payload[field] is not None and not isinstance(payload[field], str):
+            return 400, {"error": f"{field} must be a string"}
+    assignee = _opt_str(payload.get("assignee")) or ""
+    title = _opt_str(payload.get("title")) or ""
+    body = _opt_str(payload.get("body")) or ""
 
     if not assignee or not title:
         return 400, {"error": "assignee and title are required"}
@@ -221,15 +239,18 @@ def comment_card(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """Handle a /kanban/comment payload -> hermes kanban comment.
 
     Contract: {card_id, text}. Returns (status_code, json_body)."""
-    card_id = (payload.get("card_id") or "").strip()
-    text = payload.get("text") or ""
-    if not card_id or not str(text).strip():
+    for field in ("card_id", "text"):
+        if field in payload and payload[field] is not None and not isinstance(payload[field], str):
+            return 400, {"error": f"{field} must be a string"}
+    card_id = _opt_str(payload.get("card_id")) or ""
+    text = _opt_str(payload.get("text")) or ""
+    if not card_id or not text:
         return 400, {"error": "card_id and text are required"}
 
     # `hermes kanban comment <task_id> <text...>` — both positional. Put the
     # optional `--author` first, then `--` and the two positionals, so a text
     # (or id) starting with a dash can't be misparsed as a flag.
-    args = ["comment", "--author", "card-drop", "--", card_id, str(text)]
+    args = ["comment", "--author", "card-drop", "--", card_id, text]
     try:
         proc = _run_hermes_kanban(args)
     except subprocess.TimeoutExpired:
