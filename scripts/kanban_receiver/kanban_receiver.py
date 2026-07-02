@@ -110,10 +110,16 @@ def _redact_args(args: list[str]) -> list[str]:
     """Return args safe for logging: drop user-supplied content (diligence /
     inbox text) so it never lands in the launchd stderr log.
 
-    Two sources of sensitive content:
+    Sensitive content sources:
     - flag values after ``--body`` (card body on ``create``);
+    - the trailing positional ``title`` on ``create`` (``-- <title>``), which is
+      inbox/diligence-derived (same sensitivity class as the body);
     - the trailing positional ``text`` on ``comment`` (``comment <id> <text>``),
-      which arrives after the ``--`` separator alongside the safe card id.
+      which arrives after ``--`` alongside the safe card id.
+
+    Rule: everything after ``--`` is a positional. For ``comment`` the FIRST
+    such positional (the card id) is safe to log; every other trailing
+    positional is redacted to ``<redacted>``.
     """
     out: list[str] = []
     skip = False
@@ -126,17 +132,22 @@ def _redact_args(args: list[str]) -> list[str]:
             continue
         if a in _REDACT_FLAGS:
             skip = True
+            out.append(a)  # keep the flag name; its value is dropped
+            out.append("<redacted>")
             continue
         if a == "--":
             seen_ddash = True
             out.append(a)
             continue
-        # For `comment <id> <text...>`, keep the first positional (the card id)
-        # but redact everything after it (the user-supplied comment text).
-        if is_comment and seen_ddash:
+        if seen_ddash:
             positional_after_ddash += 1
-            if positional_after_ddash >= 2:
-                continue
+            # Keep only the card id (first positional on `comment`); redact
+            # every other trailing positional (comment text, create title).
+            if is_comment and positional_after_ddash == 1:
+                out.append(a)
+            else:
+                out.append("<redacted>")
+            continue
         out.append(a)
     return out
 

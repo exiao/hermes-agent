@@ -189,16 +189,19 @@ def test_create_card_none_assignee_omits_flag(monkeypatch):
     assert "none" not in captured["args"]
 
 
-def test_redact_args_drops_body_value():
-    """The card body carries diligence/inbox content and must never reach the
-    exec log — both the `--body` flag AND its following value are stripped."""
-    args = ["create", "--assignee", "dev", "--body", "SECRET diligence text", "--json", "--", "title"]
+def test_redact_args_drops_body_and_title():
+    """The card body AND the title positional carry diligence/inbox content and
+    must never reach the exec log; non-sensitive flags survive."""
+    args = ["create", "--assignee", "dev", "--body", "SECRET diligence text", "--json", "--", "SECRET title"]
     redacted = kr._redact_args(args)
-    assert "--body" not in redacted
     assert "SECRET diligence text" not in redacted
+    assert "SECRET title" not in redacted
+    # the flag NAME is kept (structure visible) but the value is redacted
+    assert "--body" in redacted
+    assert "<redacted>" in redacted
     # non-sensitive args survive
     assert "--assignee" in redacted and "dev" in redacted
-    assert "title" in redacted
+    assert "--json" in redacted
 
 
 def test_create_card_cli_failure(monkeypatch):
