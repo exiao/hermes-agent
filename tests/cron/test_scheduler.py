@@ -721,6 +721,68 @@ class TestDeliverResultWrapping:
 
         assert seen.get("scope") is False
 
+    def test_home_channel_delivery_resolves_scoped_secrets_under_multiplex(self, tmp_path, monkeypatch):
+        """Regression: ``deliver: "telegram"`` (home-channel path, no origin)
+        must resolve the home chat_id + thread_id through ``get_secret`` so they
+        honor the active profile secret scope under multiplexing.
+
+        ``os.environ`` is process-global and raced across concurrent per-profile
+        cron jobs, so reading it directly would leak Profile A's home channel to
+        Profile B. This exercises ``_get_home_target_chat_id`` /
+        ``_get_home_target_thread_id`` via the REAL ``get_secret`` against a
+        profile ``.env`` that ``os.environ`` does NOT contain."""
+        from agent import secret_scope
+        from agent.secret_scope import get_secret, current_secret_scope
+
+        # This profile's .env holds its OWN home channel; os.environ has none of
+        # these keys, so a leaked os.getenv read would resolve to "" (drop) or,
+        # under multiplex-with-no-scope, raise UnscopedSecretError.
+        profile_home = tmp_path / "profiles" / "acctA"
+        profile_home.mkdir(parents=True)
+        (profile_home / ".env").write_text(
+            "TELEGRAM_HOME_CHANNEL=-100999\n"
+            "TELEGRAM_CRON_THREAD_ID=77\n"
+        )
+        monkeypatch.setattr("cron.scheduler._get_hermes_home", lambda: profile_home)
+        # Ensure os.environ genuinely lacks these — proving we read the scope.
+        monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("TELEGRAM_CRON_THREAD_ID", raising=False)
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        assert current_secret_scope() is None
+
+        seen = {}
+
+        async def fake_send(platform, pconfig, chat_id, content, thread_id=None, **kwargs):
+            seen["chat_id"] = chat_id
+            seen["thread_id"] = thread_id
+            seen["scope"] = current_secret_scope() is not None
+            seen["scoped_home"] = get_secret("TELEGRAM_HOME_CHANNEL")
+            return {"success": True}
+
+        from gateway.config import Platform
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=fake_send):
+            job = {
+                "id": "home-scope-job",
+                "deliver": "telegram",  # home-channel path — no origin
+            }
+            err = _deliver_result(job, "Output.")
+
+        assert err is None
+        # Home chat_id + thread_id resolved from the profile scope, not os.environ.
+        assert seen.get("chat_id") == "-100999"
+        assert seen.get("thread_id") == "77"
+        assert seen.get("scope") is True
+        assert seen.get("scoped_home") == "-100999"
+        # Scope torn down after delivery — no leak into the caller.
+        assert current_secret_scope() is None
+
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
         from gateway.config import Platform
