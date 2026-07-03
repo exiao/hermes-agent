@@ -39,6 +39,45 @@ from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
 
+# A block ``reason`` is the one-line human summary shown on the board; the
+# schema and KANBAN_GUIDANCE both tell the worker to keep it to one or two
+# sentences and put structured detail (changed_files, paths, commands) in a
+# kanban_comment instead. Prose guidance alone doesn't hold — workers dump run
+# ids, tarball paths, API routes and rule citations into the reason, making the
+# board unreadable. Cap it mechanically. Truncate rather than reject so the
+# block always lands (a rejected block could leave a task un-blocked or loop),
+# and point the worker at comments for the rest.
+_BLOCK_REASON_DEFAULT_MAX_CHARS = 600
+
+
+def _clip_block_reason(reason: str) -> str:
+    """Trim an over-long block reason to the configured cap.
+
+    Returns ``reason`` unchanged when under the cap. The limit is
+    ``kanban.block_reason_max_chars`` (default
+    :data:`_BLOCK_REASON_DEFAULT_MAX_CHARS`); a value <= 0 disables clipping.
+    """
+    try:
+        cfg = load_config()
+        limit = int(
+            cfg_get(
+                cfg, "kanban", "block_reason_max_chars",
+                default=_BLOCK_REASON_DEFAULT_MAX_CHARS,
+            )
+        )
+    except Exception:
+        limit = _BLOCK_REASON_DEFAULT_MAX_CHARS
+    if limit <= 0 or len(reason) <= limit:
+        return reason
+    marker = " […truncated; put detail in a kanban_comment]"
+    # If the cap is smaller than the marker itself, appending the marker would
+    # overshoot the limit — hard-truncate the reason instead so the result
+    # never exceeds ``limit``.
+    if limit <= len(marker):
+        return reason[:limit].rstrip()
+    head = reason[: limit - len(marker)].rstrip()
+    return head + marker
+
 
 # ---------------------------------------------------------------------------
 # Gating
@@ -623,6 +662,7 @@ def _handle_block(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
+    reason = _clip_block_reason(reason)
     kind = args.get("kind")
     board = args.get("board")
     try:
@@ -1242,7 +1282,10 @@ KANBAN_BLOCK_SCHEMA = {
                 "description": (
                     "What you need answered or what stopped you, in one or "
                     "two sentences. Don't paste the whole conversation; the "
-                    "human has the board and can ask follow-ups via comments."
+                    "human has the board and can ask follow-ups via comments. "
+                    "Long reasons are truncated on the board — put run ids, "
+                    "paths, commands and other detail in a kanban_comment, "
+                    "not here."
                 ),
             },
             "kind": {
