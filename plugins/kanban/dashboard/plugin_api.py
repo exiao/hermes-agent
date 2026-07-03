@@ -40,6 +40,7 @@ import json
 import logging
 import math
 import sqlite3
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -532,6 +533,23 @@ _WINDOWED_COLUMNS: frozenset[str] = frozenset({"done", "archived"})
 _DONE_LIMIT_DEFAULT = 50
 _DONE_LIMIT_MAX = 100_000
 
+# ---------------------------------------------------------------------------
+# Short-TTL in-process cache for GET /board.
+#
+# ``get_board`` is a SYNC FastAPI route doing ~40ms of pure-Python diagnostics
+# under the GIL. Eight concurrent fetches (dispatcher tick + WS pushes + browser
+# refetches, all in the single-worker gateway process) serialize behind the GIL
+# and each take 5-6s. Memoizing the result for a couple of seconds — keyed by the
+# full query-param tuple — collapses that pileup: within the window every caller
+# replays one already-computed payload instead of recomputing under contention.
+#
+# Invalidation is time-only (no write-hook): 2-3s staleness on a board view is
+# fine, and the ``/events`` WS + poll refresh cover live updates. ``latest_event_id``
+# and ``now`` in a cache HIT are up to ~TTL seconds stale, which is acceptable.
+_BOARD_CACHE_TTL_SECONDS = 2.5
+_BOARD_CACHE: dict[tuple, tuple[float, dict[str, Any]]] = {}
+_BOARD_CACHE_LOCK = threading.Lock()
+
 
 def _windowed_terminal_tasks(
     conn: sqlite3.Connection,
@@ -658,203 +676,277 @@ def get_board(
     ``board`` selects which board to read from. Omitting it falls
     through to the active board (``HERMES_KANBAN_BOARD`` env → on-disk
     ``current`` pointer → ``default``).
+
+    Result is memoized for ``_BOARD_CACHE_TTL_SECONDS`` keyed by the full
+    resolved query-param tuple — see the cache note near ``_BOARD_CACHE``.
     """
-    board = _resolve_board(board)
-    conn = _conn(board=board)
+    # Resolve to the *concrete* active board slug (never None) so the cache
+    # key pins the board this request actually reads. Keying on a bare ``None``
+    # would let a later request served after a board switch (CLI / another API
+    # call moves the ``current`` pointer) hit the previous board's cached entry
+    # and return its stale payload. ``get_current_board()`` walks the same
+    # resolution chain ``_conn(board=None)`` uses (env → current file → default),
+    # so the key and the read stay in lockstep.
+    board = _resolve_board(board) or kanban_db.get_current_board()
     done_limit = min(int(done_limit), _DONE_LIMIT_MAX)
+    cache_key = (
+        tenant,
+        assignee,
+        include_archived,
+        board,
+        workflow_template_id,
+        current_step_key,
+        done_limit,
+        done_since,
+    )
+    now_mono = time.monotonic()
+    with _BOARD_CACHE_LOCK:
+        hit = _BOARD_CACHE.get(cache_key)
+        if hit is not None and hit[0] > now_mono:
+            return hit[1]
+
+    # Cache miss (or expired). Compute outside the lock so a cold cache under
+    # concurrent load doesn't serialize every caller behind one another; a few
+    # racing computes before the first store lands is benign (identical data,
+    # last-writer-wins) and still far cheaper than every caller recomputing on
+    # every poll within the window.
+    conn = _conn(board=board)
     try:
-        # Live (non-terminal) columns: full, naturally small. We pull
-        # everything except the windowed terminal columns here, then fetch
-        # the terminal columns separately with a bounded query so the done
-        # history never ships in full on first paint. Exclude the windowed
-        # (terminal) statuses in SQL so we never materialize the full done
-        # history just to drop it in Python.
-        live_tasks = kanban_db.list_tasks(
+        payload = _compute_board(
             conn,
             tenant=tenant,
             assignee=assignee,
-            include_archived=False,
+            include_archived=include_archived,
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
-            exclude_statuses=_WINDOWED_COLUMNS,
+            done_limit=done_limit,
+            done_since=done_since,
         )
-
-        # Windowed terminal columns: done always, archived only when shown.
-        windowed_status = ["done"]
-        if include_archived:
-            windowed_status.append("archived")
-        column_totals: dict[str, int] = {}
-        windowed_tasks: list[kanban_db.Task] = []
-        for st in windowed_status:
-            tail, total = _windowed_terminal_tasks(
-                conn,
-                st,
-                tenant=tenant,
-                assignee=assignee,
-                workflow_template_id=workflow_template_id,
-                current_step_key=current_step_key,
-                done_limit=done_limit,
-                done_since=done_since,
-            )
-            windowed_tasks.extend(tail)
-            column_totals[st] = total
-
-        tasks = live_tasks + windowed_tasks
-        task_ids = [t.id for t in tasks]
-        # Pre-fetch link counts per task (cheap: one query).
-        link_counts: dict[str, dict[str, int]] = {}
-        if task_ids:
-            for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
-                task_placeholders = ",".join("?" for _ in chunk)
-                for row in conn.execute(
-                    "SELECT parent_id, child_id FROM task_links "
-                    f"WHERE parent_id IN ({task_placeholders})",
-                    chunk,
-                ).fetchall():
-                    link_counts.setdefault(
-                        row["parent_id"], {"parents": 0, "children": 0}
-                    )["children"] += 1
-                for row in conn.execute(
-                    "SELECT parent_id, child_id FROM task_links "
-                    f"WHERE child_id IN ({task_placeholders})",
-                    chunk,
-                ).fetchall():
-                    link_counts.setdefault(
-                        row["child_id"], {"parents": 0, "children": 0}
-                    )["parents"] += 1
-
-        # Comment + event counts (both cheap aggregates).
-        comment_counts: dict[str, int] = {}
-        if task_ids:
-            for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
-                task_placeholders = ",".join("?" for _ in chunk)
-                comment_counts.update(
-                    {
-                        r["task_id"]: r["n"]
-                        for r in conn.execute(
-                            "SELECT task_id, COUNT(*) AS n FROM task_comments "
-                            f"WHERE task_id IN ({task_placeholders}) "
-                            "GROUP BY task_id",
-                            chunk,
-                        )
-                    }
-                )
-
-        # Progress rollup: for each parent, how many children are done / total.
-        # One pass over task_links joined with child status — cheaper than
-        # N per-task queries and the plugin uses it to render "N/M".
-        progress: dict[str, dict[str, int]] = {}
-        if task_ids:
-            for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
-                task_placeholders = ",".join("?" for _ in chunk)
-                for row in conn.execute(
-                    "SELECT l.parent_id AS pid, t.status AS cstatus "
-                    "FROM task_links l JOIN tasks t ON t.id = l.child_id "
-                    f"WHERE l.parent_id IN ({task_placeholders})",
-                    chunk,
-                ).fetchall():
-                    p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
-                    p["total"] += 1
-                    if row["cstatus"] == "done":
-                        p["done"] += 1
-
-        # Diagnostics rollup for this board — see kanban_diagnostics.
-        # We get the full structured list per task AND a compact
-        # summary for the card badge (so cards don't carry the detail
-        # text; the drawer fetches that via /tasks/:id or /diagnostics).
-        #
-        # Scope to the windowed working set (live columns + the bounded
-        # done/archived tail) rather than every non-archived task: the old
-        # ``task_ids=None`` form re-derived diagnostics for the entire
-        # unbounded done history on every load, which is exactly the cost
-        # this change exists to remove. Cards we don't return can't show a
-        # badge anyway.
-        diagnostics_per_task = _compute_task_diagnostics(
-            conn, task_ids=task_ids
-        )
-
-        latest_event_id = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
-        ).fetchone()["m"]
-
-        columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
-        if include_archived:
-            columns["archived"] = []
-
-        # Batch-fetch the latest non-null run summary per task in one
-        # window-function query (avoids N+1 ``latest_summary`` calls
-        # for boards with hundreds of tasks). Truncated to a card-size
-        # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, task_ids)
-
-        for t in tasks:
-            full = summary_map.get(t.id)
-            preview = (
-                full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
-            )
-            d = _task_dict(t, latest_summary=preview)
-            d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
-            d["comment_count"] = comment_counts.get(t.id, 0)
-            d["progress"] = progress.get(t.id)  # None when the task has no children
-            diags = diagnostics_per_task.get(t.id)
-            if diags:
-                # Full list goes into the payload so the drawer can render
-                # without a second round-trip. The board-level badge only
-                # needs the summary.
-                d["diagnostics"] = diags
-                d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
-            columns[col].append(d)
-
-        # Stable per-column ordering already applied by list_tasks
-        # (priority DESC, created_at ASC), keep as-is.
-
-        # List of known tenants for the UI filter dropdown.
-        tenants = [
-            r["tenant"]
-            for r in conn.execute(
-                "SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant"
-            )
-        ]
-        # List of distinct assignees for the lane-by-profile sub-grouping.
-        assignees = [
-            r["assignee"]
-            for r in conn.execute(
-                "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
-            )
-        ]
-
-        # Per-column metadata. Windowed terminal columns expose the full
-        # DB count (``total``) and whether the returned tail is partial
-        # (``has_more``); live columns are always complete, so total ==
-        # number of cards returned and has_more is false.
-        def _col_meta(name: str, returned: int) -> dict[str, Any]:
-            if name in column_totals:
-                total = column_totals[name]
-                return {"total": int(total), "has_more": returned < total}
-            return {"total": int(returned), "has_more": False}
-
-        return {
-            "columns": [
-                {
-                    "name": name,
-                    "tasks": columns[name],
-                    **_col_meta(name, len(columns[name])),
-                }
-                for name in columns.keys()
-            ],
-            "done_window": {
-                "limit": int(done_limit),
-                "since": int(done_since) if done_since is not None else None,
-            },
-            "tenants": tenants,
-            "assignees": assignees,
-            "latest_event_id": int(latest_event_id),
-            "now": int(time.time()),
-        }
     finally:
         conn.close()
+
+    expires = time.monotonic() + _BOARD_CACHE_TTL_SECONDS
+    with _BOARD_CACHE_LOCK:
+        # Prune expired entries before inserting so the cache stays bounded.
+        # ``done_since`` is a caller-supplied unix timestamp, so a client that
+        # polls with ``done_since=now`` mints a fresh key every request; without
+        # this sweep those dead entries would accumulate unboundedly in the
+        # long-lived gateway process. The scan is O(n) over a set that only ever
+        # holds a TTL-window's worth of distinct keys, so it stays cheap.
+        now_mono = time.monotonic()
+        for key in [k for k, v in _BOARD_CACHE.items() if v[0] <= now_mono]:
+            _BOARD_CACHE.pop(key, None)
+        _BOARD_CACHE[cache_key] = (expires, payload)
+    return payload
+
+
+def _compute_board(
+    conn: sqlite3.Connection,
+    *,
+    tenant: Optional[str],
+    assignee: Optional[str],
+    include_archived: bool,
+    workflow_template_id: Optional[str],
+    current_step_key: Optional[str],
+    done_limit: int,
+    done_since: Optional[int],
+) -> dict[str, Any]:
+    """Build the board payload for :func:`get_board` (the cacheable body).
+
+    ``done_limit`` is already clamped to ``_DONE_LIMIT_MAX`` by the caller.
+    Extracted verbatim from the old inline body so the return shape stays
+    byte-for-byte identical on a cache miss.
+    """
+    # Live (non-terminal) columns: full, naturally small. We pull
+    # everything except the windowed terminal columns here, then fetch
+    # the terminal columns separately with a bounded query so the done
+    # history never ships in full on first paint. Exclude the windowed
+    # (terminal) statuses in SQL so we never materialize the full done
+    # history just to drop it in Python.
+    live_tasks = kanban_db.list_tasks(
+        conn,
+        tenant=tenant,
+        assignee=assignee,
+        include_archived=False,
+        workflow_template_id=workflow_template_id,
+        current_step_key=current_step_key,
+        exclude_statuses=_WINDOWED_COLUMNS,
+    )
+
+    # Windowed terminal columns: done always, archived only when shown.
+    windowed_status = ["done"]
+    if include_archived:
+        windowed_status.append("archived")
+    column_totals: dict[str, int] = {}
+    windowed_tasks: list[kanban_db.Task] = []
+    for st in windowed_status:
+        tail, total = _windowed_terminal_tasks(
+            conn,
+            st,
+            tenant=tenant,
+            assignee=assignee,
+            workflow_template_id=workflow_template_id,
+            current_step_key=current_step_key,
+            done_limit=done_limit,
+            done_since=done_since,
+        )
+        windowed_tasks.extend(tail)
+        column_totals[st] = total
+
+    tasks = live_tasks + windowed_tasks
+    task_ids = [t.id for t in tasks]
+    # Pre-fetch link counts per task (cheap: one query).
+    link_counts: dict[str, dict[str, int]] = {}
+    if task_ids:
+        for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
+            task_placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                "SELECT parent_id, child_id FROM task_links "
+                f"WHERE parent_id IN ({task_placeholders})",
+                chunk,
+            ).fetchall():
+                link_counts.setdefault(
+                    row["parent_id"], {"parents": 0, "children": 0}
+                )["children"] += 1
+            for row in conn.execute(
+                "SELECT parent_id, child_id FROM task_links "
+                f"WHERE child_id IN ({task_placeholders})",
+                chunk,
+            ).fetchall():
+                link_counts.setdefault(
+                    row["child_id"], {"parents": 0, "children": 0}
+                )["parents"] += 1
+
+    # Comment + event counts (both cheap aggregates).
+    comment_counts: dict[str, int] = {}
+    if task_ids:
+        for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
+            task_placeholders = ",".join("?" for _ in chunk)
+            comment_counts.update(
+                {
+                    r["task_id"]: r["n"]
+                    for r in conn.execute(
+                        "SELECT task_id, COUNT(*) AS n FROM task_comments "
+                        f"WHERE task_id IN ({task_placeholders}) "
+                        "GROUP BY task_id",
+                        chunk,
+                    )
+                }
+            )
+
+    # Progress rollup: for each parent, how many children are done / total.
+    # One pass over task_links joined with child status — cheaper than
+    # N per-task queries and the plugin uses it to render "N/M".
+    progress: dict[str, dict[str, int]] = {}
+    if task_ids:
+        for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
+            task_placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                "SELECT l.parent_id AS pid, t.status AS cstatus "
+                "FROM task_links l JOIN tasks t ON t.id = l.child_id "
+                f"WHERE l.parent_id IN ({task_placeholders})",
+                chunk,
+            ).fetchall():
+                p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
+                p["total"] += 1
+                if row["cstatus"] == "done":
+                    p["done"] += 1
+
+    # Diagnostics rollup for this board — see kanban_diagnostics.
+    # We get the full structured list per task AND a compact
+    # summary for the card badge (so cards don't carry the detail
+    # text; the drawer fetches that via /tasks/:id or /diagnostics).
+    #
+    # Scope to the windowed working set (live columns + the bounded
+    # done/archived tail) rather than every non-archived task: the old
+    # ``task_ids=None`` form re-derived diagnostics for the entire
+    # unbounded done history on every load, which is exactly the cost
+    # this change exists to remove. Cards we don't return can't show a
+    # badge anyway.
+    diagnostics_per_task = _compute_task_diagnostics(
+        conn, task_ids=task_ids
+    )
+
+    latest_event_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+    ).fetchone()["m"]
+
+    columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
+    if include_archived:
+        columns["archived"] = []
+
+    # Batch-fetch the latest non-null run summary per task in one
+    # window-function query (avoids N+1 ``latest_summary`` calls
+    # for boards with hundreds of tasks). Truncated to a card-size
+    # preview here — the full text is available via /tasks/:id.
+    summary_map = kanban_db.latest_summaries(conn, task_ids)
+
+    for t in tasks:
+        full = summary_map.get(t.id)
+        preview = (
+            full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
+        )
+        d = _task_dict(t, latest_summary=preview)
+        d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
+        d["comment_count"] = comment_counts.get(t.id, 0)
+        d["progress"] = progress.get(t.id)  # None when the task has no children
+        diags = diagnostics_per_task.get(t.id)
+        if diags:
+            # Full list goes into the payload so the drawer can render
+            # without a second round-trip. The board-level badge only
+            # needs the summary.
+            d["diagnostics"] = diags
+            d["warnings"] = _warnings_summary_from_diagnostics(diags)
+        col = t.status if t.status in columns else "todo"
+        columns[col].append(d)
+
+    # Stable per-column ordering already applied by list_tasks
+    # (priority DESC, created_at ASC), keep as-is.
+
+    # List of known tenants for the UI filter dropdown.
+    tenants = [
+        r["tenant"]
+        for r in conn.execute(
+            "SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant"
+        )
+    ]
+    # List of distinct assignees for the lane-by-profile sub-grouping.
+    assignees = [
+        r["assignee"]
+        for r in conn.execute(
+            "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
+            "AND status != 'archived' ORDER BY assignee"
+        )
+    ]
+
+    # Per-column metadata. Windowed terminal columns expose the full
+    # DB count (``total``) and whether the returned tail is partial
+    # (``has_more``); live columns are always complete, so total ==
+    # number of cards returned and has_more is false.
+    def _col_meta(name: str, returned: int) -> dict[str, Any]:
+        if name in column_totals:
+            total = column_totals[name]
+            return {"total": int(total), "has_more": returned < total}
+        return {"total": int(returned), "has_more": False}
+
+    return {
+        "columns": [
+            {
+                "name": name,
+                "tasks": columns[name],
+                **_col_meta(name, len(columns[name])),
+            }
+            for name in columns.keys()
+        ],
+        "done_window": {
+            "limit": int(done_limit),
+            "since": int(done_since) if done_since is not None else None,
+        },
+        "tenants": tenants,
+        "assignees": assignees,
+        "latest_event_id": int(latest_event_id),
+        "now": int(time.time()),
+    }
 
 
 # ---------------------------------------------------------------------------
