@@ -549,6 +549,40 @@ _DONE_LIMIT_MAX = 100_000
 _BOARD_CACHE_TTL_SECONDS = 2.5
 _BOARD_CACHE: dict[tuple, tuple[float, dict[str, Any]]] = {}
 _BOARD_CACHE_LOCK = threading.Lock()
+# Monotonically-increasing generation stamp, bumped on every invalidation.
+# A board read captures it before computing (outside the lock) and refuses to
+# store its payload if the stamp moved while the compute was in flight — that
+# means a write invalidated the cache mid-compute, so the just-computed payload
+# may already be stale and must not repopulate the cache with a fresh TTL.
+_BOARD_CACHE_GEN = 0
+
+
+def _invalidate_board_cache() -> None:
+    """Drop every memoized ``/board`` payload so the next read recomputes.
+
+    The cache is time-only otherwise (2.5s TTL): a dashboard mutation that
+    lands within the window of a prior board load would keep serving the
+    pre-write payload until the entry expired, so the frontend's
+    refresh-after-mutation (``loadBoard()``) and the ``/events`` reload could
+    both replay the stale board. Every task-mutating route calls this after a
+    successful write to force a fresh compute.
+
+    A full clear (rather than a board-scoped one) is deliberate: the cache
+    only ever holds a TTL-window's worth of entries, writes are rare next to
+    the poll-driven reads, and clearing everything is impossible to get wrong
+    — it can only force an already-correct recompute, never leak a stale or
+    cross-board entry.
+
+    Bumping ``_BOARD_CACHE_GEN`` under the same lock also aborts any board read
+    that started computing before this write: it captured the old generation
+    and will decline to store a payload that predates the mutation (see
+    ``get_board``), closing the in-flight-fill race where a slow ``GET`` would
+    otherwise repopulate the cache with pre-write data right after this clear.
+    """
+    global _BOARD_CACHE_GEN
+    with _BOARD_CACHE_LOCK:
+        _BOARD_CACHE.clear()
+        _BOARD_CACHE_GEN += 1
 
 
 def _windowed_terminal_tasks(
@@ -704,6 +738,10 @@ def get_board(
         hit = _BOARD_CACHE.get(cache_key)
         if hit is not None and hit[0] > now_mono:
             return hit[1]
+        # Snapshot the generation for the store guard below. If an
+        # invalidation bumps it while we compute outside the lock, we must not
+        # store this (now-possibly-stale) payload back into the cache.
+        gen_at_miss = _BOARD_CACHE_GEN
 
     # Cache miss (or expired). Compute outside the lock so a cold cache under
     # concurrent load doesn't serialize every caller behind one another; a few
@@ -727,6 +765,14 @@ def get_board(
 
     expires = time.monotonic() + _BOARD_CACHE_TTL_SECONDS
     with _BOARD_CACHE_LOCK:
+        if _BOARD_CACHE_GEN != gen_at_miss:
+            # A dashboard mutation invalidated the cache while this board was
+            # computing. The payload predates that write, so storing it would
+            # repopulate the cache with stale data right after the clear and
+            # every loadBoard() within the TTL would see the pre-write board.
+            # Return it to *this* caller (it's as fresh as anything they could
+            # have gotten) but don't cache it — the next read recomputes.
+            return payload
         # Prune expired entries before inserting so the cache stays bounded.
         # ``done_since`` is a caller-supplied unix timestamp, so a client that
         # polls with ``done_since=now`` mints a fresh key every request; without
@@ -1073,6 +1119,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             except Exception:
                 # Probe failure must never block the create itself.
                 pass
+        _invalidate_board_cache()
         return body
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1262,6 +1309,7 @@ class UpdateTaskBody(BaseModel):
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
+    mutated = False
     try:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
@@ -1277,6 +1325,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 raise HTTPException(status_code=409, detail=str(e))
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
+            mutated = True
 
         # --- status -------------------------------------------------------
         if payload.status is not None:
@@ -1334,6 +1383,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=409,
                     detail=f"status transition to {s!r} not valid from current state",
                 )
+            mutated = True
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
@@ -1348,6 +1398,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     (task_id, json.dumps({"priority": int(payload.priority)}),
                      int(time.time())),
                 )
+            mutated = True
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
@@ -1370,10 +1421,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     "VALUES (?, 'edited', NULL, ?)",
                     (task_id, int(time.time())),
                 )
+            mutated = True
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
     finally:
+        # Invalidate in the finally so a request that commits an earlier
+        # section and then raises in a later one (e.g. assignee applied, then
+        # a blank title or status='running' 400s) still drops the stale board
+        # entry — the partial mutation already hit the DB. ``mutated`` skips
+        # the invalidation for no-op paths (e.g. a 404 before any write).
+        if mutated:
+            _invalidate_board_cache()
         conn.close()
 
 
@@ -1389,6 +1448,7 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _invalidate_board_cache()
         return {"deleted": True, "task_id": task_id}
     finally:
         conn.close()
@@ -1540,6 +1600,7 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
         kanban_db.add_comment(
             conn, task_id, author=payload.author or "dashboard", body=payload.body,
         )
+        _invalidate_board_cache()
         return {"ok": True}
     finally:
         conn.close()
@@ -1560,6 +1621,7 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     conn = _conn(board=board)
     try:
         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
+        _invalidate_board_cache()
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1577,6 +1639,7 @@ def delete_link(
     conn = _conn(board=board)
     try:
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        _invalidate_board_cache()
         return {"ok": bool(ok)}
     finally:
         conn.close()
@@ -1690,6 +1753,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
             except Exception as e:  # defensive — one bad id shouldn't kill the batch
                 entry.update(ok=False, error=str(e))
             results.append(entry)
+        _invalidate_board_cache()
         return {"results": results}
     finally:
         conn.close()
@@ -1987,6 +2051,7 @@ def terminate_run_endpoint(
                     "longer in a reclaimable state"
                 ),
             )
+        _invalidate_board_cache()
         return {"ok": True, "run_id": run_id, "task_id": r.task_id}
     finally:
         conn.close()
@@ -2025,6 +2090,7 @@ def reclaim_task_endpoint(
                     "(not running, or unknown id)"
                 ),
             )
+        _invalidate_board_cache()
         return {"ok": True, "task_id": task_id}
     finally:
         conn.close()
@@ -2074,6 +2140,8 @@ def specify_task_endpoint(
             author=(payload.author or None),
         )
 
+    if outcome.ok:
+        _invalidate_board_cache()
     return {
         "ok": bool(outcome.ok),
         "task_id": outcome.task_id,
@@ -2118,6 +2186,7 @@ def reassign_task_endpoint(
                     "running (pass reclaim_first=true to release the claim first)"
                 ),
             )
+        _invalidate_board_cache()
         return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
     finally:
         conn.close()
@@ -2403,6 +2472,11 @@ def dispatch(
         result = kanban_db.dispatch_once(
             conn, dry_run=dry_run, max_spawn=max_n, board=board,
         )
+        if not dry_run:
+            # A real dispatch nudge claims/promotes/reclaims tasks; drop the
+            # cache so the toolbar's post-nudge loadBoard() shows the new state
+            # instead of replaying the pre-dispatch payload within the TTL.
+            _invalidate_board_cache()
         # DispatchResult is a dataclass.
         try:
             return asdict(result)
@@ -2680,6 +2754,8 @@ def decompose_task_endpoint(
             author=(payload.author or None),
         )
 
+    if outcome.ok:
+        _invalidate_board_cache()
     return {
         "ok": bool(outcome.ok),
         "task_id": outcome.task_id,

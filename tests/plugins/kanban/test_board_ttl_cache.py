@@ -267,3 +267,282 @@ def test_switching_active_board_bypasses_cache_for_none_board(tmp_path, monkeypa
         for t in col["tasks"]
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Write-side invalidation (follow-up to #89): a dashboard mutation within the
+# TTL window must drop the stale entry so the next board read reflects the
+# write instead of replaying the pre-write payload.
+# ---------------------------------------------------------------------------
+
+
+def _titles(payload) -> set[str]:
+    return {
+        t["title"]
+        for col in payload["columns"]
+        for t in col["tasks"]
+    }
+
+
+def _freeze_clock(monkeypatch):
+    """Pin time.monotonic so the TTL never expires on its own — any refresh
+    across a mutation must therefore come from write invalidation, not the
+    2.5s timer. Returns the mutable clock dict."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(plugin_api.time, "monotonic", lambda: clock["t"])
+    return clock
+
+
+def test_create_within_ttl_invalidates_stale_board(tmp_path, monkeypatch):
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="first task", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    warm = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(warm) == {"first task"}
+
+    # Mutate through the dashboard route while the cache entry is still live
+    # (clock frozen → not expired). Without invalidation the next read would
+    # replay ``warm`` and never show "second task".
+    plugin_api.create_task(
+        plugin_api.CreateTaskBody(title="second task", assignee="x"),
+        board=None,
+    )
+
+    after = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert after is not warm
+    assert _titles(after) == {"first task", "second task"}
+
+
+def test_delete_within_ttl_invalidates_stale_board(tmp_path, monkeypatch):
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    tid = kb.create_task(conn, title="doomed", assignee="x")
+    kb.create_task(conn, title="survivor", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    warm = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(warm) == {"doomed", "survivor"}
+
+    plugin_api.delete_task(tid, board=None)
+
+    after = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(after) == {"survivor"}
+
+
+def test_patch_within_ttl_invalidates_stale_board(tmp_path, monkeypatch):
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    tid = kb.create_task(conn, title="old title", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    warm = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(warm) == {"old title"}
+
+    plugin_api.update_task(
+        tid, plugin_api.UpdateTaskBody(title="new title"), board=None,
+    )
+
+    after = plugin_api.get_board(
+        tenant=None, assignee=None, include_archived=False, board=None,
+        workflow_template_id=None, current_step_key=None,
+        done_limit=plugin_api._DONE_LIMIT_DEFAULT, done_since=None,
+    )
+    assert _titles(after) == {"new title"}
+
+
+def test_invalidate_helper_clears_all_entries(tmp_path, monkeypatch):
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="a", assignee="alice")
+    kb.create_task(conn, title="b", assignee="bob")
+    conn.close()
+
+    # Two distinct cache keys.
+    _get_board(assignee="alice")
+    _get_board(assignee="bob")
+    assert len(plugin_api._BOARD_CACHE) == 2
+
+    plugin_api._invalidate_board_cache()
+    assert plugin_api._BOARD_CACHE == {}
+
+
+def test_dispatch_non_dryrun_invalidates_board_cache(tmp_path, monkeypatch):
+    """A real (``dry_run=False``) dispatch nudge from the toolbar drops the
+    cache so the post-nudge ``loadBoard()`` shows the dispatched state instead
+    of replaying the pre-dispatch payload within the TTL. A ``dry_run=True``
+    preview must NOT invalidate (it mutates nothing)."""
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="pending task", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    # Warm the cache.
+    _get_board(board=None)
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+    # dispatch_once is exercised for real behaviour is out of scope here; we
+    # only assert the cache-invalidation contract of the endpoint, so stub it.
+    from dataclasses import dataclass
+
+    @dataclass
+    class _FakeResult:
+        spawned: int = 0
+
+    monkeypatch.setattr(
+        plugin_api.kanban_db, "dispatch_once",
+        lambda conn, dry_run, max_spawn, board: _FakeResult(),
+    )
+
+    # dry_run preview must leave the cache intact.
+    plugin_api.dispatch(dry_run=True, max_n=8, board=None)
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+    # A real nudge must clear it.
+    plugin_api.dispatch(dry_run=False, max_n=8, board=None)
+    assert plugin_api._BOARD_CACHE == {}
+
+
+def test_inflight_fill_does_not_repopulate_after_concurrent_invalidation(tmp_path, monkeypatch):
+    """A slow board fill that started before a dashboard write must NOT store
+    its pre-write payload after the write's invalidation runs. The generation
+    guard makes such a fill return its payload to its own caller but decline to
+    cache it, so the next read recomputes instead of serving stale data for the
+    rest of the TTL window."""
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="original", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    real_compute = plugin_api._compute_board
+
+    def _compute_then_invalidate(conn, **kwargs):
+        # Simulate a dashboard mutation committing + invalidating WHILE this
+        # slow board fill is in flight (i.e. after the caller snapshotted the
+        # generation at the cache miss, before it stores the result).
+        payload = real_compute(conn, **kwargs)
+        plugin_api._invalidate_board_cache()
+        return payload
+
+    monkeypatch.setattr(plugin_api, "_compute_board", _compute_then_invalidate)
+
+    result = _get_board(board=None)
+    # The caller still gets a real payload (as fresh as it could have been).
+    assert _titles(result) == {"original"}
+    # But it must NOT have been cached — the mid-flight invalidation bumped the
+    # generation, so the store was skipped and the cache stays empty.
+    assert plugin_api._BOARD_CACHE == {}
+
+
+def test_update_task_invalidates_after_partial_mutation_then_error(tmp_path, monkeypatch):
+    """A PATCH that commits an earlier section (assignee) and then raises in a
+    later one (blank title -> 400) must still drop the stale board cache — the
+    partial mutation already hit the DB, so the invalidation lives in a
+    ``finally`` guarded by a ``mutated`` flag rather than after the last write.
+    """
+    import pytest
+    from fastapi import HTTPException
+
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    tid = kb.create_task(conn, title="task one", assignee="old")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    # Warm the cache.
+    _get_board(board=None)
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+    # assignee commits, then the blank title raises 400 before its own write.
+    with pytest.raises(HTTPException) as exc:
+        plugin_api.update_task(
+            tid,
+            plugin_api.UpdateTaskBody(assignee="new", title="   "),
+            board=None,
+        )
+    assert exc.value.status_code == 400
+
+    # The assignee write committed, so the warm entry must have been dropped.
+    assert plugin_api._BOARD_CACHE == {}
+    after = _get_board(board=None)
+    assert any(
+        t.get("assignee") == "new"
+        for col in after["columns"]
+        for t in col["tasks"]
+    )
+
+
+def test_update_task_404_does_not_invalidate(tmp_path, monkeypatch):
+    """A PATCH on an unknown id raises 404 before any write, so it must NOT
+    invalidate a warm cache (nothing changed)."""
+    import pytest
+    from fastapi import HTTPException
+
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="only task", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+    _get_board(board=None)
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+    with pytest.raises(HTTPException) as exc:
+        plugin_api.update_task(
+            "nope-does-not-exist",
+            plugin_api.UpdateTaskBody(assignee="y"),
+            board=None,
+        )
+    assert exc.value.status_code == 404
+    # Unchanged DB -> warm cache preserved (no needless recompute).
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+
