@@ -111,6 +111,33 @@ def test_create_card_goal_flag(monkeypatch):
     assert a[a.index("--goal-max-turns") + 1] == "15"
 
 
+def test_create_card_goal_false_string_does_not_enable_goal(monkeypatch):
+    """A producer serializing goal as the STRING "false"/"0"/"no" must NOT
+    enable goal mode -- otherwise an ordinary card is dispatched as a multi-turn
+    goal loop and burns the goal budget. Only a JSON boolean true (or a genuine
+    truthy string) appends --goal."""
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id": "t_1"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    for falsey in ("false", "False", "0", "no", "off", ""):
+        captured.clear()
+        status, _ = kr.create_card(
+            {"assignee": "dev", "title": "x", "goal": falsey}
+        )
+        assert status == 200
+        assert "--goal" not in captured["args"], f"goal={falsey!r} should not enable goal mode"
+
+    # A real boolean true and a genuine truthy string still enable it.
+    for truthy in (True, "true", "1", "yes"):
+        captured.clear()
+        kr.create_card({"assignee": "dev", "title": "x", "goal": truthy})
+        assert "--goal" in captured["args"], f"goal={truthy!r} should enable goal mode"
+
+
 def test_create_card_goal_nonpositive_turns_dropped(monkeypatch):
     """A zero/negative goal_max_turns is meaningless: drop the flag and let
     the CLI apply its own default rather than forwarding a stall value."""

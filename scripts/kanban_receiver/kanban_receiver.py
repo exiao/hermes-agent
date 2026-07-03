@@ -179,6 +179,23 @@ def _opt_str(value: Any) -> Optional[str]:
     return value.strip()
 
 
+def _is_goal(value: Any) -> bool:
+    """Decide whether ``goal`` enables goal mode, accepting only real booleans.
+
+    A producer that serializes ``goal`` as a string like ``"false"`` or ``"0"``
+    is still truthy under a bare ``if payload.get("goal")`` check, which would
+    dispatch an ordinary card as a multi-turn goal loop and burn the goal
+    budget. Accept a JSON boolean directly; for string forms, treat the usual
+    falsey tokens ("", "false", "0", "no", "off") as False and everything else
+    True. Non-bool/non-str values (numbers, objects) fall back to truthiness.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "off")
+    return bool(value)
+
+
 def create_card(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """Handle a /kanban/card-drop payload -> hermes kanban create.
 
@@ -222,7 +239,7 @@ def create_card(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         except (TypeError, ValueError):
             return 400, {"error": "priority must be an integer"}
 
-    if payload.get("goal"):
+    if _is_goal(payload.get("goal")):
         args.append("--goal")
         gmt = payload.get("goal_max_turns")
         if gmt is not None:

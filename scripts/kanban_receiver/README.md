@@ -81,7 +81,7 @@ launchctl load ~/Library/LaunchAgents/ai.hermes.kanban-receiver.plist
 curl -s http://127.0.0.1:8646/health
 ```
 
-Logs: `/tmp/hermes/kanban-receiver-stdout.log` + `-stderr.log`.
+Logs: `~/.hermes/logs/kanban-receiver-stdout.log` + `-stderr.log`.
 
 ## Test
 
