@@ -2027,6 +2027,36 @@ def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanba
         conn.close()
 
 
+def test_dashboard_direct_status_change_ready_gate_accepts_archived_parent(kanban_home):
+    """Manual drag-to-ready must treat an ``archived`` parent as satisfied.
+
+    ``recompute_ready`` and ``claim_task`` both accept a parent in
+    ``{done, archived}`` as satisfying the dependency gate. The shared
+    ``set_status_direct`` must match, or a manual move of a child whose
+    parent was archived would be wrongly blocked.
+    """
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+        conn.commit()
+
+        # Parent still open -> child cannot be promoted.
+        assert _set_status_direct(conn, child, "ready") is False
+
+        # Archive the parent; the gate must now treat it as satisfied.
+        conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (parent,))
+        conn.commit()
+        assert _set_status_direct(conn, child, "ready") is True
+        assert kb.get_task(conn, child).status == "ready"
+    finally:
+        conn.close()
+
+
 def test_cli_bulk_complete_with_summary_rejects(kanban_home):
     conn = kb.connect()
     try:
