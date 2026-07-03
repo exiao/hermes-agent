@@ -29,8 +29,22 @@ if [[ -f "$ENV_FILE" ]]; then
   done
 fi
 
-# Prefer the installed `hermes` on PATH; fall back to the repo module.
+# Prefer the repo venv (a source checkout may install `hermes` only there),
+# then the installed `hermes` on PATH; fall back to the repo module.
+# Prepending the venv bin lets _hermes_bin()'s `which hermes` resolve it and
+# runs kanban_receiver.py under the venv interpreter so CLI imports succeed.
 export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+PY=""
+for venv in "$REPO_ROOT/.venv" "$REPO_ROOT/venv"; do
+  if [[ -x "$venv/bin/python3" ]]; then
+    export PATH="$venv/bin:$PATH"
+    PY="$venv/bin/python3"
+    break
+  fi
+done
 
 cd "$REPO_ROOT"
+if [[ -n "$PY" ]]; then
+  exec "$PY" scripts/kanban_receiver/kanban_receiver.py
+fi
 exec /usr/bin/env python3 scripts/kanban_receiver/kanban_receiver.py
