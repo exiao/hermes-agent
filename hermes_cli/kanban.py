@@ -311,8 +311,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
-                          help="scratch | worktree | worktree:<path> | dir:<path> "
-                               "(default: scratch)")
+                          help="scratch (default; deleted on completion) | "
+                               "worktree:<abs-repo-root> | dir:<abs-dir>. "
+                               "worktree:<path> MUST be an absolute path to ONE git "
+                               "repo root (the dir holding .git), e.g. "
+                               "worktree:/Users/me/projects/api -- NOT an umbrella dir "
+                               "that holds many repos (~/projects), NOT an invented "
+                               ".worktrees/<name> path; the dispatcher creates "
+                               "<root>/.worktrees/<task-id> for you. dir:<path> runs "
+                               "in place (no branch).")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
     p_create.add_argument("--project", default=None,
