@@ -3723,9 +3723,13 @@ def set_status_direct(
         if prev is None:
             return False
 
-        # Guard: don't allow promoting to 'ready' unless all parents are done.
-        # Prevents the dispatcher from spawning a child whose upstream work
-        # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
+        # Guard: don't allow promoting to 'ready' unless all parents are
+        # satisfied. A parent is satisfied when it's ``done`` or ``archived``
+        # — matching the dependency gate used by ``recompute_ready`` and
+        # ``claim_task`` — so a manual drag-to-ready of a task whose parent
+        # was archived isn't wrongly blocked. Prevents the dispatcher from
+        # spawning a child whose upstream work hasn't completed (e.g. T4
+        # dispatched while T3 is still blocked).
         if new_status == "ready":
             parent_statuses = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -3734,7 +3738,7 @@ def set_status_direct(
                 (task_id,),
             ).fetchall()
             if parent_statuses and not all(
-                p["status"] == "done" for p in parent_statuses
+                p["status"] in {"done", "archived"} for p in parent_statuses
             ):
                 return False
 
