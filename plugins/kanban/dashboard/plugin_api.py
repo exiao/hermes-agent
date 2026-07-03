@@ -1309,6 +1309,7 @@ class UpdateTaskBody(BaseModel):
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
+    mutated = False
     try:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
@@ -1324,6 +1325,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 raise HTTPException(status_code=409, detail=str(e))
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
+            mutated = True
 
         # --- status -------------------------------------------------------
         if payload.status is not None:
@@ -1381,6 +1383,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=409,
                     detail=f"status transition to {s!r} not valid from current state",
                 )
+            mutated = True
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
@@ -1395,6 +1398,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     (task_id, json.dumps({"priority": int(payload.priority)}),
                      int(time.time())),
                 )
+            mutated = True
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
@@ -1417,11 +1421,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     "VALUES (?, 'edited', NULL, ?)",
                     (task_id, int(time.time())),
                 )
+            mutated = True
 
         updated = kanban_db.get_task(conn, task_id)
-        _invalidate_board_cache()
         return {"task": _task_dict(updated) if updated else None}
     finally:
+        # Invalidate in the finally so a request that commits an earlier
+        # section and then raises in a later one (e.g. assignee applied, then
+        # a blank title or status='running' 400s) still drops the stale board
+        # entry — the partial mutation already hit the DB. ``mutated`` skips
+        # the invalidation for no-op paths (e.g. a 404 before any write).
+        if mutated:
+            _invalidate_board_cache()
         conn.close()
 
 

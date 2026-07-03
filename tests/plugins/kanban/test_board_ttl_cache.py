@@ -476,3 +476,73 @@ def test_inflight_fill_does_not_repopulate_after_concurrent_invalidation(tmp_pat
     # generation, so the store was skipped and the cache stays empty.
     assert plugin_api._BOARD_CACHE == {}
 
+
+def test_update_task_invalidates_after_partial_mutation_then_error(tmp_path, monkeypatch):
+    """A PATCH that commits an earlier section (assignee) and then raises in a
+    later one (blank title -> 400) must still drop the stale board cache — the
+    partial mutation already hit the DB, so the invalidation lives in a
+    ``finally`` guarded by a ``mutated`` flag rather than after the last write.
+    """
+    import pytest
+    from fastapi import HTTPException
+
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    tid = kb.create_task(conn, title="task one", assignee="old")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+
+    # Warm the cache.
+    _get_board(board=None)
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+    # assignee commits, then the blank title raises 400 before its own write.
+    with pytest.raises(HTTPException) as exc:
+        plugin_api.update_task(
+            tid,
+            plugin_api.UpdateTaskBody(assignee="new", title="   "),
+            board=None,
+        )
+    assert exc.value.status_code == 400
+
+    # The assignee write committed, so the warm entry must have been dropped.
+    assert plugin_api._BOARD_CACHE == {}
+    after = _get_board(board=None)
+    assert any(
+        t.get("assignee") == "new"
+        for col in after["columns"]
+        for t in col["tasks"]
+    )
+
+
+def test_update_task_404_does_not_invalidate(tmp_path, monkeypatch):
+    """A PATCH on an unknown id raises 404 before any write, so it must NOT
+    invalidate a warm cache (nothing changed)."""
+    import pytest
+    from fastapi import HTTPException
+
+    _reset_cache()
+    _setup_hermes_home(tmp_path, monkeypatch)
+    kb.set_current_board("default")
+    conn = kb.connect(board="default")
+    kb.create_task(conn, title="only task", assignee="x")
+    conn.close()
+
+    _freeze_clock(monkeypatch)
+    _get_board(board=None)
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+    with pytest.raises(HTTPException) as exc:
+        plugin_api.update_task(
+            "nope-does-not-exist",
+            plugin_api.UpdateTaskBody(assignee="y"),
+            board=None,
+        )
+    assert exc.value.status_code == 404
+    # Unchanged DB -> warm cache preserved (no needless recompute).
+    assert len(plugin_api._BOARD_CACHE) == 1
+
+
