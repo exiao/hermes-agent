@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Kanban card-drop receiver launchd service.
+
+  Install (replace __HOME__ with your absolute home dir, e.g. /Users/testuser):
+    cp ai.hermes.kanban-receiver.plist ~/Library/LaunchAgents/
+    sed -i '' "s|__HOME__|$HOME|g" ~/Library/LaunchAgents/ai.hermes.kanban-receiver.plist
+    launchctl load ~/Library/LaunchAgents/ai.hermes.kanban-receiver.plist
+
+  The secret is NOT in this file; run_receiver.sh sources it from
+  ~/.hermes/.env (KANBAN_RECEIVER_SECRET or CRON_SECRET). KeepAlive restarts the
+  service if it dies; RunAtLoad starts it at login.
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>ai.hermes.kanban-receiver</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>__HOME__/projects/hermes-agent/scripts/kanban_receiver/run_receiver.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>HERMES_HOME</key>
+      <string>__HOME__/.hermes</string>
+      <key>KANBAN_RECEIVER_REPO</key>
+      <string>__HOME__/projects/hermes-agent</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.hermes/logs/kanban-receiver-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.hermes/logs/kanban-receiver-stderr.log</string>
+  </dict>
+</plist>

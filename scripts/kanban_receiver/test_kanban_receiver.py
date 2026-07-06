@@ -1,0 +1,407 @@
+"""Tests for the standalone Kanban card-drop receiver.
+
+Two layers:
+  * Unit: create_card / comment_card / auth logic with the CLI shell-out
+    monkeypatched (no board, no subprocess).
+  * Integration: boot the real ThreadingHTTPServer and drive it with urllib,
+    still monkeypatching the CLI so we assert wire behavior (auth 403, dedupe
+    pass-through, goal flag) without mutating a real board.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import threading
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import pytest
+
+# Load the receiver module by path (it lives outside the package tree).
+_MOD_PATH = Path(__file__).with_name("kanban_receiver.py")
+_spec = importlib.util.spec_from_file_location("kanban_receiver", _MOD_PATH)
+assert _spec and _spec.loader
+kr = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(kr)
+
+
+class _FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+@pytest.fixture(autouse=True)
+def _clear_secret(monkeypatch):
+    monkeypatch.delenv("KANBAN_RECEIVER_SECRET", raising=False)
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+
+
+# --------------------------------------------------------------------------
+# create_card
+# --------------------------------------------------------------------------
+
+def test_create_card_happy_path(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout=json.dumps({"id": "t_abc123", "status": "ready"}))
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    status, body = kr.create_card(
+        {"assignee": "equity-analyst", "title": "AVGO deep dive", "body": "the ask"}
+    )
+    assert status == 200
+    assert body == {"id": "t_abc123"}
+    a = captured["args"]
+    assert a[0] == "create"
+    assert "--assignee" in a and "equity-analyst" in a
+    assert "--json" in a
+
+
+def test_create_card_requires_assignee_and_title(monkeypatch):
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc())
+    status, body = kr.create_card({"title": "no assignee"})
+    assert status == 400
+    status, body = kr.create_card({"assignee": "dev"})
+    assert status == 400
+
+
+def test_create_card_rejects_unknown_assignee(monkeypatch):
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc())
+    status, body = kr.create_card({"assignee": "root", "title": "x"})
+    assert status == 400
+    assert "not permitted" in body["error"]
+
+
+def test_create_card_passes_dedupe_key(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id": "t_1"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    kr.create_card({"assignee": "dev", "title": "x", "dedupe_key": "chat:run42"})
+    a = captured["args"]
+    assert "--idempotency-key" in a
+    assert a[a.index("--idempotency-key") + 1] == "chat:run42"
+
+
+def test_create_card_goal_flag(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id": "t_1"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    kr.create_card(
+        {"assignee": "equity-analyst", "title": "x", "goal": True, "goal_max_turns": 15}
+    )
+    a = captured["args"]
+    assert "--goal" in a
+    assert "--goal-max-turns" in a
+    assert a[a.index("--goal-max-turns") + 1] == "15"
+
+
+def test_create_card_goal_false_string_does_not_enable_goal(monkeypatch):
+    """A producer serializing goal as the STRING "false"/"0"/"no" must NOT
+    enable goal mode -- otherwise an ordinary card is dispatched as a multi-turn
+    goal loop and burns the goal budget. Only a JSON boolean true (or a genuine
+    truthy string) appends --goal."""
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id": "t_1"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    for falsey in ("false", "False", "0", "no", "off", ""):
+        captured.clear()
+        status, _ = kr.create_card(
+            {"assignee": "dev", "title": "x", "goal": falsey}
+        )
+        assert status == 200
+        assert "--goal" not in captured["args"], f"goal={falsey!r} should not enable goal mode"
+
+    # A real boolean true and a genuine truthy string still enable it.
+    for truthy in (True, "true", "1", "yes"):
+        captured.clear()
+        kr.create_card({"assignee": "dev", "title": "x", "goal": truthy})
+        assert "--goal" in captured["args"], f"goal={truthy!r} should enable goal mode"
+
+
+def test_create_card_goal_nonpositive_turns_dropped(monkeypatch):
+    """A zero/negative goal_max_turns is meaningless: drop the flag and let
+    the CLI apply its own default rather than forwarding a stall value."""
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id": "t_1"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    for bad in (0, -5):
+        captured.clear()
+        status, _ = kr.create_card(
+            {"assignee": "equity-analyst", "title": "x", "goal": True, "goal_max_turns": bad}
+        )
+        assert status == 200
+        assert "--goal" in captured["args"]
+        assert "--goal-max-turns" not in captured["args"]
+
+
+def test_create_card_nonpositive_goal_max_turns(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id":"t"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    # Non-positive -> flag dropped, CLI default applies (200, no --goal-max-turns).
+    status, body = kr.create_card(
+        {"assignee": "dev", "title": "x", "goal": True, "goal_max_turns": 0}
+    )
+    assert status == 200
+    assert "--goal" in captured["args"]
+    assert "--goal-max-turns" not in captured["args"]
+    # Non-integer -> clean 400.
+    status, body = kr.create_card(
+        {"assignee": "dev", "title": "x", "goal": True, "goal_max_turns": "nope"}
+    )
+    assert status == 400
+
+
+def test_create_card_rejects_non_string_fields(monkeypatch):
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc(stdout='{"id":"t"}'))
+    assert kr.create_card({"assignee": 5, "title": "x"})[0] == 400
+    assert kr.create_card({"assignee": "dev", "title": 5})[0] == 400
+    assert kr.create_card({"assignee": "dev", "title": "x", "body": {"a": 1}})[0] == 400
+
+
+def test_comment_rejects_non_string_fields(monkeypatch):
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc(stdout="ok"))
+    assert kr.comment_card({"card_id": 7, "text": "hi"})[0] == 400
+    assert kr.comment_card({"card_id": "t_1", "text": {"x": 1}})[0] == 400
+
+
+def test_create_card_bad_priority(monkeypatch):
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc())
+    status, body = kr.create_card({"assignee": "dev", "title": "x", "priority": "high"})
+    assert status == 400
+
+
+def test_create_card_none_assignee_omits_flag(monkeypatch):
+    """The `none` sentinel must NOT be forwarded as `--assignee none` (which
+    would strand the card in a nonexistent lane); the flag is omitted so the
+    card lands genuinely unassigned."""
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout='{"id": "t_1"}')
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    status, _ = kr.create_card({"assignee": "none", "title": "triage me"})
+    assert status == 200
+    assert "--assignee" not in captured["args"]
+    assert "none" not in captured["args"]
+
+
+def test_redact_args_drops_body_and_title():
+    """The card body AND the title positional carry diligence/inbox content and
+    must never reach the exec log; non-sensitive flags survive."""
+    args = ["create", "--assignee", "dev", "--body", "SECRET diligence text", "--json", "--", "SECRET title"]
+    redacted = kr._redact_args(args)
+    assert "SECRET diligence text" not in redacted
+    assert "SECRET title" not in redacted
+    # the flag NAME is kept (structure visible) but the value is redacted
+    assert "--body" in redacted
+    assert "<redacted>" in redacted
+    # non-sensitive args survive
+    assert "--assignee" in redacted and "dev" in redacted
+    assert "--json" in redacted
+
+
+def test_create_card_cli_failure(monkeypatch):
+    monkeypatch.setattr(
+        kr, "_run_hermes_kanban", lambda args: _FakeProc(returncode=1, stderr="boom")
+    )
+    status, body = kr.create_card({"assignee": "dev", "title": "x"})
+    assert status == 502
+
+
+def test_create_card_timeout(monkeypatch):
+    def raise_timeout(args):
+        raise subprocess.TimeoutExpired(cmd="hermes", timeout=30)
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", raise_timeout)
+    status, body = kr.create_card({"assignee": "dev", "title": "x"})
+    assert status == 504
+
+
+# --------------------------------------------------------------------------
+# comment_card
+# --------------------------------------------------------------------------
+
+def test_comment_happy_path(monkeypatch):
+    captured = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return _FakeProc(stdout="ok")
+
+    monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
+    status, body = kr.comment_card({"card_id": "t_abc", "text": "a follow-up"})
+    assert status == 200
+    assert body["id"] == "t_abc"
+    a = captured["args"]
+    assert a[0] == "comment"
+    assert "t_abc" in a and "a follow-up" in a
+    # positionals come after the `--` guard
+    assert a[a.index("--") + 1] == "t_abc"
+
+
+def test_comment_requires_fields(monkeypatch):
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc())
+    assert kr.comment_card({"text": "hi"})[0] == 400
+    assert kr.comment_card({"card_id": "t_1"})[0] == 400
+
+
+def test_comment_unknown_card_is_404(monkeypatch):
+    # The real CLI surfaces `kanban: unknown task <id>` (from add_comment's
+    # ValueError), not "not found" — the receiver must map that to 404.
+    monkeypatch.setattr(
+        kr, "_run_hermes_kanban",
+        lambda args: _FakeProc(returncode=1, stderr="kanban: unknown task t_x"),
+    )
+    status, body = kr.comment_card({"card_id": "t_x", "text": "hi"})
+    assert status == 404
+
+
+def test_comment_real_server_fault_is_502(monkeypatch):
+    monkeypatch.setattr(
+        kr, "_run_hermes_kanban",
+        lambda args: _FakeProc(returncode=1, stderr="kanban: could not initialize database"),
+    )
+    status, _ = kr.comment_card({"card_id": "t_x", "text": "hi"})
+    assert status == 502
+
+
+def test_redact_args_drops_comment_text():
+    """The comment `text` positional carries user content and must not reach
+    the exec log; the card id (first positional) stays for debuggability."""
+    args = ["comment", "--author", "card-drop", "--", "t_abc", "SECRET inbox note"]
+    redacted = kr._redact_args(args)
+    assert "SECRET inbox note" not in redacted
+    assert "t_abc" in redacted  # card id is safe to log
+    assert "comment" in redacted
+
+
+# --------------------------------------------------------------------------
+# secret resolution
+# --------------------------------------------------------------------------
+
+def test_secret_unset_is_none():
+    assert kr._secret() is None
+
+
+def test_secret_prefers_receiver_var(monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "cron")
+    monkeypatch.setenv("KANBAN_RECEIVER_SECRET", "recv")
+    assert kr._secret() == "recv"
+
+
+def test_secret_falls_back_to_cron(monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "cron")
+    assert kr._secret() == "cron"
+
+
+# --------------------------------------------------------------------------
+# Integration over real HTTP (CLI still mocked)
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def server(monkeypatch):
+    """Boot the receiver on an ephemeral port; yield its base URL."""
+    from http.server import ThreadingHTTPServer
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), kr.Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _post(url, payload, headers=None):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_http_health_no_auth(server):
+    with urllib.request.urlopen(f"{server}/health", timeout=5) as resp:
+        assert resp.status == 200
+        assert json.loads(resp.read())["ok"] is True
+
+
+def test_http_fail_closed_when_secret_unset(server):
+    # No secret in env -> every write is 403.
+    status, body = _post(f"{server}/kanban/card-drop",
+                         {"assignee": "dev", "title": "x"})
+    assert status == 403
+
+
+def test_http_403_wrong_secret(server, monkeypatch):
+    monkeypatch.setenv("KANBAN_RECEIVER_SECRET", "right")
+    status, body = _post(f"{server}/kanban/card-drop",
+                         {"assignee": "dev", "title": "x"},
+                         headers={"X-Cron-Secret": "wrong"})
+    assert status == 403
+
+
+def test_http_card_drop_with_secret(server, monkeypatch):
+    monkeypatch.setenv("KANBAN_RECEIVER_SECRET", "right")
+    monkeypatch.setattr(
+        kr, "_run_hermes_kanban", lambda args: _FakeProc(stdout='{"id": "t_live1"}')
+    )
+    status, body = _post(f"{server}/kanban/card-drop",
+                         {"assignee": "equity-analyst", "title": "AVGO"},
+                         headers={"X-Cron-Secret": "right"})
+    assert status == 200
+    assert body["id"] == "t_live1"
+
+
+def test_http_comment_with_secret(server, monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "s")
+    monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc(stdout="ok"))
+    status, body = _post(f"{server}/kanban/comment",
+                         {"card_id": "t_live1", "text": "hi"},
+                         headers={"X-Cron-Secret": "s"})
+    assert status == 200
+    assert body["commented"] is True
+
+
+def test_http_unknown_route_404(server, monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "s")
+    status, body = _post(f"{server}/nope", {}, headers={"X-Cron-Secret": "s"})
+    assert status == 404
