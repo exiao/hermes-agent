@@ -109,7 +109,9 @@ These hooks frame the user turn, not individual provider API attempts:
 
 Common `pre_llm_call` fields include `session_id`, `turn_id`,
 `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`,
-and `sender_id`.
+`sender_id`, `chat_type`, and `chat_id`. On gateway sessions `chat_type` is the
+channel kind (`dm`, `group`, `thread`, `channel`) and `chat_id` is the platform
+conversation id, letting a hook distinguish a group from a 1:1 DM.
 
 Common `post_llm_call` fields include `session_id`, `turn_id`,
 `user_message`, `assistant_response`, `conversation_history`, `model`, and

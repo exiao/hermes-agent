@@ -133,6 +133,8 @@ _DEFAULT_PAYLOADS = {
         "is_first_turn": True,
         "model": "gpt-4",
         "platform": "cli",
+        "chat_type": "dm",
+        "chat_id": "test-chat",
     },
     "post_llm_call": {
         "session_id": "test-session",
