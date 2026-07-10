@@ -339,11 +339,7 @@ session; surface failures non-destructively.
 
 ### Electron Desktop Chat App (`apps/desktop/`)
 
-A **separate** chat surface from the classic CLI and the dashboard's embedded TUI: an
-Electron + React + nanostore renderer (`@assistant-ui/react`) over JSON-RPC to a
-`tui_gateway` backend. It does NOT embed `hermes --tui` — own composer, transcript,
-slash-command pipeline. Route desktop bugs to the `hermes-desktop-app-work` skill, not
-`hermes-dashboard-work`.
+A **separate** chat surface from both the classic CLI and the dashboard's embedded TUI. It is an Electron + React + nanostore renderer (`@assistant-ui/react`) that talks to a `tui_gateway` backend over JSON-RPC (`requestGateway(method, params)`). The WebSocket/JSON-RPC transport lives in the framework-agnostic `apps/shared` package (`@hermes/shared` — `JsonRpcGatewayClient` + WS URL helpers), which the web dashboard (`web/`) also consumes; **desktop has no build/runtime dependency on the dashboard frontend** — it spawns a headless `hermes serve` backend server (the same gateway `dashboard` serves, minus the browser UI entirely: `serve` sets `headless_backend=True`, so `cmd_dashboard` skips `_build_web_ui` AND exports `HERMES_SERVE_HEADLESS=1` so `mount_spa()` disables the SPA even if a stray `web_dist/` exists — only the JSON-RPC/WS/API surface is reachable). `dashboard` and `serve` share `cmd_dashboard`/`start_server` but are independent surfaces — neither launches the other. The one exception is a backward-compat *fallback*: `serve` is newer, so the desktop spawn (`electron/backend-command.cjs` + `backendSupportsServe()` in `main.cjs`) detects whether the resolved runtime registers `serve` and, only when it does not (an older managed install / PATH `hermes` the app hasn't updated yet), rewrites the argv to the legacy `dashboard --no-open`. Without that, a new app against an un-upgraded runtime would crash on an unknown subcommand and brick every mid-upgrade user. It does NOT embed `hermes --tui` — it has its own composer, transcript, and slash-command pipeline. Route desktop bugs to the `hermes-desktop-app-work` skill, not `hermes-dashboard-work`.
 
 **Slash commands are curated client-side, then dispatched to the backend:**
 
@@ -842,11 +838,10 @@ workers, in-tree subprocess-isolation plugin). Direct `pytest` with API keys set
 diverges from CI and has caused multiple "works locally, fails in CI" incidents (and the reverse).
 
 ```bash
-scripts/run_tests.sh # full suite, CI-parity
-scripts/run_tests.sh tests/gateway/ # one directory
-scripts/run_tests.sh tests/agent/test_foo.py::test_x # one test
-scripts/run_tests.sh -v --tb=long # pass-through pytest flags
-scripts/run_tests.sh --no-isolate tests/foo/ # disable subprocess isolation (faster, for debugging)
+scripts/run_tests.sh                                  # full suite, CI-parity
+scripts/run_tests.sh tests/gateway/                   # one directory
+scripts/run_tests.sh tests/agent/test_foo.py::test_x  # one test
+scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
 ```
 
 ### Faster feedback loops
@@ -857,7 +852,7 @@ The suite is ~17k tests; each file pays a heavy fixed import cost. The runner
 - **Scope to what you changed.** A single file is almost always the right loop; the full `tests/` dir is a pre-push check.
 - **Pass multiple paths** to restrict discovery to the dirs you touched.
 - **Tune the worker pool with `-j`** (default `cpu_count*2` or `$HERMES_TEST_WORKERS`); on a loaded box *lowering* it (`-j 4`) can beat oversubscribing.
-- **Pass pytest flags after `--`** — forwarded to each per-file pytest, e.g. `scripts/run_tests.sh tests/foo.py -- -x --tb=long`.
+- **Bare pytest flags pass through automatically** — e.g. `scripts/run_tests.sh tests/foo.py -x --tb=long`. The explicit `--` separator also works.
 - **A loaded machine is your slowest variable;** CI's clean runner is often faster than local.
 
 > Note: this fork's runner is the per-file subprocess pool in
@@ -865,20 +860,18 @@ The suite is ~17k tests; each file pays a heavy fixed import cost. The runner
 > pytest-xdist (`-n auto`) or accept a `--no-isolate` flag — those belong to a
 > different runner variant and will not parse here. Use `-j` and path scoping.
 
-### Subprocess-per-test isolation
+### Subprocess-per-test-file isolation
 
-Every test runs in a freshly-spawned Python subprocess via the in-tree plugin
-`tests/_isolate_plugin.py`, so module-level dicts/sets and ContextVars don't leak between tests. Notes:
+Every test file runs in a freshly-spawned Python subprocess via `run_tests_parallel.py`. This means module-level dicts/sets and ContextVars from one test file cannot leak into the next.
 
-- **Uses `multiprocessing.get_context("spawn")`** — works on Linux, macOS, Windows (POSIX `fork` not used).
-- **Per-test overhead ~0.5–1.0s** (Python startup + collection), amortized across cores.
-- **`isolate_timeout` (`pyproject.toml`) caps each test at 30s**; hangs are killed and reported as failures.
-- **Pass `--no-isolate` to disable isolation** — for debugging a single test.
-- **The plugin disables itself in child processes** (sentinel `HERMES_ISOLATE_CHILD=1`), so there's no fork-bomb risk.
+### Why the wrapper
 
-### Why the wrapper (and why the old "just call pytest" doesn't work)
-
-`tests/conftest.py` enforces the first four drift sources (API keys, HOME, TZ, locale) as an autouse fixture, so ANY pytest invocation is hermetic; the wrapper adds `-n auto` xdist workers on top.
+|                     | Without wrapper                             | With wrapper                              |
+| ------------------- | ------------------------------------------- | ----------------------------------------- |
+| Provider API keys   | Whatever is in your env (auto-detects pool) | All env vars except a specific few unset. |
+| HOME / `~/.hermes/` | Your real config+auth.json                  | Temp dir per test                         |
+| Timezone            | Local TZ (PDT etc.)                         | UTC                                       |
+| Locale              | Whatever is set                             | C.UTF-8                                   |
 
 **Concrete failure mode this prevents.** Running venv pytest against a live dev env
 produces bogus failures: `HERMES_ALLOW_PRIVATE_URLS=true` fails
@@ -896,7 +889,6 @@ If you can't use the wrapper (e.g. an IDE that shells pytest directly), at least
 ```bash
 source .venv/bin/activate   # or: source venv/bin/activate
 python -m pytest tests/ -q
-python -m pytest tests/agent/test_foo.py -q --no-isolate   # bypass isolation while debugging
 ```
 
 Always run the full suite before pushing.

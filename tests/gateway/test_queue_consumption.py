@@ -382,6 +382,9 @@ class TestBusyInputModeQueueFifo:
         return runner, adapter
 
     def _text_event(self, text: str) -> MessageEvent:
+        # profile=None: a MagicMock auto-attribute reads as a truthy stamped
+        # profile and trips fail-closed adapter resolution (AGENTS.md #17).
+
         source = MagicMock(chat_id="c1", platform=Platform.TELEGRAM, profile=None)
         return MessageEvent(
             text=text,
