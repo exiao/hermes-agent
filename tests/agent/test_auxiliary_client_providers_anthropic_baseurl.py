@@ -107,3 +107,46 @@ class TestProvidersAnthropicBaseUrlInheritance:
             {"model": {"provider": "anthropic"}},
         )
         assert actual == "https://api.anthropic.com"
+
+    def test_providers_api_key_alias_applies(self, tmp_path, monkeypatch):
+        """Mirror hermes_cli/runtime_provider.py: honor the ``api`` alias when
+        ``base_url`` is absent."""
+        actual = _run_try_anthropic(
+            tmp_path,
+            monkeypatch,
+            {
+                "model": {"provider": "anthropic"},
+                "providers": {"anthropic": {"api": "http://127.0.0.1:18801"}},
+            },
+        )
+        assert actual == "http://127.0.0.1:18801"
+
+    def test_providers_url_key_alias_applies(self, tmp_path, monkeypatch):
+        """Honor the ``url`` alias when ``base_url``/``api`` are absent."""
+        actual = _run_try_anthropic(
+            tmp_path,
+            monkeypatch,
+            {
+                "model": {"provider": "anthropic"},
+                "providers": {"anthropic": {"url": "http://127.0.0.1:18801"}},
+            },
+        )
+        assert actual == "http://127.0.0.1:18801"
+
+    def test_providers_base_url_wins_over_aliases(self, tmp_path, monkeypatch):
+        """``base_url`` takes priority over the ``api``/``url`` aliases."""
+        actual = _run_try_anthropic(
+            tmp_path,
+            monkeypatch,
+            {
+                "model": {"provider": "anthropic"},
+                "providers": {
+                    "anthropic": {
+                        "base_url": "http://127.0.0.1:18801",
+                        "api": "http://127.0.0.1:29999",
+                        "url": "http://127.0.0.1:39999",
+                    }
+                },
+            },
+        )
+        assert actual == "http://127.0.0.1:18801"

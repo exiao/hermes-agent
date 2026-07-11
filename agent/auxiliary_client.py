@@ -2661,7 +2661,12 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
             if isinstance(providers_cfg, dict):
                 anthropic_cfg = providers_cfg.get("anthropic")
                 if isinstance(anthropic_cfg, dict):
-                    prov_base_url = str(anthropic_cfg.get("base_url") or "").strip().rstrip("/")
+                    prov_base_url = str(
+                        anthropic_cfg.get("base_url")
+                        or anthropic_cfg.get("api")
+                        or anthropic_cfg.get("url")
+                        or ""
+                    ).strip().rstrip("/")
                     if prov_base_url:
                         base_url = prov_base_url
     except Exception:
