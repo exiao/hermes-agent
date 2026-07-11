@@ -13835,7 +13835,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id=task_id,
                     platform=platform_key,
                     session_db=None,
-                    fallback_model=self._fallback_model,
+                    fallback_model=self._refresh_fallback_model(),
                     skip_memory=True,
                     skip_context_files=True,
                     persist_session=False,
@@ -14125,7 +14125,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Gated by ``display.tool_progress_command`` in config.yaml (default off).
         When enabled, cycles the tool progress mode through off → new → all →
-        verbose → off for the *current platform*.  The setting is saved to
+        verbose → log → off for the *current platform*.  The setting is saved to
         ``display.platforms.<platform>.tool_progress`` so each channel can
         have its own verbosity level independently.
         """
@@ -14147,12 +14147,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return t("gateway.verbose.not_enabled")
 
         # --- cycle mode (per-platform) ----------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "log"]
         descriptions = {
             "off": t("gateway.verbose.mode_off"),
             "new": t("gateway.verbose.mode_new"),
             "all": t("gateway.verbose.mode_all"),
             "verbose": t("gateway.verbose.mode_verbose"),
+            "log": t("gateway.verbose.mode_log"),
         }
 
         # Read current effective mode for this platform via the resolver
