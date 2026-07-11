@@ -16012,7 +16012,7 @@ def main(
                 "Unknown skill(s) requested, skipping: %s. %s "
                 "List available skills with `hermes skills list`.",
                 missing_display,
-                continuing.capitalize(),
+                continuing[0].upper() + continuing[1:],
             )
         if skills_prompt:
             cli.system_prompt = "\n\n".join(

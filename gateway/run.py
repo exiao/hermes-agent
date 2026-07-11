@@ -14413,7 +14413,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return t("gateway.compress.rotation_failed")
                     session_entry.session_id = new_session_id
                     self.session_store._save()
-                    self._sync_telegram_topic_binding(
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding,
                         source, session_entry, reason="compress-command",
                     )
                 else:
