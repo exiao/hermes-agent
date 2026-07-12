@@ -1451,6 +1451,76 @@ class TestIsSafeLookalikeTldFinding:
     def test_matching_dev_tld(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".dev"})
 
+    def test_bare_run_tld_not_matched(self):
+        """A bare .run TLD token is the whole public Identity Digital registry,
+        not Modal — it must NOT be suppressed (only modal.run is)."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": ".run"})
+
+    def test_run_message_field_not_matched(self):
+        """A generic '.run' TLD warning is not a Modal endpoint; keep the warn."""
+        assert not self.fn({"rule_id": "lookalike_tld",
+                             "message": "Domain uses '.run' TLD"})
+
+    def test_arbitrary_run_host_not_matched(self):
+        """An arbitrary .run host (potential phishing) is not suppressed."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "attacker.run"})
+
+    def test_matching_modal_run_domain(self):
+        assert self.fn({"rule_id": "lookalike_tld",
+                        "value": "cpe-research--cpe-web.modal.run"})
+
+    def test_matching_bare_modal_run_domain(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": "modal.run"})
+
+    def test_lookalike_modal_run_suffix_not_matched(self):
+        """A host that only ends the label with ...notmodal.run is not Modal."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "evilmodal.run"})
+
+    def test_modal_run_deeper_suffix_not_matched(self):
+        """modal.run followed by a further risky TLD must not be suppressed."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "modal.run.evil.zip"})
+
+    def test_run_as_subdomain_label_not_matched(self):
+        """`.run` as a non-terminal label does not count as safe."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "foo.run.example.zip"})
+
+    def test_real_tirith_schema_modal_run_evidence(self):
+        """Real Tirith schema-v3 output: the host lives in evidence[].raw and
+        the description is generic, so the Modal carve-out must read evidence."""
+        finding = {
+            "rule_id": "lookalike_tld",
+            "severity": "MEDIUM",
+            "title": "Lookalike TLD detected",
+            "description": "Domain uses '.run' TLD which can be confused with file extensions",
+            "evidence": [{"type": "url", "raw": "cpe-research--cpe-web.modal.run"}],
+        }
+        assert self.fn(finding)
+
+    def test_real_tirith_schema_arbitrary_run_evidence_not_matched(self):
+        """Same schema, but an arbitrary .run host in evidence stays warned."""
+        finding = {
+            "rule_id": "lookalike_tld",
+            "severity": "MEDIUM",
+            "description": "Domain uses '.run' TLD which can be confused with file extensions",
+            "evidence": [{"type": "url", "raw": "attacker.run"}],
+        }
+        assert not self.fn(finding)
+
+    def test_real_tirith_schema_app_evidence(self):
+        """A safe .app gTLD carried only in evidence[].raw is suppressed."""
+        finding = {
+            "rule_id": "lookalike_tld",
+            "description": "Domain uses '.app' TLD which can be confused with file extensions",
+            "evidence": [{"type": "url", "raw": "my-service.web.app"}],
+        }
+        assert self.fn(finding)
+
+    def test_evidence_non_dict_items_tolerated(self):
+        """Malformed evidence entries (non-dict) are scanned as strings, not fatal."""
+        assert self.fn({"rule_id": "lookalike_tld",
+                        "evidence": ["cpe-web.modal.run"]})
+        assert not self.fn({"rule_id": "lookalike_tld", "evidence": ["attacker.run"]})
+
     def test_matching_dev_message_field(self):
         assert self.fn({"rule_id": "lookalike_tld",
                         "message": "Domain uses '.dev' TLD"})
