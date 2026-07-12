@@ -859,12 +859,16 @@ def check_command_security(command: str) -> dict:
 
 # gTLDs that Tirith's lookalike_tld heuristic flags but which are legitimate,
 # HTTPS-only registries in wide production use. .app and .dev are
-# Google-operated; .run is Google-operated and is the TLD for every Modal
-# web endpoint (*.modal.run), a routine target for health checks and API
-# calls from this agent. Suppressing their warnings removes false positives
-# without weakening protection against filename-collision TLDs (.zip, .mov)
-# used in real phishing.
-_SAFE_LOOKALIKE_TLDS = (".app", ".dev", ".run")
+# Google-operated gTLDs on the HSTS preload list (browsers force HTTPS), used
+# by many production services (e.g. *.workers.dev, *.web.app). Suppressing
+# their warnings removes false positives without weakening protection against
+# filename-collision TLDs (.zip, .mov) used in real phishing.
+#
+# NOTE: .run is deliberately NOT in this list. Unlike .app/.dev it is a
+# generic Identity Digital (Binky Moon) registry, not HTTPS-only, so blanket
+# suppression would silence the lookalike warning for any .run host
+# (e.g. ``attacker.run``). We only carve out Modal's own endpoints below.
+_SAFE_LOOKALIKE_TLDS = (".app", ".dev")
 
 # Match a safe gTLD only as a complete TLD token, never as a substring of a
 # longer label. Without the trailing boundary, a substring check would let a
@@ -878,15 +882,28 @@ _SAFE_TLD_RE = re.compile(
     r"(?![A-Za-z0-9_-])(?!\.\w)"
 )
 
+# Modal web endpoints all live under the ``modal.run`` registrable domain
+# (e.g. ``cpe-research--cpe-web.modal.run``), a routine target for health
+# checks and API calls from this agent, and the reason the lookalike_tld
+# heuristic fires on ``.run`` in normal use. We suppress the warning only for
+# this specific registrable domain — the host must be ``modal.run`` itself or
+# end in ``.modal.run`` as a terminal label — so an arbitrary ``attacker.run``
+# still preserves the warn action. The trailing negative lookahead keeps a
+# deeper suffix like ``modal.run.evil.zip`` from matching.
+_MODAL_RUN_RE = re.compile(r"(?:^|[^A-Za-z0-9_.-])(?:[a-z0-9-]+\.)*modal\.run(?![A-Za-z0-9_.-])")
+
 
 def _is_safe_lookalike_tld_finding(finding: dict) -> bool:
-    """Return True if this finding is a lookalike_tld warning for a known-safe
-    gTLD (see ``_SAFE_LOOKALIKE_TLDS``).
+    """Return True if this finding is a lookalike_tld warning we treat as a
+    known false positive: a terminal ``.app`` / ``.dev`` gTLD, or a host under
+    Modal's ``modal.run`` registrable domain (see ``_SAFE_LOOKALIKE_TLDS`` /
+    ``_MODAL_RUN_RE``).
 
     Checks the rule_id and inspects common value/detail field names that
-    Tirith may use to carry the TLD string. The safe TLD must appear as a
-    distinct terminal TLD token; substrings like ``example.dev.zip`` (where
-    ``.zip`` is the real, unsafe TLD) are not suppressed.
+    Tirith may use to carry the TLD or host string. The safe TLD must appear
+    as a distinct terminal token; substrings like ``example.dev.zip`` (where
+    ``.zip`` is the real, unsafe TLD) and arbitrary ``.run`` hosts such as
+    ``attacker.run`` are not suppressed.
     """
     if not isinstance(finding, dict):
         return False
@@ -896,7 +913,8 @@ def _is_safe_lookalike_tld_finding(finding: dict) -> bool:
         val = finding.get(field)
         if val is None:
             continue
-        if _SAFE_TLD_RE.search(str(val).lower()):
+        text = str(val).lower()
+        if _SAFE_TLD_RE.search(text) or _MODAL_RUN_RE.search(text):
             return True
     return False
 

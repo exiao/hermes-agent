@@ -1451,16 +1451,34 @@ class TestIsSafeLookalikeTldFinding:
     def test_matching_dev_tld(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".dev"})
 
-    def test_matching_run_tld(self):
-        assert self.fn({"rule_id": "lookalike_tld", "value": ".run"})
+    def test_bare_run_tld_not_matched(self):
+        """A bare .run TLD token is the whole public Identity Digital registry,
+        not Modal — it must NOT be suppressed (only modal.run is)."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": ".run"})
 
-    def test_matching_run_message_field(self):
-        assert self.fn({"rule_id": "lookalike_tld",
-                        "message": "Domain uses '.run' TLD"})
+    def test_run_message_field_not_matched(self):
+        """A generic '.run' TLD warning is not a Modal endpoint; keep the warn."""
+        assert not self.fn({"rule_id": "lookalike_tld",
+                             "message": "Domain uses '.run' TLD"})
+
+    def test_arbitrary_run_host_not_matched(self):
+        """An arbitrary .run host (potential phishing) is not suppressed."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "attacker.run"})
 
     def test_matching_modal_run_domain(self):
         assert self.fn({"rule_id": "lookalike_tld",
                         "value": "cpe-research--cpe-web.modal.run"})
+
+    def test_matching_bare_modal_run_domain(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": "modal.run"})
+
+    def test_lookalike_modal_run_suffix_not_matched(self):
+        """A host that only ends the label with ...notmodal.run is not Modal."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "evilmodal.run"})
+
+    def test_modal_run_deeper_suffix_not_matched(self):
+        """modal.run followed by a further risky TLD must not be suppressed."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "modal.run.evil.zip"})
 
     def test_run_as_subdomain_label_not_matched(self):
         """`.run` as a non-terminal label does not count as safe."""
