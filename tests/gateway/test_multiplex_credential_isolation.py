@@ -284,3 +284,62 @@ class TestModelSwitchOpenRouterPathUsesScope:
         runtime = switch_scoped()
         assert runtime["api_key"] == "sk-fromA-env"
         assert "openrouter.ai" in runtime["base_url"]
+
+
+class TestModelSwitchPersistScopedToSourceProfile:
+    """`/model <name>` config persist must target the REQUESTING profile.
+
+    Regression for the P1 on the credential-scope fix: scoping only the
+    `switch_model` resolver (secret read) but persisting `config.yaml` outside
+    the profile scope meant a secondary profile's `/model glm` rewrote the
+    DEFAULT profile's config.yaml (via the module-level home) and left the
+    requesting profile unchanged. `_persist_switched_model` runs the config
+    read+`save_config` under `_profile_runtime_scope`, so `get_hermes_home()`
+    (which `save_config` honors) resolves to the requesting profile.
+
+    This mirrors the closure the handler builds (see
+    `_handle_model_command._persist_switched_model`) without standing up a full
+    gateway.
+    """
+
+    def test_persist_writes_source_profile_not_default(self, tmp_path):
+        import yaml
+
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.config import save_config
+        from hermes_constants import get_hermes_home
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"default": "gpt-5.4", "provider": "openai-codex"}}),
+            encoding="utf-8",
+        )
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+        (source_home / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"default": "old-model", "provider": "openrouter"}}),
+            encoding="utf-8",
+        )
+
+        ss.set_multiplex_active(True)
+
+        # Mirror _do_persist() under the requesting profile's scope.
+        def persist_scoped(new_model, provider):
+            with _profile_runtime_scope(source_home):
+                cfg_path = get_hermes_home() / "config.yaml"
+                with open(cfg_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                model_cfg = cfg.setdefault("model", {})
+                model_cfg["default"] = new_model
+                model_cfg["provider"] = provider
+                save_config(cfg)
+
+        persist_scoped("z-ai/glm-5.2", "openrouter")
+
+        # The requesting profile got the switch...
+        src_cfg = yaml.safe_load((source_home / "config.yaml").read_text())
+        assert src_cfg["model"]["default"] == "z-ai/glm-5.2"
+        # ...and the default profile's config was NOT touched.
+        def_cfg = yaml.safe_load((default_home / "config.yaml").read_text())
+        assert def_cfg["model"]["default"] == "gpt-5.4"

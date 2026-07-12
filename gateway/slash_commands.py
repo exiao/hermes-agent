@@ -1447,7 +1447,6 @@ class GatewaySlashCommandsMixin:
         current_api_key = ""
         user_provs = None
         custom_provs = None
-        config_path = _hermes_home / "config.yaml"
         try:
             cfg = _load_gateway_config()
             if cfg:
@@ -1494,6 +1493,62 @@ class GatewaySlashCommandsMixin:
             from gateway.run import _profile_runtime_scope
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
                 return _switch_model(**kwargs)
+
+        def _persist_switched_model(result) -> None:
+            """Persist the resolved switch to this source's profile config.yaml.
+
+            The config read+write must run under the SAME profile scope as the
+            resolver (``_switch_model_scoped``): under ``multiplex_profiles`` a
+            plain ``/model <name>`` from a secondary profile would otherwise
+            read/write the module-level (default) profile's ``config.yaml``,
+            leaving the requesting profile unchanged and corrupting the default
+            profile's active model. ``_profile_runtime_scope`` redirects
+            ``get_hermes_home()`` (which ``_load_gateway_config`` and
+            ``save_config`` both honor), so the config load, ``config_path``,
+            and persist all target the requesting profile. No-op scope when
+            multiplexing is off — single-profile gateways behave as before.
+            """
+            from hermes_constants import get_hermes_home
+            from hermes_cli.config import save_config
+
+            def _do_persist() -> None:
+                cfg_path = get_hermes_home() / "config.yaml"
+                if cfg_path.exists():
+                    with open(cfg_path, encoding="utf-8") as f:
+                        cfg = yaml.safe_load(f) or {}
+                else:
+                    cfg = {}
+                # Coerce scalar/None ``model:`` into a dict before mutation —
+                # otherwise the assignment below raises TypeError when
+                # config.yaml has a flat ``model: <name>`` string.
+                raw_model = cfg.get("model")
+                if isinstance(raw_model, dict):
+                    model_cfg = raw_model
+                elif isinstance(raw_model, str) and raw_model.strip():
+                    model_cfg = {"default": raw_model.strip()}
+                    cfg["model"] = model_cfg
+                else:
+                    model_cfg = {}
+                    cfg["model"] = model_cfg
+                model_cfg["default"] = result.new_model
+                model_cfg["provider"] = result.target_provider
+                if result.base_url:
+                    model_cfg["base_url"] = result.base_url
+                if str(result.target_provider or "").strip().lower() != "custom":
+                    clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
+                save_config(cfg)
+
+            try:
+                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    from gateway.run import _profile_runtime_scope
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        _do_persist()
+                else:
+                    _do_persist()
+            except Exception as e:
+                logger.warning("Failed to persist model switch: %s", e)
 
         override = self._session_model_overrides.get(session_key, {})
         if override:
@@ -1672,32 +1727,11 @@ class GatewaySlashCommandsMixin:
                         # Persist to config (default) unless --session opted out,
                         # mirroring the text /model command path above so a picked
                         # model survives across sessions like a typed one (#49066).
+                        # Scoped to the requesting profile under multiplexing so a
+                        # secondary profile's switch doesn't rewrite the default
+                        # profile's config.yaml (see _persist_switched_model).
                         if persist_global:
-                            try:
-                                if config_path.exists():
-                                    with open(config_path, encoding="utf-8") as f:
-                                        _persist_cfg = yaml.safe_load(f) or {}
-                                else:
-                                    _persist_cfg = {}
-                                _raw_model = _persist_cfg.get("model")
-                                if isinstance(_raw_model, dict):
-                                    _persist_model_cfg = _raw_model
-                                elif isinstance(_raw_model, str) and _raw_model.strip():
-                                    _persist_model_cfg = {"default": _raw_model.strip()}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                else:
-                                    _persist_model_cfg = {}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
-                                if result.base_url:
-                                    _persist_model_cfg["base_url"] = result.base_url
-                                if str(result.target_provider or "").strip().lower() != "custom":
-                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
-                            except Exception as e:
-                                logger.warning("Failed to persist model switch: %s", e)
+                            _persist_switched_model(result)
 
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
@@ -1916,39 +1950,12 @@ class GatewaySlashCommandsMixin:
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
 
-            # Persist to config (default) unless --session opted out
+            # Persist to config (default) unless --session opted out. Scoped to
+            # the requesting profile under multiplexing so a secondary profile's
+            # switch doesn't rewrite the default profile's config.yaml (see
+            # _persist_switched_model).
             if persist_global:
-                try:
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            cfg = yaml.safe_load(f) or {}
-                    else:
-                        cfg = {}
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
-                    if str(result.target_provider or "").strip().lower() != "custom":
-                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                    from hermes_cli.config import save_config
-                    save_config(cfg)
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
+                _persist_switched_model(result)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
