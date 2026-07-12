@@ -1422,6 +1422,8 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
 
+        source = event.source
+
         # Parse --provider, --global, --session, and --refresh flags
         (
             model_input,
@@ -1430,7 +1432,6 @@ class GatewaySlashCommandsMixin:
             force_refresh,
             is_session,
         ) = parse_model_flags(raw_args)
-        persist_global = resolve_persist_behavior(is_global_flag, is_session)
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -1440,26 +1441,29 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 pass
 
-        # Read current model/provider from config. Under profile multiplexing
-        # this MUST run in the requesting profile's scope: current_provider /
-        # current_base_url / user_provs / custom_provs feed switch_model's
-        # resolution, and _load_gateway_config reads via get_hermes_home(). An
-        # unscoped read here would resolve a secondary profile's /model <name>
-        # against the DEFAULT profile's provider/custom-provider map (wrong
-        # endpoint, or missing the profile's own configured provider) even
-        # though the resolver + persist are already scoped. Scope is a no-op
+        # Read current model/provider from config AND resolve the persist
+        # default. Under profile multiplexing both MUST run in the requesting
+        # profile's scope: current_provider / current_base_url / user_provs /
+        # custom_provs feed switch_model's resolution, and
+        # resolve_persist_behavior reads ``model.persist_switch_by_default`` —
+        # all via get_hermes_home(). An unscoped read here would resolve a
+        # secondary profile's /model <name> against the DEFAULT profile's
+        # provider/custom-provider map (wrong endpoint) and apply the default
+        # profile's persist-by-default decision to the requesting profile (e.g.
+        # persisting when the secondary profile opted out). Scope is a no-op
         # when multiplexing is off — single-profile gateways are unchanged.
-        source = event.source
         current_model = ""
         current_provider = "openrouter"
         current_base_url = ""
         current_api_key = ""
         user_provs = None
         custom_provs = None
+        persist_global = resolve_persist_behavior(is_global_flag, is_session)
 
         def _read_current_config() -> None:
             nonlocal current_model, current_provider, current_base_url
-            nonlocal user_provs, custom_provs
+            nonlocal user_provs, custom_provs, persist_global
+            persist_global = resolve_persist_behavior(is_global_flag, is_session)
             cfg = _load_gateway_config()
             if cfg:
                 model_cfg = cfg.get("model", {})

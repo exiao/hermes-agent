@@ -396,3 +396,40 @@ class TestModelSwitchPersistScopedToSourceProfile:
         assert cfg["model"]["default"] == "z-ai/glm-5.2"
         names = [p["name"] for p in cfg.get("custom_providers", [])]
         assert names == ["B Endpoint"]
+
+    def test_persist_default_resolved_under_source_profile(self, tmp_path):
+        """A plain `/model <name>` (no --global/--session) must honor the
+        REQUESTING profile's ``model.persist_switch_by_default``.
+
+        Regression for the P2: ``resolve_persist_behavior`` reads
+        ``persist_switch_by_default`` via ``load_config`` -> ``get_hermes_home``.
+        Computed unscoped, a secondary profile that opted OUT of persistence
+        (``persist_switch_by_default: false``) would still rewrite its config.yaml
+        because the default profile's persist-on decision leaked in. Resolving it
+        inside ``_profile_runtime_scope`` reads the requesting profile's value.
+        """
+        import yaml
+
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.model_switch import resolve_persist_behavior
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"persist_switch_by_default": True}}),
+            encoding="utf-8",
+        )
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+        (source_home / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"persist_switch_by_default": False}}),
+            encoding="utf-8",
+        )
+
+        ss.set_multiplex_active(True)
+
+        # Plain /model (no --global, no --session): persist_global should follow
+        # the profile's persist_switch_by_default, resolved under its scope.
+        with _profile_runtime_scope(source_home):
+            persist_global = resolve_persist_behavior(is_global=False, is_session=False)
+        # ProfileB opted out → no persist, despite the default profile opting in.
+        assert persist_global is False
