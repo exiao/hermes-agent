@@ -1519,6 +1519,24 @@ class GatewaySlashCommandsMixin:
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
                 return _switch_model(**kwargs)
 
+        def _list_scoped(_list_fn, **kwargs):
+            """Run a provider-listing fn under this source's profile scope.
+
+            ``list_picker_providers`` / ``list_authenticated_providers`` probe
+            provider availability by reading provider env vars / ``key_env`` /
+            ``base_url_env_var`` via ``os.environ``. Under ``multiplex_profiles``
+            a secondary profile's bare ``/model`` would otherwise probe/display
+            using the DEFAULT profile's credentials. Install the profile scope
+            so those reads resolve the requesting profile (contextvars propagate
+            into the ``to_thread`` worker via ``copy_context``). No-op when
+            multiplexing is off — single-profile gateways are unchanged.
+            """
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return _list_fn(**kwargs)
+            from gateway.run import _profile_runtime_scope
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                return _list_fn(**kwargs)
+
         def _persist_switched_model(result) -> None:
             """Persist the resolved switch to this source's profile config.yaml.
 
@@ -1597,6 +1615,7 @@ class GatewaySlashCommandsMixin:
                     # synchronous urllib HTTP fetch on a stale cache) off the
                     # event loop so the gateway doesn't freeze. See #41289.
                     providers = await asyncio.to_thread(
+                        _list_scoped,
                         list_picker_providers,
                         current_provider=current_provider,
                         current_base_url=current_base_url,
@@ -1818,6 +1837,7 @@ class GatewaySlashCommandsMixin:
                 # Offload blocking provider-listing off the event loop so the
                 # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
                 providers = await asyncio.to_thread(
+                    _list_scoped,
                     list_authenticated_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,

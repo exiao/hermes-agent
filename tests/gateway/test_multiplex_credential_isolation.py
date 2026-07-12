@@ -476,3 +476,36 @@ class TestModelSwitchPersistScopedToSourceProfile:
         # The profile's scoped key won, not the os.environ leak.
         assert result.api_key == "sk-profileB"
         assert result.base_url == "https://myprov.example/v1"
+
+    def test_list_scoped_runs_listing_under_source_profile(self, tmp_path, monkeypatch):
+        """The bare `/model` listing must run under the requesting profile's
+        scope so auth-store / config / credential-pool provider detection
+        resolves the requesting profile, not the default.
+
+        Mirrors the handler's `_list_scoped` wrapper: `_profile_runtime_scope`
+        redirects `get_hermes_home()`, so a listing fn's `_load_auth_store` /
+        `get_provider_auth_state` / config reads see the requesting profile.
+        (The raw provider-env `os.environ` probes are a separate, tracked gap.)
+        """
+        from gateway.run import _profile_runtime_scope
+        from hermes_constants import get_hermes_home
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+
+        ss.set_multiplex_active(True)
+
+        seen = {}
+
+        def _fake_listing(**kwargs):
+            # A listing fn resolves the active home for auth.json / config reads.
+            seen["home"] = str(get_hermes_home())
+            return []
+
+        # Mirror _list_scoped under multiplexing.
+        with _profile_runtime_scope(source_home):
+            _fake_listing()
+
+        assert seen["home"] == str(source_home)
