@@ -1451,6 +1451,21 @@ class TestIsSafeLookalikeTldFinding:
     def test_matching_dev_tld(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".dev"})
 
+    def test_matching_run_tld(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": ".run"})
+
+    def test_matching_run_message_field(self):
+        assert self.fn({"rule_id": "lookalike_tld",
+                        "message": "Domain uses '.run' TLD"})
+
+    def test_matching_modal_run_domain(self):
+        assert self.fn({"rule_id": "lookalike_tld",
+                        "value": "cpe-research--cpe-web.modal.run"})
+
+    def test_run_as_subdomain_label_not_matched(self):
+        """`.run` as a non-terminal label does not count as safe."""
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "foo.run.example.zip"})
+
     def test_matching_dev_message_field(self):
         assert self.fn({"rule_id": "lookalike_tld",
                         "message": "Domain uses '.dev' TLD"})

@@ -858,10 +858,13 @@ def check_command_security(command: str) -> dict:
 
 
 # gTLDs that Tirith's lookalike_tld heuristic flags but which are legitimate,
-# Google-operated, HTTPS-only registries in wide production use. Suppressing
-# their warnings removes false positives without weakening protection against
-# filename-collision TLDs (.zip, .mov) used in real phishing.
-_SAFE_LOOKALIKE_TLDS = (".app", ".dev")
+# HTTPS-only registries in wide production use. .app and .dev are
+# Google-operated; .run is Google-operated and is the TLD for every Modal
+# web endpoint (*.modal.run), a routine target for health checks and API
+# calls from this agent. Suppressing their warnings removes false positives
+# without weakening protection against filename-collision TLDs (.zip, .mov)
+# used in real phishing.
+_SAFE_LOOKALIKE_TLDS = (".app", ".dev", ".run")
 
 # Match a safe gTLD only as a complete TLD token, never as a substring of a
 # longer label. Without the trailing boundary, a substring check would let a
