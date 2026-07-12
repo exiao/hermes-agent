@@ -433,3 +433,46 @@ class TestModelSwitchPersistScopedToSourceProfile:
             persist_global = resolve_persist_behavior(is_global=False, is_session=False)
         # ProfileB opted out → no persist, despite the default profile opting in.
         assert persist_global is False
+
+    def test_user_provider_key_ref_resolved_via_scope(self, monkeypatch):
+        """`switch_model` user-provider branch (`api_key: ${VAR}` / `key_env`)
+        must resolve the key through the profile secret scope, not os.environ.
+
+        Regression for the P1: under multiplexing the wrapper installs the
+        secret scope but does NOT mutate os.environ, so reading the user
+        provider's `${VAR}` / `key_env` via os.environ.get would see the default
+        profile's value (or nothing). Routing through get_secret reads the
+        requesting profile's scoped .env.
+        """
+        from hermes_cli.model_switch import switch_model
+
+        # os.environ carries the DEFAULT profile's value — must NOT be used.
+        monkeypatch.setenv("MYPROV_KEY", "sk-default-leak")
+        ss.set_multiplex_active(True)
+
+        user_providers = {
+            "myprov": {
+                "base_url": "https://myprov.example/v1",
+                "model": "myprov-model",
+                "key_env": "MYPROV_KEY",
+            }
+        }
+
+        # Scope carries the REQUESTING profile's key.
+        tok = ss.set_secret_scope({"MYPROV_KEY": "sk-profileB"})
+        try:
+            result = switch_model(
+                raw_input="myprov-model",
+                current_provider="openrouter",
+                current_model="old",
+                is_global=False,
+                explicit_provider="myprov",
+                user_providers=user_providers,
+            )
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert result.success, result.error_message
+        # The profile's scoped key won, not the os.environ leak.
+        assert result.api_key == "sk-profileB"
+        assert result.base_url == "https://myprov.example/v1"
