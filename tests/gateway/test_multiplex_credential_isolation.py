@@ -509,3 +509,76 @@ class TestModelSwitchPersistScopedToSourceProfile:
             _fake_listing()
 
         assert seen["home"] == str(source_home)
+
+
+class TestListProvidersEnvProbesUseScope:
+    """Bare `/model` provider listing must probe env-var provider credentials
+    through the profile secret scope, not the process `os.environ`.
+
+    Regression for the display-only gap left after the `_list_scoped` fix:
+    `_profile_runtime_scope` installs the profile secret scope but intentionally
+    does NOT mutate `os.environ`, so `list_authenticated_providers`' raw
+    `os.environ.get(...)` provider-credential probes still saw the DEFAULT
+    profile's keys. Under multiplexing a secondary profile's `/model` therefore
+    listed an env-var provider as available using the default profile's key.
+    Routing those probes through `get_secret` reads the requesting profile's
+    scope; with no scope + multiplexing off (CLI/TUI) it falls back to
+    `os.environ`, so single-profile listing is unchanged.
+    """
+
+    def _list_deepseek(self, monkeypatch):
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        # Isolate the section-1 direct env-var probe: mock the models.dev catalog
+        # to a single api_key provider (deepseek), and disable the overlay /
+        # canonical detection paths (which resolve credentials via the separate
+        # credential-pool auto-seed, out of scope for this fix). Keep the listing
+        # hermetic — no live model fetch.
+        monkeypatch.setattr("agent.models_dev.fetch_models_dev",
+                            lambda: {"deepseek": {"env": ["DEEPSEEK_API_KEY"]}})
+        monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+        monkeypatch.setattr("hermes_cli.models.CANONICAL_PROVIDERS", [])
+        monkeypatch.setattr("hermes_cli.models.cached_provider_model_ids",
+                            lambda *a, **kw: ["deepseek-chat"])
+        providers = list_authenticated_providers(max_models=5)
+        return [p for p in providers if p.get("slug") == "deepseek"]
+
+    def test_scoped_profile_env_provider_detected_no_environ_leak(self, monkeypatch):
+        """Profile B's scoped DEEPSEEK_API_KEY makes deepseek list even when
+        os.environ has NO deepseek key (the default profile's env)."""
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        ss.set_multiplex_active(True)
+
+        tok = ss.set_secret_scope({"DEEPSEEK_API_KEY": "sk-profileB-deepseek"})
+        try:
+            rows = self._list_deepseek(monkeypatch)
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert rows, "deepseek should list from the profile's scoped key"
+
+    def test_default_profile_environ_not_leaked_to_scoped_profile(self, monkeypatch):
+        """os.environ carries the DEFAULT profile's deepseek key, but a
+        secondary profile whose scope lacks it must NOT list deepseek."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-default-leak")
+        ss.set_multiplex_active(True)
+
+        # Profile B's scope has a different provider's key, not deepseek's.
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-openai"})
+        try:
+            rows = self._list_deepseek(monkeypatch)
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert not rows, "os.environ deepseek key must not leak into profile B's listing"
+
+    def test_single_profile_reads_environ_unchanged(self, monkeypatch):
+        """Multiplex off, no scope (CLI/TUI): get_secret falls back to
+        os.environ, so an env-var provider still lists exactly as before."""
+        ss.set_multiplex_active(False)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-cli-user")
+
+        rows = self._list_deepseek(monkeypatch)
+
+        assert rows, "single-profile CLI listing must still detect the env-var provider"
+
