@@ -1440,14 +1440,26 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 pass
 
-        # Read current model/provider from config
+        # Read current model/provider from config. Under profile multiplexing
+        # this MUST run in the requesting profile's scope: current_provider /
+        # current_base_url / user_provs / custom_provs feed switch_model's
+        # resolution, and _load_gateway_config reads via get_hermes_home(). An
+        # unscoped read here would resolve a secondary profile's /model <name>
+        # against the DEFAULT profile's provider/custom-provider map (wrong
+        # endpoint, or missing the profile's own configured provider) even
+        # though the resolver + persist are already scoped. Scope is a no-op
+        # when multiplexing is off — single-profile gateways are unchanged.
+        source = event.source
         current_model = ""
         current_provider = "openrouter"
         current_base_url = ""
         current_api_key = ""
         user_provs = None
         custom_provs = None
-        try:
+
+        def _read_current_config() -> None:
+            nonlocal current_model, current_provider, current_base_url
+            nonlocal user_provs, custom_provs
             cfg = _load_gateway_config()
             if cfg:
                 model_cfg = cfg.get("model", {})
@@ -1461,11 +1473,20 @@ class GatewaySlashCommandsMixin:
                     custom_provs = get_compatible_custom_providers(cfg)
                 except Exception:
                     custom_provs = cfg.get("custom_providers")
+
+        try:
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                from gateway.run import _profile_runtime_scope
+                with _profile_runtime_scope(
+                    self._resolve_profile_home_for_source(source)
+                ):
+                    _read_current_config()
+            else:
+                _read_current_config()
         except Exception:
             pass
 
         # Check for session override
-        source = event.source
         # Normalize the source the same way a normal message turn does
         # (Telegram DM topic recovery) before deriving the override key, so
         # the override is stored under the key the next message turn reads

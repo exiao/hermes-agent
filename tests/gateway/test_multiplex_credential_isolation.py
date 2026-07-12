@@ -343,3 +343,56 @@ class TestModelSwitchPersistScopedToSourceProfile:
         # ...and the default profile's config was NOT touched.
         def_cfg = yaml.safe_load((default_home / "config.yaml").read_text())
         assert def_cfg["model"]["default"] == "gpt-5.4"
+
+    def test_current_config_read_scoped_to_source_profile(self, tmp_path):
+        """The initial current-model/provider/custom-provider read must use the
+        REQUESTING profile's config, not the default profile's.
+
+        Regression for the follow-on P1: current_provider / user_provs /
+        custom_provs feed switch_model's resolution. If read from the default
+        profile's config, a secondary profile's `/model <name>` resolves against
+        the wrong provider/custom-provider map. `_read_current_config` runs under
+        `_profile_runtime_scope`, so `_load_gateway_config` (via get_hermes_home)
+        reads the requesting profile.
+        """
+        import yaml
+
+        from gateway.run import _profile_runtime_scope, _load_gateway_config
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {"default": "gpt-5.4", "provider": "openai-codex"},
+                    "custom_providers": [
+                        {"name": "Default Endpoint", "base_url": "http://default/v1", "model": "d"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+        (source_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {"default": "z-ai/glm-5.2", "provider": "openrouter"},
+                    "custom_providers": [
+                        {"name": "B Endpoint", "base_url": "http://profileb/v1", "model": "b"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        ss.set_multiplex_active(True)
+
+        with _profile_runtime_scope(source_home):
+            cfg = _load_gateway_config()
+
+        # Read resolved the REQUESTING profile, not the default.
+        assert cfg["model"]["provider"] == "openrouter"
+        assert cfg["model"]["default"] == "z-ai/glm-5.2"
+        names = [p["name"] for p in cfg.get("custom_providers", [])]
+        assert names == ["B Endpoint"]
