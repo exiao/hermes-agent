@@ -1484,6 +1484,43 @@ class TestIsSafeLookalikeTldFinding:
         """`.run` as a non-terminal label does not count as safe."""
         assert not self.fn({"rule_id": "lookalike_tld", "value": "foo.run.example.zip"})
 
+    def test_real_tirith_schema_modal_run_evidence(self):
+        """Real Tirith schema-v3 output: the host lives in evidence[].raw and
+        the description is generic, so the Modal carve-out must read evidence."""
+        finding = {
+            "rule_id": "lookalike_tld",
+            "severity": "MEDIUM",
+            "title": "Lookalike TLD detected",
+            "description": "Domain uses '.run' TLD which can be confused with file extensions",
+            "evidence": [{"type": "url", "raw": "cpe-research--cpe-web.modal.run"}],
+        }
+        assert self.fn(finding)
+
+    def test_real_tirith_schema_arbitrary_run_evidence_not_matched(self):
+        """Same schema, but an arbitrary .run host in evidence stays warned."""
+        finding = {
+            "rule_id": "lookalike_tld",
+            "severity": "MEDIUM",
+            "description": "Domain uses '.run' TLD which can be confused with file extensions",
+            "evidence": [{"type": "url", "raw": "attacker.run"}],
+        }
+        assert not self.fn(finding)
+
+    def test_real_tirith_schema_app_evidence(self):
+        """A safe .app gTLD carried only in evidence[].raw is suppressed."""
+        finding = {
+            "rule_id": "lookalike_tld",
+            "description": "Domain uses '.app' TLD which can be confused with file extensions",
+            "evidence": [{"type": "url", "raw": "my-service.web.app"}],
+        }
+        assert self.fn(finding)
+
+    def test_evidence_non_dict_items_tolerated(self):
+        """Malformed evidence entries (non-dict) are scanned as strings, not fatal."""
+        assert self.fn({"rule_id": "lookalike_tld",
+                        "evidence": ["cpe-web.modal.run"]})
+        assert not self.fn({"rule_id": "lookalike_tld", "evidence": ["attacker.run"]})
+
     def test_matching_dev_message_field(self):
         assert self.fn({"rule_id": "lookalike_tld",
                         "message": "Domain uses '.dev' TLD"})

@@ -899,23 +899,41 @@ def _is_safe_lookalike_tld_finding(finding: dict) -> bool:
     Modal's ``modal.run`` registrable domain (see ``_SAFE_LOOKALIKE_TLDS`` /
     ``_MODAL_RUN_RE``).
 
-    Checks the rule_id and inspects common value/detail field names that
-    Tirith may use to carry the TLD or host string. The safe TLD must appear
-    as a distinct terminal token; substrings like ``example.dev.zip`` (where
-    ``.zip`` is the real, unsafe TLD) and arbitrary ``.run`` hosts such as
-    ``attacker.run`` are not suppressed.
+    Inspects the top-level string fields Tirith may use to carry the TLD/host
+    (``value``/``tld``/``detail``/``description``/``message``) AND the
+    ``evidence`` list, whose entries carry the actual matched host in a
+    ``raw``/``value``/``url`` field (real Tirith schema v3 output puts the host
+    only in ``evidence[].raw`` — the ``description`` is generic, e.g. "Domain
+    uses '.run' TLD ...", so the Modal carve-out would never fire without
+    reading evidence). The safe TLD must appear as a distinct terminal token;
+    substrings like ``example.dev.zip`` (where ``.zip`` is the real, unsafe
+    TLD) and arbitrary ``.run`` hosts such as ``attacker.run`` are not
+    suppressed.
     """
     if not isinstance(finding, dict):
         return False
     if finding.get("rule_id") != "lookalike_tld":
         return False
-    for field in ("value", "tld", "detail", "description", "message"):
-        val = finding.get(field)
+
+    def _is_safe_text(val) -> bool:
         if val is None:
-            continue
+            return False
         text = str(val).lower()
-        if _SAFE_TLD_RE.search(text) or _MODAL_RUN_RE.search(text):
+        return bool(_SAFE_TLD_RE.search(text) or _MODAL_RUN_RE.search(text))
+
+    for field in ("value", "tld", "detail", "description", "message"):
+        if _is_safe_text(finding.get(field)):
             return True
+
+    evidence = finding.get("evidence")
+    if isinstance(evidence, (list, tuple)):
+        for item in evidence:
+            if isinstance(item, dict):
+                for sub in ("raw", "value", "url", "host", "domain"):
+                    if _is_safe_text(item.get(sub)):
+                        return True
+            elif _is_safe_text(item):
+                return True
     return False
 
 
