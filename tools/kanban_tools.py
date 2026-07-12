@@ -985,6 +985,7 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
                 board=board,
+                model_override=args.get("model") or None,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1594,6 +1595,17 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Per-task model override. When set, the dispatcher runs "
+                    "this task's worker with this model, overriding the "
+                    "assignee profile's configured model for this run only "
+                    "(e.g. 'claude-sonnet-5-0' to run a simple card on a "
+                    "cheaper model while the lane defaults to a stronger "
+                    "one). Omit to use the profile's default model."
                 ),
             },
             "board": _board_schema_prop(),
