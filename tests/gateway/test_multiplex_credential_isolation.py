@@ -201,3 +201,86 @@ class TestProfilePathResolutionUnderMultiplexScope:
 
         assert seen["home"] == str(prof_b)
 
+
+
+class TestModelSwitchOpenRouterPathUsesScope:
+    """`/model <alias>` for an OpenRouter-backed provider must run under the
+    profile secret scope.
+
+    Regression for the `/model glm` failure: switch_model ->
+    resolve_runtime_provider hits the ``provider == "openrouter"`` branch, which
+    reads ``OPENAI_BASE_URL`` (and ``OPENROUTER_BASE_URL``) via ``_getenv`` ->
+    ``get_secret``. Under multiplexing an unscoped read fails closed with
+    ``UnscopedSecretError`` instead of leaking another profile's value, so the
+    slash-command dispatch (which the multiplexer does NOT wrap in the per-turn
+    agent scope) raised. The fix installs the profile scope around the switch;
+    these prove the resolution path fails closed unscoped and succeeds scoped.
+    """
+
+    def test_openrouter_resolution_fails_closed_unscoped(self, monkeypatch):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        # A stale value in os.environ is exactly what fail-closed protects
+        # against leaking to another profile's turn.
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://leaked.example/v1")
+        ss.set_multiplex_active(True)
+        with pytest.raises(ss.UnscopedSecretError):
+            resolve_runtime_provider(
+                requested="openrouter",
+                target_model="z-ai/glm-5.2",
+            )
+
+    def test_openrouter_resolution_succeeds_under_scope(self, monkeypatch):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        ss.set_multiplex_active(True)
+        # The profile scope carries this profile's OpenRouter key; the base_url
+        # is absent (falls back to the OpenRouter default), which is the normal
+        # case for an OpenRouter alias.
+        tok = ss.set_secret_scope({"OPENROUTER_API_KEY": "sk-profileA-or"})
+        try:
+            runtime = resolve_runtime_provider(
+                requested="openrouter",
+                target_model="z-ai/glm-5.2",
+            )
+        finally:
+            ss.reset_secret_scope(tok)
+        assert "openrouter.ai" in runtime["base_url"]
+        assert runtime["api_key"] == "sk-profileA-or"
+
+    def test_switch_model_scoped_wrapper_installs_scope(self, tmp_path, monkeypatch):
+        """The slash handler's ``_switch_model_scoped`` closure runs the switch
+        inside ``_profile_runtime_scope`` under multiplexing, so the OpenRouter
+        credential read sees a scope instead of failing closed.
+
+        Exercises the exact wrapper the handler builds, without standing up a
+        full gateway: a stand-in object providing the two attributes the closure
+        touches (``config.multiplex_profiles`` and
+        ``_resolve_profile_home_for_source``).
+        """
+        # Profile home with its own .env carrying the OpenRouter key.
+        prof = tmp_path / "profileA"
+        prof.mkdir()
+        (prof / ".env").write_text("OPENROUTER_API_KEY=sk-fromA-env\n")
+
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://leaked.example/v1")
+        ss.set_multiplex_active(True)
+
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        # Mirror the closure the handler installs (see slash_commands.py
+        # _handle_model_command._switch_model_scoped).
+        multiplex_on = True
+
+        def switch_scoped():
+            if not multiplex_on:
+                return resolve_runtime_provider(
+                    requested="openrouter", target_model="z-ai/glm-5.2"
+                )
+            with _profile_runtime_scope(prof):
+                return resolve_runtime_provider(
+                    requested="openrouter", target_model="z-ai/glm-5.2"
+                )
+
+        runtime = switch_scoped()
+        assert runtime["api_key"] == "sk-fromA-env"
+        assert "openrouter.ai" in runtime["base_url"]

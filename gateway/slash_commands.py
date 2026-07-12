@@ -1473,6 +1473,28 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+
+        def _switch_model_scoped(**kwargs):
+            """Run ``switch_model`` under this source's profile secret scope.
+
+            ``switch_model`` -> ``resolve_runtime_provider`` reads provider
+            credentials via ``get_secret`` (e.g. ``OPENAI_BASE_URL`` on the
+            OpenRouter path). Under ``multiplex_profiles`` an unscoped
+            ``get_secret`` fails closed with ``UnscopedSecretError`` to avoid
+            leaking another profile's value. The multiplexer only installs the
+            secret scope around the agent RUN, not around slash-command
+            dispatch, so ``/model <name>`` for an OpenRouter-backed alias
+            raised instead of switching. Install the scope here, on the same
+            worker thread that reads the secret (contextvars propagate into the
+            ``to_thread`` worker via ``copy_context``). No-op when multiplexing
+            is off — single-profile gateways behave exactly as before.
+            """
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return _switch_model(**kwargs)
+            from gateway.run import _profile_runtime_scope
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                return _switch_model(**kwargs)
+
         override = self._session_model_overrides.get(session_key, {})
         if override:
             current_model = override.get("model", current_model)
@@ -1529,7 +1551,7 @@ class GatewaySlashCommandsMixin:
                         # (requests.get, 15s timeout) on a cold/expired cache,
                         # which freezes the gateway otherwise. See #20525, #41289.
                         result = await asyncio.to_thread(
-                            _switch_model,
+                            _switch_model_scoped,
                             raw_input=model_id,
                             current_provider=_cur_provider,
                             current_model=_cur_model,
@@ -1772,7 +1794,7 @@ class GatewaySlashCommandsMixin:
         # timeout) on a cold/expired cache, which freezes the gateway
         # otherwise. See #20525, #41289.
         result = await asyncio.to_thread(
-            _switch_model,
+            _switch_model_scoped,
             raw_input=model_input,
             current_provider=current_provider,
             current_model=current_model,
