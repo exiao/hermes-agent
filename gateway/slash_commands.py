@@ -1433,11 +1433,27 @@ class GatewaySlashCommandsMixin:
             is_session,
         ) = parse_model_flags(raw_args)
 
-        # --refresh: bust the disk cache so the picker shows live data.
+        # --refresh: bust the disk cache so the picker shows live data. Under
+        # profile multiplexing this MUST run in the requesting profile's scope:
+        # the listing path below reads that profile's
+        # ``$HERMES_HOME/provider_models_cache.json`` under ``_list_scoped``, so
+        # an unscoped clear here would wipe the DEFAULT profile's cache and then
+        # immediately reuse the requesting profile's stale entry — i.e.
+        # ``/model --refresh`` would silently not refresh for a secondary
+        # profile. Scope is a no-op when multiplexing is off. See #97.
         if force_refresh:
             try:
                 from hermes_cli.models import clear_provider_models_cache
-                clear_provider_models_cache()
+
+                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    from gateway.run import _profile_runtime_scope
+
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        clear_provider_models_cache()
+                else:
+                    clear_provider_models_cache()
             except Exception:
                 pass
 

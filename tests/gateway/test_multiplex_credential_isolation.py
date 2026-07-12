@@ -509,3 +509,49 @@ class TestModelSwitchPersistScopedToSourceProfile:
             _fake_listing()
 
         assert seen["home"] == str(source_home)
+
+    def test_refresh_cache_clear_scoped_to_source_profile(self, tmp_path, monkeypatch):
+        """`/model --refresh` must clear the REQUESTING profile's provider cache.
+
+        Regression for the P2: the listing path reads the source profile's
+        `provider_models_cache.json` under `_list_scoped`, but the `--refresh`
+        cache clear ran before any scope was installed. Under multiplexing an
+        unscoped clear wipes the DEFAULT profile's cache and then the listing
+        reuses the requesting profile's stale entry — so refresh silently does
+        nothing for a secondary profile. Clearing under the source-profile scope
+        (`_profile_runtime_scope` redirects `get_hermes_home()`, which
+        `_provider_models_cache_path()` honors) targets the right cache file.
+        """
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.models import (
+            _provider_models_cache_path,
+            clear_provider_models_cache,
+        )
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+
+        ss.set_multiplex_active(True)
+
+        # Resolve each profile's cache path under its own scope, then seed both.
+        with _profile_runtime_scope(default_home):
+            default_cache = _provider_models_cache_path()
+        with _profile_runtime_scope(source_home):
+            source_cache = _provider_models_cache_path()
+
+        assert default_cache != source_cache
+        default_cache.parent.mkdir(parents=True, exist_ok=True)
+        source_cache.parent.mkdir(parents=True, exist_ok=True)
+        default_cache.write_text("{}", encoding="utf-8")
+        source_cache.write_text("{}", encoding="utf-8")
+
+        # Mirror the handler: clear under the requesting profile's scope.
+        with _profile_runtime_scope(source_home):
+            clear_provider_models_cache()
+
+        # Only the requesting profile's cache was wiped; the default survives.
+        assert not source_cache.exists()
+        assert default_cache.exists()
+
