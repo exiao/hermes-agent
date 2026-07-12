@@ -596,6 +596,36 @@ class TestResolveAnthropicToken:
 
         assert resolve_anthropic_token() == "sk-ant-oat01-static-token"
 
+    def test_scoped_secret_wins_over_os_environ_under_multiplexing(self, monkeypatch, tmp_path):
+        """Regression for t_601f23d1: under gateway profile multiplexing the
+        resolver must read ANTHROPIC_TOKEN from the active _SECRET_SCOPE (the
+        requesting profile's .env), NOT the process/default-profile os.environ.
+
+        Mirrors tests/gateway/test_credits_usage_profile_scope.py: with a scope
+        installed, profile B's token wins; before the get_secret routing it
+        returned the default profile's os.environ value.
+        """
+        from agent import secret_scope as ss
+
+        # Default-profile value living in the process env.
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-DEFAULT")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+
+        # Secondary profile B's isolated secret scope.
+        token = ss.set_secret_scope({"ANTHROPIC_TOKEN": "sk-ant-oat01-PROFILE-B"})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-B"
+        finally:
+            ss.reset_secret_scope(token)
+
+        # No scope installed → unchanged os.environ behavior.
+        assert resolve_anthropic_token() == "sk-ant-oat01-DEFAULT"
+
 
 class TestRefreshOauthToken:
     def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
