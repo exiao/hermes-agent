@@ -78,3 +78,85 @@ def test_scope_installs_profile_secret_scope(tmp_path):
 
     with runner._profile_secret_scope_for_source(object()):
         assert get_secret("OPENROUTER_API_KEY") == "sk-fromB-env"
+
+
+# ── nested ThreadPoolExecutor must inherit the scope ──────────────────────
+# The scope helper installs _HERMES_HOME_OVERRIDE / _SECRET_SCOPE as ContextVars
+# and the handlers cross into a worker via asyncio.to_thread (which propagates
+# context). But build_credits_view / nous_credits_lines then spawn their OWN
+# concurrent.futures.ThreadPoolExecutor to run the portal fetch, and a bare
+# executor does NOT propagate ContextVars. Without contextvars.copy_context()
+# the fetch reads the DEFAULT profile's home/creds — the exact leak gemini &
+# Codex flagged. These prove the override survives into the nested worker.
+
+
+def _capture_home_in_worker(monkeypatch, entrypoint, prof_home: Path):
+    """Run `entrypoint` under a home-override scope; return the home the
+    portal-fetch worker thread observed."""
+    import agent.account_usage as au
+    import hermes_cli.nous_account as na
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    seen: dict = {}
+
+    def _fake_fetch(*args, **kwargs):
+        # Executes inside the ThreadPoolExecutor worker thread.
+        seen["home"] = str(get_hermes_home())
+        return None  # fail-open path below; we only care about the captured home
+
+    monkeypatch.setattr(na, "get_nous_portal_account_info", _fake_fetch)
+    # Pass the local auth gate so we reach the executor.
+    monkeypatch.setattr(
+        au, "get_nous_portal_account_info", _fake_fetch, raising=False
+    )
+
+    token = set_hermes_home_override(str(prof_home))
+    try:
+        entrypoint()
+    finally:
+        reset_hermes_home_override(token)
+    return seen.get("home")
+
+
+def test_nous_credits_lines_scope_survives_nested_executor(tmp_path, monkeypatch):
+    from hermes_cli import auth as auth_mod
+
+    prof_b = tmp_path / "profB"
+    prof_b.mkdir()
+
+    monkeypatch.setattr(
+        auth_mod,
+        "get_provider_auth_state",
+        lambda provider: {"access_token": "tok-B"},
+    )
+
+    from agent.account_usage import nous_credits_lines
+
+    seen_home = _capture_home_in_worker(
+        monkeypatch, lambda: nous_credits_lines(markdown=True), prof_b
+    )
+    assert seen_home == str(prof_b)
+
+
+def test_build_credits_view_scope_survives_nested_executor(tmp_path, monkeypatch):
+    from hermes_cli import auth as auth_mod
+
+    prof_b = tmp_path / "profB"
+    prof_b.mkdir()
+
+    monkeypatch.setattr(
+        auth_mod,
+        "get_provider_auth_state",
+        lambda provider: {"access_token": "tok-B"},
+    )
+
+    from agent.account_usage import build_credits_view
+
+    seen_home = _capture_home_in_worker(
+        monkeypatch, lambda: build_credits_view(markdown=True), prof_b
+    )
+    assert seen_home == str(prof_b)
