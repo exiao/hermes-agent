@@ -244,6 +244,30 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_create_task_persists_model_override(kanban_home):
+    """A per-task model override round-trips through create_task -> row.
+
+    The dispatcher spawns the worker with ``-m <model_override>`` when set,
+    so an override must survive the INSERT. Omitting it (or passing blank)
+    must leave the column NULL so the worker falls back to the profile model.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="cheap card", assignee="alice",
+            model_override="claude-sonnet-5-0",
+        )
+        default_tid = kb.create_task(conn, title="normal card", assignee="alice")
+        blank_tid = kb.create_task(
+            conn, title="blank override", assignee="alice", model_override="  ",
+        )
+        overridden = kb.get_task(conn, tid)
+        defaulted = kb.get_task(conn, default_tid)
+        blanked = kb.get_task(conn, blank_tid)
+    assert overridden.model_override == "claude-sonnet-5-0"
+    assert defaulted.model_override is None
+    assert blanked.model_override is None
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")

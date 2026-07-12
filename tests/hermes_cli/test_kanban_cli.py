@@ -250,6 +250,32 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_json_includes_model_override(kanban_home):
+    """The per-task model override must be visible on every JSON surface
+    (`create`/`show`/`list --json`), not just plain-text `show`, so a
+    scripted consumer that sets `--model` can read back the value it wrote.
+    Omitting `--model` leaves the field null."""
+    created = json.loads(
+        kc.run_slash("create 'with model' --assignee alice --model m-x --json")
+    )
+    assert created["model_override"] == "m-x"
+    tid = created["id"]
+
+    shown = json.loads(kc.run_slash(f"show {tid} --json"))
+    assert shown["task"]["model_override"] == "m-x"
+
+    listed = json.loads(kc.run_slash("list --json"))
+    assert any(
+        row.get("id") == tid and row.get("model_override") == "m-x"
+        for row in listed
+    )
+
+    omitted = json.loads(
+        kc.run_slash("create 'no model' --assignee alice --json")
+    )
+    assert omitted["model_override"] is None
+
+
 def test_run_slash_usage_error_returns_message(kanban_home):
     # Missing required argument for create
     out = kc.run_slash("create")

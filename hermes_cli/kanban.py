@@ -76,6 +76,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "completed_at": t.completed_at,
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
+        "model_override": t.model_override,
         "max_retries": t.max_retries,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
@@ -345,6 +346,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). The kanban lifecycle is already "
                                "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument("--model", default=None, dest="model_override",
+                          metavar="MODEL",
+                          help="Per-task model override. When set, the "
+                               "dispatcher runs this task's worker with "
+                               "-m <MODEL>, overriding the assignee profile's "
+                               "configured model for this run only "
+                               "(e.g. --model claude-sonnet-5-0 to run a "
+                               "simple card on a cheaper model while the "
+                               "lane defaults to opus). Omit to use the "
+                               "profile's model.default.")
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -1363,6 +1374,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            model_override=getattr(args, "model_override", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
