@@ -1202,7 +1202,7 @@ class TestConvertMessages:
 
         assert tool_use["type"] == "tool_use"
         assert tool_use["id"] == "tc_1"
-        assert tool_use["cache_control"] == {"type": "ephemeral"}
+        assert tool_use["cache_control"] == make_cache_marker()
 
     def test_ordered_replay_tool_use_cache_control_is_preserved(self):
         messages = apply_anthropic_cache_control([
@@ -1246,7 +1246,7 @@ class TestConvertMessages:
         assert tool_use["type"] == "tool_use"
         assert tool_use["id"] == "tc_1"
         assert tool_use["input"] == {"query": "redacted"}
-        assert tool_use["cache_control"] == {"type": "ephemeral"}
+        assert tool_use["cache_control"] == make_cache_marker()
 
     def test_tool_cache_control_is_preserved_on_tool_result_block(self):
         messages = apply_anthropic_cache_control([

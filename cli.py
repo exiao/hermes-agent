@@ -15992,25 +15992,28 @@ def main(
             # an exit-1 just thrashes the dispatcher into burning its whole
             # retry budget on the identical wall (see kanban t_d85833c1).
             missing_display = ", ".join(missing_skills)
-            # If at least one skill loaded, degrade gracefully: skip the
-            # unknown ones and continue. Only when EVERY requested skill is
-            # missing do we hard-fail, so a fully-misconfigured worker fails
-            # loudly instead of running blind.
-            if loaded_skills:
-                print(
-                    f"\033[33m⚠ Skipping unknown force-loaded skill(s): "
-                    f"{missing_display} — continuing with: {', '.join(loaded_skills)}.\033[0m",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                logger.warning(
-                    "Unknown skill(s) requested, skipping: %s. Continuing with: %s. "
-                    "List available skills with `hermes skills list`.",
-                    missing_display,
-                    ", ".join(loaded_skills),
-                )
-            else:
-                raise ValueError(f"Unknown skill(s): {missing_display}")
+            # Degrade gracefully: skip the unknown skill(s) and continue
+            # starting the agent, even when NONE of the requested skills
+            # resolved. A running agent can still do the work or block
+            # intelligently, whereas an exit-1 just thrashes the dispatcher
+            # into burning its whole retry budget on the identical wall.
+            continuing = (
+                f"continuing with: {', '.join(loaded_skills)}."
+                if loaded_skills
+                else "continuing without them."
+            )
+            print(
+                f"\033[33m⚠ Skipping unknown force-loaded skill(s): "
+                f"{missing_display} — {continuing}\033[0m",
+                file=sys.stderr,
+                flush=True,
+            )
+            logger.warning(
+                "Unknown skill(s) requested, skipping: %s. %s "
+                "List available skills with `hermes skills list`.",
+                missing_display,
+                continuing[0].upper() + continuing[1:],
+            )
         if skills_prompt:
             cli.system_prompt = "\n\n".join(
                 part for part in (cli.system_prompt, skills_prompt) if part

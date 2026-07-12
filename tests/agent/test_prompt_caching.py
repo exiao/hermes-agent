@@ -240,5 +240,5 @@ class TestApplyAnthropicCacheControl:
         ]
         result = apply_anthropic_cache_control(msgs, native_anthropic=False)
         assert isinstance(result[1]["content"], list)
-        assert result[1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert result[1]["content"][0]["cache_control"] == make_cache_marker()
         assert "cache_control" not in result[1]

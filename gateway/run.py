@@ -13806,8 +13806,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
                 history_snapshot = list(getattr(running_agent, "_session_messages", []) or [])
             else:
-                session_entry = self.session_store.get_or_create_session(source)
-                history_snapshot = self.session_store.load_transcript(session_entry.session_id)
+                session_entry = await self.async_session_store.get_or_create_session(source)
+                history_snapshot = await self.async_session_store.load_transcript(session_entry.session_id)
 
             btw_prompt = (
                 "[Ephemeral /btw side question. Answer using the conversation "
@@ -13835,7 +13835,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id=task_id,
                     platform=platform_key,
                     session_db=None,
-                    fallback_model=self._fallback_model,
+                    fallback_model=self._refresh_fallback_model(),
                     skip_memory=True,
                     skip_context_files=True,
                     persist_session=False,
@@ -14125,7 +14125,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Gated by ``display.tool_progress_command`` in config.yaml (default off).
         When enabled, cycles the tool progress mode through off → new → all →
-        verbose → off for the *current platform*.  The setting is saved to
+        verbose → log → off for the *current platform*.  The setting is saved to
         ``display.platforms.<platform>.tool_progress`` so each channel can
         have its own verbosity level independently.
         """
@@ -14147,12 +14147,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return t("gateway.verbose.not_enabled")
 
         # --- cycle mode (per-platform) ----------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "log"]
         descriptions = {
             "off": t("gateway.verbose.mode_off"),
             "new": t("gateway.verbose.mode_new"),
             "all": t("gateway.verbose.mode_all"),
             "verbose": t("gateway.verbose.mode_verbose"),
+            "log": t("gateway.verbose.mode_log"),
         }
 
         # Read current effective mode for this platform via the resolver
@@ -14281,8 +14282,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         https://code.claude.com/docs/en/whats-new/2026-w20).
         """
         source = event.source
-        session_entry = self.session_store.get_or_create_session(source)
-        history = self.session_store.load_transcript(session_entry.session_id)
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        history = await self.async_session_store.load_transcript(session_entry.session_id)
 
         if not history or len(history) < 4:
             return t("gateway.compress.not_enough")
@@ -14290,12 +14291,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Parse args: either a focus topic (full compress) or the
         # boundary-aware "here [N]" form (partial compress).
         from hermes_cli.partial_compress import (
+            extract_compress_flags,
             parse_partial_compress_args,
             rejoin_compressed_head_and_tail,
             split_history_for_partial_compress,
+            summarize_compress_preview,
         )
+        from agent.model_metadata import estimate_request_tokens_rough
+
         _raw_args = (event.get_command_args() or "").strip()
+        # Strip --preview/--dry-run/--aggressive before positional parsing so
+        # the flags coexist with the 'here [N]' / focus-topic forms.
+        _raw_args, preview, aggressive = extract_compress_flags(_raw_args)
         partial, keep_last, focus_topic = parse_partial_compress_args(_raw_args)
+
+        # --aggressive (LLM-free hard truncation) is intentionally not wired:
+        # it would need its own transcript-persistence branch outside the
+        # guarded _compress_context rotation machinery (#44794 data-loss
+        # class). Surface a note instead of mis-parsing it as a focus topic.
+        _aggressive_note = t("gateway.compress.aggressive_unsupported")
+        if aggressive and not preview:
+            return _aggressive_note
+
+        if preview:
+            # Report what WOULD be compressed without building an agent or
+            # touching the transcript.
+            _preview_msgs = [
+                {"role": m.get("role"), "content": m.get("content")}
+                for m in history
+                if m.get("role") in {"user", "assistant"} and m.get("content")
+            ]
+            approx_tokens = estimate_request_tokens_rough(_preview_msgs)
+            report = summarize_compress_preview(
+                _preview_msgs,
+                partial,
+                keep_last,
+                focus_topic or None,
+                approx_tokens,
+            )
+            lines = list(report["lines"])
+            if aggressive:
+                lines.append(_aggressive_note)
+            return "\n".join(lines)
 
         try:
             from run_agent import AIAgent
@@ -14402,7 +14439,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 new_session_id = tmp_agent.session_id
                 rotated = new_session_id != session_entry.session_id
                 if rotated:
-                    if not self.session_store.rewrite_transcript(new_session_id, compressed):
+                    if not await self.async_session_store.rewrite_transcript(new_session_id, compressed):
                         logger.warning(
                             "Manual /compress: rewrite_transcript failed for rotated "
                             "session %s; leaving live session on %s.",
@@ -14411,8 +14448,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         return t("gateway.compress.rotation_failed")
                     session_entry.session_id = new_session_id
-                    self.session_store._save()
-                    self._sync_telegram_topic_binding(
+                    await self.async_session_store._save()
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding,
                         source, session_entry, reason="compress-command",
                     )
                 else:
@@ -14457,7 +14495,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # else (full in-place): archive_and_compact already persisted
                     # the complete compacted set; no further write needed.
                 # Reset stored token count — transcript changed, old value is stale
-                self.session_store.update_session(
+                await self.async_session_store.update_session(
                     session_entry.session_key, last_prompt_tokens=0
                 )
                 new_tokens = estimate_request_tokens_rough(

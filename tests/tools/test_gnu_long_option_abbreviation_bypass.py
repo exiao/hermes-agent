@@ -83,7 +83,11 @@ class TestGitPushForceLongOptionAbbreviation:
         assert dangerous is True
 
     def test_git_push_no_force_not_flagged(self):
-        dangerous, _, _ = detect_dangerous_command("git push origin main")
+        # Use a feature branch, not main/master: a plain push carries no force
+        # flag, but pushing to main/master is separately blocked by the
+        # push-to-protected-branch policy (tools/approval.py), so this negative
+        # case must target a non-protected branch to isolate force detection.
+        dangerous, _, _ = detect_dangerous_command("git push origin feature")
         assert dangerous is False
 
     def test_git_push_set_upstream_not_flagged(self):

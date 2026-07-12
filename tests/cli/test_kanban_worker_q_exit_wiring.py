@@ -181,7 +181,7 @@ def _drive_non_quiet_q(monkeypatch, *, failure_reason, kanban_task):
             self._last_failure_reason = failure_reason
             return "done"
 
-        def _print_exit_summary(self):
+        def _print_exit_summary(self, clear_screen: bool = True):
             calls.append("summary")
 
     if kanban_task:
