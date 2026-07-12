@@ -2636,12 +2636,39 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         from hermes_cli.config import load_config
         cfg = load_config()
         model_cfg = cfg.get("model")
+        base_url_overridden = False
         if isinstance(model_cfg, dict):
             cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
             if cfg_provider == "anthropic":
                 cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
                 if cfg_base_url and _is_anthropic_compatible_host(cfg_base_url):
                     base_url = cfg_base_url
+                    base_url_overridden = True
+        # Mirror the main session's providers.<name>.* inheritance
+        # (hermes_cli/runtime_provider.py): when model.base_url did not
+        # supply an endpoint, an explicit providers.anthropic.base_url is
+        # the operator's declared Anthropic endpoint (e.g. a local billing
+        # proxy at 127.0.0.1). Unlike model.base_url — which can point at a
+        # foreign OpenAI-shaped host when the operator routes the MAIN
+        # session elsewhere (issue #52608) — providers.anthropic.* is by
+        # construction Anthropic-only, so no host gate is applied, same as
+        # the main session trusts it. Without this, every auxiliary side
+        # channel (goal judge, title generation, memory extract, vision
+        # fallback) bypasses the operator's proxy and 401s against
+        # api.anthropic.com with a placeholder key.
+        if not base_url_overridden:
+            providers_cfg = cfg.get("providers")
+            if isinstance(providers_cfg, dict):
+                anthropic_cfg = providers_cfg.get("anthropic")
+                if isinstance(anthropic_cfg, dict):
+                    prov_base_url = str(
+                        anthropic_cfg.get("base_url")
+                        or anthropic_cfg.get("api")
+                        or anthropic_cfg.get("url")
+                        or ""
+                    ).strip().rstrip("/")
+                    if prov_base_url:
+                        base_url = prov_base_url
     except Exception:
         pass
 
