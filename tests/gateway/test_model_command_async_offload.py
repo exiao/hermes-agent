@@ -14,9 +14,13 @@ Fix (ported from #41304, which patched the old ``gateway/run.py`` location):
   * line ~1382 — text-fallback   -> ``list_authenticated_providers``
 
 These tests assert the *offload contract* at the real handler seam: each listing
-function must be dispatched through ``asyncio.to_thread`` and must NOT be invoked
-directly. Reverting either ``to_thread`` wrap (calling the sync fn inline again)
-makes the corresponding test fail — i.e. the tests are mutation-survivable.
+function must be dispatched off the event loop via ``asyncio.to_thread`` and must
+NOT be invoked directly. Under profile multiplexing the offloaded target is a
+thin ``_list_scoped`` wrapper that installs the requesting profile's secret scope
+and receives the raw listing fn as its first positional arg (still running it on
+the worker thread), so the spy inspects both the ``to_thread`` target and its
+callable positional args. Reverting either offload (calling the sync fn inline
+again) makes the corresponding test fail — i.e. the tests are mutation-survivable.
 """
 
 import asyncio
@@ -63,7 +67,21 @@ class _ToThreadSpy:
         return await self._real(func, *args, **kwargs)
 
     def funcs_offloaded(self):
-        return [c[0] for c in self.calls]
+        """Every callable dispatched off the event loop.
+
+        Includes both the direct ``to_thread`` target and any callable passed
+        as a positional arg to it. The profile-scope wrapper
+        (``_list_scoped``) offloads itself and receives the raw listing fn as
+        its first positional arg, so the raw fn still runs on the worker thread
+        — this surfaces it either way while staying mutation-survivable
+        (reverting the ``to_thread`` wrap calls the fn inline, so it appears in
+        neither position).
+        """
+        seen = []
+        for func, args, _kwargs in self.calls:
+            seen.append(func)
+            seen.extend(a for a in args if callable(a))
+        return seen
 
 
 @pytest.fixture
