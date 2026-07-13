@@ -662,6 +662,13 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr(
             "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
         )
+        # Active scope belongs to a NON-default profile (profile B), so the
+        # host-global ~/.claude credential is not this profile's and must be
+        # suppressed. get_active_profile_name reads HERMES_HOME (overridden per
+        # turn by _profile_runtime_scope); stub it to the requesting profile.
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
 
         # Requesting profile B carries its own scoped OAuth token.
         token = ss.set_secret_scope(
@@ -710,6 +717,10 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr(
             "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
         )
+        # Active scope belongs to a NON-default profile.
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
 
         # Requesting profile B has only a scoped API key (no OAuth token).
         token = ss.set_secret_scope(
@@ -722,6 +733,51 @@ class TestResolveAnthropicToken:
 
         # No scope → the global Claude Code credential still resolves at source #3.
         assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
+
+    def test_default_profile_scope_still_resolves_global_claude_code_creds(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression for the Codex P2 on PR #99: under multiplexing the DEFAULT
+        profile's own turns also run inside a secret scope, but the DEFAULT
+        profile OWNS the host-global ~/.claude credential. The suppression must
+        NOT fire for it — otherwise a default profile relying on Claude Code
+        OAuth (rather than .env / pool creds) loses Anthropic auth and /usage.
+
+        The default profile has no scoped ANTHROPIC_TOKEN / API key; its only
+        Anthropic credential is the global Claude Code record at source #3, which
+        must still resolve while a (default-profile) scope is active.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        global_creds = {
+            "accessToken": "sk-ant-oat01-GLOBAL-DEFAULT",
+            "refreshToken": "refresh-default",
+            "expiresAt": 9999999999999,
+            "source": "file",
+        }
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: global_creds,
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+        # Active scope belongs to the DEFAULT profile (owner of ~/.claude).
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+
+        # Default profile's scope carries no Anthropic secret of its own.
+        token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
+        finally:
+            ss.reset_secret_scope(token)
 
 
 class TestRefreshOauthToken:

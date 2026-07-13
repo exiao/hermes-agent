@@ -1309,6 +1309,33 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
+def _scope_is_non_default_profile() -> bool:
+    """True when a profile secret scope is active for a NON-default profile.
+
+    Under gateway multiplexing every turn — including the default profile's own
+    turns — runs inside a ``set_secret_scope`` scope, so ``current_secret_scope()``
+    alone can't tell whether the active profile owns the host-global ~/.claude /
+    Keychain credential. The default profile does (it owns ~/.hermes and
+    ~/.claude); any other profile does not. This gates suppression of the global
+    Claude Code credential in ``resolve_anthropic_token`` so a non-default profile
+    can't authenticate with the default profile's global token, while the default
+    profile's own turns keep resolving it as before.
+
+    ``get_active_profile_name`` reads HERMES_HOME, which ``_profile_runtime_scope``
+    overrides per turn, so it reflects the profile whose scope is active. Returns
+    False when no scope is installed (single-profile / non-gateway callers), where
+    behavior is unchanged.
+    """
+    if _current_secret_scope() is None:
+        return False
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return (get_active_profile_name() or "default") != "default"
+    except Exception:  # pragma: no cover - defensive; treat unknown as global-owner
+        return False
+
+
 def _resolve_anthropic_pool_token() -> Optional[str]:
     """Return the first available Anthropic OAuth token from credential_pool.
 
@@ -1371,17 +1398,20 @@ def resolve_anthropic_token() -> Optional[str]:
     # os.environ, so behavior is byte-identical to the prior os.getenv.
     #
     # read_claude_code_credentials() reads the host's global ~/.claude / Keychain
-    # record, which belongs to the DEFAULT profile — not the profile requesting
-    # this turn. Under an active secret scope (a multiplexed turn) that global
-    # record must not participate: otherwise a refreshable default-profile
-    # credential would override the scoped ANTHROPIC_TOKEN (source #1/#2) or be
-    # returned outright as source #3, authenticating as the wrong profile. Drop
-    # it to None when scoped so it can't shadow the scoped env tokens, and skip
-    # the source-#3 Claude Code fallback entirely (that resolver re-reads the
-    # global file when handed None, so None alone doesn't suppress it) — only
-    # the profile's own scoped secrets resolve.
-    scope_active = _current_secret_scope() is not None
-    if scope_active:
+    # record, which belongs to the DEFAULT profile — the profile that owns
+    # ~/.hermes and ~/.claude. Under multiplexing every turn runs inside a secret
+    # scope, including the DEFAULT profile's own turns, so the mere presence of a
+    # scope is NOT enough to tell "this global cred isn't mine": for a NON-default
+    # profile the global record is the wrong profile's and must not participate
+    # (otherwise it would override the scoped ANTHROPIC_TOKEN at source #1/#2 or be
+    # returned outright at source #3), but for the DEFAULT profile it legitimately
+    # IS that profile's credential and must still resolve. Suppress the global
+    # record only for a non-default scoped profile: drop it to None so it can't
+    # shadow the scoped env tokens, and skip the source-#3 Claude Code fallback
+    # entirely (that resolver re-reads the global file when handed None, so None
+    # alone doesn't suppress it) — leaving only the profile's own scoped secrets.
+    suppress_global_creds = _scope_is_non_default_profile()
+    if suppress_global_creds:
         creds = None
 
     # 1. Hermes-managed OAuth/setup token env var
@@ -1400,11 +1430,12 @@ def resolve_anthropic_token() -> Optional[str]:
             return preferred
         return cc_token
 
-    # 3. Claude Code credential file. Skipped entirely under an active scope:
+    # 3. Claude Code credential file. Skipped for a non-default scoped profile:
     # this reads the host's global default-profile ~/.claude record, which must
-    # not resolve for a multiplexed profile (passing creds=None here would just
-    # re-read that global file — see _resolve_claude_code_token_from_credentials).
-    if not scope_active:
+    # not resolve for another profile (passing creds=None here would just re-read
+    # that global file — see _resolve_claude_code_token_from_credentials). The
+    # default profile owns ~/.claude, so it still resolves here as before.
+    if not suppress_global_creds:
         resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
         if resolved_claude_token:
             return resolved_claude_token
