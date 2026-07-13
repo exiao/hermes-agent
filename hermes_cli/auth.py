@@ -583,12 +583,16 @@ def _resolve_api_key_provider_secret(
             pass
         return "", ""
 
+    from agent.secret_scope import current_secret_scope, get_secret as _get_secret
     from hermes_cli.config import get_env_value_prefer_dotenv
+
     for env_var in pconfig.api_key_env_vars:
-        # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation
-        # in the user's .env file isn't shadowed by a stale shell export
-        # inherited from a parent process (Codex CLI, test runners, etc.).
-        val = (get_env_value_prefer_dotenv(env_var) or "").strip()
+        # Profile scopes are authoritative. Outside a scope retain the existing
+        # dotenv-over-process lookup used for ordinary single-profile runs.
+        if current_secret_scope() is None:
+            val = (get_env_value_prefer_dotenv(env_var) or "").strip()
+        else:
+            val = (_get_secret(env_var, "") or "").strip()
         if has_usable_secret(val):
             return val, env_var
 
