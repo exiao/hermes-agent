@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.secret_scope import current_secret_scope as _current_secret_scope
 from agent.secret_scope import get_secret as _get_secret
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
@@ -1368,6 +1369,16 @@ def resolve_anthropic_token() -> Optional[str]:
     # process/default-profile value. With no scope installed (single-profile
     # deployments, non-gateway callers) get_secret transparently reads
     # os.environ, so behavior is byte-identical to the prior os.getenv.
+    #
+    # read_claude_code_credentials() reads the host's global ~/.claude / Keychain
+    # record, which belongs to the DEFAULT profile — not the profile requesting
+    # this turn. Under an active secret scope (a multiplexed turn) that global
+    # record must not participate: otherwise a refreshable default-profile
+    # credential would override the scoped ANTHROPIC_TOKEN (source #1/#2) or be
+    # returned outright as source #3, authenticating as the wrong profile. Drop
+    # it to None when scoped so only the profile's own scoped secrets resolve.
+    if _current_secret_scope() is not None:
+        creds = None
 
     # 1. Hermes-managed OAuth/setup token env var
     token = (_get_secret("ANTHROPIC_TOKEN", "") or "").strip()

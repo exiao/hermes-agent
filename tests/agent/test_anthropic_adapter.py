@@ -626,6 +626,55 @@ class TestResolveAnthropicToken:
         # No scope installed → unchanged os.environ behavior.
         assert resolve_anthropic_token() == "sk-ant-oat01-DEFAULT"
 
+    def test_scoped_token_wins_over_global_refreshable_creds_under_multiplexing(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression for the Codex P1 on PR #99: when the host has refreshable
+        Claude Code credentials for the DEFAULT profile, a scoped turn must NOT
+        let those global creds override the requesting profile's scoped
+        ANTHROPIC_TOKEN.
+
+        read_claude_code_credentials() reads the global ~/.claude / Keychain
+        record. Before the scope-drops-creds fix, _prefer_refreshable_claude_code_token
+        resolved that refreshable global credential and returned it in place of
+        the scoped token — authenticating /usage and Anthropic calls as the
+        wrong profile. The earlier regression test missed this because it stubbed
+        read_claude_code_credentials to None.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        # Host default-profile refreshable Claude Code credential (global).
+        global_creds = {
+            "accessToken": "sk-ant-oat01-GLOBAL-DEFAULT",
+            "refreshToken": "refresh-default",
+            "expiresAt": 9999999999999,
+            "source": "file",
+        }
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: global_creds,
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+
+        # Requesting profile B carries its own scoped OAuth token.
+        token = ss.set_secret_scope(
+            {"ANTHROPIC_TOKEN": "sk-ant-oat01-PROFILE-B"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-B"
+        finally:
+            ss.reset_secret_scope(token)
+
+        # No scope → the global refreshable credential resolves as before.
+        assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
+
 
 class TestRefreshOauthToken:
     def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
