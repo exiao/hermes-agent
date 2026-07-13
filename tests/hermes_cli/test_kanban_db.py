@@ -4417,6 +4417,176 @@ def test_init_db_allows_missing_then_healthy(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Clone-storm cap + index-only self-heal (2026-07-13 incident)
+# ---------------------------------------------------------------------------
+
+
+def _corrupt_an_index_page(db_path: Path) -> bool:
+    """Blank a secondary/auto index's b-tree entries while keeping the page
+    structurally valid, so ``PRAGMA integrity_check`` reports the *index* has
+    the wrong entry count (the recoverable index-only class) rather than a
+    page-level "database disk image is malformed".
+
+    Technique: set the index root page's "number of cells" field (2-byte big-
+    endian at page offset 3) to zero and clear the cell-pointer array. SQLite
+    then sees an index b-tree with fewer entries than the base table → "wrong #
+    of entries in index". The base-table b-trees are untouched, so every row is
+    still readable and ``iterdump`` recovers them fully.
+
+    Returns True if an index page was corrupted, False if the DB has no
+    corruptible secondary index (caller should skip). Assumes rollback journal
+    mode with no live WAL sidecars.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        rows = conn.execute(
+            "SELECT name, rootpage FROM sqlite_master "
+            "WHERE type='index' AND rootpage > 0 ORDER BY rootpage"
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return False
+    _name, rootpage = rows[-1]
+    offset = (rootpage - 1) * page_size
+    with db_path.open("r+b") as fh:
+        fh.seek(offset)
+        page = bytearray(fh.read(page_size))
+        page_type = page[0]  # 0x0a leaf index / 0x02 interior index — keep it
+        # Zero the "number of cells" field (offset 3-4) and the cell-pointer
+        # array so the index b-tree reports zero entries while staying parseable.
+        page[3] = 0x00
+        page[4] = 0x00
+        header_len = 8 if page_type in (0x0a, 0x0d) else 12
+        for i in range(header_len, page_size):
+            page[i] = 0x00
+        fh.seek(offset)
+        fh.write(bytes(page))
+    return True
+
+
+def _make_index_corrupt_kanban_db(db_path: Path) -> list[str]:
+    """Build a healthy kanban DB with data, then corrupt one index page.
+
+    Returns the task titles that must survive a repair. Skips (pytest.skip) if
+    the schema has no corruptible secondary index on this SQLite build.
+    """
+    with kb.connect_closing(db_path=db_path) as conn:
+        kb.create_task(conn, title="alpha")
+        kb.create_task(conn, title="beta")
+        kb.create_task(conn, title="gamma")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    # Collapse WAL into the main file and switch to rollback journaling so the
+    # main-file page layout is stable before we corrupt a page by byte offset.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.commit()
+    finally:
+        conn.close()
+    for sidecar in ("-wal", "-shm"):
+        s = db_path.with_name(db_path.name + sidecar)
+        if s.exists():
+            s.unlink()
+    if not _corrupt_an_index_page(db_path):
+        pytest.skip("no corruptible secondary index in kanban schema")
+    return ["alpha", "beta", "gamma"]
+
+
+def test_is_index_only_corruption_classifier():
+    assert kb._is_index_only_corruption(
+        ["wrong # of entries in index idx_notify_task"]
+    )
+    assert kb._is_index_only_corruption(
+        [
+            "row missing from index sqlite_autoindex_kanban_notify_subs_1",
+            "wrong # of entries in index idx_notify_task",
+        ]
+    )
+    # Any non-index problem disqualifies the whole set — never a partial repair.
+    assert not kb._is_index_only_corruption(
+        ["wrong # of entries in index idx_x", "Page 4 is never used"]
+    )
+    assert not kb._is_index_only_corruption(["database disk image is malformed"])
+    assert not kb._is_index_only_corruption([])
+
+
+def test_index_only_corruption_self_heals_and_preserves_rows(tmp_path):
+    """The 2026-07-13 board corruption class (stale indexes, base tables intact)
+    must self-heal on open via REINDEX / .dump+reload with zero row loss —
+    instead of refusing and quarantining a clone."""
+    db_path = tmp_path / "kanban.db"
+    expected = _make_index_corrupt_kanban_db(db_path)
+
+    # Precondition: the DB is genuinely index-corrupt right now.
+    problems = kb._integrity_problems(db_path)
+    assert problems is not None, "expected the injected index corruption to register"
+    assert kb._is_index_only_corruption(problems), problems
+
+    # Clear the one-shot repair claim so the guard actually attempts repair.
+    kb._REPAIR_ATTEMPTED_PATHS.discard(str(db_path.resolve()))
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    # Opening the DB must now recover it in place, not raise.
+    with kb.connect(db_path=db_path) as conn:
+        titles = sorted(t.title for t in kb.list_tasks(conn))
+    assert titles == sorted(expected), "row data must survive the repair"
+
+    # DB is clean afterwards and no forensic clone was kept for a recovered DB.
+    assert kb._integrity_problems(db_path) is None
+    assert list(tmp_path.glob("*.corrupt.*.bak")) == []
+    # The rebuild temp file must not linger.
+    assert list(tmp_path.glob("*.rebuild.tmp")) == []
+
+
+def test_corrupt_clone_count_is_capped(tmp_path):
+    """A live WAL DB mutates on every rw probe, so N concurrent opens fingerprint
+    different bytes and each used to write a fresh multi-MB clone (the storm).
+    The per-path clone cap bounds this: the number of .corrupt.*.bak files must
+    never exceed _MAX_CORRUPT_CLONES no matter how many times the bytes change."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+
+    for i in range(12):
+        # Mutate the corrupt bytes each iteration so content-addressing alone
+        # would mint a brand-new clone (this is what the WAL churn did live).
+        with db_path.open("r+b") as fh:
+            fh.seek(4096)
+            fh.write(bytes([i % 256]) * 128)
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with pytest.raises(kb.KanbanDbCorruptError):
+            kb.connect(db_path=db_path)
+
+    clones = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(clones) <= kb._MAX_CORRUPT_CLONES, (
+        f"clone-storm not bounded: {len(clones)} clones "
+        f"(cap {kb._MAX_CORRUPT_CLONES}): {[c.name for c in clones]}"
+    )
+
+
+def test_capped_backup_still_returns_a_forensic_path(tmp_path):
+    """Even at the cap, the raised error carries a real, existing backup path so
+    forensics (and the error message) are never left dangling."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    seen: list[Path] = []
+    for i in range(6):
+        with db_path.open("r+b") as fh:
+            fh.seek(2048)
+            fh.write(bytes([i]) * 64)
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+            kb.connect(db_path=db_path)
+        bp = excinfo.value.backup_path
+        assert bp is not None and bp.exists()
+        seen.append(bp)
+    # At most the cap number of distinct forensic clones exist on disk.
+    assert len({p.resolve() for p in seen}) <= kb._MAX_CORRUPT_CLONES
+
+
+# ---------------------------------------------------------------------------
 # First-use tip for scratch workspaces
 # ---------------------------------------------------------------------------
 
