@@ -3349,7 +3349,17 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
         ).fetchall()
     ]
     if not parent_ids:
-        return True
+        # No parents now. If a parent LINK was removed AFTER the wait (an
+        # operator `kanban unlink` that corrected a mistaken edge), the child
+        # has nothing left to wait on — release the park. Distinguishes this
+        # deliberate graph repair from a wait that never had any parent link
+        # (the <1s loop this guard exists to stop), which must still park.
+        unlinked_after = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND id > ? AND kind = 'unlinked' LIMIT 1",
+            (task_id, dep_evt_id),
+        ).fetchone()
+        return not unlinked_after
     # Has any parent reached a terminal state AFTER the dependency_wait? That
     # is the primary signal that a real dependency resolved since the block.
     # One IN() query instead of a per-parent loop (fewer round-trips).

@@ -313,6 +313,29 @@ def test_dependency_link_done_parent_recovers(kanban_home: Path) -> None:
         )
 
 
+def test_dependency_unlink_all_parents_recovers(kanban_home: Path) -> None:
+    """Graph repair (mirror of link): a child that parked with a mistaken
+    parent edge recovers when that edge is removed via `kanban unlink` after
+    the block — leaving no parents means nothing to wait on, so the park is
+    released rather than stuck forever. A wait that NEVER had a parent still
+    parks (no post-wait 'unlinked' event).
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        # A mistaken edge is added, then the child declares a dependency wait.
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="wait on wrong parent", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+        # Operator removes the mistaken edge — recompute must now release it.
+        kb.unlink_tasks(conn, parent_id=parent, child_id=child)
+        assert kb.get_task(conn, child).status == "ready", (
+            "unlinking the last parent after the wait must release the park"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Worker self-block with a rotated run-claim (t_e85f0abe Part B)
 # ---------------------------------------------------------------------------
