@@ -5883,6 +5883,68 @@ def test_reindex_lock_error_propagates_not_swallowed(tmp_path, monkeypatch):
     assert list(tmp_path.glob("*.rebuild.tmp")) == []
 
 
+def test_transient_lock_during_repair_releases_claim(tmp_path, monkeypatch):
+    """When the guard's self-heal hits a transient `database is locked`, it
+    re-raises AND releases the one-shot repair claim, so the next connect (after
+    the lock clears) re-attempts the heal instead of skipping to backup+refuse
+    and leaving a recoverable board down until restart."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+    resolved = str(db_path.resolve())
+    kb._REPAIR_ATTEMPTED_PATHS.discard(resolved)
+    kb._INITIALIZED_PATHS.discard(resolved)
+
+    def _boom(_path):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(kb, "_attempt_index_only_repair", _boom)
+
+    with pytest.raises(sqlite3.OperationalError):
+        kb._guard_existing_db_is_healthy(db_path)
+
+    # Claim released so a retry can re-attempt the repair.
+    with kb._REPAIR_ATTEMPT_LOCK:
+        assert resolved not in kb._REPAIR_ATTEMPTED_PATHS
+
+
+def test_dump_reload_lock_error_propagates(tmp_path, monkeypatch):
+    """A transient `database is locked` during the dump+reload fallback must
+    re-raise (not be swallowed by the broad DatabaseError->None handler that
+    would trigger backup+refuse of a recoverable board)."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+
+    real_connect = kb._sqlite_connect
+
+    class _LockOnIterdump:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a, **kw):
+            # Force REINDEX to fail structurally so we fall into dump+reload...
+            if sql.strip().upper().startswith("REINDEX"):
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return self._conn.execute(sql, *a, **kw)
+
+        def iterdump(self):
+            # ...then have the dump raise a transient lock.
+            raise sqlite3.OperationalError("database is locked")
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _wrapped(path, *a, **kw):
+        return _LockOnIterdump(real_connect(path, *a, **kw))
+
+    monkeypatch.setattr(kb, "_sqlite_connect", _wrapped)
+
+    with pytest.raises(sqlite3.OperationalError):
+        kb._attempt_index_only_repair(db_path)
+
+    # Rebuild temp must be cleaned up on the transient re-raise.
+    assert list(tmp_path.glob("*.rebuild.tmp")) == []
+
+
 def test_corrupt_clone_count_is_capped(tmp_path):
     """A live WAL DB mutates on every rw probe, so N concurrent opens fingerprint
     different bytes and each used to write a fresh multi-MB clone (the storm).

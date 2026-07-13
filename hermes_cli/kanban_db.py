@@ -1925,6 +1925,13 @@ def _attempt_index_only_repair(path: Path) -> Optional[str]:
                 dst.close()
         finally:
             src.close()
+    except sqlite3.OperationalError:
+        # Transient `database is locked`/busy during iterdump is contention, not
+        # corruption. Re-raise before the broad DatabaseError handler so the
+        # caller's transient-lock path fires instead of converting it to a
+        # backup+refuse (leaving a recoverable board down until a retry).
+        _cleanup_rebuild_artifacts(rebuilt)
+        raise
     except sqlite3.DatabaseError as exc:
         _log.warning("kanban .dump+reload rebuild failed for %s: %s", resolved, exc)
         _cleanup_rebuild_artifacts(rebuilt)
@@ -2044,6 +2051,11 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             strategy = _attempt_index_only_repair(resolved)
         except sqlite3.OperationalError:
             # Repair hit lock contention — treat as transient, not corruption.
+            # Release the one-shot claim so the next connect (after the lock
+            # clears) re-attempts the self-heal instead of skipping straight to
+            # backup+refuse and leaving a recoverable board down until restart.
+            with _REPAIR_ATTEMPT_LOCK:
+                _REPAIR_ATTEMPTED_PATHS.discard(str(resolved))
             raise
         if strategy is not None:
             try:
@@ -2060,6 +2072,10 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
                         _REPAIR_ATTEMPTED_PATHS.discard(str(resolved))
                     return
             except sqlite3.OperationalError:
+                # Post-repair verify hit transient contention — release the
+                # claim so a later connect can re-verify/re-heal.
+                with _REPAIR_ATTEMPT_LOCK:
+                    _REPAIR_ATTEMPTED_PATHS.discard(str(resolved))
                 raise
             except sqlite3.DatabaseError:
                 pass
