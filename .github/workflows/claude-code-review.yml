@@ -34,9 +34,15 @@ jobs:
 
   claude-review:
     needs: check-author
+    # Skip fork PRs: GitHub does not expose repo secrets to forked
+    # `pull_request` runs, so CLAUDE_CODE_OAUTH_TOKEN would be empty and the
+    # review would FAIL (red X) instead of cleanly skipping. Gate on the PR
+    # head living in this same repo so a false `if:` skips the job (neutral)
+    # rather than running it token-less.
     if: |
       needs.check-author.outputs.should_run == 'true' &&
-      github.event.pull_request.user.login != 'dependabot[bot]'
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     # Review-only: the reviewer reads code and posts a formal review + sticky
     # comment. It does NOT commit auto-fixes. hermes-agent is a framework with
