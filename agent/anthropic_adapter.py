@@ -1376,8 +1376,12 @@ def resolve_anthropic_token() -> Optional[str]:
     # record must not participate: otherwise a refreshable default-profile
     # credential would override the scoped ANTHROPIC_TOKEN (source #1/#2) or be
     # returned outright as source #3, authenticating as the wrong profile. Drop
-    # it to None when scoped so only the profile's own scoped secrets resolve.
-    if _current_secret_scope() is not None:
+    # it to None when scoped so it can't shadow the scoped env tokens, and skip
+    # the source-#3 Claude Code fallback entirely (that resolver re-reads the
+    # global file when handed None, so None alone doesn't suppress it) — only
+    # the profile's own scoped secrets resolve.
+    scope_active = _current_secret_scope() is not None
+    if scope_active:
         creds = None
 
     # 1. Hermes-managed OAuth/setup token env var
@@ -1396,10 +1400,14 @@ def resolve_anthropic_token() -> Optional[str]:
             return preferred
         return cc_token
 
-    # 3. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
-    if resolved_claude_token:
-        return resolved_claude_token
+    # 3. Claude Code credential file. Skipped entirely under an active scope:
+    # this reads the host's global default-profile ~/.claude record, which must
+    # not resolve for a multiplexed profile (passing creds=None here would just
+    # re-read that global file — see _resolve_claude_code_token_from_credentials).
+    if not scope_active:
+        resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
+        if resolved_claude_token:
+            return resolved_claude_token
 
     # 4. Hermes credential_pool OAuth entry.
     resolved_pool_token = _resolve_anthropic_pool_token()

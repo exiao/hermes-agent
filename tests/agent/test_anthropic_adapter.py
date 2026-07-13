@@ -675,6 +675,54 @@ class TestResolveAnthropicToken:
         # No scope → the global refreshable credential resolves as before.
         assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
 
+    def test_scoped_api_key_wins_over_global_creds_at_source_3_under_multiplexing(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression for the second Codex P1 on PR #99 (source-#3 gap): when a
+        scoped profile has NO ANTHROPIC_TOKEN / CLAUDE_CODE_OAUTH_TOKEN — only a
+        scoped ANTHROPIC_API_KEY — the global Claude Code credential must NOT be
+        returned at source #3.
+
+        Setting creds=None under scope does not suppress source #3 on its own,
+        because _resolve_claude_code_token_from_credentials(None) re-reads the
+        global ~/.claude file. The scoped turn must skip that fallback entirely
+        so the profile's own scoped API key (source #5) resolves instead of the
+        default profile's global Claude Code token.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        # Host default-profile refreshable Claude Code credential (global).
+        global_creds = {
+            "accessToken": "sk-ant-oat01-GLOBAL-DEFAULT",
+            "refreshToken": "refresh-default",
+            "expiresAt": 9999999999999,
+            "source": "file",
+        }
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: global_creds,
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+
+        # Requesting profile B has only a scoped API key (no OAuth token).
+        token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-PROFILE-B"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-api03-PROFILE-B"
+        finally:
+            ss.reset_secret_scope(token)
+
+        # No scope → the global Claude Code credential still resolves at source #3.
+        assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
+
 
 class TestRefreshOauthToken:
     def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
