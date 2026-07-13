@@ -1523,7 +1523,9 @@ def resolve_anthropic_token() -> Optional[str]:
         scope is not None
         and str(scope.get("ANTHROPIC_API_KEY", "") or "").strip()
     )
-    nondefault_scope = _scope_is_non_default_profile()
+    from agent.secret_scope import is_multiplex_active
+
+    nondefault_scope = _scope_is_non_default_profile() and is_multiplex_active()
     suppress_global_creds = nondefault_scope or scope_has_api_key
     if suppress_global_creds:
         creds = None

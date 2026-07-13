@@ -751,6 +751,7 @@ class TestResolveAnthropicToken:
         )
 
         # Requesting profile B carries its own scoped OAuth token.
+        ss.set_multiplex_active(True)
         token = ss.set_secret_scope(
             {"ANTHROPIC_TOKEN": "sk-ant-oat01-PROFILE-B"}
         )
@@ -758,6 +759,7 @@ class TestResolveAnthropicToken:
             assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-B"
         finally:
             ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
 
         # No scope → the global refreshable credential resolves as before.
         assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
@@ -803,6 +805,7 @@ class TestResolveAnthropicToken:
         )
 
         # Requesting profile B has only a scoped API key (no OAuth token).
+        ss.set_multiplex_active(True)
         token = ss.set_secret_scope(
             {"ANTHROPIC_API_KEY": "sk-ant-api03-PROFILE-B"}
         )
@@ -810,6 +813,7 @@ class TestResolveAnthropicToken:
             assert resolve_anthropic_token() == "sk-ant-api03-PROFILE-B"
         finally:
             ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
 
         # No scope → the global Claude Code credential still resolves at source #3.
         assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
@@ -928,6 +932,7 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr(
             "agent.anthropic_adapter._resolve_anthropic_pool_token", _pool_token
         )
+        ss.set_multiplex_active(True)
         scope_token = ss.set_secret_scope(
             {"ANTHROPIC_API_KEY": "sk-ant-api03-PROFILE-B"}
         )
@@ -935,6 +940,7 @@ class TestResolveAnthropicToken:
             assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-MANUAL"
         finally:
             ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
         assert calls == [True]
 
     def test_nondefault_scope_preserves_profile_local_hermes_pkce(
@@ -976,11 +982,13 @@ class TestResolveAnthropicToken:
         )
 
         home_token = set_hermes_home_override(str(profile))
+        ss.set_multiplex_active(True)
         scope_token = ss.set_secret_scope({})
         try:
             assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-PKCE"
         finally:
             ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
             reset_hermes_home_override(home_token)
 
     def test_nondefault_scope_honors_suppressed_profile_pkce(

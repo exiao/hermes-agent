@@ -3984,12 +3984,19 @@ class GatewaySlashCommandsMixin:
         credits_lines: list[str] = []
         if provider:
             try:
-                account_snapshot = await asyncio.to_thread(
-                    fetch_account_usage,
-                    provider,
-                    base_url=base_url,
-                    api_key=api_key,
-                )
+                # Slash commands run outside _run_agent's profile scope. Re-enter
+                # the source scope so account lookup uses the same credential as
+                # the session, including the default profile in multiplex mode.
+                from gateway.run import _profile_runtime_scope
+
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    account_snapshot = await asyncio.to_thread(
+                        fetch_account_usage,
+                        provider,
+                        base_url=base_url,
+                        api_key=api_key,
+                    )
             except Exception:
                 account_snapshot = None
             if account_snapshot:
