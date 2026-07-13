@@ -3321,19 +3321,24 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
     if dep_evt is None:
         # Not a dependency-wait — normal todo promotion applies.
         return False
-    # An 'unblocked' event AFTER the dependency_wait means an operator
-    # explicitly cleared it — stop parking and let the normal gate run. We do
-    # NOT treat a later 'promoted'/'claimed' as superseding: those are exactly
-    # the loop this guard exists to stop (a prior bad auto-promotion must not
-    # disable the guard on the next tick).
-    unblocked_after = conn.execute(
-        "SELECT 1 FROM task_events "
-        "WHERE task_id = ? AND id > ? AND kind = 'unblocked' LIMIT 1",
-        (task_id, dep_evt["id"]),
-    ).fetchone()
-    if unblocked_after:
-        return False
     dep_evt_id = dep_evt["id"]
+    # A superseding event AFTER the dependency_wait clears the park:
+    #   * 'unblocked' — an operator explicitly cleared it.
+    #   * 'completed'/'archived' — the task ITSELF finished and was later
+    #     re-run/re-activated. Without this, a stale dependency_wait from a
+    #     prior run (there is no 'unblocked' after a completion) would keep the
+    #     revived task parked forever.
+    # We deliberately do NOT treat a later 'promoted'/'claimed' as superseding:
+    # those are exactly the loop this guard exists to stop (a prior bad
+    # auto-promotion must not disable the guard on the next tick).
+    superseded_after = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND id > ? "
+        "AND kind IN ('unblocked', 'completed', 'archived') LIMIT 1",
+        (task_id, dep_evt_id),
+    ).fetchone()
+    if superseded_after:
+        return False
     # Does the task have any parent link at all? No parents → nothing to wait
     # on → park (the named dependency isn't a task_link).
     parent_ids = [
@@ -3346,19 +3351,46 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
     if not parent_ids:
         return True
     # Has any parent reached a terminal state AFTER the dependency_wait? That
-    # is the only signal that a real dependency resolved since the block.
-    for pid in parent_ids:
-        resolved_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND id > ? "
-            "AND kind IN ('completed', 'archived') LIMIT 1",
-            (pid, dep_evt_id),
+    # is the primary signal that a real dependency resolved since the block.
+    # One IN() query instead of a per-parent loop (fewer round-trips).
+    placeholders = ",".join("?" * len(parent_ids))
+    resolved_after = conn.execute(
+        f"SELECT 1 FROM task_events "
+        f"WHERE task_id IN ({placeholders}) AND id > ? "
+        f"AND kind IN ('completed', 'archived') LIMIT 1",
+        (*parent_ids, dep_evt_id),
+    ).fetchone()
+    if resolved_after:
+        return False
+    # Graph-repair recovery: if a parent LINK was added AFTER the wait and that
+    # parent is ALREADY terminal, no post-wait 'completed'/'archived' event will
+    # ever fire for it — so the query above can't see it. Accept a parent that
+    # was linked after the block (a deliberate `kanban link` fix) and is now
+    # done/archived as a genuine resolution; otherwise `kanban link`-ing an
+    # already-finished dependency would park the child forever.
+    linked_after = [
+        r["parent"]
+        for r in conn.execute(
+            "SELECT json_extract(payload, '$.parent') AS parent "
+            "FROM task_events "
+            "WHERE task_id = ? AND id > ? AND kind = 'linked'",
+            (task_id, dep_evt_id),
+        ).fetchall()
+        if r["parent"]
+    ]
+    if linked_after:
+        lp = ",".join("?" * len(linked_after))
+        parent_done = conn.execute(
+            f"SELECT 1 FROM tasks "
+            f"WHERE id IN ({lp}) AND status IN ('done', 'archived') LIMIT 1",
+            tuple(linked_after),
         ).fetchone()
-        if resolved_after:
+        if parent_done:
             return False
-    # Parents exist but none completed since the block (e.g. already-done
-    # parent, or parents still in flight). Park — promoting now would just
-    # re-run the worker that already declared itself dependency-blocked.
+    # Parents exist but none resolved since the block (e.g. already-done
+    # parent linked before the block, or parents still in flight). Park —
+    # promoting now would just re-run the worker that already declared itself
+    # dependency-blocked.
     return True
 
 
@@ -4924,12 +4956,7 @@ def block_task(
         # THIS task, snap the guard to the row's live ``current_run_id`` so the
         # block lands on the current run instead of falsely failing (which
         # would risk a protocol_violation exit for a well-behaved worker).
-        db_current_run = (
-            int(cur_row["current_run_id"])
-            if "current_run_id" in cur_row.keys()
-            and cur_row["current_run_id"] is not None
-            else None
-        )
+        db_current_run = cur_row["current_run_id"]
         if (
             expected_run_id is not None
             and cur_row["status"] == "running"
@@ -4943,6 +4970,19 @@ def block_task(
                 (int(expected_run_id), task_id),
             ).fetchone()
             if owns_a_run:
+                # Close the caller's now-superseded run before snapping the
+                # guard to the live run. Otherwise the block ends only
+                # ``db_current_run`` and the worker's original run stays
+                # ``running``/``ended_at IS NULL`` forever — a phantom active
+                # attempt in run history / dashboard active-run queries.
+                conn.execute(
+                    "UPDATE task_runs "
+                    "SET status = 'reclaimed', outcome = 'reclaimed', "
+                    "    ended_at = ?, claim_lock = NULL, "
+                    "    claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                    (int(time.time()), int(expected_run_id), task_id),
+                )
                 _append_event(
                     conn, task_id, "block_run_reconciled",
                     {

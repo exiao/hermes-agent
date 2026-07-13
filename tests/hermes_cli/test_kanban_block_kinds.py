@@ -257,9 +257,109 @@ def test_dependency_parent_completes_after_park_promotes(
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_dependency_rerun_after_completion_not_parked(kanban_home: Path) -> None:
+    """A stale dependency_wait from a PRIOR run must not park a task that has
+    since completed and been re-activated. The task's own 'completed' event
+    after the dependency_wait supersedes the parked state (there is no
+    'unblocked' after a completion), otherwise the revived task parks forever.
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        # First life: worker declares a dependency wait (no parent) → parks.
+        kb.block_task(conn, tid, reason="wait", kind="dependency")
+        assert kb.get_task(conn, tid).status == "todo"
+        # Task is then driven to completion (e.g. operator promote + finish).
+        ok, _ = kb.promote_task(conn, tid, actor="operator", force=True)
+        assert ok
+        kb.claim_task(conn, tid, claimer="worker")
+        kb.complete_task(conn, tid, result="done")
+        assert kb.get_task(conn, tid).status == "done"
+        # Second life: re-activate the finished task back into todo and run the
+        # gate. The stale dependency_wait must NOT re-park it.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+        for _ in range(5):
+            kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "ready", (
+            "a completed-then-reactivated task must not be re-parked by a "
+            "stale dependency_wait from its previous run"
+        )
+
+
+def test_dependency_link_done_parent_recovers(kanban_home: Path) -> None:
+    """Graph repair: a parked wait with no parent recovers when an
+    ALREADY-done parent is linked AFTER the block via `kanban link`. No new
+    'completed' event fires for the finished parent, so the recovery must key
+    off the post-wait 'linked' event + the parent's current terminal status.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        # Finish the parent BEFORE it is ever linked.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="done")
+        # Child declares a dependency wait with NO parent link → parks.
+        kb.block_task(conn, child, reason="wait on parent", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+        # Operator repairs the graph by linking the already-done parent.
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready", (
+            "linking an already-done parent after the wait must resolve it"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Worker self-block with a rotated run-claim (t_e85f0abe Part B)
 # ---------------------------------------------------------------------------
+
+
+def test_self_block_reconcile_closes_stale_run(kanban_home: Path) -> None:
+    """When the run-claim rotated, reconciling the block to the live run must
+    also CLOSE the worker's superseded run so it doesn't linger as a phantom
+    running/ended_at-NULL attempt.
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        live_run = kb.get_task(conn, tid).current_run_id
+        assert live_run is not None
+        # Rotate the claim: a new run row becomes current, worker holds the old.
+        with kb.write_txn(conn):
+            cur = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                "VALUES (?, 'worker', 'running', 0)",
+                (tid,),
+            )
+            rotated_run = cur.lastrowid
+            conn.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                (rotated_run, tid),
+            )
+        assert kb.block_task(
+            conn, tid, reason="need creds", kind="needs_input",
+            expected_run_id=live_run,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        # The worker's old run must no longer be an open running row.
+        old = conn.execute(
+            "SELECT status, ended_at FROM task_runs WHERE id = ?",
+            (live_run,),
+        ).fetchone()
+        assert old["ended_at"] is not None, "stale worker run must be closed"
+        assert old["status"] != "running", (
+            "reconciled stale run must not remain 'running'"
+        )
+        # No phantom running row with ended_at IS NULL should survive.
+        phantom = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_runs "
+            "WHERE task_id = ? AND status = 'running' AND ended_at IS NULL",
+            (tid,),
+        ).fetchone()
+        assert phantom["n"] == 0, "no phantom active run should remain"
 
 
 def test_self_block_with_stale_expected_run_id(kanban_home: Path) -> None:
