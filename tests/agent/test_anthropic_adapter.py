@@ -908,6 +908,35 @@ class TestResolveAnthropicToken:
             ss.reset_secret_scope(scope_token)
             reset_hermes_home_override(home_token)
 
+    def test_nondefault_scope_prefers_local_manual_pool_to_scoped_api_key(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+        calls = []
+
+        def _pool_token(*, profile_only=False):
+            calls.append(profile_only)
+            return "sk-ant-oat01-PROFILE-MANUAL"
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", _pool_token
+        )
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-PROFILE-B"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-MANUAL"
+        finally:
+            ss.reset_secret_scope(scope_token)
+        assert calls == [True]
+
     def test_nondefault_scope_preserves_profile_local_hermes_pkce(
         self, monkeypatch, tmp_path
     ):

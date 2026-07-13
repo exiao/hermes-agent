@@ -1523,7 +1523,8 @@ def resolve_anthropic_token() -> Optional[str]:
         scope is not None
         and str(scope.get("ANTHROPIC_API_KEY", "") or "").strip()
     )
-    suppress_global_creds = _scope_is_non_default_profile() or scope_has_api_key
+    nondefault_scope = _scope_is_non_default_profile()
+    suppress_global_creds = nondefault_scope or scope_has_api_key
     if suppress_global_creds:
         creds = None
 
@@ -1553,10 +1554,11 @@ def resolve_anthropic_token() -> Optional[str]:
         if resolved_claude_token:
             return resolved_claude_token
 
-    # 4. Hermes credential_pool OAuth entry. A non-default multiplexed
-    # profile may use its own local pool, but must never borrow the root pool.
+    # 4. Hermes credential_pool OAuth entry. A scoped request must use only
+    # its local pool, but valid manual OAuth entries retain their documented
+    # precedence over a scoped ANTHROPIC_API_KEY.
     resolved_pool_token = None
-    if not scope_has_anthropic_secret:
+    if not scope_has_api_key or nondefault_scope:
         resolved_pool_token = _resolve_anthropic_pool_token(
             profile_only=suppress_global_creds
         )
