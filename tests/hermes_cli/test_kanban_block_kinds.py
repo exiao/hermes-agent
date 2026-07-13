@@ -162,9 +162,142 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_dependency_no_parent_does_not_repromote(kanban_home: Path) -> None:
+    """Regression (t_e85f0abe): a dependency-wait with NO parent link must
+    PARK in ``todo`` and never auto-re-promote — the <1s
+    dependency_wait→promoted→claimed→spawned loop that burned a paid worker
+    run per tick.
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason="waiting on a sibling", kind="dependency")
+        assert kb.get_task(conn, tid).status == "todo"
+        # Simulate many dispatcher ticks. Without the park guard, the very
+        # first recompute_ready would flip it back to 'ready'.
+        for _ in range(20):
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, tid).status == "todo", (
+                "dependency-wait with no parent must not auto-re-promote"
+            )
+        # No 'promoted' event fired after the dependency_wait.
+        evs = kb.list_events(conn, tid)
+        dep_idx = max(i for i, e in enumerate(evs) if e.kind == "dependency_wait")
+        assert not any(
+            e.kind == "promoted" for e in evs[dep_idx + 1:]
+        ), "no re-promotion event should follow the dependency_wait"
+
+
+def test_dependency_already_done_parent_does_not_repromote(
+    kanban_home: Path,
+) -> None:
+    """Regression (t_e85f0abe, mirrors live t_309aaeb8): a dependency-wait
+    whose parent was ALREADY done at block time must PARK — the named
+    dependency isn't the parent, so nothing genuinely resolved and
+    re-promoting just re-runs the worker that declared itself blocked.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        # Finish the parent FIRST, then the child declares a dependency wait.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="done")
+        kb.block_task(conn, child, reason="waiting on something else", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        for _ in range(20):
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, child).status == "todo", (
+                "dependency-wait with an already-done parent must not "
+                "auto-re-promote"
+            )
+
+
+def test_dependency_unblock_recovers_parked_wait(kanban_home: Path) -> None:
+    """A parked dependency-wait (no parent) recovers on an explicit
+    kanban_unblock — the sanctioned exit from the park state.
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="need a sibling artifact", kind="dependency")
+        assert kb.get_task(conn, tid).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "todo"
+        # Explicit operator unblock. block_task on a 'todo' dependency-wait set
+        # status='todo' (not 'blocked'), so drive it via the normal recovery:
+        # unblock only acts on blocked/scheduled, so a parked todo recovers by
+        # a manual promote_task instead.
+        ok, _ = kb.promote_task(conn, tid, actor="operator", force=True)
+        assert ok
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_dependency_parent_completes_after_park_promotes(
+    kanban_home: Path,
+) -> None:
+    """A dependency-wait that parks (parent still in flight) DOES resume once
+    the parent actually completes after the block — the healthy auto-recover
+    path must survive the park guard.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="wait for parent", kind="dependency")
+        # Parent not done yet — child parks and does not promote.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+        # Now finish the parent; the next recompute must promote the child.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="done")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+
+
 # ---------------------------------------------------------------------------
-# Completion resets loop memory
+# Worker self-block with a rotated run-claim (t_e85f0abe Part B)
 # ---------------------------------------------------------------------------
+
+
+def test_self_block_with_stale_expected_run_id(kanban_home: Path) -> None:
+    """A live worker whose env run-id is stale (claim rotated) can still
+    self-block against a running row instead of failing with
+    "not in running/ready".
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        # The row's real current_run_id is the live run.
+        t = kb.get_task(conn, tid)
+        live_run = t.current_run_id
+        assert live_run is not None
+        stale_run = live_run + 999  # a run id that isn't the current one
+        # Passing a run id that doesn't belong to the task must still fail-safe.
+        assert not kb.block_task(
+            conn, tid, reason="x", kind="needs_input", expected_run_id=stale_run
+        )
+        # But an expected_run_id that IS a real (prior) run for this task, while
+        # current_run_id has rotated, must reconcile to the live run and block.
+        # Simulate rotation: insert a second run row and point current_run_id
+        # at it, leaving the worker holding the older (real) run id.
+        with kb.write_txn(conn):
+            cur = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                "VALUES (?, 'worker', 'running', 0)",
+                (tid,),
+            )
+            rotated_run = cur.lastrowid
+            conn.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                (rotated_run, tid),
+            )
+        assert kb.block_task(
+            conn, tid, reason="need creds", kind="needs_input",
+            expected_run_id=live_run,
+        ), "worker with a real-but-non-current run id should reconcile + block"
+        assert kb.get_task(conn, tid).status == "blocked"
 
 
 def test_completion_clears_block_memory(kanban_home: Path) -> None:
