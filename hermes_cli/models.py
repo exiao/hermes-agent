@@ -2728,6 +2728,39 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
         pass
 
 
+def _scoped_anthropic_pool_token() -> str:
+    """Return a token persisted in the active profile's auth store only."""
+    try:
+        from agent.credential_pool import (
+            PooledCredential,
+            STATUS_DEAD,
+            _exhausted_until,
+        )
+        import time
+        from hermes_cli.auth import _load_auth_store
+
+        raw_pool = _load_auth_store().get("credential_pool")
+        entries = raw_pool.get("anthropic", []) if isinstance(raw_pool, dict) else []
+        if not isinstance(entries, list):
+            return ""
+        now = time.time()
+        for raw_entry in entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = PooledCredential.from_dict("anthropic", raw_entry)
+            if entry.last_status == STATUS_DEAD:
+                continue
+            exhausted_until = _exhausted_until(entry)
+            if exhausted_until is not None and exhausted_until > now:
+                continue
+            token = str(entry.access_token or "").strip()
+            if token:
+                return token
+    except Exception:
+        pass
+    return ""
+
+
 def _fetch_anthropic_models(
     timeout: float = 5.0,
     *,
@@ -2742,10 +2775,26 @@ def _fetch_anthropic_models(
     """
     try:
         from agent.anthropic_adapter import resolve_anthropic_token, _is_oauth_token
+        from agent.secret_scope import current_secret_scope, get_secret
     except ImportError:
         return None
 
-    token = (api_key or "").strip() or resolve_anthropic_token()
+    active_scope = current_secret_scope()
+    scoped_token = ""
+    if active_scope is not None:
+        for secret_name in (
+            "ANTHROPIC_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ):
+            scoped_token = str(get_secret(secret_name, "") or "").strip()
+            if scoped_token:
+                break
+        if not scoped_token:
+            scoped_token = _scoped_anthropic_pool_token()
+    token = (api_key or "").strip() or (
+        scoped_token if active_scope is not None else resolve_anthropic_token()
+    )
     if not token:
         return None
 
@@ -3739,9 +3788,18 @@ def fetch_ollama_cloud_models(
 
     # 2. Live API probe
     if not api_key:
-        api_key = os.getenv("OLLAMA_API_KEY", "")
+        try:
+            from agent.secret_scope import get_secret
+            api_key = get_secret("OLLAMA_API_KEY", "") or ""
+        except ImportError:
+            api_key = os.getenv("OLLAMA_API_KEY", "")
     if not base_url:
-        base_url = os.getenv("OLLAMA_BASE_URL", "") or "https://ollama.com/v1"
+        try:
+            from agent.secret_scope import get_secret
+            base_url = get_secret("OLLAMA_BASE_URL", "") or ""
+        except ImportError:
+            base_url = os.getenv("OLLAMA_BASE_URL", "")
+        base_url = base_url or "https://ollama.com/v1"
 
     live_models: list[str] = []
     if api_key:
