@@ -639,12 +639,18 @@ class BitwardenSource(SecretSource):
             },
         }
 
-    def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
+    def fetch(
+        self,
+        cfg: dict,
+        home_path: Path,
+        environ: Optional[Dict[str, str]] = None,
+    ) -> FetchResult:
         cfg = cfg if isinstance(cfg, dict) else {}
+        env = os.environ if environ is None else environ
         result = FetchResult()
 
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
-        access_token = os.environ.get(access_token_env, "").strip()
+        access_token = env.get(access_token_env, "").strip()
         if not access_token:
             result.error = (
                 f"secrets.bitwarden.enabled is true but {access_token_env} is "

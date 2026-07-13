@@ -623,8 +623,14 @@ class OnePasswordSource(SecretSource):
             },
         }
 
-    def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
+    def fetch(
+        self,
+        cfg: dict,
+        home_path: Path,
+        environ: Optional[Dict[str, str]] = None,
+    ) -> FetchResult:
         cfg = cfg if isinstance(cfg, dict) else {}
+        env = os.environ if environ is None else environ
         result = FetchResult()
 
         env_map = cfg.get("env")
@@ -672,6 +678,11 @@ class OnePasswordSource(SecretSource):
                 token_env=str(
                     cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV
                 ),
+                token_value=env.get(
+                    str(cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV), ""
+                ),
+                include_process_auth=environ is None,
+                auth_env=env,
                 binary=binary,
                 cache_ttl_seconds=ttl,
                 home_path=home_path,

@@ -28,6 +28,7 @@ third-party backends ship as standalone plugin repos implementing
 from __future__ import annotations
 
 import concurrent.futures
+import inspect
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -188,7 +189,10 @@ def _reset_registry_for_tests() -> None:
 
 
 def _fetch_with_timeout(
-    source: SecretSource, cfg: dict, home_path: Path
+    source: SecretSource,
+    cfg: dict,
+    home_path: Path,
+    environ: Optional[Dict[str, str]] = None,
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
 
@@ -203,7 +207,11 @@ def _fetch_with_timeout(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
     try:
-        future = executor.submit(source.fetch, cfg, home_path)
+        fetch_params = inspect.signature(source.fetch).parameters
+        if "environ" in fetch_params:
+            future = executor.submit(source.fetch, cfg, home_path, environ=environ)
+        else:
+            future = executor.submit(source.fetch, cfg, home_path)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -313,7 +321,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path)
+        result = _fetch_with_timeout(source, cfg, home_path, env)
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):

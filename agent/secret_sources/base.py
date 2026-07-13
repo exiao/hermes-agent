@@ -141,8 +141,17 @@ class SecretSource(ABC):
     # -- required ----------------------------------------------------------
 
     @abstractmethod
-    def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
+    def fetch(
+        self,
+        cfg: dict,
+        home_path: Path,
+        environ: Optional[Dict[str, str]] = None,
+    ) -> FetchResult:
         """Resolve this source's secrets. MUST NOT raise or prompt.
+
+        ``environ`` is the caller's credential environment. Sources must use it
+        instead of process globals when supplied, so multiplexed profiles cannot
+        borrow another profile's secret-source auth.
 
         ``cfg`` is the source's raw config section (``secrets.<name>``)
         from config.yaml — treat every field defensively, the section

@@ -210,8 +210,23 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     """
     home = Path(hermes_home)
     secrets = load_env_file(home / ".env")
+
+    # Secret sources normally populate os.environ. Resolve them into this
+    # isolated mapping instead so a multiplexed scope can remain authoritative.
+    try:
+        from hermes_cli.env_loader import _load_secrets_config
+        from agent.secret_sources.registry import apply_all
+
+        sources_cfg = _load_secrets_config(home)
+        source_values = dict(secrets)
+        apply_all(sources_cfg, home, environ=source_values)
+        secrets = source_values
+    except Exception:
+        pass
+
     raw_op_refs = {
-        name: value for name, value in secrets.items()
+        name: value
+        for name, value in secrets.items()
         if isinstance(value, str) and value.strip().startswith("op://")
     }
 
