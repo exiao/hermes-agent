@@ -3279,6 +3279,89 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when a ``dependency``-blocked ``todo`` task must PARK
+    rather than be auto-promoted by :func:`recompute_ready` (t_e85f0abe).
+
+    A worker that calls ``kanban_block(kind="dependency")`` lands in ``todo``
+    (not ``blocked``) so the normal parent-gating can auto-resume it once a
+    parent finishes. But ``recompute_ready`` promotes any ``todo`` whose
+    parents are all done — and ``all([])`` is True. So a dependency-wait that
+
+      * has NO parent link at all, or
+      * has parents that were ALREADY terminal at block time (nothing changed
+        since the worker declared itself blocked),
+
+    gets re-promoted within the same dispatcher tick, re-claimed within ~1s,
+    and respawned forever — burning a paid worker run per tick with zero
+    progress (observed on t_309aaeb8: dependency_wait→promoted→claimed→spawned
+    all in one second, repeatedly). The named dependency in those cases is not
+    wired as a task_link, so there is nothing for the parent-gate to actually
+    wait on.
+
+    The gate: a dependency-wait is auto-promotable ONLY when a genuine
+    dependency resolved SINCE the block — i.e. the task has ≥1 parent link AND
+    at least one parent reached a terminal state (``completed``/``archived``
+    event) AFTER the most recent ``dependency_wait`` event. Otherwise it parks
+    in ``todo`` until an explicit ``kanban_unblock`` (which clears
+    ``block_kind`` handling via the ``unblocked`` event path). This breaks the
+    loop without touching the healthy "child waits on a real parent, parent
+    finishes, child resumes" path.
+
+    Returns True  → park (skip promotion this tick).
+    Returns False → not a dependency-wait, or a real dependency resolved; let
+    the normal parent-gate decide.
+    """
+    dep_evt = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'dependency_wait' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if dep_evt is None:
+        # Not a dependency-wait — normal todo promotion applies.
+        return False
+    # An 'unblocked' event AFTER the dependency_wait means an operator
+    # explicitly cleared it — stop parking and let the normal gate run. We do
+    # NOT treat a later 'promoted'/'claimed' as superseding: those are exactly
+    # the loop this guard exists to stop (a prior bad auto-promotion must not
+    # disable the guard on the next tick).
+    unblocked_after = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND id > ? AND kind = 'unblocked' LIMIT 1",
+        (task_id, dep_evt["id"]),
+    ).fetchone()
+    if unblocked_after:
+        return False
+    dep_evt_id = dep_evt["id"]
+    # Does the task have any parent link at all? No parents → nothing to wait
+    # on → park (the named dependency isn't a task_link).
+    parent_ids = [
+        r["parent_id"]
+        for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?",
+            (task_id,),
+        ).fetchall()
+    ]
+    if not parent_ids:
+        return True
+    # Has any parent reached a terminal state AFTER the dependency_wait? That
+    # is the only signal that a real dependency resolved since the block.
+    for pid in parent_ids:
+        resolved_after = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND id > ? "
+            "AND kind IN ('completed', 'archived') LIMIT 1",
+            (pid, dep_evt_id),
+        ).fetchone()
+        if resolved_after:
+            return False
+    # Parents exist but none completed since the block (e.g. already-done
+    # parent, or parents still in flight). Park — promoting now would just
+    # re-run the worker that already declared itself dependency-blocked.
+    return True
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -3326,6 +3409,16 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
+                continue
+            if cur_status == "todo" and _dependency_wait_should_park(
+                conn, task_id
+            ):
+                # Dependency-wait with nothing genuinely resolving since the
+                # block (no parent link, or no parent completed after it).
+                # Auto-promoting here re-runs the worker that just declared
+                # itself blocked, producing the <1s dependency_wait→promoted
+                # →claimed→spawned loop (t_e85f0abe). Park until an explicit
+                # kanban_unblock or a real parent dependency resolves.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -4805,7 +4898,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -4817,6 +4911,46 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+
+        # Reconcile a stale/rotated run-claim so a live worker can self-block
+        # (t_e85f0abe). The worker passes ``expected_run_id`` from its env
+        # (``HERMES_KANBAN_RUN_ID``), pinned at spawn. If the dispatcher
+        # rotated the claim (reclaim → re-promote → re-claim opened a NEW run)
+        # while this process is still alive, the row's ``current_run_id`` no
+        # longer equals the worker's env value, so the strict
+        # ``AND current_run_id = ?`` guard misses and the block fails with
+        # "not in running/ready" even though the row IS running. When the row
+        # is running and the caller's ``expected_run_id`` is a real run row for
+        # THIS task, snap the guard to the row's live ``current_run_id`` so the
+        # block lands on the current run instead of falsely failing (which
+        # would risk a protocol_violation exit for a well-behaved worker).
+        db_current_run = (
+            int(cur_row["current_run_id"])
+            if "current_run_id" in cur_row.keys()
+            and cur_row["current_run_id"] is not None
+            else None
+        )
+        if (
+            expected_run_id is not None
+            and cur_row["status"] == "running"
+            and db_current_run is not None
+            and int(expected_run_id) != db_current_run
+        ):
+            owns_a_run = conn.execute(
+                "SELECT 1 FROM task_runs "
+                "WHERE id = ? AND task_id = ? "
+                "AND status = 'running' AND ended_at IS NULL LIMIT 1",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if owns_a_run:
+                _append_event(
+                    conn, task_id, "block_run_reconciled",
+                    {
+                        "worker_run_id": int(expected_run_id),
+                        "current_run_id": db_current_run,
+                    },
+                )
+                expected_run_id = db_current_run
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
