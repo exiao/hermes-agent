@@ -874,6 +874,54 @@ class TestResolveAnthropicToken:
             ss.reset_secret_scope(scope_token)
             reset_hermes_home_override(home_token)
 
+    def test_nondefault_scope_honors_suppressed_profile_pkce(
+        self, monkeypatch, tmp_path
+    ):
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        (profile / ".anthropic_oauth.json").write_text(
+            json.dumps(
+                {
+                    "accessToken": "sk-ant-oat01-SUPPRESSED-PKCE",
+                    "refreshToken": "refresh-suppressed",
+                    "expiresAt": 9999999999999,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (profile / "auth.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "providers": {},
+                    "suppressed_sources": {"anthropic": ["hermes_pkce"]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        scope_token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() is None
+        finally:
+            ss.reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+
     def test_default_profile_scope_still_resolves_global_claude_code_creds(
         self, monkeypatch, tmp_path
     ):

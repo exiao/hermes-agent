@@ -1367,9 +1367,10 @@ def _resolve_anthropic_pool_token(*, profile_only: bool = False) -> Optional[str
             # for ordinary workers but crosses the boundary of a multiplexed
             # request. Avoid its singleton/env seeding too: token resolution is a
             # read and must not persist borrowed credentials as a side effect.
-            from hermes_cli.auth import _load_auth_store
+            from hermes_cli.auth import _load_auth_store, is_source_suppressed
 
             auth_store = _load_auth_store()
+            pkce_suppressed = is_source_suppressed("anthropic", "hermes_pkce")
             raw_pool = auth_store.get("credential_pool")
             raw_entries = (
                 raw_pool.get("anthropic", []) if isinstance(raw_pool, dict) else []
@@ -1383,6 +1384,10 @@ def _resolve_anthropic_pool_token(*, profile_only: bool = False) -> Optional[str
                 # sync an exhausted entry from that global file and persist the
                 # default profile's token. Never admit it on this isolated path.
                 and str(payload.get("source") or "") != "claude_code"
+                and not (
+                    pkce_suppressed
+                    and str(payload.get("source") or "") == "hermes_pkce"
+                )
             ]
             profile_api_key_explicit = bool(
                 (_get_secret("ANTHROPIC_API_KEY", "") or "").strip()
@@ -1393,7 +1398,10 @@ def _resolve_anthropic_pool_token(*, profile_only: bool = False) -> Optional[str
                 entries = [
                     entry for entry in entries if entry.source != "hermes_pkce"
                 ]
-            elif not any(entry.source == "hermes_pkce" for entry in entries):
+            elif (
+                not pkce_suppressed
+                and not any(entry.source == "hermes_pkce" for entry in entries)
+            ):
                 # The dashboard writes this profile-local file before its
                 # best-effort pool insert. Preserve that valid intermediate
                 # state without running load_pool() and its global seeders.
