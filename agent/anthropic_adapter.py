@@ -1336,8 +1336,13 @@ def _scope_is_non_default_profile() -> bool:
         return False
 
 
-def _resolve_anthropic_pool_token() -> Optional[str]:
+def _resolve_anthropic_pool_token(*, profile_only: bool = False) -> Optional[str]:
     """Return the first available Anthropic OAuth token from credential_pool.
+
+    ``profile_only`` bypasses the root-pool fallback used by ordinary named
+    profiles. A multiplexed request already carries an authoritative profile
+    secret scope, so borrowing the root profile's OAuth token there would cross
+    the isolation boundary and could shadow the requesting profile's API key.
 
     Read-only: enumerates with ``clear_expired=False, refresh=False`` so a bare
     token *resolve* (which runs from diagnostic/read-only call sites such as
@@ -1346,12 +1351,72 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     path's pool recovery, not the resolver.
     """
     try:
-        from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
+        from agent.credential_pool import (
+            AUTH_TYPE_OAUTH,
+            CredentialPool,
+            PooledCredential,
+            load_pool,
+        )
     except Exception:
         return None
 
     try:
-        pool = load_pool("anthropic")
+        if profile_only:
+            # Read the active profile's pool directly. ``load_pool`` goes through
+            # read_credential_pool(), whose deliberate root fallback is correct
+            # for ordinary workers but crosses the boundary of a multiplexed
+            # request. Avoid its singleton/env seeding too: token resolution is a
+            # read and must not persist borrowed credentials as a side effect.
+            from hermes_cli.auth import _load_auth_store
+
+            auth_store = _load_auth_store()
+            raw_pool = auth_store.get("credential_pool")
+            raw_entries = (
+                raw_pool.get("anthropic", []) if isinstance(raw_pool, dict) else []
+            )
+            entries = [
+                PooledCredential.from_dict("anthropic", payload)
+                for payload in raw_entries
+                if isinstance(payload, dict)
+                # ``claude_code`` is a singleton backed by host-global ~/.claude.
+                # Even when copied into a named profile pool, CredentialPool can
+                # sync an exhausted entry from that global file and persist the
+                # default profile's token. Never admit it on this isolated path.
+                and str(payload.get("source") or "") != "claude_code"
+            ]
+            profile_api_key_explicit = bool(
+                (_get_secret("ANTHROPIC_API_KEY", "") or "").strip()
+            )
+            if profile_api_key_explicit:
+                # Match load_pool(): an explicit API-key setup suppresses stale
+                # auto-seeded OAuth singletons, while manual pool entries remain.
+                entries = [
+                    entry for entry in entries if entry.source != "hermes_pkce"
+                ]
+            elif not any(entry.source == "hermes_pkce" for entry in entries):
+                # The dashboard writes this profile-local file before its
+                # best-effort pool insert. Preserve that valid intermediate
+                # state without running load_pool() and its global seeders.
+                local_oauth = read_hermes_oauth_credentials()
+                if local_oauth and local_oauth.get("accessToken"):
+                    entries.append(
+                        PooledCredential.from_dict(
+                            "anthropic",
+                            {
+                                "id": "hermes_pkce",
+                                "label": "Hermes PKCE",
+                                "auth_type": AUTH_TYPE_OAUTH,
+                                "priority": len(entries),
+                                "source": "hermes_pkce",
+                                "access_token": local_oauth.get("accessToken", ""),
+                                "refresh_token": local_oauth.get("refreshToken"),
+                                "expires_at_ms": local_oauth.get("expiresAt"),
+                            },
+                        )
+                    )
+            pool = CredentialPool("anthropic", entries)
+        else:
+            pool = load_pool("anthropic")
         # Enumerate read-only (clear_expired=False, refresh=False): never persist
         # to auth.json or trigger a network refresh from a bare resolve. select()
         # is deliberately NOT used — it runs clear_expired=True, refresh=True,
@@ -1440,8 +1505,11 @@ def resolve_anthropic_token() -> Optional[str]:
         if resolved_claude_token:
             return resolved_claude_token
 
-    # 4. Hermes credential_pool OAuth entry.
-    resolved_pool_token = _resolve_anthropic_pool_token()
+    # 4. Hermes credential_pool OAuth entry. A non-default multiplexed
+    # profile may use its own local pool, but must never borrow the root pool.
+    resolved_pool_token = _resolve_anthropic_pool_token(
+        profile_only=suppress_global_creds
+    )
     if resolved_pool_token:
         return resolved_pool_token
 

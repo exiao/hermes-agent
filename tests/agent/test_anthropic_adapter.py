@@ -734,6 +734,146 @@ class TestResolveAnthropicToken:
         # No scope → the global Claude Code credential still resolves at source #3.
         assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
 
+    def test_nondefault_scope_does_not_borrow_global_pool_before_scoped_api_key(
+        self, monkeypatch, tmp_path
+    ):
+        """A named profile's scoped API key must beat the root pool fallback.
+
+        ``read_credential_pool`` deliberately borrows root entries when a profile
+        has no local entries. That sharing is useful for ordinary profile workers,
+        but unsafe inside a multiplexed request whose secret scope belongs to a
+        different profile: the borrowed OAuth token would shadow source #5.
+        """
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / ".hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        (root / "auth.json").write_text(
+            json.dumps(
+                {
+                    "credential_pool": {
+                        "anthropic": [
+                            {
+                                "id": "root-oauth",
+                                "label": "root-oauth",
+                                "auth_type": "oauth",
+                                "priority": 0,
+                                "source": "manual",
+                                "access_token": "sk-ant-oat01-GLOBAL-POOL",
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (profile / "auth.json").write_text(
+            json.dumps(
+                {
+                    "credential_pool": {
+                        "anthropic": [
+                            {
+                                "id": "profile-claude",
+                                "label": "profile-claude",
+                                "auth_type": "oauth",
+                                "priority": 0,
+                                "source": "claude_code",
+                                "access_token": "sk-ant-oat01-STALE-PROFILE",
+                                "last_status": "dead",
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (profile / ".anthropic_oauth.json").write_text(
+            json.dumps(
+                {
+                    "accessToken": "sk-ant-oat01-STALE-PKCE",
+                    "refreshToken": "refresh-stale",
+                    "expiresAt": 9999999999999,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "sk-ant-oat01-GLOBAL-CLAUDE",
+                "refreshToken": "refresh-global",
+                "expiresAt": 9999999999999,
+            },
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-PROFILE-B"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-api03-PROFILE-B"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+
+    def test_nondefault_scope_preserves_profile_local_hermes_pkce(
+        self, monkeypatch, tmp_path
+    ):
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        (profile / ".anthropic_oauth.json").write_text(
+            json.dumps(
+                {
+                    "accessToken": "sk-ant-oat01-PROFILE-PKCE",
+                    "refreshToken": "refresh-profile",
+                    "expiresAt": 9999999999999,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "sk-ant-oat01-GLOBAL-CLAUDE",
+                "refreshToken": "refresh-global",
+                "expiresAt": 9999999999999,
+            },
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        scope_token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-PKCE"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+
     def test_default_profile_scope_still_resolves_global_claude_code_creds(
         self, monkeypatch, tmp_path
     ):
