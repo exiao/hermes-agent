@@ -2155,7 +2155,9 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         from agent.secret_scope import current_secret_scope as _current_scope
 
         scoped = _current_scope() is not None
-        env_val = "" if scoped else os.environ.get(key, "").strip()
+        if scoped:
+            return (_get_secret(key, "") or "").strip()
+        env_val = os.environ.get(key, "").strip()
         # If .env contains an unresolved op:// reference, prefer the
         # already-resolved value from os.environ (set by
         # load_hermes_dotenv() -> apply_onepassword_secrets()).  The raw

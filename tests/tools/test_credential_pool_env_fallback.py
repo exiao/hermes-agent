@@ -125,6 +125,50 @@ class TestCredentialPoolSeedsFromDotEnv:
         assert len(seeded) == 1
         assert seeded[0].access_token == "sk-dotenv-fresh"
 
+    def test_scoped_plaintext_dotenv_prefers_resolved_secret(
+        self, isolated_hermes_home
+    ):
+        _write_env_file(
+            isolated_hermes_home,
+            DEEPSEEK_API_KEY="sk-stale-plaintext",
+        )
+        from agent import secret_scope as ss
+        from agent.credential_pool import _seed_from_env
+
+        token = ss.set_secret_scope(
+            {"DEEPSEEK_API_KEY": "sk-profile-resolved-deepseek"}
+        )
+        try:
+            entries = []
+            changed, _ = _seed_from_env("deepseek", entries)
+        finally:
+            ss.reset_secret_scope(token)
+
+        assert changed is True
+        assert len(entries) == 1
+        assert entries[0].access_token == "sk-profile-resolved-deepseek"
+
+    def test_scoped_secret_miss_does_not_resurrect_plaintext_dotenv(
+        self, isolated_hermes_home
+    ):
+        _write_env_file(
+            isolated_hermes_home,
+            DEEPSEEK_API_KEY="sk-stale-plaintext",
+        )
+        from agent import secret_scope as ss
+        from agent.credential_pool import _seed_from_env
+
+        token = ss.set_secret_scope({})
+        try:
+            entries = []
+            changed, active = _seed_from_env("deepseek", entries)
+        finally:
+            ss.reset_secret_scope(token)
+
+        assert changed is False
+        assert entries == []
+        assert active == set()
+
     def test_scoped_op_reference_seeds_resolved_value(
         self, isolated_hermes_home
     ):
