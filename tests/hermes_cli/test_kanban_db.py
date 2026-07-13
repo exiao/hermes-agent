@@ -5945,6 +5945,57 @@ def test_dump_reload_lock_error_propagates(tmp_path, monkeypatch):
     assert list(tmp_path.glob("*.rebuild.tmp")) == []
 
 
+def test_repair_quiesces_writers_before_swap(tmp_path, monkeypatch):
+    """The dump+reload repair must acquire an exclusive lock before swapping.
+    A concurrent connection holding a write lock makes the repair re-raise a
+    transient OperationalError (retry later) rather than publishing a rebuilt
+    DB that could drop the other writer's committed rows."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+
+    # Keep the repair's BEGIN EXCLUSIVE from waiting the full default 120s on the
+    # blocker — fail fast so the test is quick and deterministic.
+    monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "200")
+
+    # Hold an exclusive write transaction open on the board from another
+    # connection for the duration of the repair attempt.
+    blocker = sqlite3.connect(str(db_path), isolation_level=None, timeout=0.2)
+    blocker.execute("PRAGMA busy_timeout=200")
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(sqlite3.OperationalError):
+            kb._attempt_index_only_repair(db_path)
+        # Nothing was published: no rebuild temp lingering, original untouched.
+        assert list(tmp_path.glob("*.rebuild.tmp")) == []
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+def test_reused_backup_fills_in_missing_sidecars(tmp_path):
+    """When the same corrupt main-file hash is quarantined again after a WAL
+    sidecar appears, reusing the existing backup must still copy the sidecar so
+    a WAL-only committed transaction is recoverable from the forensic copy."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+
+    # First quarantine: no sidecars yet.
+    first = kb._backup_corrupt_db(db_path)
+    assert first is not None and first.exists()
+    assert not (tmp_path / (first.name + "-wal")).exists()
+
+    # A WAL sidecar now appears alongside the (byte-identical) corrupt main file.
+    wal = db_path.with_name(db_path.name + "-wal")
+    wal.write_bytes(b"fake-wal-committed-rows")
+
+    # Re-quarantine: same hash → reuses `first`, but must now copy the sidecar.
+    second = kb._backup_corrupt_db(db_path)
+    assert second == first, "byte-identical corruption should reuse the backup"
+    assert (tmp_path / (first.name + "-wal")).exists(), (
+        "reused backup must gain the newly-present WAL sidecar"
+    )
+
+
 def test_corrupt_clone_count_is_capped(tmp_path):
     """A live WAL DB mutates on every rw probe, so N concurrent opens fingerprint
     different bytes and each used to write a fresh multi-MB clone (the storm).

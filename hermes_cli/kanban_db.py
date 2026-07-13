@@ -1709,7 +1709,12 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     if candidate.parent != parent:
         return None
     if candidate.exists():
-        # Byte-identical corruption already quarantined — reuse it, copy nothing.
+        # Byte-identical corruption already quarantined — reuse it, copy nothing
+        # of the main file. But still try to fill in any WAL/SHM sidecars that
+        # were absent (or failed to copy) on the earlier quarantine: in WAL mode
+        # committed transactions can live only in the sidecars, so a main-only
+        # backup can't reproduce the board state for forensics/recovery.
+        _copy_missing_sidecars(parent, base_name, candidate)
         return candidate
     # Bound the clone count per DB path. Content-addressing dedupes identical
     # bytes, but a live WAL-mode DB mutates on every rw integrity probe, so
@@ -1743,6 +1748,19 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         shutil.copy2(resolved, candidate)
     except OSError:
         return None
+    _copy_missing_sidecars(parent, base_name, candidate)
+    return candidate
+
+
+def _copy_missing_sidecars(parent: Path, base_name: str, candidate: Path) -> None:
+    """Best-effort copy of the live DB's ``-wal``/``-shm`` sidecars next to the
+    forensic ``candidate`` backup, skipping any that are already present.
+
+    In WAL mode committed transactions can live only in ``kanban.db-wal`` until
+    a checkpoint, so a main-file-only quarantine can't reproduce the board
+    state. Idempotent: safe to call again when reusing an existing backup whose
+    sidecars were absent (or failed to copy) the first time round.
+    """
     for suffix in ("-wal", "-shm"):
         sidecar = parent / (base_name + suffix)
         if sidecar.parent != parent or not sidecar.exists():
@@ -1754,7 +1772,6 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             shutil.copy2(sidecar, sidecar_backup)
         except OSError:
             pass
-    return candidate
 
 
 def _claim_repair_attempt(db_path: Path) -> bool:
@@ -1903,6 +1920,17 @@ def _attempt_index_only_repair(path: Path) -> Optional[str]:
         _log.warning("kanban REINDEX pass failed for %s: %s", resolved, exc)
 
     # ── Strategy 2: .dump + reload, then atomic swap ──────────────────────
+    # Quiesce writers for the whole snapshot→swap window. iterdump is only a
+    # read snapshot and the cross-process init lock serializes first-open
+    # callers, not connections already open on this board. Without a lock a
+    # concurrent writer could commit rows to the original after the dump starts
+    # (lost by the swap) or keep writing to the replaced inode. We hold a single
+    # BEGIN EXCLUSIVE transaction on `src` across both the dump and the
+    # os.replace: EXCLUSIVE blocks every other reader/writer, so the snapshot is
+    # consistent and no writer is mid-transaction when we publish. If another
+    # connection already holds a lock, BEGIN EXCLUSIVE raises OperationalError
+    # (locked) → our transient path re-raises and we retry later rather than
+    # publishing a lossy rebuild.
     rebuilt = resolved.with_name(resolved.name + ".rebuild.tmp")
     try:
         for stale in (rebuilt, Path(str(rebuilt) + "-wal"), Path(str(rebuilt) + "-shm")):
@@ -1910,50 +1938,60 @@ def _attempt_index_only_repair(path: Path) -> Optional[str]:
                 stale.unlink()
     except OSError:
         pass
+    src: Optional[sqlite3.Connection] = None
+    src_locked = False
     try:
         src = _sqlite_connect(resolved)
+        # Acquire the exclusive write lock up front; hold it through the swap.
+        src.execute("BEGIN EXCLUSIVE")
+        src_locked = True
+        dst = sqlite3.connect(str(rebuilt), isolation_level=None)
         try:
-            dst = sqlite3.connect(str(rebuilt), isolation_level=None)
-            try:
-                # iterdump reads base-table rows + schema DDL; it does not read
-                # the corrupt secondary-index pages, so the reload rebuilds every
-                # index correctly from the recovered rows.
-                for stmt in src.iterdump():
-                    dst.execute(stmt)
-                dst.commit()
-            finally:
-                dst.close()
+            # iterdump reads base-table rows + schema DDL; it does not read
+            # the corrupt secondary-index pages, so the reload rebuilds every
+            # index correctly from the recovered rows.
+            for stmt in src.iterdump():
+                dst.execute(stmt)
+            dst.commit()
         finally:
-            src.close()
+            dst.close()
+
+        # Verify the rebuilt DB is clean before we trust it with a swap. Done
+        # while still holding the exclusive lock so writers stay quiesced.
+        if _integrity_problems(rebuilt) is not None:
+            _cleanup_rebuild_artifacts(rebuilt)
+            return None
+
+        # Atomic replace. os.replace is atomic within a filesystem; the rebuilt
+        # file is a sibling in the same directory (same filesystem). Still under
+        # the exclusive lock, so no writer can be mid-transaction on the inode.
+        os.replace(str(rebuilt), str(resolved))
     except sqlite3.OperationalError:
-        # Transient `database is locked`/busy during iterdump is contention, not
-        # corruption. Re-raise before the broad DatabaseError handler so the
-        # caller's transient-lock path fires instead of converting it to a
-        # backup+refuse (leaving a recoverable board down until a retry).
+        # Transient `database is locked`/busy (another connection holds a lock,
+        # or contention during iterdump) is contention, not corruption. Re-raise
+        # before the broad DatabaseError handler so the caller's transient-lock
+        # path fires instead of converting it to a backup+refuse.
         _cleanup_rebuild_artifacts(rebuilt)
         raise
     except sqlite3.DatabaseError as exc:
         _log.warning("kanban .dump+reload rebuild failed for %s: %s", resolved, exc)
         _cleanup_rebuild_artifacts(rebuilt)
         return None
-
-    # Verify the rebuilt DB is clean before we trust it with a swap.
-    try:
-        if _integrity_problems(rebuilt) is not None:
-            _cleanup_rebuild_artifacts(rebuilt)
-            return None
-    except sqlite3.DatabaseError:
-        _cleanup_rebuild_artifacts(rebuilt)
-        return None
-
-    # Atomic replace. os.replace is atomic within a filesystem; the rebuilt file
-    # is a sibling in the same directory, so it is on the same filesystem.
-    try:
-        os.replace(str(rebuilt), str(resolved))
     except OSError as exc:
         _log.warning("kanban repaired-DB swap failed for %s: %s", resolved, exc)
         _cleanup_rebuild_artifacts(rebuilt)
         return None
+    finally:
+        if src is not None:
+            if src_locked:
+                # Original is already replaced; rollback just drops the lock on
+                # the now-detached inode (best-effort).
+                try:
+                    src.rollback()
+                except sqlite3.Error:
+                    pass
+            src.close()
+
     # Drop any stale WAL/SHM sidecars of the ORIGINAL: they belong to the corrupt
     # file we just replaced and would confuse the next open.
     for suffix in ("-wal", "-shm"):
