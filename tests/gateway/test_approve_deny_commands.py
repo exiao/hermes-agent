@@ -376,8 +376,13 @@ class TestBlockingApprovalE2E:
 
         session_key = "e2e-test"
         notified = []
+        notify_event = threading.Event()
 
-        register_gateway_notify(session_key, lambda d: notified.append(d))
+        def _notify(d):
+            notified.append(d)
+            notify_event.set()
+
+        register_gateway_notify(session_key, _notify)
 
         result_holder = [None]
 
@@ -401,11 +406,11 @@ class TestBlockingApprovalE2E:
         t = threading.Thread(target=agent_thread)
         t.start()
 
-        for _ in range(50):
-            if notified:
-                break
-            time.sleep(0.05)
-
+        # Deterministic wait: the notify callback fires exactly when the agent
+        # thread has registered its approval request. Block on that event with
+        # a generous timeout instead of a fixed sleep-poll window that misses
+        # under CI load.
+        assert notify_event.wait(timeout=10), "approval notify never fired"
         assert len(notified) == 1
         assert "rm -rf /important" in notified[0]["command"]
 
@@ -425,7 +430,13 @@ class TestBlockingApprovalE2E:
 
         session_key = "e2e-deny"
         notified = []
-        register_gateway_notify(session_key, lambda d: notified.append(d))
+        notify_event = threading.Event()
+
+        def _notify(d):
+            notified.append(d)
+            notify_event.set()
+
+        register_gateway_notify(session_key, _notify)
 
         result_holder = [None]
 
@@ -448,10 +459,8 @@ class TestBlockingApprovalE2E:
 
         t = threading.Thread(target=agent_thread)
         t.start()
-        for _ in range(50):
-            if notified:
-                break
-            time.sleep(0.05)
+        # Deterministic wait on the notify callback (see approve_once test).
+        assert notify_event.wait(timeout=10), "approval notify never fired"
 
         resolve_gateway_approval(session_key, "deny")
         t.join(timeout=5)
@@ -509,7 +518,14 @@ class TestBlockingApprovalE2E:
 
         session_key = "e2e-parallel"
         notified = []
-        register_gateway_notify(session_key, lambda d: notified.append(d))
+        all_notified = threading.Event()
+
+        def _notify(d):
+            notified.append(d)
+            if len(notified) >= 3:
+                all_notified.set()
+
+        register_gateway_notify(session_key, _notify)
 
         results = [None, None, None]
 
@@ -538,11 +554,8 @@ class TestBlockingApprovalE2E:
         for t in threads:
             t.start()
 
-        # Wait for all 3 to block
-        for _ in range(100):
-            if len(notified) >= 3:
-                break
-            time.sleep(0.05)
+        # Wait for all 3 to block — deterministic via the notify event.
+        assert all_notified.wait(timeout=10), "not all 3 approvals notified"
 
         assert len(notified) == 3
         assert len(_gateway_queues.get(session_key, [])) == 3
@@ -749,8 +762,9 @@ class TestCrossSessionApprovalIsolation:
         )
         notified_a = []
         notified_b = []
-        register_gateway_notify("session-A", lambda d: notified_a.append(d))
-        register_gateway_notify("session-B", lambda d: notified_b.append(d))
+        notify_event = threading.Event()
+        register_gateway_notify("session-A", lambda d: (notified_a.append(d), notify_event.set()))
+        register_gateway_notify("session-B", lambda d: (notified_b.append(d), notify_event.set()))
 
         # Concurrent session B clobbered the process-global env var last.
         os.environ["HERMES_SESSION_KEY"] = "session-B"
@@ -774,10 +788,8 @@ class TestCrossSessionApprovalIsolation:
         t = threading.Thread(target=worker_a)
         t.start()
         try:
-            for _ in range(50):
-                if notified_a or notified_b:
-                    break
-                time.sleep(0.05)
+            # Deterministic wait: either session's notify sets the event.
+            assert notify_event.wait(timeout=10), "approval notify never fired"
 
             # The prompt must land in session A (the originator), never B.
             assert len(notified_a) == 1, "approval prompt did not route to session A"
