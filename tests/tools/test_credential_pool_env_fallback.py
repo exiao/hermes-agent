@@ -296,3 +296,73 @@ class TestAnthropicEnvAuthTypeClassification:
         _write_env_file(isolated_hermes_home, ANTHROPIC_API_KEY="sk-ant-api-fake-12345")
         entry = self._seed("ANTHROPIC_API_KEY", "sk-ant-api-fake-12345")
         assert entry.auth_type == AUTH_TYPE_API_KEY
+
+
+class TestSeedFromEnvScopeAuthoritative:
+    """Under gateway profile multiplexing, _seed_from_env must NOT fall back to
+    os.environ.
+
+    Regression for the P1 Codex finding on #100: opening bare /model for a
+    secondary profile that lacks a provider key (empty scope + empty profile
+    .env) but whose PROCESS env still carries the default profile's key would
+    seed an ``env:<VAR>`` entry from os.environ and PERSIST the default
+    profile's key into profile B's credential pool. With a scope installed,
+    os.environ is no longer an authoritative source, so a scoped miss stays a
+    miss.
+    """
+
+    def test_environ_does_not_leak_under_active_scope(self, isolated_hermes_home, monkeypatch):
+        from agent import secret_scope as ss
+
+        # No key in profile B's .env nor its scope; only the DEFAULT profile's
+        # key sits in os.environ.
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-default-profile-leak")
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-other"})
+        try:
+            from agent.credential_pool import _seed_from_env
+            entries = []
+            changed, active_sources = _seed_from_env("deepseek", entries)
+        finally:
+            ss.reset_secret_scope(tok)
+            ss.set_multiplex_active(False)
+
+        assert changed is False, "os.environ key must not seed under an active scope"
+        assert "env:DEEPSEEK_API_KEY" not in active_sources
+        assert entries == [], (
+            "the default profile's os.environ key must never be persisted into "
+            f"the scoped profile's pool, got: {[(e.source, e.access_token) for e in entries]}"
+        )
+
+    def test_scoped_key_still_seeds_under_active_scope(self, isolated_hermes_home, monkeypatch):
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope({"DEEPSEEK_API_KEY": "sk-profileB-deepseek"})
+        try:
+            from agent.credential_pool import _seed_from_env
+            entries = []
+            changed, active_sources = _seed_from_env("deepseek", entries)
+        finally:
+            ss.reset_secret_scope(tok)
+            ss.set_multiplex_active(False)
+
+        assert changed is True
+        assert "env:DEEPSEEK_API_KEY" in active_sources
+        assert any(e.access_token == "sk-profileB-deepseek" for e in entries)
+
+    def test_single_profile_still_reads_environ(self, isolated_hermes_home, monkeypatch):
+        """No scope (CLI/TUI single-profile): os.environ fallback preserved."""
+        from agent import secret_scope as ss
+
+        ss.set_multiplex_active(False)  # no scope installed
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-cli-user")
+
+        from agent.credential_pool import _seed_from_env
+        entries = []
+        changed, active_sources = _seed_from_env("deepseek", entries)
+
+        assert changed is True
+        assert "env:DEEPSEEK_API_KEY" in active_sources
+        assert any(e.access_token == "sk-cli-user" for e in entries)
