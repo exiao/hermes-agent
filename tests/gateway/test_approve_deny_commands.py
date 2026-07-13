@@ -818,8 +818,16 @@ class TestCrossSessionApprovalIsolation:
         notified_a = []
         notified_b = []
         notify_event = threading.Event()
-        register_gateway_notify("session-A", lambda d: (notified_a.append(d), notify_event.set()))
-        register_gateway_notify("session-B", lambda d: (notified_b.append(d), notify_event.set()))
+
+        def make_notify(target_list):
+            def _notify(d):
+                target_list.append(d)
+                notify_event.set()
+
+            return _notify
+
+        register_gateway_notify("session-A", make_notify(notified_a))
+        register_gateway_notify("session-B", make_notify(notified_b))
 
         # Concurrent session B clobbered the process-global env var last.
         os.environ["HERMES_SESSION_KEY"] = "session-B"
