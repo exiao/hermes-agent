@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import glob
 import hashlib
 import json
 import os
@@ -1369,6 +1370,25 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+
+# One-shot in-process guard against a malformed DB triggering an unbounded
+# repair/reopen loop, and against concurrent threads racing surgery on the same
+# file. Mirrors hermes_state._claim_repair_attempt. Cleared for a path only when
+# a repair succeeds (so a genuinely fresh corruption on the same path later can
+# be retried).
+_REPAIR_ATTEMPTED_PATHS: set[str] = set()
+_REPAIR_ATTEMPT_LOCK = threading.Lock()
+
+# Hard cap on how many distinct ``<db>.corrupt.*.bak`` forensic clones we will
+# ever keep for one DB path. Content-addressed naming already dedupes byte-for-
+# byte-identical corrupt bytes, but a live WAL-mode DB mutates on every rw probe
+# (checkpoint/recover), so N concurrent worker lanes each fingerprinted slightly
+# different bytes and produced a NEW clone per open — a clone-storm that filled
+# the disk (2026-07-13 incident, ~13 clones / ~310MB in 5 min). Once this many
+# clones exist for a path, further quarantines reuse the newest existing clone
+# instead of amplifying disk usage. One forensic snapshot of a given corruption
+# event is enough; the whole point is to preserve evidence, not to hoard it.
+_MAX_CORRUPT_CLONES = 2
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -1688,11 +1708,35 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     # Defensive: candidate must still be inside parent after construction.
     if candidate.parent != parent:
         return None
-    if not candidate.exists():
-        try:
-            shutil.copy2(resolved, candidate)
-        except OSError:
-            return None
+    if candidate.exists():
+        # Byte-identical corruption already quarantined — reuse it, copy nothing.
+        return candidate
+    # Bound the clone count per DB path. Content-addressing dedupes identical
+    # bytes, but a live WAL-mode DB mutates on every rw integrity probe, so
+    # concurrent lanes fingerprint slightly different bytes and would otherwise
+    # each write a fresh multi-MB clone — the 2026-07-13 clone-storm that filled
+    # the disk. Once _MAX_CORRUPT_CLONES distinct clones exist for this path,
+    # stop cloning and hand back the newest existing one for the error message.
+    # This runs under the caller's cross-process init lock, so the count + create
+    # is race-safe across host processes.
+    existing = sorted(
+        parent.glob(f"{glob.escape(base_name)}.corrupt.*.bak"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+    )
+    if len(existing) >= _MAX_CORRUPT_CLONES:
+        newest = existing[-1]
+        _log.warning(
+            "kanban corrupt-clone cap reached (%d clones of %s); reusing %s "
+            "instead of writing another forensic copy",
+            len(existing),
+            base_name,
+            newest.name,
+        )
+        return newest
+    try:
+        shutil.copy2(resolved, candidate)
+    except OSError:
+        return None
     for suffix in ("-wal", "-shm"):
         sidecar = parent / (base_name + suffix)
         if sidecar.parent != parent or not sidecar.exists():
@@ -1705,6 +1749,214 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         except OSError:
             pass
     return candidate
+
+
+def _claim_repair_attempt(db_path: Path) -> bool:
+    """Claim the one-shot repair attempt for *db_path* in this process.
+
+    Returns True for the first caller, False afterwards. Keeps a malformed DB
+    from triggering an unbounded repair/reopen loop and stops concurrent callers
+    from racing surgery on the same file. Mirrors
+    ``hermes_state._claim_repair_attempt``.
+    """
+    key = str(db_path)
+    with _REPAIR_ATTEMPT_LOCK:
+        if key in _REPAIR_ATTEMPTED_PATHS:
+            return False
+        _REPAIR_ATTEMPTED_PATHS.add(key)
+        return True
+
+
+def _integrity_problems(db_path: Path) -> Optional[list[str]]:
+    """Return the list of ``PRAGMA integrity_check`` problems, or None if clean.
+
+    Runs the check on a fresh short-lived read/write connection. Raises the
+    underlying ``sqlite3.OperationalError`` on lock/busy (transient) so callers
+    can distinguish contention from corruption. A ``sqlite3.DatabaseError`` that
+    is not an ``OperationalError`` (file refuses to open at all) is surfaced as a
+    single synthetic problem string.
+    """
+    conn = _sqlite_connect(db_path)
+    try:
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+    except sqlite3.OperationalError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        return [f"sqlite refused to open file: {exc}"]
+    finally:
+        conn.close()
+    problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+    return problems or None
+
+
+# integrity_check lines for the index-only corruption class: the row counts in a
+# secondary/auto index disagree with the base table, but the table b-trees are
+# intact. This is what corrupted the shared board on 2026-07-13 (stale
+# sqlite_autoindex_kanban_notify_subs_1 / idx_notify_task). Rebuilding the
+# indexes (or a full .dump+reload) fully recovers it with zero row loss.
+_INDEX_ONLY_MARKERS = (
+    "wrong # of entries in index",
+    "wrong # of entries in index ",
+    "row missing from index",
+    "non-unique entry in index",
+)
+
+# integrity_check lines that are advisory noise, not corruption: they never
+# disqualify the index-only classification. "*** in database main ***" is a
+# section banner; a "fragmentation" line reports harmless free-byte accounting
+# on a page and is fixed for free by the same REINDEX/VACUUM/reload that repairs
+# the indexes; "row N missing from index <idx>" is itself an index-level entry
+# mismatch (same recoverable class as a wrong entry count).
+_INDEX_BENIGN_MARKERS = (
+    "*** in database main ***",
+    "fragmentation of",
+    "row missing from index",
+    "missing from index",
+)
+
+
+def _is_index_only_corruption(problems: list[str]) -> bool:
+    """True iff every integrity problem is an index-level issue we can rebuild.
+
+    Conservative: a single non-index problem (malformed page, corrupt cell,
+    missing base-table row, unreadable header) disqualifies the whole set so we
+    never run a partial repair over genuinely damaged base data. Advisory noise
+    lines (:data:`_INDEX_BENIGN_MARKERS`) do not count against the set.
+    """
+    if not problems:
+        return False
+    saw_index_problem = False
+    for line in problems:
+        low = line.lower()
+        if any(marker in low for marker in _INDEX_ONLY_MARKERS):
+            saw_index_problem = True
+            continue
+        if any(marker in low for marker in _INDEX_BENIGN_MARKERS):
+            # "missing from index" is itself an index-level mismatch we recover.
+            if "index" in low:
+                saw_index_problem = True
+            continue
+        return False
+    return saw_index_problem
+
+
+def _attempt_index_only_repair(path: Path) -> Optional[str]:
+    """Try to self-heal an index-only-corrupt kanban DB in place.
+
+    Only touches the index-corruption class (see :data:`_INDEX_ONLY_MARKERS`):
+    base tables read fine but a secondary/auto index has stale entry counts.
+    This is the exact shape that took the shared board down on 2026-07-13, and
+    it was repaired by hand via ``.dump`` + reload with zero legitimate row loss.
+    This automates that so a future occurrence self-heals instead of refusing
+    (and clone-storming the disk on every retry).
+
+    Strategy, least-destructive first:
+
+      1. ``REINDEX`` — rebuild every index from its table b-tree. Cheap and
+         non-destructive; fixes stale-count indexes when the page holding the
+         index isn't itself malformed.
+      2. ``.dump`` + reload into a sibling file, then atomically replace the
+         original. ``iterdump`` reads only the base-table rows and schema (never
+         the corrupt index pages), so the rebuilt DB has correct indexes and
+         identical data. The swap is atomic (``os.replace``) and only proceeds
+         if the rebuilt file passes ``integrity_check`` clean.
+
+    Returns the strategy name on success (``"reindex"`` / ``"dump_reload"``),
+    or ``None`` if the DB could not be healed (caller then backs up + refuses).
+    The original bytes are only replaced after a clean rebuild is verified, so a
+    failed repair leaves the corrupt original untouched for forensics.
+    """
+    resolved = path.resolve()
+
+    # ── Strategy 1: REINDEX in place ──────────────────────────────────────
+    try:
+        conn = _sqlite_connect(resolved)
+        try:
+            conn.execute("REINDEX")
+            conn.commit()
+        finally:
+            conn.close()
+        if _integrity_problems(resolved) is None:
+            _log.warning(
+                "kanban DB %s self-healed via REINDEX (index-only corruption)",
+                resolved,
+            )
+            return "reindex"
+    except sqlite3.DatabaseError as exc:
+        # REINDEX can abort if the index page itself is malformed — fall through
+        # to the dump+reload path, which never reads the corrupt index pages.
+        _log.warning("kanban REINDEX pass failed for %s: %s", resolved, exc)
+
+    # ── Strategy 2: .dump + reload, then atomic swap ──────────────────────
+    rebuilt = resolved.with_name(resolved.name + ".rebuild.tmp")
+    try:
+        for stale in (rebuilt, Path(str(rebuilt) + "-wal"), Path(str(rebuilt) + "-shm")):
+            if stale.exists():
+                stale.unlink()
+    except OSError:
+        pass
+    try:
+        src = _sqlite_connect(resolved)
+        try:
+            dst = sqlite3.connect(str(rebuilt), isolation_level=None)
+            try:
+                # iterdump reads base-table rows + schema DDL; it does not read
+                # the corrupt secondary-index pages, so the reload rebuilds every
+                # index correctly from the recovered rows.
+                for stmt in src.iterdump():
+                    dst.execute(stmt)
+                dst.commit()
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    except sqlite3.DatabaseError as exc:
+        _log.warning("kanban .dump+reload rebuild failed for %s: %s", resolved, exc)
+        _cleanup_rebuild_artifacts(rebuilt)
+        return None
+
+    # Verify the rebuilt DB is clean before we trust it with a swap.
+    try:
+        if _integrity_problems(rebuilt) is not None:
+            _cleanup_rebuild_artifacts(rebuilt)
+            return None
+    except sqlite3.DatabaseError:
+        _cleanup_rebuild_artifacts(rebuilt)
+        return None
+
+    # Atomic replace. os.replace is atomic within a filesystem; the rebuilt file
+    # is a sibling in the same directory, so it is on the same filesystem.
+    try:
+        os.replace(str(rebuilt), str(resolved))
+    except OSError as exc:
+        _log.warning("kanban repaired-DB swap failed for %s: %s", resolved, exc)
+        _cleanup_rebuild_artifacts(rebuilt)
+        return None
+    # Drop any stale WAL/SHM sidecars of the ORIGINAL: they belong to the corrupt
+    # file we just replaced and would confuse the next open.
+    for suffix in ("-wal", "-shm"):
+        sidecar = resolved.with_name(resolved.name + suffix)
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+        except OSError:
+            pass
+    _log.warning(
+        "kanban DB %s self-healed via .dump+reload (index-only corruption; "
+        "base-table rows preserved)",
+        resolved,
+    )
+    return "dump_reload"
+
+
+def _cleanup_rebuild_artifacts(rebuilt: Path) -> None:
+    """Best-effort removal of a failed rebuild's temp files."""
+    for stale in (rebuilt, Path(str(rebuilt) + "-wal"), Path(str(rebuilt) + "-shm")):
+        try:
+            if stale.exists():
+                stale.unlink()
+        except OSError:
+            pass
 
 
 def _guard_existing_db_is_healthy(path: Path) -> None:
@@ -1746,14 +1998,16 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     if str(resolved) in _INITIALIZED_PATHS:
         return
     reason: Optional[str] = None
+    problems: Optional[list[str]] = None
     try:
         probe = _sqlite_connect(resolved)
         try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
+            rows = probe.execute("PRAGMA integrity_check").fetchall()
         finally:
             probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+        problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+        if problems:
+            reason = f"integrity_check returned {problems[0]!r}"
     except sqlite3.OperationalError:
         # Lock contention, busy, transient IO — not corruption. Let it propagate.
         raise
@@ -1761,6 +2015,35 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
+
+    # Self-heal the index-only corruption class before refusing. This is the
+    # shape that took the shared board down on 2026-07-13 (stale indexes on
+    # kanban_notify_subs; base tables intact) and had to be repaired by hand.
+    # Automating it means a future occurrence recovers instead of refusing on
+    # every open — which is what let the old fail-closed path clone-storm the
+    # disk (one forensic clone per open × ~10 concurrent lanes). Guarded so one
+    # process attempts the repair once; concurrent callers fall through to the
+    # backup+raise path and retry cleanly on their next connect after the swap.
+    if problems and _is_index_only_corruption(problems) and _claim_repair_attempt(resolved):
+        try:
+            strategy = _attempt_index_only_repair(resolved)
+        except sqlite3.OperationalError:
+            # Repair hit lock contention — treat as transient, not corruption.
+            raise
+        if strategy is not None:
+            try:
+                if _integrity_problems(resolved) is None:
+                    _log.warning(
+                        "kanban DB %s recovered in place (%s); no forensic clone kept",
+                        resolved,
+                        strategy,
+                    )
+                    return
+            except sqlite3.OperationalError:
+                raise
+            except sqlite3.DatabaseError:
+                pass
+
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
