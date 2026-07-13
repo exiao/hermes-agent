@@ -125,6 +125,29 @@ class TestCredentialPoolSeedsFromDotEnv:
         assert len(seeded) == 1
         assert seeded[0].access_token == "sk-dotenv-fresh"
 
+    def test_scoped_op_reference_seeds_resolved_value(
+        self, isolated_hermes_home
+    ):
+        _write_env_file(
+            isolated_hermes_home,
+            DEEPSEEK_API_KEY="op://Private/DeepSeek/key",
+        )
+        from agent import secret_scope as ss
+        from agent.credential_pool import _seed_from_env
+
+        token = ss.set_secret_scope(
+            {"DEEPSEEK_API_KEY": "sk-profile-resolved-deepseek"}
+        )
+        try:
+            entries = []
+            changed, _ = _seed_from_env("deepseek", entries)
+        finally:
+            ss.reset_secret_scope(token)
+
+        assert changed is True
+        assert len(entries) == 1
+        assert entries[0].access_token == "sk-profile-resolved-deepseek"
+
 
 class TestAuthResolvesFromDotEnv:
     """_resolve_api_key_provider_secret must also read from ~/.hermes/.env."""

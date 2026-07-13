@@ -2165,8 +2165,9 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         # references straight into .env rather than the secrets.onepassword
         # config block.  For every non-op:// value the original
         # .env-takes-precedence behaviour is preserved unchanged.
-        if raw.startswith("op://") and env_val:
-            return env_val
+        if raw.startswith("op://"):
+            resolved = (_get_secret(key, "") or "").strip()
+            return resolved or env_val or ("" if scoped else raw)
         return raw or (_get_secret(key, "") or "") or env_val
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
