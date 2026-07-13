@@ -1309,6 +1309,32 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
+def _read_anthropic_secret(name: str) -> str:
+    """Read an Anthropic env secret without breaking non-multiplex scopes.
+
+    Multiplexed profile scopes are authoritative and must never fall through to
+    the process/default profile. Other scoped callers, notably single-profile
+    cron jobs, retain the legacy service-environment fallback when their local
+    scope does not define the key.
+    """
+    scope = _current_secret_scope()
+    value = (_get_secret(name, "") or "").strip()
+    if value or scope is None:
+        return value
+    from agent.secret_scope import is_multiplex_active
+
+    if not is_multiplex_active():
+        scoped_names = (
+            "ANTHROPIC_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        )
+        if any(str(scope.get(key, "") or "").strip() for key in scoped_names):
+            return ""
+        return (os.environ.get(name, "") or "").strip()
+    return ""
+
+
 def _scope_is_non_default_profile() -> bool:
     """True when a profile secret scope is active for a NON-default profile.
 
@@ -1483,12 +1509,26 @@ def resolve_anthropic_token() -> Optional[str]:
     # shadow the scoped env tokens, and skip the source-#3 Claude Code fallback
     # entirely (that resolver re-reads the global file when handed None, so None
     # alone doesn't suppress it) — leaving only the profile's own scoped secrets.
-    suppress_global_creds = _scope_is_non_default_profile()
+    scope = _current_secret_scope()
+    scoped_names = (
+        "ANTHROPIC_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    )
+    scope_has_anthropic_secret = bool(
+        scope is not None
+        and any(str(scope.get(key, "") or "").strip() for key in scoped_names)
+    )
+    scope_has_api_key = bool(
+        scope is not None
+        and str(scope.get("ANTHROPIC_API_KEY", "") or "").strip()
+    )
+    suppress_global_creds = _scope_is_non_default_profile() or scope_has_api_key
     if suppress_global_creds:
         creds = None
 
     # 1. Hermes-managed OAuth/setup token env var
-    token = (_get_secret("ANTHROPIC_TOKEN", "") or "").strip()
+    token = _read_anthropic_secret("ANTHROPIC_TOKEN")
     if token:
         preferred = _prefer_refreshable_claude_code_token(token, creds)
         if preferred:
@@ -1496,7 +1536,7 @@ def resolve_anthropic_token() -> Optional[str]:
         return token
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = (_get_secret("CLAUDE_CODE_OAUTH_TOKEN", "") or "").strip()
+    cc_token = _read_anthropic_secret("CLAUDE_CODE_OAUTH_TOKEN")
     if cc_token:
         preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
         if preferred:
@@ -1515,15 +1555,17 @@ def resolve_anthropic_token() -> Optional[str]:
 
     # 4. Hermes credential_pool OAuth entry. A non-default multiplexed
     # profile may use its own local pool, but must never borrow the root pool.
-    resolved_pool_token = _resolve_anthropic_pool_token(
-        profile_only=suppress_global_creds
-    )
+    resolved_pool_token = None
+    if not scope_has_anthropic_secret:
+        resolved_pool_token = _resolve_anthropic_pool_token(
+            profile_only=suppress_global_creds
+        )
     if resolved_pool_token:
         return resolved_pool_token
 
     # 5. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
     # This remains as a compatibility fallback for pre-migration Hermes configs.
-    api_key = (_get_secret("ANTHROPIC_API_KEY", "") or "").strip()
+    api_key = _read_anthropic_secret("ANTHROPIC_API_KEY")
     if api_key:
         return api_key
 

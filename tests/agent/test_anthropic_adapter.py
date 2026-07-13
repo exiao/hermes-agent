@@ -596,6 +596,86 @@ class TestResolveAnthropicToken:
 
         assert resolve_anthropic_token() == "sk-ant-oat01-static-token"
 
+    def test_nonmultiplex_scope_falls_back_to_service_env(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-SERVICE-ENV")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+        )
+        ss.set_multiplex_active(False)
+        scope_token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-SERVICE-ENV"
+        finally:
+            ss.reset_secret_scope(scope_token)
+
+    def test_nonmultiplex_scope_secret_beats_service_env_priority(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-SERVICE-ENV")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "sk-ant-oat01-GLOBAL-CLAUDE",
+                "refreshToken": "refresh-global",
+                "expiresAt": 9999999999999,
+            },
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda _: True
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token",
+            lambda **_: "sk-ant-oat01-GLOBAL-POOL",
+        )
+        ss.set_multiplex_active(False)
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-SCOPED-CRON"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-api03-SCOPED-CRON"
+        finally:
+            ss.reset_secret_scope(scope_token)
+
+    def test_nonmultiplex_scoped_oauth_keeps_refreshable_claude_preference(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "sk-ant-oat01-REFRESHABLE-CLAUDE",
+                "refreshToken": "refresh-global",
+                "expiresAt": 9999999999999,
+            },
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda _: True
+        )
+        ss.set_multiplex_active(False)
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_TOKEN": "sk-ant-oat01-STATIC-SCOPED"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-REFRESHABLE-CLAUDE"
+        finally:
+            ss.reset_secret_scope(scope_token)
+
     def test_scoped_secret_wins_over_os_environ_under_multiplexing(self, monkeypatch, tmp_path):
         """Regression for t_601f23d1: under gateway profile multiplexing the
         resolver must read ANTHROPIC_TOKEN from the active _SECRET_SCOPE (the
