@@ -702,3 +702,47 @@ class TestOpenAIDiscoveryUsesScope:
             ss.reset_secret_scope(tok_b)
 
         assert fp_a != fp_b, "distinct scoped keys must produce distinct fingerprints"
+
+
+class TestApiKeyProviderBaseUrlUsesScope:
+    """resolve_api_key_provider_credentials resolves *_BASE_URL via the scope.
+
+    Regression for the follow-on Codex P2 on #100: the scoped listing admits a
+    scoped API-key provider (e.g. deepseek/stepfun with a scoped *_BASE_URL),
+    then discovery calls cached_provider_model_ids -> provider_model_ids ->
+    resolve_api_key_provider_credentials, which read the base URL with
+    os.getenv(base_url_env_var). So /model could fetch the catalog from the
+    default profile's base URL while using the secondary profile's api key.
+    """
+
+    def test_base_url_reads_scope_under_multiplex(self, monkeypatch):
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+
+        # deepseek: api_key via DEEPSEEK_API_KEY, base_url via DEEPSEEK_BASE_URL.
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://default-profile.example/v1")
+        ss.set_multiplex_active(True)
+
+        tok = ss.set_secret_scope({
+            "DEEPSEEK_API_KEY": "sk-profileB",
+            "DEEPSEEK_BASE_URL": "https://profileB.example/v1",
+        })
+        try:
+            creds = resolve_api_key_provider_credentials("deepseek")
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert creds["base_url"] == "https://profileB.example/v1", (
+            "scoped base URL must win over the default profile's os.environ value"
+        )
+
+    def test_base_url_single_profile_reads_environ(self, monkeypatch):
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+
+        ss.set_multiplex_active(False)
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://cli-user.example/v1")
+
+        creds = resolve_api_key_provider_credentials("deepseek")
+
+        assert creds["base_url"] == "https://cli-user.example/v1", (
+            "single-profile base URL must still read os.environ, byte-identical"
+        )

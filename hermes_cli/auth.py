@@ -6434,7 +6434,17 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+        # Resolve the base URL through the active profile secret scope so a
+        # multiplexed secondary profile's scoped *_BASE_URL override is honored
+        # instead of the default profile's value in os.environ. This keeps the
+        # /model listing→discovery path (cached_provider_model_ids ->
+        # provider_model_ids -> here) fetching from the requesting profile's
+        # endpoint, aligned with its scoped api key. get_secret falls back to
+        # os.environ when unscoped + multiplex off, so single-profile
+        # runtime/discovery is byte-identical.
+        from agent.secret_scope import get_secret as _get_secret
+
+        env_url = (_get_secret(pconfig.base_url_env_var, "") or "").strip()
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
