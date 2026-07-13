@@ -670,6 +670,47 @@ class TestOpenAIDiscoveryUsesScope:
 
         assert seen.get("api_key") == "sk-profileB"
 
+    def test_discovery_resolves_profile_onepassword_reference(
+        self, monkeypatch, tmp_path
+    ):
+        """The gateway-built scope must not pass a raw op:// ref to /models."""
+        profile = tmp_path / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        (profile / ".env").write_text(
+            "OPENAI_API_KEY=op://Private/ProfileB/key\n", encoding="utf-8"
+        )
+        (profile / ".op.env").write_text(
+            "OP_SERVICE_ACCOUNT_TOKEN=ops-profileB\n"
+            "OP_CONNECT_HOST=https://connect.profileb.test\n"
+            "OP_CONNECT_TOKEN=connect-profileB\n",
+            encoding="utf-8",
+        )
+
+        def _fake_fetch(**kwargs):
+            assert kwargs["token_value"] == "ops-profileB"
+            assert kwargs["include_process_auth"] is False
+            assert kwargs["auth_env"] == {
+                "OP_CONNECT_HOST": "https://connect.profileb.test",
+                "OP_CONNECT_TOKEN": "connect-profileB",
+            }
+            assert kwargs["home_path"] == profile
+            return {"OPENAI_API_KEY": "  sk-profileB-resolved  "}, []
+
+        monkeypatch.setattr(
+            "agent.secret_sources.onepassword.fetch_onepassword_secrets",
+            _fake_fetch,
+        )
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        ss.set_multiplex_active(True)
+
+        tok = ss.set_secret_scope(ss.build_profile_secret_scope(profile))
+        try:
+            seen = self._capture_discovery_key(monkeypatch)
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert seen.get("api_key") == "sk-profileB-resolved"
+
     def test_discovery_single_profile_reads_environ(self, monkeypatch):
         """Multiplex off, no scope (CLI/TUI): discovery falls back to
         os.environ, byte-identical to the legacy os.getenv behavior."""

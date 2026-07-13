@@ -195,11 +195,116 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
+    """Build a resolved profile-secret mapping from ``<home>/.env``.
+
+    Direct ``op://`` references are resolved for this profile before the mapping
+    is installed. Passing the raw reference through ``get_secret`` would send the
+    reference string itself as an API key; falling back to process ``os.environ``
+    would be worse because that value may belong to another profile. Failed
+    references are omitted so callers fail closed rather than authenticating with
+    either unsafe value.
 
     Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
     global vars are intentionally NOT copied in — ``get_secret`` reads those
     from ``os.environ`` directly, so the scope holds only profile secrets.
     """
-    return load_env_file(Path(hermes_home) / ".env")
+    home = Path(hermes_home)
+    secrets = load_env_file(home / ".env")
+    raw_op_refs = {
+        name: value for name, value in secrets.items()
+        if isinstance(value, str) and value.strip().startswith("op://")
+    }
+
+    op_cfg: Dict[str, object] = {}
+    try:
+        from hermes_cli.env_loader import _load_secrets_config
+
+        sources_cfg = _load_secrets_config(home)
+        candidate = sources_cfg.get("onepassword")
+        if isinstance(candidate, dict):
+            op_cfg = candidate
+    except Exception:
+        op_cfg = {}
+
+    configured_refs: Dict[str, str] = {}
+    if op_cfg.get("enabled"):
+        configured = op_cfg.get("env")
+        if isinstance(configured, dict):
+            configured_refs = {
+                str(name): str(value)
+                for name, value in configured.items()
+                if isinstance(name, str)
+                and isinstance(value, str)
+                and value.strip().startswith("op://")
+            }
+    override_existing = bool(op_cfg.get("override_existing", True))
+    op_refs = (
+        {**raw_op_refs, **configured_refs}
+        if override_existing
+        else {**configured_refs, **raw_op_refs}
+    )
+
+    if op_refs:
+        resolved: Dict[str, str] = {}
+        try:
+            from agent.secret_sources.onepassword import fetch_onepassword_secrets
+
+            token_env = str(
+                op_cfg.get("service_account_token_env")
+                or "OP_SERVICE_ACCOUNT_TOKEN"
+            )
+            bootstrap = load_env_file(home / ".op.env")
+            profile_auth_values = {**bootstrap, **secrets}
+            auth_env = {
+                name: value
+                for name, value in profile_auth_values.items()
+                if name in {"OP_ACCOUNT", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN"}
+                or name.startswith("OP_SESSION_")
+            }
+            local_token = str(
+                secrets.get(token_env) or bootstrap.get(token_env) or ""
+            ).strip()
+            include_process_auth = home.parent.name != "profiles"
+            # A default/profile-owner scope may keep the legacy shell/desktop
+            # auth fallback. Named profiles pass an explicit empty token and
+            # disable process auth so they can never borrow the gateway's
+            # 1Password identity.
+            token_value: Optional[str] = (
+                local_token if local_token else (None if include_process_auth else "")
+            )
+            try:
+                cache_ttl = float(str(op_cfg.get("cache_ttl_seconds", 300)))
+            except (TypeError, ValueError):
+                cache_ttl = 300.0
+            resolved, _warnings = fetch_onepassword_secrets(
+                references=op_refs,
+                account=str(op_cfg.get("account") or ""),
+                token_env=token_env,
+                token_value=token_value,
+                # Named profiles must not inherit the gateway process's
+                # OP_SESSION_*/OP_CONNECT identity. The default profile still
+                # keeps desktop-session behavior.
+                include_process_auth=include_process_auth,
+                auth_env=auth_env,
+                binary_path=str(op_cfg.get("binary_path") or ""),
+                cache_ttl_seconds=cache_ttl,
+                home_path=home,
+            )
+        except Exception:
+            # A missing/unauthenticated source must not turn a reference string
+            # into a credential or leak the process/default profile's value.
+            resolved = {}
+        for name, value in resolved.items():
+            rendered = str(value or "")
+            if rendered.strip() and (
+                override_existing or name not in secrets or name in raw_op_refs
+            ):
+                secrets[name] = rendered
+        fail_closed_names = set(raw_op_refs)
+        if override_existing:
+            fail_closed_names.update(configured_refs)
+        for name in fail_closed_names:
+            if name not in resolved:
+                secrets.pop(name, None)
+    return secrets
 

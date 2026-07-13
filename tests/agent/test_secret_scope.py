@@ -128,3 +128,75 @@ class TestEnvFileParsing:
         assert ss.build_profile_secret_scope(tmp_path) == {
             "ANTHROPIC_API_KEY": "sk-profile"
         }
+
+    def test_default_scope_keeps_shell_onepassword_auth(self, tmp_path, monkeypatch):
+        (tmp_path / ".env").write_text(
+            "OPENAI_API_KEY=op://Private/Default/key\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops-shell-default")
+
+        def _fake_fetch(**kwargs):
+            # None preserves fetch_onepassword_secrets' process-env fallback.
+            assert kwargs["token_value"] is None
+            assert kwargs["include_process_auth"] is True
+            return {"OPENAI_API_KEY": "  sk-default-resolved  "}, []
+
+        monkeypatch.setattr(
+            "agent.secret_sources.onepassword.fetch_onepassword_secrets",
+            _fake_fetch,
+        )
+
+        assert ss.build_profile_secret_scope(tmp_path)["OPENAI_API_KEY"] == (
+            "  sk-default-resolved  "
+        )
+
+    def test_failed_configured_onepassword_ref_drops_stale_env(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / ".env").write_text(
+            "OPENAI_API_KEY=sk-stale-plaintext\n", encoding="utf-8"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "secrets:\n"
+            "  onepassword:\n"
+            "    enabled: true\n"
+            "    env:\n"
+            "      OPENAI_API_KEY: op://Private/OpenAI/key\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "agent.secret_sources.onepassword.fetch_onepassword_secrets",
+            lambda **kwargs: ({}, ["auth failed"]),
+        )
+
+        assert "OPENAI_API_KEY" not in ss.build_profile_secret_scope(tmp_path)
+
+    def test_configured_onepassword_ref_overrides_raw_env_ref(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / ".env").write_text(
+            "OPENAI_API_KEY=op://Private/Stale/key\n", encoding="utf-8"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "secrets:\n"
+            "  onepassword:\n"
+            "    enabled: true\n"
+            "    env:\n"
+            "      OPENAI_API_KEY: op://Private/Configured/key\n",
+            encoding="utf-8",
+        )
+
+        def _fake_fetch(**kwargs):
+            assert kwargs["references"]["OPENAI_API_KEY"] == (
+                "op://Private/Configured/key"
+            )
+            return {"OPENAI_API_KEY": "sk-configured"}, []
+
+        monkeypatch.setattr(
+            "agent.secret_sources.onepassword.fetch_onepassword_secrets",
+            _fake_fetch,
+        )
+
+        assert ss.build_profile_secret_scope(tmp_path)["OPENAI_API_KEY"] == (
+            "sk-configured"
+        )

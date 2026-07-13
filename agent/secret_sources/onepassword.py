@@ -169,7 +169,13 @@ def _validate_references(
     return valid, warnings
 
 
-def _auth_fingerprint(token_env: str) -> str:
+def _auth_fingerprint(
+    token_env: str,
+    *,
+    token_value: Optional[str] = None,
+    include_process_auth: bool = True,
+    auth_env: Optional[Dict[str, str]] = None,
+) -> str:
     """SHA-256 prefix over the auth material `op` would use.
 
     Folds in the service-account token, ``OP_ACCOUNT``, and *all*
@@ -179,13 +185,30 @@ def _auth_fingerprint(token_env: str) -> str:
     a previous identity is never served under a new one.  Never logged or
     displayed; the raw token never leaves this hash.
     """
+    resolved_token = (
+        os.environ.get(token_env, "") if token_value is None else token_value
+    )
     parts: List[str] = [
-        f"token={os.environ.get(token_env, '')}",
-        f"account={os.environ.get('OP_ACCOUNT', '')}",
+        f"token={resolved_token}",
+        f"auth_mode={'process' if include_process_auth else 'isolated'}",
     ]
-    for key in sorted(os.environ):
-        if key.startswith("OP_SESSION_"):
-            parts.append(f"{key}={os.environ[key]}")
+    if include_process_auth:
+        parts.append(f"account={os.environ.get('OP_ACCOUNT', '')}")
+        for key in (
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
+        ):
+            parts.append(f"{key}={os.environ.get(key, '')}")
+        for key in sorted(os.environ):
+            if key.startswith("OP_SESSION_"):
+                parts.append(f"{key}={os.environ[key]}")
+    if auth_env:
+        for key in sorted(auth_env):
+            parts.append(f"profile:{key}={auth_env[key]}")
     material = "\n".join(parts)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
@@ -228,17 +251,48 @@ def _scrub(text: str) -> str:
     return _ANSI_CSI_RE.sub("", text).replace("\x1b", "").strip()
 
 
-def _op_child_env(token_value: str) -> Dict[str, str]:
+def _op_child_env(
+    token_value: str,
+    *,
+    include_process_auth: bool = True,
+    auth_env: Optional[Dict[str, str]] = None,
+    isolated_home: Optional[Path] = None,
+) -> Dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
     env: Dict[str, str] = {}
+    auth_path_vars = {
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+    }
     for key in _OP_ENV_ALLOWLIST:
+        if not include_process_auth and (
+            key.startswith("OP_") or key in auth_path_vars
+        ):
+            continue
         val = os.environ.get(key)
         if val is not None:
             env[key] = val
-    # Desktop / interactive session credentials.
-    for key, val in os.environ.items():
-        if key.startswith("OP_SESSION_"):
-            env[key] = val
+    # Desktop / interactive session credentials belong to the process profile.
+    # A named multiplexed profile must not inherit them.
+    if include_process_auth:
+        for key, val in os.environ.items():
+            if key.startswith("OP_SESSION_"):
+                env[key] = val
+    if isolated_home is not None:
+        isolated = Path(isolated_home)
+        env["HOME"] = str(isolated)
+        env["USERPROFILE"] = str(isolated)
+        env["XDG_CONFIG_HOME"] = str(isolated / ".config")
+        env["APPDATA"] = str(isolated / "AppData" / "Roaming")
+        env["LOCALAPPDATA"] = str(isolated / "AppData" / "Local")
+    if auth_env:
+        for key, val in auth_env.items():
+            if key in _OP_ENV_ALLOWLIST or key.startswith("OP_SESSION_"):
+                env[key] = val
     # `op` reads OP_SERVICE_ACCOUNT_TOKEN regardless of which env var the user
     # configured Hermes to source it from, so normalize to that name here.
     if token_value:
@@ -253,6 +307,9 @@ def _run_op_read(
     *,
     account: str = "",
     token_value: str = "",
+    include_process_auth: bool = True,
+    auth_env: Optional[Dict[str, str]] = None,
+    isolated_home: Optional[Path] = None,
 ) -> str:
     """Resolve a single ``op://`` reference to its value.
 
@@ -270,7 +327,12 @@ def _run_op_read(
     try:
         proc = subprocess.run(  # noqa: S603 — op path is user-trusted, argv list
             cmd,
-            env=_op_child_env(token_value),
+            env=_op_child_env(
+                token_value,
+                include_process_auth=include_process_auth,
+                auth_env=auth_env,
+                isolated_home=isolated_home,
+            ),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -312,6 +374,9 @@ def fetch_onepassword_secrets(
     references: Dict[str, str],
     account: str = "",
     token_env: str = _DEFAULT_TOKEN_ENV,
+    token_value: Optional[str] = None,
+    include_process_auth: bool = True,
+    auth_env: Optional[Dict[str, str]] = None,
     binary: Optional[Path] = None,
     binary_path: str = "",
     use_cache: bool = True,
@@ -332,9 +397,16 @@ def fetch_onepassword_secrets(
     if not valid:
         return {}, warnings
 
-    token_value = os.environ.get(token_env, "").strip()
+    resolved_token_value = (
+        os.environ.get(token_env, "") if token_value is None else token_value
+    ).strip()
     cache_key: _CacheKey = (
-        _auth_fingerprint(token_env),
+        _auth_fingerprint(
+            token_env,
+            token_value=resolved_token_value,
+            include_process_auth=include_process_auth,
+            auth_env=auth_env,
+        ),
         account or "",
         str(home_path) if home_path is not None else "",
         _refs_fingerprint(valid),
@@ -363,7 +435,13 @@ def fetch_onepassword_secrets(
     for name in sorted(valid):
         try:
             secrets[name] = _run_op_read(
-                op, valid[name], account=account, token_value=token_value
+                op,
+                valid[name],
+                account=account,
+                token_value=resolved_token_value,
+                include_process_auth=include_process_auth,
+                auth_env=auth_env,
+                isolated_home=home_path if not include_process_auth else None,
             )
         except RuntimeError as exc:
             warnings.append(str(exc))
