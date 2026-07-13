@@ -1719,9 +1719,15 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     # stop cloning and hand back the newest existing one for the error message.
     # This runs under the caller's cross-process init lock, so the count + create
     # is race-safe across host processes.
+    def _safe_mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
     existing = sorted(
         parent.glob(f"{glob.escape(base_name)}.corrupt.*.bak"),
-        key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+        key=_safe_mtime,
     )
     if len(existing) >= _MAX_CORRUPT_CLONES:
         newest = existing[-1]
@@ -1776,15 +1782,17 @@ def _integrity_problems(db_path: Path) -> Optional[list[str]]:
     is not an ``OperationalError`` (file refuses to open at all) is surfaced as a
     single synthetic problem string.
     """
-    conn = _sqlite_connect(db_path)
+    conn = None
     try:
+        conn = _sqlite_connect(db_path)
         rows = conn.execute("PRAGMA integrity_check").fetchall()
     except sqlite3.OperationalError:
         raise
     except sqlite3.DatabaseError as exc:
         return [f"sqlite refused to open file: {exc}"]
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
     return problems or None
 
@@ -1882,6 +1890,13 @@ def _attempt_index_only_repair(path: Path) -> Optional[str]:
                 resolved,
             )
             return "reindex"
+    except sqlite3.OperationalError:
+        # `database is locked`/busy is transient contention, NOT corruption. It
+        # subclasses DatabaseError, so re-raise it explicitly here (before the
+        # broader handler below) to keep the caller's transient-lock path intact
+        # instead of falling through to the destructive dump+reload swap while
+        # another writer may still hold the original.
+        raise
     except sqlite3.DatabaseError as exc:
         # REINDEX can abort if the index page itself is malformed — fall through
         # to the dump+reload path, which never reads the corrupt index pages.
@@ -2038,6 +2053,11 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
                         resolved,
                         strategy,
                     )
+                    # Repair succeeded: clear the one-shot claim so a genuinely
+                    # fresh corruption on this same path later can be retried
+                    # (honors the _REPAIR_ATTEMPTED_PATHS contract).
+                    with _REPAIR_ATTEMPT_LOCK:
+                        _REPAIR_ATTEMPTED_PATHS.discard(str(resolved))
                     return
             except sqlite3.OperationalError:
                 raise

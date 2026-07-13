@@ -5830,6 +5830,59 @@ def test_index_only_corruption_self_heals_and_preserves_rows(tmp_path):
     assert list(tmp_path.glob("*.rebuild.tmp")) == []
 
 
+def test_successful_repair_clears_repair_claim(tmp_path):
+    """After a successful in-place repair the path is discarded from
+    _REPAIR_ATTEMPTED_PATHS, so a genuinely fresh corruption on the same path
+    later can be retried (honors the one-shot-claim contract)."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+    resolved = str(db_path.resolve())
+
+    kb._REPAIR_ATTEMPTED_PATHS.discard(resolved)
+    kb._INITIALIZED_PATHS.discard(resolved)
+
+    with kb.connect(db_path=db_path) as conn:
+        kb.list_tasks(conn)
+
+    # Repair succeeded, so the one-shot claim must have been released.
+    with kb._REPAIR_ATTEMPT_LOCK:
+        assert resolved not in kb._REPAIR_ATTEMPTED_PATHS
+
+
+def test_reindex_lock_error_propagates_not_swallowed(tmp_path, monkeypatch):
+    """A `database is locked` OperationalError during REINDEX is transient
+    contention, not corruption. It subclasses DatabaseError but must re-raise
+    (not fall through to the destructive dump+reload swap)."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+
+    real_connect = kb._sqlite_connect
+
+    class _LockOnReindex:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a, **kw):
+            if sql.strip().upper().startswith("REINDEX"):
+                raise sqlite3.OperationalError("database is locked")
+            return self._conn.execute(sql, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _wrapped(path, *a, **kw):
+        return _LockOnReindex(real_connect(path, *a, **kw))
+
+    monkeypatch.setattr(kb, "_sqlite_connect", _wrapped)
+
+    with pytest.raises(sqlite3.OperationalError):
+        kb._attempt_index_only_repair(db_path)
+
+    # It must NOT have fallen through to dump+reload (no rebuild temp file, and
+    # the original corrupt DB is left in place untouched by a destructive swap).
+    assert list(tmp_path.glob("*.rebuild.tmp")) == []
+
+
 def test_corrupt_clone_count_is_capped(tmp_path):
     """A live WAL DB mutates on every rw probe, so N concurrent opens fingerprint
     different bytes and each used to write a fresh multi-MB clone (the storm).
