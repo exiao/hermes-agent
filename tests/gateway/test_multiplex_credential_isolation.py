@@ -627,3 +627,78 @@ class TestListProvidersEnvProbesUseScope:
 
         assert rows, "single-profile CLI listing must still detect the env-var provider"
 
+
+
+class TestOpenAIDiscoveryUsesScope:
+    """provider_model_ids / fingerprint for openai-api honor the profile scope.
+
+    Regression for the Codex P2 on #100: the /model listing marks the
+    openai-api row available from the requesting profile's scoped
+    OPENAI_API_KEY, but downstream live discovery + the disk-cache
+    fingerprint read os.getenv/os.environ directly, so profile B's picker
+    could call /models and cache model availability using profile A's key.
+    """
+
+    def _capture_discovery_key(self, monkeypatch):
+        """Return the api_key fetch_api_models is called with for openai-api."""
+        from hermes_cli import models as m
+
+        seen = {}
+
+        def _fake_fetch(api_key, base_url, *a, **kw):
+            seen["api_key"] = api_key
+            seen["base_url"] = base_url
+            # Return a model that survives the default-endpoint curated filter.
+            return list(m._PROVIDER_MODELS.get("openai-api", [])) or ["gpt-5"]
+
+        monkeypatch.setattr(m, "fetch_api_models", _fake_fetch)
+        m.provider_model_ids("openai-api", force_refresh=True)
+        return seen
+
+    def test_discovery_uses_scoped_key_not_environ(self, monkeypatch):
+        """Under multiplex, discovery must fetch with profile B's scoped key,
+        never the default profile's OPENAI_API_KEY in os.environ."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-default-leak")
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        ss.set_multiplex_active(True)
+
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB"})
+        try:
+            seen = self._capture_discovery_key(monkeypatch)
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert seen.get("api_key") == "sk-profileB"
+
+    def test_discovery_single_profile_reads_environ(self, monkeypatch):
+        """Multiplex off, no scope (CLI/TUI): discovery falls back to
+        os.environ, byte-identical to the legacy os.getenv behavior."""
+        ss.set_multiplex_active(False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-cli-user")
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+        seen = self._capture_discovery_key(monkeypatch)
+
+        assert seen.get("api_key") == "sk-cli-user"
+
+    def test_fingerprint_isolated_between_profiles(self, monkeypatch):
+        """The cache fingerprint must differ per scoped key so profile B
+        never hits profile A's cached openai-api entry."""
+        from hermes_cli.models import _credential_fingerprint
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-default-leak")
+        ss.set_multiplex_active(True)
+
+        tok_a = ss.set_secret_scope({"OPENAI_API_KEY": "sk-A"})
+        try:
+            fp_a = _credential_fingerprint("openai-api")
+        finally:
+            ss.reset_secret_scope(tok_a)
+
+        tok_b = ss.set_secret_scope({"OPENAI_API_KEY": "sk-B"})
+        try:
+            fp_b = _credential_fingerprint("openai-api")
+        finally:
+            ss.reset_secret_scope(tok_b)
+
+        assert fp_a != fp_b, "distinct scoped keys must produce distinct fingerprints"

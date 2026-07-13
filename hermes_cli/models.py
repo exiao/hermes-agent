@@ -2382,9 +2382,18 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         if live:
             return live
     if normalized in ("openai", "openai-api"):
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        # Resolve via the active profile secret scope (get_secret) rather than
+        # os.getenv. Under gateway profile multiplexing the /model listing marks
+        # the openai-api row available from the requesting profile's scoped
+        # OPENAI_API_KEY; discovery must use that SAME key/base_url so profile
+        # B's picker never calls /models with profile A's OpenAI credential.
+        # get_secret falls back to os.environ when unscoped + multiplex off, so
+        # single-profile CLI/TUI behavior is byte-identical.
+        from agent.secret_scope import get_secret as _get_secret
+
+        api_key = (_get_secret("OPENAI_API_KEY", "") or "").strip()
         if api_key:
-            base_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+            base_raw = (_get_secret("OPENAI_BASE_URL", "") or "").strip().rstrip("/")
             base = base_raw or "https://api.openai.com/v1"
             # Custom OpenAI-compatible endpoints (proxies, gateways, self-hosted)
             # may serve a small curated catalog — use the live list verbatim so
@@ -2557,6 +2566,13 @@ def _credential_fingerprint(provider: str) -> str:
     import hashlib
     import os as _os
 
+    # Read credential env-var VALUES through the active profile secret scope so
+    # the fingerprint is per-profile under gateway multiplexing: profile B's
+    # cache entry keys off profile B's OPENAI_API_KEY, never profile A's value
+    # sitting in os.environ. get_secret falls back to os.environ when unscoped +
+    # multiplex off, so single-profile fingerprints are byte-identical.
+    from agent.secret_scope import get_secret as _get_secret
+
     parts: list[str] = []
 
     # Env vars from PROVIDER_REGISTRY for this slug
@@ -2565,10 +2581,10 @@ def _credential_fingerprint(provider: str) -> str:
         pcfg = PROVIDER_REGISTRY.get(provider)
         if pcfg is not None:
             for ev in getattr(pcfg, "api_key_env_vars", ()) or ():
-                parts.append(f"{ev}={_os.environ.get(ev, '')}")
+                parts.append(f"{ev}={_get_secret(ev, '') or ''}")
             bev = getattr(pcfg, "base_url_env_var", "") or ""
             if bev:
-                parts.append(f"{bev}={_os.environ.get(bev, '')}")
+                parts.append(f"{bev}={_get_secret(bev, '') or ''}")
     except Exception:
         pass
 
