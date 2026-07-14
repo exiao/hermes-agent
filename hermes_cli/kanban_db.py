@@ -4014,16 +4014,24 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
     # was linked after the block (a deliberate `kanban link` fix) and is now
     # done/archived as a genuine resolution; otherwise `kanban link`-ing an
     # already-finished dependency would park the child forever.
-    linked_after = [
-        r["parent"]
-        for r in conn.execute(
-            "SELECT json_extract(payload, '$.parent') AS parent "
-            "FROM task_events "
-            "WHERE task_id = ? AND id > ? AND kind = 'linked'",
-            (task_id, dep_evt_id),
-        ).fetchall()
-        if r["parent"]
-    ]
+    # Parse the payload in Python rather than via SQLite's json_extract: the
+    # JSON1 extension is not built-in on older SQLite (pre-3.38.0), so json_extract
+    # would raise there. json.loads matches the payload-parsing pattern used
+    # elsewhere in this module and keeps the query portable.
+    linked_after = []
+    for r in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND id > ? AND kind = 'linked'",
+        (task_id, dep_evt_id),
+    ).fetchall():
+        if not r["payload"]:
+            continue
+        try:
+            parent = json.loads(r["payload"]).get("parent")
+        except (ValueError, TypeError):
+            continue
+        if parent:
+            linked_after.append(parent)
     if linked_after:
         lp = ",".join("?" * len(linked_after))
         parent_done = conn.execute(
@@ -5413,6 +5421,7 @@ def block_task(
                         "worker_run_id": int(expected_run_id),
                         "current_run_id": db_current_run,
                     },
+                    run_id=db_current_run,
                 )
                 expected_run_id = db_current_run
 
