@@ -5737,18 +5737,41 @@ def _is_async_httpx_client(inner: Any) -> bool:
         return False
 
 
+def _find_network_stream(conn: Any) -> Any:
+    """Descend an httpcore pool entry to the leaf connection's ``_network_stream``.
+
+    A direct pool entry is an ``AsyncHTTPConnection`` whose ``._connection`` is
+    the ``AsyncHTTP11Connection`` that actually holds ``_network_stream``. But a
+    **proxied** pool entry (``AsyncForwardHTTPConnection`` /
+    ``AsyncTunnelHTTPConnection``, used whenever ``HTTP_PROXY``/``ALL_PROXY`` is
+    set) wraps another ``AsyncHTTPConnection`` in ``._connection``, so the real
+    ``_network_stream`` is one hop deeper. Walk the ``._connection`` chain until
+    we reach the object that carries ``_network_stream`` rather than assuming a
+    fixed depth. Bounded to avoid pathological cycles.
+    """
+    node = conn
+    for _ in range(6):  # depth guard: direct=1, forward/tunnel proxy=2, headroom to spare
+        if node is None:
+            return None
+        stream = getattr(node, "_network_stream", None)
+        if stream is not None:
+            return stream
+        node = getattr(node, "_connection", None)
+    return None
+
+
 def _close_connection_socket(conn: Any) -> None:
     """Close the raw OS socket behind one httpcore pool connection.
 
-    Walks ``conn._connection._network_stream._stream`` down to the anyio
-    asyncio ``SocketStream`` (one extra ``.transport_stream`` hop for TLS) and
-    closes its ``_transport._sock`` — a real ``socket.socket``. This frees the
-    fd synchronously without invoking the (possibly dead) event loop the async
-    transport is bound to. Best-effort against httpx/httpcore/anyio internals.
+    Finds the leaf connection's anyio asyncio ``SocketStream`` (one extra
+    ``.transport_stream`` hop for TLS) and closes its ``_transport._sock`` — a
+    real ``socket.socket``. This frees the fd synchronously without invoking the
+    (possibly dead) event loop the async transport is bound to. Best-effort
+    against httpx/httpcore/anyio internals; handles direct and proxied pool
+    entries alike via ``_find_network_stream``.
     """
     try:
-        inner_conn = getattr(conn, "_connection", None)
-        stream = getattr(inner_conn, "_network_stream", None) if inner_conn is not None else None
+        stream = _find_network_stream(conn)
         raw = getattr(stream, "_stream", None)
         if raw is None:
             return

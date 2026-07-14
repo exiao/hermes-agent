@@ -167,3 +167,79 @@ class TestAuxClientFdRelease:
 
         # The sync httpx pool close() marks the client closed and reaps sockets.
         assert sync.is_closed
+
+
+class TestAuxClientFdReleaseProxied:
+    """Proxied pool entries nest one connection deeper — the fd walker must follow.
+
+    With ``HTTP_PROXY``/``ALL_PROXY`` set and a plain ``http://`` target, httpcore
+    keeps the pool entry as ``AsyncForwardHTTPConnection`` whose ``._connection``
+    is another ``AsyncHTTPConnection`` (the real ``_network_stream`` is one hop
+    deeper, on the inner ``AsyncHTTP11Connection``). A fixed-depth
+    ``conn._connection._network_stream`` walk misses it and strands the proxy
+    socket — the exact leak this PR fixes, in the proxy setup.
+
+    The connection is built and driven directly (rather than via a pooled
+    ``AsyncClient``) because httpcore does not retain a keep-alive proxy entry in
+    the visible ``pool._connections`` list under a bare stdlib forward proxy;
+    constructing the real ``AsyncForwardHTTPConnection`` graph is the
+    deterministic way to exercise the nesting.
+    """
+
+    def _make_dead_loop_proxy_connection(self, proxy_url: str):
+        """Build a real AsyncForwardHTTPConnection, drive one request through the
+        local server as a forward proxy so a socket is live, then kill the loop."""
+        import httpcore
+
+        parsed = httpx.URL(proxy_url)
+        loop = asyncio.new_event_loop()
+
+        async def _go():
+            from httpcore._async.http_proxy import AsyncForwardHTTPConnection
+
+            conn = AsyncForwardHTTPConnection(
+                proxy_origin=httpcore.Origin(b"http", parsed.host.encode(), parsed.port),
+                remote_origin=httpcore.Origin(b"http", b"example.invalid", 80),
+            )
+            req = httpcore.Request(
+                method=b"GET",
+                url=b"http://example.invalid/",
+                headers=[(b"Host", b"example.invalid")],
+            )
+            resp = await conn.handle_async_request(req)
+            await resp.aread()
+            await resp.aclose()
+            return conn
+
+        conn = loop.run_until_complete(_go())
+        loop.close()  # loop dead -> proxy socket stranded, aclose() cannot run
+        return conn
+
+    def test_single_hop_walk_misses_proxy_socket(self, local_http_server):
+        """Red: the old fixed-depth walk lands on the inner AsyncHTTPConnection,
+        which has no _network_stream, so the proxy socket would never be closed."""
+        conn = self._make_dead_loop_proxy_connection(local_http_server)
+        inner = getattr(conn, "_connection", None)
+        assert inner is not None
+        assert getattr(inner, "_network_stream", None) is None, (
+            "proxy pool entry no longer nests deeper; leak repro is stale"
+        )
+        # ...but the depth-following walker DOES reach the stream.
+        from agent.auxiliary_client import _find_network_stream
+
+        assert _find_network_stream(conn) is not None
+
+    def test_release_closes_proxied_socket(self, local_http_server):
+        """Green: _close_connection_socket frees the proxied socket fd via the walker."""
+        from agent.auxiliary_client import _close_connection_socket, _find_network_stream
+
+        conn = self._make_dead_loop_proxy_connection(local_http_server)
+        stream = _find_network_stream(conn)
+        raw = stream._stream
+        holder = getattr(raw, "transport_stream", None) or raw
+        sock = getattr(getattr(holder, "_transport", None), "_sock", None)
+        assert sock is not None and sock.fileno() >= 0, "expected an open proxy socket"
+
+        _close_connection_socket(conn)
+
+        assert sock.fileno() == -1, "proxy socket fd not released after eviction"
