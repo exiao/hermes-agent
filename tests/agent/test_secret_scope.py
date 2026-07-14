@@ -463,3 +463,32 @@ class TestEnvFileParsing:
 
         assert "hit" not in ran  # failed closed before calling fetch()
         assert "LEGACY_KEY" not in scope
+
+    def test_named_profile_inherits_shared_root_env(self, tmp_path, monkeypatch):
+        """A named profile with an empty (or partial) .env still sees shared
+        root ~/.hermes/.env secrets in its scope — mirroring load_hermes_dotenv's
+        root-then-profile merge. Without this, /model provider detection (which
+        reads through get_secret) would miss a shared root OPENAI_API_KEY."""
+        # Layout: tmp_path is the root home; tmp_path/profiles/alpha is the
+        # named profile. get_default_hermes_root(profile_home) → tmp_path.
+        (tmp_path / ".env").write_text(
+            "OPENAI_API_KEY=sk-shared-root\nSHARED_TOKEN=root-tok\n",
+            encoding="utf-8",
+        )
+        profile_home = tmp_path / "profiles" / "alpha"
+        profile_home.mkdir(parents=True)
+        # Profile overrides one value, inherits the rest from root.
+        (profile_home / ".env").write_text(
+            "SHARED_TOKEN=profile-override\n", encoding="utf-8"
+        )
+
+        scope = ss.build_profile_secret_scope(profile_home)
+        assert scope.get("OPENAI_API_KEY") == "sk-shared-root"  # inherited
+        assert scope.get("SHARED_TOKEN") == "profile-override"  # profile wins
+
+    def test_default_profile_does_not_double_load_root(self, tmp_path):
+        """The default/root home resolves its root to itself — no duplicate
+        base-layer pass, and its own .env is authoritative."""
+        (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-root-only\n", encoding="utf-8")
+        scope = ss.build_profile_secret_scope(tmp_path)
+        assert scope.get("OPENAI_API_KEY") == "sk-root-only"

@@ -209,7 +209,25 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     from ``os.environ`` directly, so the scope holds only profile secrets.
     """
     home = Path(hermes_home)
-    secrets = load_env_file(home / ".env")
+    # Named profiles inherit the shared root ``~/.hermes/.env`` as a base layer,
+    # then override with their own ``.env`` — mirroring ``load_hermes_dotenv``'s
+    # root-then-profile merge so a profile with an empty (or partial) ``.env``
+    # still sees shared root secrets (e.g. OPENAI_API_KEY, CPE_GITHUB_TOKEN)
+    # through the scope. The default/root home resolves to itself, so no base
+    # layer is added there. Resolve the root from the home being built (NOT the
+    # process HERMES_HOME) so a custom/isolated home can't inherit an unrelated
+    # ~/.hermes/.env.
+    secrets: Dict[str, str] = {}
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root_home = Path(get_default_hermes_root(home))
+        root_env = root_home / ".env"
+        if root_env.resolve() != (home / ".env").resolve() and root_env.exists():
+            secrets.update(load_env_file(root_env))
+    except Exception:  # noqa: BLE001 — never block scope build on root resolution
+        pass
+    secrets.update(load_env_file(home / ".env"))  # profile .env overrides root
 
     # Secret sources normally populate os.environ. Resolve them into this
     # isolated mapping instead so a multiplexed scope can remain authoritative.
