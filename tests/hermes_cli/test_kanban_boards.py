@@ -428,6 +428,55 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
+        # The dispatcher's resolved FD-headroom threshold must be pinned into
+        # the worker env so a worker that rewrites HERMES_HOME to its own
+        # profile still honors the dispatching profile's kanban.fd_headroom.
+        assert env["HERMES_KANBAN_FD_HEADROOM"] == str(kb._resolve_fd_headroom())
+
+    def test_default_spawn_propagates_dispatcher_fd_headroom(
+        self, fresh_home, monkeypatch
+    ):
+        """A dispatcher override of kanban.fd_headroom reaches the worker env.
+
+        The worker rewrites HERMES_HOME to its assignee profile, so without the
+        explicit pin it would read fd_headroom from the wrong config. Pin the
+        dispatcher's resolved value via the highest-precedence env bridge.
+        """
+        captured = {}
+
+        class FakeProc:
+            pid = 999
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        # Dispatcher operator disables the guard in the gateway profile.
+        monkeypatch.setenv("HERMES_KANBAN_FD_HEADROOM", "0")
+        kb.create_board("fdboard")
+
+        task = kb.Task(
+            id="t_fd",
+            title="fd test",
+            body=None,
+            assignee="teknium",
+            status="ready",
+            priority=0,
+            created_by="user",
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+        kb._default_spawn(task, str(fresh_home / "ws"), board="fdboard")
+
+        assert captured["env"]["HERMES_KANBAN_FD_HEADROOM"] == "0"
 
     def test_default_board_spawn_keeps_legacy_paths(self, fresh_home, monkeypatch):
         captured = {}

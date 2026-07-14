@@ -23,6 +23,9 @@ from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
+
+from agent.secret_scope import current_secret_scope as _current_secret_scope
+from agent.secret_scope import get_secret as _get_secret
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
@@ -978,12 +981,12 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         return None
 
     raw = result.stdout.strip()
-    if not raw:
+    if not raw or not isinstance(raw, str):
         return None
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 
@@ -1306,8 +1309,91 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
-def _resolve_anthropic_pool_token() -> Optional[str]:
+def _read_anthropic_secret(name: str) -> str:
+    """Read an Anthropic env secret without breaking non-multiplex scopes.
+
+    Multiplexed profile scopes are authoritative and must never fall through to
+    the process/default profile. Other scoped callers, notably single-profile
+    cron jobs, retain the legacy service-environment fallback when their local
+    scope does not define the key.
+    """
+    scope = _current_secret_scope()
+    value = (_get_secret(name, "") or "").strip()
+    if value or scope is None:
+        return value
+
+    scoped_names = (
+        "ANTHROPIC_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    )
+    scope_has_anthropic_secret = any(
+        str(scope.get(key, "") or "").strip() for key in scoped_names
+    )
+    if scope_has_anthropic_secret:
+        return ""
+
+    # A profile can intentionally DISABLE an Anthropic path by writing a blank
+    # slot to its .env (``ANTHROPIC_TOKEN=`` / ``ANTHROPIC_API_KEY=``); the setup
+    # helpers do exactly this to zero the OAuth path when switching to an API key
+    # (and vice versa). load_env_file keeps those as present-but-empty scope
+    # keys. That explicit clear must win — falling through to os.environ below
+    # would let a service-level ANTHROPIC_TOKEN override the profile's clear. So
+    # treat any Anthropic slot that is PRESENT in the scope (blank or not) as the
+    # profile having spoken, and suppress the process-env fallback.
+    scope_declares_anthropic_slot = any(key in scope for key in scoped_names)
+    if scope_declares_anthropic_slot:
+        return ""
+
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        # Multiplex scopes are fail-closed for secondary profiles, but the
+        # default profile may legitimately receive its Anthropic credential from
+        # the process/service environment instead of ~/.hermes/.env. When its
+        # profile scope has no Anthropic secret of its own, keep that legacy
+        # default-profile fallback; never borrow it for non-default profiles.
+        if not _scope_is_non_default_profile():
+            return (os.environ.get(name, "") or "").strip()
+        return ""
+
+    return (os.environ.get(name, "") or "").strip()
+
+
+def _scope_is_non_default_profile() -> bool:
+    """True when a profile secret scope is active for a NON-default profile.
+
+    Under gateway multiplexing every turn — including the default profile's own
+    turns — runs inside a ``set_secret_scope`` scope, so ``current_secret_scope()``
+    alone can't tell whether the active profile owns the host-global ~/.claude /
+    Keychain credential. The default profile does (it owns ~/.hermes and
+    ~/.claude); any other profile does not. This gates suppression of the global
+    Claude Code credential in ``resolve_anthropic_token`` so a non-default profile
+    can't authenticate with the default profile's global token, while the default
+    profile's own turns keep resolving it as before.
+
+    ``get_active_profile_name`` reads HERMES_HOME, which ``_profile_runtime_scope``
+    overrides per turn, so it reflects the profile whose scope is active. Returns
+    False when no scope is installed (single-profile / non-gateway callers), where
+    behavior is unchanged.
+    """
+    if _current_secret_scope() is None:
+        return False
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return (get_active_profile_name() or "default") != "default"
+    except Exception:  # pragma: no cover - defensive; treat unknown as global-owner
+        return False
+
+
+def _resolve_anthropic_pool_token(*, profile_only: bool = False) -> Optional[str]:
     """Return the first available Anthropic OAuth token from credential_pool.
+
+    ``profile_only`` bypasses the root-pool fallback used by ordinary named
+    profiles. A multiplexed request already carries an authoritative profile
+    secret scope, so borrowing the root profile's OAuth token there would cross
+    the isolation boundary and could shadow the requesting profile's API key.
 
     Read-only: enumerates with ``clear_expired=False, refresh=False`` so a bare
     token *resolve* (which runs from diagnostic/read-only call sites such as
@@ -1316,12 +1402,107 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     path's pool recovery, not the resolver.
     """
     try:
-        from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
+        from agent.credential_pool import (
+            AUTH_TYPE_OAUTH,
+            CredentialPool,
+            PooledCredential,
+            _normalize_pool_priorities,
+            load_pool,
+        )
     except Exception:
         return None
 
     try:
-        pool = load_pool("anthropic")
+        if profile_only:
+            # Read the active profile's pool directly. ``load_pool`` goes through
+            # read_credential_pool(), whose deliberate root fallback is correct
+            # for ordinary workers but crosses the boundary of a multiplexed
+            # request. Avoid its singleton/env seeding too: token resolution is a
+            # read and must not persist borrowed credentials as a side effect.
+            from hermes_cli.auth import _load_auth_store, is_source_suppressed
+
+            auth_store = _load_auth_store()
+            pkce_suppressed = is_source_suppressed("anthropic", "hermes_pkce")
+            raw_pool = auth_store.get("credential_pool")
+            raw_entries = (
+                raw_pool.get("anthropic", []) if isinstance(raw_pool, dict) else []
+            )
+            entries = [
+                PooledCredential.from_dict("anthropic", payload)
+                for payload in raw_entries
+                if isinstance(payload, dict)
+                # ``claude_code`` is a singleton backed by host-global ~/.claude.
+                # Even when copied into a named profile pool, CredentialPool can
+                # sync an exhausted entry from that global file and persist the
+                # default profile's token. Never admit it on this isolated path.
+                and str(payload.get("source") or "") != "claude_code"
+                and not (
+                    pkce_suppressed
+                    and str(payload.get("source") or "") == "hermes_pkce"
+                )
+            ]
+            profile_api_key_explicit = bool(
+                (_get_secret("ANTHROPIC_API_KEY", "") or "").strip()
+                and not (_get_secret("ANTHROPIC_TOKEN", "") or "").strip()
+                and not (_get_secret("CLAUDE_CODE_OAUTH_TOKEN", "") or "").strip()
+            )
+            if profile_api_key_explicit:
+                # Match load_pool()'s api_key_path_explicit pruning: an explicit
+                # API-key setup suppresses stale AUTO-SEEDED OAuth credentials so
+                # rotation on a transient 401/429 can't silently flip the session
+                # onto an OAuth identity (which forces the Claude Code masquerade).
+                # That means not just hermes_pkce/claude_code but the env-seeded
+                # OAuth singletons too (source ``env:ANTHROPIC_TOKEN`` /
+                # ``env:CLAUDE_CODE_OAUTH_TOKEN``) — otherwise source #4 can still
+                # return the stale env OAuth token here. Manual pool entries
+                # (source ``manual:*``) are independent user-added credentials and
+                # are kept; api_key entries are kept.
+                _auto_oauth = ("hermes_pkce", "claude_code")
+                entries = [
+                    entry
+                    for entry in entries
+                    if not (
+                        entry.auth_type == AUTH_TYPE_OAUTH
+                        and (
+                            entry.source in _auto_oauth
+                            or str(entry.source or "").startswith("env:")
+                        )
+                    )
+                ]
+            elif (
+                not pkce_suppressed
+                and not any(entry.source == "hermes_pkce" for entry in entries)
+            ):
+                # The dashboard writes this profile-local file before its
+                # best-effort pool insert. Preserve that valid intermediate
+                # state without running load_pool() and its global seeders.
+                local_oauth = read_hermes_oauth_credentials()
+                if local_oauth and local_oauth.get("accessToken"):
+                    entries.append(
+                        PooledCredential.from_dict(
+                            "anthropic",
+                            {
+                                "id": "hermes_pkce",
+                                "label": "Hermes PKCE",
+                                "auth_type": AUTH_TYPE_OAUTH,
+                                "priority": len(entries),
+                                "source": "hermes_pkce",
+                                "access_token": local_oauth.get("accessToken", ""),
+                                "refresh_token": local_oauth.get("refreshToken"),
+                                "expires_at_ms": local_oauth.get("expiresAt"),
+                            },
+                        )
+                    )
+            # Apply the same manual-over-seeded priority normalization that
+            # load_pool() runs. Building the pool directly here (to avoid
+            # load_pool's global seeders on the isolated profile path) otherwise
+            # skips it, so a manually-added OAuth entry that `hermes auth add`
+            # appended with a larger priority would sort BEHIND a seeded
+            # singleton instead of taking precedence. Reorder in place first.
+            _normalize_pool_priorities("anthropic", entries)
+            pool = CredentialPool("anthropic", entries)
+        else:
+            pool = load_pool("anthropic")
         # Enumerate read-only (clear_expired=False, refresh=False): never persist
         # to auth.json or trigger a network refresh from a bare resolve. select()
         # is deliberately NOT used — it runs clear_expired=True, refresh=True,
@@ -1361,8 +1542,48 @@ def resolve_anthropic_token() -> Optional[str]:
     """
     creds = read_claude_code_credentials()
 
+    # Reads route through get_secret so a multiplexed gateway resolves the
+    # requesting profile's token (via the active _SECRET_SCOPE) instead of the
+    # process/default-profile value. With no scope installed (single-profile
+    # deployments, non-gateway callers) get_secret transparently reads
+    # os.environ, so behavior is byte-identical to the prior os.getenv.
+    #
+    # read_claude_code_credentials() reads the host's global ~/.claude / Keychain
+    # record, which belongs to the DEFAULT profile — the profile that owns
+    # ~/.hermes and ~/.claude. Under multiplexing every turn runs inside a secret
+    # scope, including the DEFAULT profile's own turns, so the mere presence of a
+    # scope is NOT enough to tell "this global cred isn't mine": for a NON-default
+    # profile the global record is the wrong profile's and must not participate
+    # (otherwise it would override the scoped ANTHROPIC_TOKEN at source #1/#2 or be
+    # returned outright at source #3), but for the DEFAULT profile it legitimately
+    # IS that profile's credential and must still resolve. Suppress the global
+    # record only for a non-default scoped profile: drop it to None so it can't
+    # shadow the scoped env tokens, and skip the source-#3 Claude Code fallback
+    # entirely (that resolver re-reads the global file when handed None, so None
+    # alone doesn't suppress it) — leaving only the profile's own scoped secrets.
+    scope = _current_secret_scope()
+    scoped_names = (
+        "ANTHROPIC_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    )
+    scope_has_anthropic_secret = bool(
+        scope is not None
+        and any(str(scope.get(key, "") or "").strip() for key in scoped_names)
+    )
+    scope_has_api_key = bool(
+        scope is not None
+        and str(scope.get("ANTHROPIC_API_KEY", "") or "").strip()
+    )
+    from agent.secret_scope import is_multiplex_active
+
+    nondefault_scope = _scope_is_non_default_profile() and is_multiplex_active()
+    suppress_global_creds = nondefault_scope or scope_has_api_key
+    if suppress_global_creds:
+        creds = None
+
     # 1. Hermes-managed OAuth/setup token env var
-    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+    token = _read_anthropic_secret("ANTHROPIC_TOKEN")
     if token:
         preferred = _prefer_refreshable_claude_code_token(token, creds)
         if preferred:
@@ -1370,26 +1591,51 @@ def resolve_anthropic_token() -> Optional[str]:
         return token
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    cc_token = _read_anthropic_secret("CLAUDE_CODE_OAUTH_TOKEN")
     if cc_token:
         preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
         if preferred:
             return preferred
         return cc_token
 
-    # 3. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
-    if resolved_claude_token:
-        return resolved_claude_token
+    # 3. Claude Code credential file. Skipped for a non-default scoped profile:
+    # this reads the host's global default-profile ~/.claude record, which must
+    # not resolve for another profile (passing creds=None here would just re-read
+    # that global file — see _resolve_claude_code_token_from_credentials). The
+    # default profile owns ~/.claude, so it still resolves here as before.
+    if not suppress_global_creds:
+        resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
+        if resolved_claude_token:
+            return resolved_claude_token
 
-    # 4. Hermes credential_pool OAuth entry.
-    resolved_pool_token = _resolve_anthropic_pool_token()
+    # 4. Hermes credential_pool OAuth entry. A scoped request must use only
+    # its local pool, but valid manual OAuth entries retain their documented
+    # precedence over a scoped ANTHROPIC_API_KEY.
+    #
+    # The pool is consulted whenever there is no scoped API key (the no-scope
+    # and OAuth-only paths) OR whenever a MULTIPLEX scope is active — including
+    # the DEFAULT profile's own scope. Under multiplexing the default profile
+    # owns ~/.hermes/auth.json, so a manually-added OAuth entry there keeps the
+    # same source-#4-before-#5 precedence it has on the no-scope default path;
+    # gating the pool out for a default multiplex scope that happens to carry an
+    # API key silently dropped that manual credential and returned the API key
+    # instead. A NON-multiplex single-profile cron scope is intentionally
+    # excluded: its scoped API key stays authoritative and must not pick up a
+    # borrowed global pool token. ``_resolve_anthropic_pool_token(profile_only
+    # =...)`` isolates each caller's pool (dropping borrowed/claude_code/
+    # auto-seeded entries), so it is always safe to consult here.
+    scope_under_multiplex = scope is not None and is_multiplex_active()
+    resolved_pool_token = None
+    if not scope_has_api_key or scope_under_multiplex:
+        resolved_pool_token = _resolve_anthropic_pool_token(
+            profile_only=suppress_global_creds
+        )
     if resolved_pool_token:
         return resolved_pool_token
 
     # 5. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
     # This remains as a compatibility fallback for pre-migration Hermes configs.
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    api_key = _read_anthropic_secret("ANTHROPIC_API_KEY")
     if api_key:
         return api_key
 

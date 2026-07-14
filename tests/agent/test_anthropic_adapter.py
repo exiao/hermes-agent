@@ -13,6 +13,7 @@ from agent.anthropic_adapter import (
     _is_azure_anthropic_endpoint,
     _is_oauth_token,
     _refresh_oauth_token,
+    _resolve_anthropic_pool_token,
     _to_plain_data,
     _write_claude_code_credentials,
     build_anthropic_client,
@@ -595,6 +596,768 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         assert resolve_anthropic_token() == "sk-ant-oat01-static-token"
+
+    def test_nonmultiplex_scope_falls_back_to_service_env(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-SERVICE-ENV")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+        )
+        ss.set_multiplex_active(False)
+        scope_token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-SERVICE-ENV"
+        finally:
+            ss.reset_secret_scope(scope_token)
+
+    def test_nonmultiplex_scope_secret_beats_service_env_priority(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-SERVICE-ENV")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "sk-ant-oat01-GLOBAL-CLAUDE",
+                "refreshToken": "refresh-global",
+                "expiresAt": 9999999999999,
+            },
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda _: True
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token",
+            lambda **_: "sk-ant-oat01-GLOBAL-POOL",
+        )
+        ss.set_multiplex_active(False)
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-SCOPED-CRON"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-api03-SCOPED-CRON"
+        finally:
+            ss.reset_secret_scope(scope_token)
+
+    def test_nonmultiplex_scoped_oauth_keeps_refreshable_claude_preference(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "sk-ant-oat01-REFRESHABLE-CLAUDE",
+                "refreshToken": "refresh-global",
+                "expiresAt": 9999999999999,
+            },
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda _: True
+        )
+        ss.set_multiplex_active(False)
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_TOKEN": "sk-ant-oat01-STATIC-SCOPED"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-REFRESHABLE-CLAUDE"
+        finally:
+            ss.reset_secret_scope(scope_token)
+
+    def test_scoped_secret_wins_over_os_environ_under_multiplexing(self, monkeypatch, tmp_path):
+        """Regression for t_601f23d1: under gateway profile multiplexing the
+        resolver must read ANTHROPIC_TOKEN from the active _SECRET_SCOPE (the
+        requesting profile's .env), NOT the process/default-profile os.environ.
+
+        Mirrors tests/gateway/test_credits_usage_profile_scope.py: with a scope
+        installed, profile B's token wins; before the get_secret routing it
+        returned the default profile's os.environ value.
+        """
+        from agent import secret_scope as ss
+
+        # Default-profile value living in the process env.
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-DEFAULT")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+
+        # Secondary profile B's isolated secret scope.
+        token = ss.set_secret_scope({"ANTHROPIC_TOKEN": "sk-ant-oat01-PROFILE-B"})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-B"
+        finally:
+            ss.reset_secret_scope(token)
+
+        # No scope installed → unchanged os.environ behavior.
+        assert resolve_anthropic_token() == "sk-ant-oat01-DEFAULT"
+
+    def test_scoped_token_wins_over_global_refreshable_creds_under_multiplexing(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression for the Codex P1 on PR #99: when the host has refreshable
+        Claude Code credentials for the DEFAULT profile, a scoped turn must NOT
+        let those global creds override the requesting profile's scoped
+        ANTHROPIC_TOKEN.
+
+        read_claude_code_credentials() reads the global ~/.claude / Keychain
+        record. Before the scope-drops-creds fix, _prefer_refreshable_claude_code_token
+        resolved that refreshable global credential and returned it in place of
+        the scoped token — authenticating /usage and Anthropic calls as the
+        wrong profile. The earlier regression test missed this because it stubbed
+        read_claude_code_credentials to None.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        # Host default-profile refreshable Claude Code credential (global).
+        global_creds = {
+            "accessToken": "sk-ant-oat01-GLOBAL-DEFAULT",
+            "refreshToken": "refresh-default",
+            "expiresAt": 9999999999999,
+            "source": "file",
+        }
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: global_creds,
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+        # Active scope belongs to a NON-default profile (profile B), so the
+        # host-global ~/.claude credential is not this profile's and must be
+        # suppressed. get_active_profile_name reads HERMES_HOME (overridden per
+        # turn by _profile_runtime_scope); stub it to the requesting profile.
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        # Requesting profile B carries its own scoped OAuth token.
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope(
+            {"ANTHROPIC_TOKEN": "sk-ant-oat01-PROFILE-B"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-B"
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        # No scope → the global refreshable credential resolves as before.
+        assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
+
+    def test_scoped_api_key_wins_over_global_creds_at_source_3_under_multiplexing(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression for the second Codex P1 on PR #99 (source-#3 gap): when a
+        scoped profile has NO ANTHROPIC_TOKEN / CLAUDE_CODE_OAUTH_TOKEN — only a
+        scoped ANTHROPIC_API_KEY — the global Claude Code credential must NOT be
+        returned at source #3.
+
+        Setting creds=None under scope does not suppress source #3 on its own,
+        because _resolve_claude_code_token_from_credentials(None) re-reads the
+        global ~/.claude file. The scoped turn must skip that fallback entirely
+        so the profile's own scoped API key (source #5) resolves instead of the
+        default profile's global Claude Code token.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        # Host default-profile refreshable Claude Code credential (global).
+        global_creds = {
+            "accessToken": "sk-ant-oat01-GLOBAL-DEFAULT",
+            "refreshToken": "refresh-default",
+            "expiresAt": 9999999999999,
+            "source": "file",
+        }
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: global_creds,
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+        # Active scope belongs to a NON-default profile.
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        # Requesting profile B has only a scoped API key (no OAuth token).
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-PROFILE-B"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-api03-PROFILE-B"
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        # No scope → the global Claude Code credential still resolves at source #3.
+        assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
+
+    def test_nondefault_scope_does_not_borrow_global_pool_before_scoped_api_key(
+        self, monkeypatch, tmp_path
+    ):
+        """A named profile's scoped API key must beat the root pool fallback.
+
+        ``read_credential_pool`` deliberately borrows root entries when a profile
+        has no local entries. That sharing is useful for ordinary profile workers,
+        but unsafe inside a multiplexed request whose secret scope belongs to a
+        different profile: the borrowed OAuth token would shadow source #5.
+        """
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / ".hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        (root / "auth.json").write_text(
+            json.dumps(
+                {
+                    "credential_pool": {
+                        "anthropic": [
+                            {
+                                "id": "root-oauth",
+                                "label": "root-oauth",
+                                "auth_type": "oauth",
+                                "priority": 0,
+                                "source": "manual",
+                                "access_token": "sk-ant-oat01-GLOBAL-POOL",
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (profile / "auth.json").write_text(
+            json.dumps(
+                {
+                    "credential_pool": {
+                        "anthropic": [
+                            {
+                                "id": "profile-claude",
+                                "label": "profile-claude",
+                                "auth_type": "oauth",
+                                "priority": 0,
+                                "source": "claude_code",
+                                "access_token": "sk-ant-oat01-STALE-PROFILE",
+                                "last_status": "dead",
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (profile / ".anthropic_oauth.json").write_text(
+            json.dumps(
+                {
+                    "accessToken": "sk-ant-oat01-STALE-PKCE",
+                    "refreshToken": "refresh-stale",
+                    "expiresAt": 9999999999999,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "sk-ant-oat01-GLOBAL-CLAUDE",
+                "refreshToken": "refresh-global",
+                "expiresAt": 9999999999999,
+            },
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-PROFILE-B"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-api03-PROFILE-B"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+
+    def test_nondefault_scope_prefers_local_manual_pool_to_scoped_api_key(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+        calls = []
+
+        def _pool_token(*, profile_only=False):
+            calls.append(profile_only)
+            return "sk-ant-oat01-PROFILE-MANUAL"
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", _pool_token
+        )
+        ss.set_multiplex_active(True)
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-PROFILE-B"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-MANUAL"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
+        assert calls == [True]
+
+    def test_default_multiplex_scope_prefers_manual_pool_to_scoped_api_key(
+        self, monkeypatch
+    ):
+        """The DEFAULT profile under multiplexing keeps source-#4 pool precedence.
+
+        Regression for the default-profile gap: when the multiplexed gateway
+        handles the default profile whose ``.env`` sets ``ANTHROPIC_API_KEY``,
+        ``scope_has_api_key`` is true while ``nondefault_scope`` is false. The
+        pool-consult gate must still run ``_resolve_anthropic_pool_token`` so a
+        manually-added OAuth entry retains its documented precedence over the
+        scoped API key — matching both the no-scope default path and the
+        non-default multiplex path. Before the fix the gate short-circuited and
+        returned the API key, silently dropping the manual OAuth credential.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+        calls = []
+
+        def _pool_token(*, profile_only=False):
+            calls.append(profile_only)
+            return "sk-ant-oat01-DEFAULT-MANUAL"
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", _pool_token
+        )
+        ss.set_multiplex_active(True)
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-DEFAULT"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-DEFAULT-MANUAL"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
+        # Default profile owns ~/.hermes, so its own pool is read directly
+        # (profile_only=True under the active scope), never the borrowed root.
+        assert calls == [True]
+
+    def test_nondefault_scope_preserves_profile_local_hermes_pkce(
+        self, monkeypatch, tmp_path
+    ):
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        (profile / ".anthropic_oauth.json").write_text(
+            json.dumps(
+                {
+                    "accessToken": "sk-ant-oat01-PROFILE-PKCE",
+                    "refreshToken": "refresh-profile",
+                    "expiresAt": 9999999999999,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "sk-ant-oat01-GLOBAL-CLAUDE",
+                "refreshToken": "refresh-global",
+                "expiresAt": 9999999999999,
+            },
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        ss.set_multiplex_active(True)
+        scope_token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-PROFILE-PKCE"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
+            reset_hermes_home_override(home_token)
+
+    def test_nondefault_scope_honors_suppressed_profile_pkce(
+        self, monkeypatch, tmp_path
+    ):
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        (profile / ".anthropic_oauth.json").write_text(
+            json.dumps(
+                {
+                    "accessToken": "sk-ant-oat01-SUPPRESSED-PKCE",
+                    "refreshToken": "refresh-suppressed",
+                    "expiresAt": 9999999999999,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (profile / "auth.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "providers": {},
+                    "suppressed_sources": {"anthropic": ["hermes_pkce"]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        scope_token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() is None
+        finally:
+            ss.reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+
+    def test_default_profile_scope_still_resolves_global_claude_code_creds(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression for the Codex P2 on PR #99: under multiplexing the DEFAULT
+        profile's own turns also run inside a secret scope, but the DEFAULT
+        profile OWNS the host-global ~/.claude credential. The suppression must
+        NOT fire for it — otherwise a default profile relying on Claude Code
+        OAuth (rather than .env / pool creds) loses Anthropic auth and /usage.
+
+        The default profile has no scoped ANTHROPIC_TOKEN / API key; its only
+        Anthropic credential is the global Claude Code record at source #3, which
+        must still resolve while a (default-profile) scope is active.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        global_creds = {
+            "accessToken": "sk-ant-oat01-GLOBAL-DEFAULT",
+            "refreshToken": "refresh-default",
+            "expiresAt": 9999999999999,
+            "source": "file",
+        }
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: global_creds,
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+        )
+        # Active scope belongs to the DEFAULT profile (owner of ~/.claude).
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+
+        # Default profile's scope carries no Anthropic secret of its own.
+        token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-GLOBAL-DEFAULT"
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_default_multiplex_empty_scope_falls_back_to_service_env(
+        self, monkeypatch, tmp_path
+    ):
+        """The default profile may get its Anthropic token from the service env.
+
+        ``_profile_runtime_scope`` builds the default profile's secret scope from
+        ``$HERMES_HOME/.env`` only. If the gateway process instead inherited
+        ANTHROPIC_TOKEN from its service environment, the scope is empty while
+        ``os.environ`` still owns the DEFAULT profile's credential. Multiplex
+        fail-closed isolation must block that fallback only for non-default
+        scopes, not for the default profile's own scope.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-DEFAULT-SERVICE")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-DEFAULT-SERVICE"
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+    def test_default_multiplex_blank_scoped_slot_beats_service_env(
+        self, monkeypatch, tmp_path
+    ):
+        """A profile that explicitly CLEARS an Anthropic slot must not have that
+        clear overridden by the service env.
+
+        The setup helpers write blank slots (``ANTHROPIC_TOKEN=``) to disable a
+        path; load_env_file keeps them as present-but-empty scope keys. A blank
+        scoped Anthropic slot means the profile opted OUT, so the default-profile
+        os.environ fallback must not resurrect a service-level ANTHROPIC_TOKEN.
+        Distinct from the empty-scope ({}) case above, where no slot is declared
+        and the service-env fallback is legitimate.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-SERVICE-SHOULD-NOT-WIN")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+
+        ss.set_multiplex_active(True)
+        # Profile .env explicitly cleared the OAuth token (present but blank).
+        token = ss.set_secret_scope({"ANTHROPIC_TOKEN": ""})
+        try:
+            assert resolve_anthropic_token() is None
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+    def test_nondefault_multiplex_empty_scope_does_not_borrow_service_env(
+        self, monkeypatch, tmp_path
+    ):
+        """The default env fallback is not allowed for a secondary profile."""
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-DEFAULT-SERVICE")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() is None
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+    def test_profile_only_pool_prunes_stale_env_oauth_under_explicit_api_key(
+        self, monkeypatch, tmp_path
+    ):
+        """A non-default profile that switched OAuth -> API key must not let a
+        stale auto-seeded env OAuth pool entry survive on the profile_only pool
+        path.
+
+        Regression: the profile_only reader dropped only ``hermes_pkce`` when an
+        explicit API key was present, so an ``env:ANTHROPIC_TOKEN`` /
+        ``env:CLAUDE_CODE_OAUTH_TOKEN`` OAuth singleton left in the profile
+        auth.json could still be returned by source #4, reviving the Claude Code
+        masquerade the API-key path opted out of. It must prune every
+        auto-seeded OAuth entry (env:* + hermes_pkce + claude_code) while
+        keeping manual entries.
+        """
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        profile_auth = {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "env:ANTHROPIC_TOKEN",
+                        "source": "env:ANTHROPIC_TOKEN",
+                        "auth_type": "oauth",
+                        "access_token": "sk-ant-oat01-STALE-ENV-OAUTH",
+                        "priority": 0,
+                    },
+                    {
+                        "id": "manual:keep",
+                        "source": "manual:keep",
+                        "auth_type": "api_key",
+                        "access_token": "sk-ant-api-MANUAL-KEPT",
+                        "priority": 1,
+                    },
+                ]
+            },
+        }
+        (profile / "auth.json").write_text(json.dumps(profile_auth), encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        ss.set_multiplex_active(True)
+        # Explicit API-key path: API key set, no OAuth env tokens.
+        scope_token = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-ant-api-SCOPED"})
+        try:
+            token = _resolve_anthropic_pool_token(profile_only=True)
+            # The stale env OAuth token must never be what resolves here.
+            assert token != "sk-ant-oat01-STALE-ENV-OAUTH"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
+            reset_hermes_home_override(home_token)
+
+    def test_profile_only_pool_manual_oauth_takes_precedence_over_seeded(
+        self, monkeypatch, tmp_path
+    ):
+        """A manually-added OAuth entry must outrank a seeded singleton on the
+        profile_only pool path.
+
+        Regression: the profile_only branch builds CredentialPool directly to
+        skip load_pool's global seeders, but that also skipped
+        _normalize_pool_priorities, so a manual OAuth entry that `hermes auth
+        add` appended with a LARGER priority number sorted BEHIND a seeded
+        env:ANTHROPIC_TOKEN singleton and the seeded token resolved first.
+        Applying the normalization restores manual-over-seeded precedence.
+        """
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        profile_auth = {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "env:ANTHROPIC_TOKEN",
+                        "source": "env:ANTHROPIC_TOKEN",
+                        "auth_type": "oauth",
+                        "access_token": "sk-ant-oat01-SEEDED-SINGLETON",
+                        "priority": 0,
+                    },
+                    {
+                        "id": "manual:mine",
+                        "source": "manual:mine",
+                        "auth_type": "oauth",
+                        "access_token": "sk-ant-oat01-MANUAL-PREFERRED",
+                        "priority": 1,
+                    },
+                ]
+            },
+        }
+        (profile / "auth.json").write_text(json.dumps(profile_auth), encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        ss.set_multiplex_active(True)
+        # No API-key clear here: both OAuth entries survive; precedence is what's
+        # under test.
+        scope_token = ss.set_secret_scope({})
+        try:
+            token = _resolve_anthropic_pool_token(profile_only=True)
+            assert token == "sk-ant-oat01-MANUAL-PREFERRED"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
+            reset_hermes_home_override(home_token)
 
 
 class TestRefreshOauthToken:

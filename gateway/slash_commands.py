@@ -48,13 +48,6 @@ from utils import (
 
 logger = logging.getLogger("gateway.run")
 
-# Upper bound on the off-loop agent-resource cleanup during a /new or /reset
-# (see _handle_reset_command). A stuck teardown must not block the event loop;
-# past this the reset proceeds and the cleanup is left to finish (or leak) in
-# its worker thread. (#35994)
-_RESET_CLEANUP_TIMEOUT_S = 30.0
-
-
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -141,47 +134,68 @@ class GatewaySlashCommandsMixin:
         old_entry = self.session_store._entries.get(session_key)
 
         # Close tool resources on the old agent (terminal sandboxes, browser
-        # daemons, background processes) before evicting from cache.
+        # daemons, background processes) and shut down its memory provider.
         # Guard with getattr because test fixtures may skip __init__.
         #
-        # _cleanup_agent_resources is synchronous and can block for a long time
-        # (agent.close() does subprocess teardown; shutdown_memory_provider()
-        # may do network IO). This handler runs ON the event loop when a
-        # Telegram/Discord/Slack confirm-button click resolves the slash-confirm
-        # (see _request_slash_confirm), so an inline call wedges the whole loop
-        # and the bot goes silent until restart (#35994). Offload it to a worker
-        # thread (via the contextvar-preserving executor helper) with a bounded
-        # timeout so the loop is never blocked.
+        # _cleanup_agent_resources is synchronous and can block for a long time:
+        # agent.close() does subprocess teardown, and shutdown_memory_provider()
+        # fires the memory-session-end plugin, which makes a network LLM call to
+        # extract end-of-session memory. On a large session that extraction can
+        # take many seconds, and awaiting it here made /new sit behind the full
+        # 30s cleanup deadline before the fresh session started (observed ~30s
+        # resets, #35994 follow-up).
+        #
+        # None of that teardown needs to finish before the NEW session begins:
+        # the old agent's run generation is already invalidated and its running
+        # slot released above, so nothing races the next turn. Evict it from the
+        # cache now, then schedule the (still-bounded, off-loop) cleanup as a
+        # tracked background task so /new returns as soon as the session is
+        # rotated. _cleanup_agent_resources_off_loop keeps its own 30s cap and
+        # runs the sync teardown in a worker thread; we simply stop awaiting it.
         _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _old_agent = None
         if _cache_lock is not None:
             with _cache_lock:
                 _cached = self._agent_cache.get(session_key)
                 _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
-            if _old_agent is not None:
-                try:
-                    await asyncio.wait_for(
-                        self._run_in_executor_with_context(
-                            self._cleanup_agent_resources, _old_agent
-                        ),
-                        timeout=_RESET_CLEANUP_TIMEOUT_S,
-                    )
-                except asyncio.TimeoutError:
-                    # wait_for cancels the await, but the worker thread cannot be
-                    # cancelled — a wedged teardown keeps running (or leaks) for
-                    # the gateway's lifetime. The reset proceeds regardless.
-                    logger.warning(
-                        "Agent resource cleanup for session %s exceeded %ss during "
-                        "/new reset; proceeding with reset (the worker thread is left "
-                        "to finish on its own). (#35994)",
-                        session_key, _RESET_CLEANUP_TIMEOUT_S,
-                    )
-                except Exception as cleanup_exc:
-                    logger.warning(
-                        "Agent resource cleanup for session %s failed during /new "
-                        "reset: %s (#35994)",
-                        session_key, cleanup_exc,
-                    )
+        # Snapshot the transcript BEFORE eviction. _evict_cached_agent spawns a
+        # daemon soft-release thread that clears agent._session_messages, which
+        # is the same field _cleanup_agent_resources reads to feed the
+        # memory-provider on_session_end hook. Capturing it here (and passing it
+        # through below) keeps session-end memory extraction from racing on an
+        # emptied transcript (#35994 follow-up).
+        from gateway.run import _SESSION_MESSAGES_UNSET
+
+        _messages_snapshot = _SESSION_MESSAGES_UNSET
+        if _old_agent is not None:
+            _live = getattr(_old_agent, "_session_messages", None)
+            if isinstance(_live, list):
+                _messages_snapshot = list(_live)
         self._evict_cached_agent(session_key)
+        if _old_agent is not None:
+            _bg_tasks = getattr(self, "_background_tasks", None)
+            try:
+                _cleanup_task = asyncio.create_task(
+                    self._cleanup_agent_resources_off_loop(
+                        _old_agent,
+                        context=f"/new reset {session_key}",
+                        session_messages=_messages_snapshot,
+                    )
+                )
+                # Track so shutdown can cancel it; add_done_callback keeps the
+                # set from growing (mirrors gateway/run.py background tasks).
+                if isinstance(_bg_tasks, set):
+                    _bg_tasks.add(_cleanup_task)
+                    _cleanup_task.add_done_callback(_bg_tasks.discard)
+            except RuntimeError:
+                # No running loop (test fixture / non-async caller) — fall back
+                # to a bounded inline cleanup so resources still get released.
+                try:
+                    self._cleanup_agent_resources(
+                        _old_agent, session_messages=_messages_snapshot
+                    )
+                except Exception:
+                    pass
 
         # Discard any /queue overflow for this session — /new is a
         # conversation-boundary operation, queued follow-ups from the
@@ -4095,6 +4109,9 @@ class GatewaySlashCommandsMixin:
         credits_lines: list[str] = []
         if provider:
             try:
+                # Slash commands run outside _run_agent's profile scope. Re-enter
+                # the source scope so account lookup uses the same credential as
+                # the session, including the default profile in multiplex mode.
                 with self._profile_secret_scope_for_source(source):
                     account_snapshot = await asyncio.to_thread(
                         fetch_account_usage,

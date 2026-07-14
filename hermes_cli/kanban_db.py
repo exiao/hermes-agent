@@ -2186,6 +2186,194 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+class KanbanFDPressureError(RuntimeError):
+    """Raised when the host is too close to an FD ceiling to open the board safely.
+
+    Opening a SQLite WAL database under file-descriptor starvation is the
+    documented 2026-07-13 corruption path: an ``open()``/``mmap()`` that
+    returns EMFILE while SQLite is extending its ``-wal``/``-shm`` sidecars can
+    leave a b-tree index desynced from its table (``wrong # of entries in index
+    idx_notify_task``). Refusing to connect is recoverable — the dispatcher /
+    notifier / claim paths already tolerate a skipped tick and retry — while a
+    torn index is not. So we fail *closed*, loudly and typed, before touching
+    the DB rather than after.
+    """
+
+
+# Refuse to open the board when either the per-process OR the system-wide FD
+# headroom drops below this many descriptors. Behavioral config (not a secret):
+# lives in ``config.yaml`` under ``kanban.fd_headroom``; the
+# ``HERMES_KANBAN_FD_HEADROOM`` env var is an internal bridge override only
+# (e.g. for a worker subprocess or a test) and takes precedence when set.
+DEFAULT_FD_HEADROOM = 64
+
+
+def _resolve_fd_headroom() -> int:
+    """Return the effective FD-headroom threshold.
+
+    Precedence: ``HERMES_KANBAN_FD_HEADROOM`` env bridge → ``config.yaml``
+    ``kanban.fd_headroom`` → :data:`DEFAULT_FD_HEADROOM`. A value ``<= 0``
+    disables the preflight (headroom can never be below zero), which is the
+    documented escape hatch for environments where the FD counters are
+    misleading.
+    """
+    raw = os.environ.get("HERMES_KANBAN_FD_HEADROOM", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg_val = (load_config_readonly().get("kanban") or {}).get("fd_headroom")
+    except Exception:
+        cfg_val = None
+    if cfg_val is not None:
+        try:
+            return int(cfg_val)
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_FD_HEADROOM
+
+
+def _count_open_fds() -> Optional[int]:
+    """Return this process's open-FD count, or ``None`` if it can't be told.
+
+    Tries ``/proc/<pid>/fd`` (Linux) first, then ``/dev/fd`` (macOS/BSD).
+    Enumerating the directory needs one transient FD; if that itself fails with
+    EMFILE the process is already out of descriptors, so we return a very large
+    count to force the preflight to trip (fail closed) rather than ``None``
+    (fail open). Any other error → ``None`` (can't tell → don't block).
+    """
+    for fd_dir in (f"/proc/{os.getpid()}/fd", "/dev/fd"):
+        try:
+            return len(os.listdir(fd_dir))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            # EMFILE/ENFILE while trying to opendir the fd table == already
+            # starved. Signal maximal pressure so the caller refuses to connect.
+            if exc.errno in (24, 23):  # EMFILE, ENFILE
+                return 1 << 30
+            return None
+    return None
+
+
+def _proc_fd_headroom() -> Optional[int]:
+    """Return ``soft_rlimit - open_fds`` for this process, or ``None``.
+
+    ``None`` when the soft ``RLIMIT_NOFILE`` is unlimited/unreadable or the open
+    count can't be determined — i.e. we can't compute a per-proc headroom.
+    """
+    try:
+        import resource
+
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, ValueError, OSError):
+        return None
+    if soft in (resource.RLIM_INFINITY, -1, 0):
+        return None
+    open_fds = _count_open_fds()
+    if open_fds is None:
+        return None
+    return soft - open_fds
+
+
+def _system_fd_headroom() -> Optional[int]:
+    """Return the SYSTEM-WIDE FD headroom (``max - in_use``), or ``None``.
+
+    This is the binding limit in the real incident: on macOS the wall is
+    ``kern.maxfiles`` (system-wide), NOT the generous per-process
+    ``RLIMIT_NOFILE``, so a purely per-proc check would never fire. We read:
+
+    * macOS/BSD: ``sysctlbyname('kern.maxfiles')`` and ``kern.num_files`` —
+      cheap, no FD opened.
+    * Linux: ``/proc/sys/fs/file-nr`` (``allocated  unused  max``).
+
+    Returns ``None`` on any other platform or on any read failure.
+    """
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            import ctypes.util
+
+            libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+            # Pin the signature explicitly. Without argtypes/restype ctypes
+            # defaults every arg and the return to 32-bit ``c_int``, which
+            # truncates the pointer arguments on 64-bit macOS and yields
+            # undefined behavior. int sysctlbyname(const char *, void *,
+            # size_t *, const void *, size_t).
+            libc.sysctlbyname.restype = ctypes.c_int
+            libc.sysctlbyname.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+
+            def _sysctl_int(name: str) -> Optional[int]:
+                val = ctypes.c_int(0)
+                size = ctypes.c_size_t(ctypes.sizeof(val))
+                rc = libc.sysctlbyname(
+                    name.encode(), ctypes.byref(val), ctypes.byref(size), None, 0
+                )
+                if rc != 0:
+                    return None
+                return int(val.value)
+
+            maxfiles = _sysctl_int("kern.maxfiles")
+            num_files = _sysctl_int("kern.num_files")
+            if maxfiles is None or num_files is None or maxfiles <= 0:
+                return None
+            return maxfiles - num_files
+        except Exception:
+            return None
+    if sys.platform.startswith("linux"):
+        try:
+            allocated_s, _unused_s, max_s = (
+                Path("/proc/sys/fs/file-nr").read_text(encoding="utf-8").split()
+            )
+            maxf = int(max_s)
+            if maxf <= 0:
+                return None
+            return maxf - int(allocated_s)
+        except Exception:
+            return None
+    return None
+
+
+def _assert_fd_headroom() -> None:
+    """Refuse to open the board when FD headroom is below the threshold.
+
+    Checks BOTH the per-process and the system-wide headroom and trips on
+    whichever is *closer* to its ceiling (the smaller of the two computable
+    values). If neither headroom can be computed, the preflight is a no-op —
+    we never block a connect we can't justify. A configured threshold ``<= 0``
+    also disables the check.
+    """
+    headroom = _resolve_fd_headroom()
+    if headroom <= 0:
+        return
+    proc_h = _proc_fd_headroom()
+    sys_h = _system_fd_headroom()
+    candidates = [
+        (h, scope)
+        for h, scope in ((proc_h, "per-process"), (sys_h, "system-wide"))
+        if h is not None
+    ]
+    if not candidates:
+        return
+    tightest, scope = min(candidates, key=lambda c: c[0])
+    if tightest < headroom:
+        raise KanbanFDPressureError(
+            f"refusing kanban connect: {scope} FD headroom {tightest} "
+            f"< {headroom} required; opening the WAL/SHM board now risks "
+            f"index-desync corruption. Skipping this tick (self-healing)."
+        )
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -2214,6 +2402,13 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # FD-headroom preflight (Layer 2 corruption guard). Before opening the DB —
+    # on BOTH the cached fast path and the first-init path — refuse when the
+    # host/process is within the configured margin of an FD ceiling. Opening a
+    # WAL board under EMFILE is the 2026-07-13 index-desync corruption path; a
+    # refused connect is self-healing (callers skip the tick and retry).
+    _assert_fd_headroom()
 
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
@@ -3767,10 +3962,11 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
-        conn.execute(
+        cur = conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
+        inserted = cur.rowcount > 0
         # If child was ready but parent is not yet done, demote child to todo.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
@@ -3780,10 +3976,11 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
-        _append_event(
-            conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
-        )
+        if inserted:
+            _append_event(
+                conn, child_id, "linked",
+                {"parent": parent_id, "child": child_id},
+            )
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -4334,6 +4531,219 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when a ``dependency``-blocked ``todo`` task must PARK
+    rather than be auto-promoted by :func:`recompute_ready` (t_e85f0abe).
+
+    A worker that calls ``kanban_block(kind="dependency")`` lands in ``todo``
+    (not ``blocked``) so the normal parent-gating can auto-resume it once a
+    parent finishes. But ``recompute_ready`` promotes any ``todo`` whose
+    parents are all done — and ``all([])`` is True. So a dependency-wait that
+
+      * has NO parent link at all, or
+      * has parents that were ALREADY terminal at block time (nothing changed
+        since the worker declared itself blocked),
+
+    gets re-promoted within the same dispatcher tick, re-claimed within ~1s,
+    and respawned forever — burning a paid worker run per tick with zero
+    progress (observed on t_309aaeb8: dependency_wait→promoted→claimed→spawned
+    all in one second, repeatedly). The named dependency in those cases is not
+    wired as a task_link, so there is nothing for the parent-gate to actually
+    wait on.
+
+    The gate: a dependency-wait is auto-promotable ONLY when a genuine
+    dependency resolved SINCE the block — i.e. the task has ≥1 parent link AND
+    at least one parent reached a terminal state (``completed``/``archived``
+    event) AFTER the most recent ``dependency_wait`` event. Otherwise it parks
+    in ``todo`` until an explicit ``kanban_unblock`` (which clears
+    ``block_kind`` handling via the ``unblocked`` event path). This breaks the
+    loop without touching the healthy "child waits on a real parent, parent
+    finishes, child resumes" path.
+
+    Returns True  → park (skip promotion this tick).
+    Returns False → not a dependency-wait, or a real dependency resolved; let
+    the normal parent-gate decide.
+    """
+    dep_evt = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'dependency_wait' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if dep_evt is None:
+        # Not a dependency-wait — normal todo promotion applies.
+        return False
+    dep_evt_id = dep_evt["id"]
+    # A superseding event AFTER the dependency_wait clears the park:
+    #   * 'unblocked' — an operator explicitly cleared it.
+    #   * 'completed'/'archived' — the task ITSELF finished and was later
+    #     re-run/re-activated. Without this, a stale dependency_wait from a
+    #     prior run (there is no 'unblocked' after a completion) would keep the
+    #     revived task parked forever.
+    #   * a terminal 'status' move — the task was marked done/archived via the
+    #     dashboard/direct path (``set_status_direct`` records a 'status' event,
+    #     not 'completed'/'archived'). A later reopen must not leave the old
+    #     dependency_wait treated as active. Mirrors the parent-side terminal
+    #     'status' handling in the lifecycle replay below.
+    # We deliberately do NOT treat a later 'promoted'/'claimed' as superseding:
+    # those are exactly the loop this guard exists to stop (a prior bad
+    # auto-promotion must not disable the guard on the next tick).
+    for r in conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND id > ? "
+        "AND kind IN ('unblocked', 'completed', 'archived', 'status')",
+        (task_id, dep_evt_id),
+    ).fetchall():
+        if r["kind"] != "status":
+            return False
+        try:
+            status = json.loads(r["payload"]).get("status") if r["payload"] else None
+        except (ValueError, TypeError):
+            status = None
+        if status in {"done", "archived"}:
+            return False
+    # Does the task have any parent link at all? No parents → nothing to wait
+    # on → park (the named dependency isn't a task_link).
+    parent_ids = [
+        r["parent_id"]
+        for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?",
+            (task_id,),
+        ).fetchall()
+    ]
+    if not parent_ids:
+        # No parents now. If a parent LINK was removed AFTER the wait (an
+        # operator `kanban unlink` that corrected a mistaken edge), the child
+        # has nothing left to wait on — release the park. Distinguishes this
+        # deliberate graph repair from a wait that never had any parent link
+        # (the <1s loop this guard exists to stop), which must still park.
+        unlinked_after = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND id > ? AND kind = 'unlinked' LIMIT 1",
+            (task_id, dep_evt_id),
+        ).fetchone()
+        return not unlinked_after
+    # Has any parent become NEWLY terminal AFTER the dependency_wait? That is
+    # the primary signal that a real dependency resolved since the block.
+    #
+    # We must distinguish a *genuine* new resolution from noise that would
+    # re-promote the parked child and reintroduce the respawn loop this guard
+    # exists to stop:
+    #   * routine cleanup that archives an already-``done`` parent emits a
+    #     post-wait ``archived`` event but resolves nothing new;
+    #   * a parent that was terminal at wait time and stays terminal.
+    # Reopens complicate this: ``set_status_direct`` moving a parent OFF
+    # done/archived emits a ``status`` event with a non-terminal payload, and a
+    # later completion IS a genuine resolution — whether the reopen happened
+    # before OR after the wait.
+    #
+    # The unambiguous rule: replay each parent's lifecycle in id order, tracking
+    # whether it is terminal, and look for a non-terminal→terminal transition
+    # that occurs strictly AFTER the wait. Any such transition is a real,
+    # newly-satisfied dependency; a post-wait terminal event with no preceding
+    # non-terminal state (already terminal, just being tidied) is not.
+    placeholders = ",".join("?" * len(parent_ids))
+    _TERMINAL_STATUSES = {"done", "archived"}
+    terminal_now: dict[str, bool] = {}
+    newly_resolved = False
+    for r in conn.execute(
+        f"SELECT id, task_id, kind, payload FROM task_events "
+        f"WHERE task_id IN ({placeholders}) "
+        f"AND kind IN ('completed', 'archived', 'status') "
+        f"ORDER BY id",
+        tuple(parent_ids),
+    ).fetchall():
+        pid = r["task_id"]
+        # Determine the terminal state this event puts the parent into.
+        #   * 'completed'/'archived' events → terminal.
+        #   * 'status' events → terminal iff the payload status is done/archived
+        #     (``set_status_direct(parent, 'done')`` is a real completion path
+        #     that also calls recompute_ready), otherwise a reopen → non-terminal.
+        if r["kind"] in ("completed", "archived"):
+            is_terminal = True
+        else:
+            try:
+                status = json.loads(r["payload"]).get("status") if r["payload"] else None
+            except (ValueError, TypeError):
+                status = None
+            if status is None:
+                continue  # a status event with no status payload — ignore.
+            is_terminal = status in _TERMINAL_STATUSES
+        if is_terminal:
+            became_terminal = not terminal_now.get(pid, False)
+            terminal_now[pid] = True
+            # A non-terminal→terminal transition strictly after the wait is a
+            # genuine newly-satisfied dependency.
+            if became_terminal and r["id"] > dep_evt_id:
+                newly_resolved = True
+                break
+        else:
+            terminal_now[pid] = False
+    if newly_resolved:
+        return False
+    # Graph-repair recovery: if a parent LINK was added AFTER the wait and that
+    # parent is ALREADY terminal, no post-wait 'completed'/'archived' event will
+    # ever fire for it — so the query above can't see it. Accept a parent that
+    # was linked after the block (a deliberate `kanban link` fix) and is now
+    # done/archived as a genuine resolution; otherwise `kanban link`-ing an
+    # already-finished dependency would park the child forever.
+    # Parse the payload in Python rather than via SQLite's json_extract: the
+    # JSON1 extension is not built-in on older SQLite (pre-3.38.0), so json_extract
+    # would raise there. json.loads matches the payload-parsing pattern used
+    # elsewhere in this module and keeps the query portable.
+    linked_after = []
+    for r in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND id > ? AND kind = 'linked'",
+        (task_id, dep_evt_id),
+    ).fetchall():
+        if not r["payload"]:
+            continue
+        try:
+            parent = json.loads(r["payload"]).get("parent")
+        except (ValueError, TypeError):
+            continue
+        if parent:
+            linked_after.append(parent)
+    if linked_after:
+        lp = ",".join("?" * len(linked_after))
+        parent_done = conn.execute(
+            f"SELECT 1 FROM tasks "
+            f"WHERE id IN ({lp}) AND status IN ('done', 'archived') LIMIT 1",
+            tuple(linked_after),
+        ).fetchone()
+        if parent_done:
+            return False
+    # Partial-unlink graph repair: an operator may remove only the unresolved
+    # edge after the wait (e.g. `kanban unlink`/delete the mistaken in-flight
+    # parent B) while leaving one or more already-terminal parents (A) linked.
+    # No remaining parent fires a new terminal event, so the checks above can't
+    # see it — but if a post-wait ``unlinked`` event happened AND every parent
+    # that remains is terminal (done/archived), the dependency graph is now
+    # satisfied and the child must release. Requiring the post-wait ``unlinked``
+    # event keeps this distinct from a never-resolved wait (the loop this guard
+    # stops), which has no such edge removal.
+    unlinked_after = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND id > ? AND kind = 'unlinked' LIMIT 1",
+        (task_id, dep_evt_id),
+    ).fetchone()
+    if unlinked_after:
+        unresolved_parent = conn.execute(
+            f"SELECT 1 FROM tasks "
+            f"WHERE id IN ({placeholders}) "
+            f"AND status NOT IN ('done', 'archived') LIMIT 1",
+            tuple(parent_ids),
+        ).fetchone()
+        if not unresolved_parent:
+            return False
+    # Parents exist but none resolved since the block (e.g. already-done
+    # parent linked before the block, or parents still in flight). Park —
+    # promoting now would just re-run the worker that already declared itself
+    # dependency-blocked.
+    return True
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4381,6 +4791,16 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
+                continue
+            if cur_status == "todo" and _dependency_wait_should_park(
+                conn, task_id
+            ):
+                # Dependency-wait with nothing genuinely resolving since the
+                # block (no parent link, or no parent completed after it).
+                # Auto-promoting here re-runs the worker that just declared
+                # itself blocked, producing the <1s dependency_wait→promoted
+                # →claimed→spawned loop (t_e85f0abe). Park until an explicit
+                # kanban_unblock or a real parent dependency resolves.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -5638,7 +6058,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -5650,6 +6071,55 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+
+        # Reconcile a stale/rotated run-claim so a live worker can self-block
+        # (t_e85f0abe). The worker passes ``expected_run_id`` from its env
+        # (``HERMES_KANBAN_RUN_ID``), pinned at spawn. If the dispatcher
+        # rotated the claim (reclaim → re-promote → re-claim opened a NEW run)
+        # while this process is still alive, the row's ``current_run_id`` no
+        # longer equals the worker's env value, so the strict
+        # ``AND current_run_id = ?`` guard misses and the block fails with
+        # "not in running/ready" even though the row IS running. When the row
+        # is running and the caller's ``expected_run_id`` is a real run row for
+        # THIS task, snap the guard to the row's live ``current_run_id`` so the
+        # block lands on the current run instead of falsely failing (which
+        # would risk a protocol_violation exit for a well-behaved worker).
+        db_current_run = cur_row["current_run_id"]
+        if (
+            expected_run_id is not None
+            and cur_row["status"] == "running"
+            and db_current_run is not None
+            and int(expected_run_id) != db_current_run
+        ):
+            owns_a_run = conn.execute(
+                "SELECT 1 FROM task_runs "
+                "WHERE id = ? AND task_id = ? "
+                "AND status = 'running' AND ended_at IS NULL LIMIT 1",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if owns_a_run:
+                # Close the caller's now-superseded run before snapping the
+                # guard to the live run. Otherwise the block ends only
+                # ``db_current_run`` and the worker's original run stays
+                # ``running``/``ended_at IS NULL`` forever — a phantom active
+                # attempt in run history / dashboard active-run queries.
+                conn.execute(
+                    "UPDATE task_runs "
+                    "SET status = 'reclaimed', outcome = 'reclaimed', "
+                    "    ended_at = ?, claim_lock = NULL, "
+                    "    claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                    (int(time.time()), int(expected_run_id), task_id),
+                )
+                _append_event(
+                    conn, task_id, "block_run_reconciled",
+                    {
+                        "worker_run_id": int(expected_run_id),
+                        "current_run_id": db_current_run,
+                    },
+                    run_id=db_current_run,
+                )
+                expected_run_id = db_current_run
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
@@ -6397,6 +6867,20 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        # Emit an ``unlinked`` event for each child edge BEFORE dropping the
+        # links (same as ``delete_task``): a dependency-waiting child whose only
+        # parent is this purged task must see the post-wait ``unlinked`` so
+        # ``_dependency_wait_should_park`` releases it instead of stranding it in
+        # ``todo`` forever.
+        removed_child_links = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?",
+            (task_id,),
+        ).fetchall()
+        for r in removed_child_links:
+            _append_event(
+                conn, r["child_id"], "unlinked",
+                {"parent": task_id, "child": r["child_id"], "via": "delete_archived_task"},
+            )
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -6406,7 +6890,11 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+        deleted = cur.rowcount == 1
+    if deleted:
+        # Promote any child freed by the removed edge (mirrors delete_task).
+        recompute_ready(conn)
+    return deleted
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -6423,7 +6911,19 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        removed_child_links = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?",
+            (task_id,),
+        ).fetchall()
+        for row in removed_child_links:
+            _append_event(
+                conn, row["child_id"], "unlinked",
+                {"parent": task_id, "child": row["child_id"], "via": "delete_task"},
+            )
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
@@ -9178,6 +9678,18 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    # Pin the dispatcher's resolved FD-headroom threshold into the worker env.
+    # _spawn_worker rewrites HERMES_HOME to the assignee profile (above), so a
+    # worker's own _resolve_fd_headroom() would read kanban.fd_headroom from
+    # THAT profile's config.yaml, not the dispatching (gateway) profile's. An
+    # operator who raises or disables the guard in the gateway profile expects
+    # every worker on the shared board to honor it; without this pin the worker
+    # silently falls back to its own profile/default threshold and can open the
+    # board inside the intended margin (or refuse despite a disabled guard).
+    # Resolve here (still in the dispatcher's env/HERMES_HOME) and bridge it via
+    # the highest-precedence HERMES_KANBAN_FD_HEADROOM override, matching the
+    # DB/board/workspaces pins just above.
+    env["HERMES_KANBAN_FD_HEADROOM"] = str(_resolve_fd_headroom())
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
