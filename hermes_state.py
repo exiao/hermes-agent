@@ -175,6 +175,15 @@ _FTS_TRIGGERS = (
     "messages_fts_trigram_update",
 )
 
+# Subset of _FTS_TRIGGERS that feed the trigram index specifically. Dropped
+# (leaving the base messages_fts triggers intact) when sessions.trigram_fts
+# is disabled — see SessionDB._drop_trigram_fts.
+_TRIGRAM_FTS_TRIGGERS = (
+    "messages_fts_trigram_insert",
+    "messages_fts_trigram_delete",
+    "messages_fts_trigram_update",
+)
+
 
 def _set_last_init_error(msg: Optional[str]) -> None:
     """Record (or clear) the most recent state.db init failure.
@@ -995,6 +1004,24 @@ class SessionDB:
     # ── Core write helper ──
 
     @staticmethod
+    def _trigram_fts_enabled() -> bool:
+        """Read ``sessions.trigram_fts`` from config (default True).
+
+        Lazy import + best-effort: any config-load failure defaults to the
+        historical behavior (trigram enabled).  Cheap enough to call once per
+        schema init; not on the message write hot path."""
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            sessions = cfg.get("sessions") if isinstance(cfg, dict) else None
+            if isinstance(sessions, dict) and "trigram_fts" in sessions:
+                return bool(sessions["trigram_fts"])
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
     def _is_fts5_unavailable_error(exc: sqlite3.OperationalError) -> bool:
         err = str(exc).lower()
         if "no such module" in err and "fts5" in err:
@@ -1057,6 +1084,35 @@ class SessionDB:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
                 pass
+
+    @staticmethod
+    def _drop_trigram_fts(cursor: sqlite3.Cursor) -> bool:
+        """Drop the trigram FTS5 index and its triggers.  Returns True if the
+        virtual table existed and was removed (so the caller knows a VACUUM
+        would reclaim space).  Used when ``sessions.trigram_fts`` is disabled:
+        the trigram index is the single largest object in state.db and fires
+        on every message INSERT, so a heavy user opts out to shrink the DB and
+        speed up writes.  Substring/CJK search falls back to a LIKE scan; the
+        base ``messages_fts`` word index is untouched."""
+        for trigger in _TRIGRAM_FTS_TRIGGERS:
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+        existed = False
+        try:
+            row = cursor.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'messages_fts_trigram'"
+            ).fetchone()
+            existed = row is not None
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        except sqlite3.OperationalError:
+            # FTS5 module missing entirely, or the shadow tables are in a
+            # state we can't drop cleanly — leave it be; nothing queries it
+            # when the flag is off.
+            pass
+        return existed
 
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
@@ -1572,22 +1628,40 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            trigram_wanted = self._trigram_fts_enabled()
+            # Expected trigger count depends on whether the trigram index is
+            # enabled: with it off we intentionally keep only the 3 base
+            # messages_fts triggers, so comparing against all 6 would falsely
+            # flag a repair (and rebuild base FTS) on every startup.
+            expected_trigger_count = (
+                len(_FTS_TRIGGERS) if trigram_wanted else len(_FTS_TRIGGERS) - len(_TRIGRAM_FTS_TRIGGERS)
+            )
+            triggers_need_repair = self._fts_trigger_count(cursor) < expected_trigger_count
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
             # to the main FTS table; if it cannot be created, CJK search falls
-            # back to LIKE.
+            # back to LIKE. When sessions.trigram_fts is disabled, drop it
+            # instead of creating it — it is the largest object in state.db and
+            # fires on every message INSERT. Search transparently falls back to
+            # LIKE (see search_messages / self._trigram_available).
             if self._fts_enabled:
-                trigram_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
-                self._trigram_available = trigram_enabled
-                if triggers_need_repair:
-                    self._rebuild_fts_indexes(
-                        cursor,
-                        include_trigram=trigram_enabled,
+                if trigram_wanted:
+                    trigram_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                     )
+                    self._trigram_available = trigram_enabled
+                    if triggers_need_repair:
+                        self._rebuild_fts_indexes(
+                            cursor,
+                            include_trigram=trigram_enabled,
+                        )
+                else:
+                    self._drop_trigram_fts(cursor)
+                    self._trigram_available = False
+                    if triggers_need_repair:
+                        # Base FTS only — trigram is intentionally absent.
+                        self._rebuild_fts_indexes(cursor, include_trigram=False)
 
         self._conn.commit()
 

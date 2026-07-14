@@ -3068,6 +3068,18 @@ DEFAULT_CONFIG = {
         # GBs of disk on heavy users.  Opt in only if you have an external
         # tool that consumes the JSON files directly.
         "write_json_snapshots": False,
+        # Secondary trigram FTS5 index over message content, used for
+        # substring and CJK (Chinese/Japanese/Korean) search.  It stores
+        # its own full copy of every message plus a 3-character-gram index,
+        # so it is by far the largest object in state.db (3-5x the raw
+        # message text) and fires on every message INSERT.  On heavy users
+        # it dominates DB size and slows writes enough to blow the
+        # write-lock retry budget ("database is locked").  When false, the
+        # index is dropped at startup and never recreated; substring/CJK
+        # search transparently falls back to a LIKE scan (the base
+        # ``messages_fts`` word index — used by recall and session search —
+        # is unaffected).  Default true preserves current behavior.
+        "trigram_fts": True,
     },
 
     # Contextual first-touch onboarding hints (see agent/onboarding.py).
