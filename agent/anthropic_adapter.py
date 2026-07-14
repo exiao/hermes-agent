@@ -1406,6 +1406,7 @@ def _resolve_anthropic_pool_token(*, profile_only: bool = False) -> Optional[str
             AUTH_TYPE_OAUTH,
             CredentialPool,
             PooledCredential,
+            _normalize_pool_priorities,
             load_pool,
         )
     except Exception:
@@ -1492,6 +1493,13 @@ def _resolve_anthropic_pool_token(*, profile_only: bool = False) -> Optional[str
                             },
                         )
                     )
+            # Apply the same manual-over-seeded priority normalization that
+            # load_pool() runs. Building the pool directly here (to avoid
+            # load_pool's global seeders on the isolated profile path) otherwise
+            # skips it, so a manually-added OAuth entry that `hermes auth add`
+            # appended with a larger priority would sort BEHIND a seeded
+            # singleton instead of taking precedence. Reorder in place first.
+            _normalize_pool_priorities("anthropic", entries)
             pool = CredentialPool("anthropic", entries)
         else:
             pool = load_pool("anthropic")

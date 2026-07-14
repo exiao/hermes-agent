@@ -1296,6 +1296,69 @@ class TestResolveAnthropicToken:
             ss.set_multiplex_active(False)
             reset_hermes_home_override(home_token)
 
+    def test_profile_only_pool_manual_oauth_takes_precedence_over_seeded(
+        self, monkeypatch, tmp_path
+    ):
+        """A manually-added OAuth entry must outrank a seeded singleton on the
+        profile_only pool path.
+
+        Regression: the profile_only branch builds CredentialPool directly to
+        skip load_pool's global seeders, but that also skipped
+        _normalize_pool_priorities, so a manual OAuth entry that `hermes auth
+        add` appended with a LARGER priority number sorted BEHIND a seeded
+        env:ANTHROPIC_TOKEN singleton and the seeded token resolved first.
+        Applying the normalization restores manual-over-seeded precedence.
+        """
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        profile_auth = {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "env:ANTHROPIC_TOKEN",
+                        "source": "env:ANTHROPIC_TOKEN",
+                        "auth_type": "oauth",
+                        "access_token": "sk-ant-oat01-SEEDED-SINGLETON",
+                        "priority": 0,
+                    },
+                    {
+                        "id": "manual:mine",
+                        "source": "manual:mine",
+                        "auth_type": "oauth",
+                        "access_token": "sk-ant-oat01-MANUAL-PREFERRED",
+                        "priority": 1,
+                    },
+                ]
+            },
+        }
+        (profile / "auth.json").write_text(json.dumps(profile_auth), encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        ss.set_multiplex_active(True)
+        # No API-key clear here: both OAuth entries survive; precedence is what's
+        # under test.
+        scope_token = ss.set_secret_scope({})
+        try:
+            token = _resolve_anthropic_pool_token(profile_only=True)
+            assert token == "sk-ant-oat01-MANUAL-PREFERRED"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
+            reset_hermes_home_override(home_token)
+
 
 class TestRefreshOauthToken:
     def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
