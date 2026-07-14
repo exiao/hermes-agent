@@ -142,10 +142,21 @@ async def test_reset_does_not_block_event_loop_during_cleanup():
     assert close_started.is_set(), "close() never ran"
 
     # Now sample ticks while close() is STILL blocking. If the loop were
-    # frozen (pre-fix inline call), this stays ~0.
+    # frozen (pre-fix inline call), _handle_reset_command never yields and
+    # the heartbeat cannot advance at all, so this stays 0. With the fix,
+    # cleanup is offloaded to a worker thread and the loop keeps scheduling
+    # the heartbeat. Poll for forward progress cooperatively (yield-driven,
+    # not wall-clock) so a loaded CI runner's timer jitter can't starve the
+    # count — we only need to observe that the loop is NOT frozen.
     ticks_at_block = ticks["n"]
-    await asyncio.sleep(0.1)
-    ticks_during_block = ticks["n"] - ticks_at_block
+    ticks_during_block = 0
+    for _ in range(500):
+        if release.is_set():
+            break
+        ticks_during_block = ticks["n"] - ticks_at_block
+        if ticks_during_block >= 5:
+            break
+        await asyncio.sleep(0.005)
 
     release.set()
     await reset_task
