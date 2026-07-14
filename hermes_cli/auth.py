@@ -617,6 +617,21 @@ def _resolve_copilot_raw_token(pconfig: ProviderConfig) -> tuple[str, str]:
     if scoped is not None:
         return scoped
 
+    # Fail closed on the unscoped multiplex path, mirroring the generic API-key
+    # resolver: with gateway.multiplex_profiles active but reached OUTSIDE a
+    # scope (current_secret_scope() is None, so the scoped helper returned None),
+    # resolve_copilot_token() would read the process env / ``gh auth token`` —
+    # the DEFAULT profile's GitHub identity — and hand it to a caller with no
+    # scope installed. That is the same cross-profile token leak the generic
+    # path guards against, so return no token instead of the gh fallback.
+    from agent.secret_scope import (
+        current_secret_scope as _current_secret_scope,
+        is_multiplex_active as _is_multiplex_active,
+    )
+
+    if _current_secret_scope() is None and _is_multiplex_active():
+        return "", ""
+
     from hermes_cli.copilot_auth import resolve_copilot_token
 
     return resolve_copilot_token()
@@ -6535,9 +6550,24 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
         # endpoint, aligned with its scoped api key. get_secret falls back to
         # os.environ when unscoped + multiplex off, so single-profile
         # runtime/discovery is byte-identical.
-        from agent.secret_scope import get_secret as _get_secret
+        from agent.secret_scope import (
+            get_secret as _get_secret,
+            current_secret_scope as _current_secret_scope,
+            is_multiplex_active as _is_multiplex_active,
+            UnscopedSecretError as _UnscopedSecretError,
+        )
 
-        env_url = (_get_secret(pconfig.base_url_env_var, "") or "").strip()
+        # Fail closed on the unscoped multiplex path: without a scope installed,
+        # get_secret raises UnscopedSecretError. The credential already failed
+        # closed above, so leave the base URL empty rather than crashing (or
+        # reading the default profile's *_BASE_URL from os.environ).
+        if _current_secret_scope() is None and _is_multiplex_active():
+            env_url = ""
+        else:
+            try:
+                env_url = (_get_secret(pconfig.base_url_env_var, "") or "").strip()
+            except _UnscopedSecretError:
+                env_url = ""
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)

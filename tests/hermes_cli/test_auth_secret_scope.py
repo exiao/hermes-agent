@@ -196,3 +196,74 @@ def test_api_key_provider_single_profile_still_reads_dotenv(monkeypatch):
     credentials = resolve_api_key_provider_credentials("kimi-coding-cn")
     assert credentials.get("api_key") == "single-profile-dotenv-key"
 
+
+def test_copilot_unscoped_multiplex_fails_closed(monkeypatch):
+    """Codex P1 on #100: when gateway.multiplex_profiles is on but the Copilot
+    resolver is reached OUTSIDE a scope (current_secret_scope() is None, so the
+    scoped helper returns None), it must NOT fall through to resolve_copilot_token()
+    — that reads the process env / gh auth token, i.e. the DEFAULT profile's GitHub
+    identity, and would hand it to an unscoped multiplex caller. It must fail closed,
+    matching the generic API-key path."""
+    from hermes_cli.auth import _resolve_copilot_raw_token, PROVIDER_REGISTRY
+
+    # The gh/process fallback would return the default profile's token — it must
+    # NOT be reached under an unscoped multiplex call.
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("gho_DEFAULT_PROFILE_GH", "gh_cli"),
+    )
+    pconfig = PROVIDER_REGISTRY["copilot"]
+
+    ss.set_multiplex_active(True)
+    # No scope installed (current_secret_scope() is None).
+    try:
+        raw, source = _resolve_copilot_raw_token(pconfig)
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert raw == "", (
+        "unscoped multiplex Copilot call must fail closed, not borrow the "
+        "default profile's gh token"
+    )
+    assert source == ""
+
+
+def test_copilot_unscoped_single_profile_still_falls_back_to_gh(monkeypatch):
+    """Single-profile (multiplex OFF, no scope): the Copilot gh/process fallback
+    is unchanged — an ordinary CLI/TUI run still resolves its token via gh."""
+    from hermes_cli.auth import _resolve_copilot_raw_token, PROVIDER_REGISTRY
+
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("gho_GH_FALLBACK", "gh_cli"),
+    )
+    pconfig = PROVIDER_REGISTRY["copilot"]
+
+    ss.set_multiplex_active(False)
+    raw, source = _resolve_copilot_raw_token(pconfig)
+
+    assert raw == "gho_GH_FALLBACK"
+    assert source == "gh_cli"
+
+
+def test_api_key_provider_base_url_fails_closed_when_unscoped_multiplex(monkeypatch):
+    """Codex P2 on #100: resolve_api_key_provider_credentials must not crash by
+    reaching get_secret() for the base URL on the unscoped multiplex path. Without
+    a scope installed, get_secret raises UnscopedSecretError; the credential has
+    already failed closed above, so the base URL must resolve empty (registry
+    default) rather than raising."""
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    # openai-api has a base_url_env_var (OPENAI_BASE_URL).
+    assert PROVIDER_REGISTRY["openai-api"].base_url_env_var
+
+    ss.set_multiplex_active(True)
+    # No scope installed → get_secret would raise UnscopedSecretError.
+    try:
+        credentials = resolve_api_key_provider_credentials("openai-api")
+    finally:
+        ss.set_multiplex_active(False)
+
+    # Fails closed on the credential and does NOT crash on the base URL read.
+    assert not credentials.get("api_key")
+    assert credentials.get("base_url") == PROVIDER_REGISTRY["openai-api"].inference_base_url
