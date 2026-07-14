@@ -5972,6 +5972,83 @@ def test_repair_quiesces_writers_before_swap(tmp_path, monkeypatch):
         blocker.close()
 
 
+def test_repair_preserves_inode_so_idle_handle_writes_survive(tmp_path, monkeypatch):
+    """An idle kb.connect() handle opened BEFORE an index-only repair must not
+    write to a detached inode after the heal.
+
+    Regression for the os.replace-swap bug: the dump+reload repair used to
+    publish a rebuilt sibling file via os.replace, giving the board a new
+    inode. A long-lived handle opened before the swap stayed attached to the
+    replaced inode, so a later create through it committed to the detached file
+    and was invisible to fresh connections (silently lost). The in-place
+    rebuild keeps the inode stable, so the idle handle's post-repair write is
+    visible everywhere.
+    """
+    db_path = tmp_path / "kanban.db"
+    survivors = _make_index_corrupt_kanban_db(db_path)
+
+    real_connect = kb._sqlite_connect
+
+    class _ReindexFails:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a, **kw):
+            if sql.strip().upper().startswith("REINDEX"):
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return self._conn.execute(sql, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _wrapped(path, *a, **kw):
+        return _ReindexFails(real_connect(path, *a, **kw))
+
+    def _inode(p: Path) -> int:
+        return p.stat().st_ino
+
+    inode_before = _inode(db_path)
+
+    # A long-lived REAL handle opened BEFORE the repair (the vulnerable one).
+    # Force a fresh open past the per-process init cache so it's a real new fd.
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    idle = kb.connect(db_path=db_path)
+    try:
+        # Force REINDEX (Strategy 1) to fail structurally so the repair falls
+        # into the dump+reload path this test exercises, but only for the repair
+        # call itself — the idle handle above and the verification connections
+        # below use the real, unwrapped opener.
+        monkeypatch.setattr(kb, "_sqlite_connect", _wrapped)
+        strategy = kb._attempt_index_only_repair(db_path)
+        monkeypatch.undo()
+        assert strategy == "dump_reload"
+
+        # Same inode -> pre-existing handles were never detached.
+        assert _inode(db_path) == inode_before
+
+        # The recovered rows survived the heal.
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with kb.connect_closing(db_path=db_path) as verify:
+            titles = {
+                r[0] for r in verify.execute("SELECT title FROM tasks").fetchall()
+            }
+        assert set(survivors).issubset(titles)
+
+        # A write through the idle pre-repair handle must land on the healed
+        # inode and be visible to a brand-new connection.
+        kb.create_task(idle, title="written-through-idle-handle")
+        idle.commit()
+
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with kb.connect_closing(db_path=db_path) as fresh:
+            titles_after = {
+                r[0] for r in fresh.execute("SELECT title FROM tasks").fetchall()
+            }
+        assert "written-through-idle-handle" in titles_after
+    finally:
+        idle.close()
+
+
 def test_reused_backup_fills_in_missing_sidecars(tmp_path):
     """When the same corrupt main-file hash is quarantined again after a WAL
     sidecar appears, reusing the existing backup must still copy the sidecar so

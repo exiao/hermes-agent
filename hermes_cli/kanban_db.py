@@ -1880,11 +1880,15 @@ def _attempt_index_only_repair(path: Path) -> Optional[str]:
       1. ``REINDEX`` — rebuild every index from its table b-tree. Cheap and
          non-destructive; fixes stale-count indexes when the page holding the
          index isn't itself malformed.
-      2. ``.dump`` + reload into a sibling file, then atomically replace the
-         original. ``iterdump`` reads only the base-table rows and schema (never
-         the corrupt index pages), so the rebuilt DB has correct indexes and
-         identical data. The swap is atomic (``os.replace``) and only proceeds
-         if the rebuilt file passes ``integrity_check`` clean.
+      2. ``.dump`` + reload rebuilt back into the original file in place, so
+      the healed data keeps the same inode. ``iterdump`` reads only the
+      base-table rows and schema (never the corrupt index pages), so the
+      rebuilt data has correct indexes and identical rows. The recovered
+      dump is verified against a throwaway sibling file first, then replayed
+      into the original's own connection under one ``BEGIN EXCLUSIVE``
+      transaction and only committed if it re-checks clean — so a failed
+      heal rolls back to the intact corrupt original, and no ``os.replace``
+      detaches idle handles from the live inode.
 
     Returns the strategy name on success (``"reindex"`` / ``"dump_reload"``),
     or ``None`` if the DB could not be healed (caller then backs up + refuses).
@@ -1919,18 +1923,29 @@ def _attempt_index_only_repair(path: Path) -> Optional[str]:
         # to the dump+reload path, which never reads the corrupt index pages.
         _log.warning("kanban REINDEX pass failed for %s: %s", resolved, exc)
 
-    # ── Strategy 2: .dump + reload, then atomic swap ──────────────────────
-    # Quiesce writers for the whole snapshot→swap window. iterdump is only a
+    # ── Strategy 2: .dump + in-place reload (same inode) ──────────────────
+    # Quiesce writers for the whole snapshot→publish window. iterdump is only a
     # read snapshot and the cross-process init lock serializes first-open
     # callers, not connections already open on this board. Without a lock a
     # concurrent writer could commit rows to the original after the dump starts
-    # (lost by the swap) or keep writing to the replaced inode. We hold a single
-    # BEGIN EXCLUSIVE transaction on `src` across both the dump and the
-    # os.replace: EXCLUSIVE blocks every other reader/writer, so the snapshot is
-    # consistent and no writer is mid-transaction when we publish. If another
-    # connection already holds a lock, BEGIN EXCLUSIVE raises OperationalError
-    # (locked) → our transient path re-raises and we retry later rather than
-    # publishing a lossy rebuild.
+    # or keep writing to a swapped-out inode. We hold a single BEGIN EXCLUSIVE
+    # transaction on `src` across the dump, the verify, and the in-place reload:
+    # EXCLUSIVE blocks every other reader/writer, so the snapshot is consistent
+    # and no writer is mid-transaction when we publish. If another connection
+    # already holds a lock, BEGIN EXCLUSIVE raises OperationalError (locked) →
+    # our transient path re-raises and we retry later rather than publishing a
+    # lossy rebuild.
+    #
+    # Publish is done by rebuilding the recovered rows back INTO the original
+    # file's own connection (drop the user objects, replay the verified dump)
+    # rather than os.replace of a sibling file. os.replace would give the board
+    # a NEW inode; any idle ``kb.connect()`` handle opened before the swap stays
+    # attached to the replaced inode, so a later write on that handle succeeds
+    # but is invisible to fresh connections (silently lost). Rebuilding in place
+    # keeps the inode stable, so every pre-existing handle retargets for free.
+    # SQLite runs the whole drop+replay inside the one EXCLUSIVE transaction, so
+    # a mid-replay failure rolls back to the intact corrupt original for
+    # forensics — the same all-or-nothing guarantee os.replace gave.
     rebuilt = resolved.with_name(resolved.name + ".rebuild.tmp")
     try:
         for stale in (rebuilt, Path(str(rebuilt) + "-wal"), Path(str(rebuilt) + "-shm")):
@@ -1940,32 +1955,71 @@ def _attempt_index_only_repair(path: Path) -> Optional[str]:
         pass
     src: Optional[sqlite3.Connection] = None
     src_locked = False
+    published = False
     try:
         src = _sqlite_connect(resolved)
-        # Acquire the exclusive write lock up front; hold it through the swap.
+        # Acquire the exclusive write lock up front; hold it through the whole
+        # snapshot → verify → in-place reload window.
         src.execute("BEGIN EXCLUSIVE")
         src_locked = True
+
+        # iterdump reads base-table rows + schema DDL; it does not read the
+        # corrupt secondary-index pages, so the recovered statements rebuild
+        # every index correctly from the base-table rows. Materialize the dump
+        # once (under the lock) — it feeds both the sibling verify and the
+        # in-place replay.
+        dump_statements = list(src.iterdump())
+
+        # Verify the recovered data reloads clean by first rebuilding a sibling
+        # file and integrity-checking it. This proves the dump is sound BEFORE
+        # we drop the live objects in place, so we never destroy the corrupt
+        # original on the strength of a dump that would not reload cleanly.
         dst = sqlite3.connect(str(rebuilt), isolation_level=None)
         try:
-            # iterdump reads base-table rows + schema DDL; it does not read
-            # the corrupt secondary-index pages, so the reload rebuilds every
-            # index correctly from the recovered rows.
-            for stmt in src.iterdump():
+            for stmt in dump_statements:
                 dst.execute(stmt)
             dst.commit()
         finally:
             dst.close()
-
-        # Verify the rebuilt DB is clean before we trust it with a swap. Done
-        # while still holding the exclusive lock so writers stay quiesced.
         if _integrity_problems(rebuilt) is not None:
             _cleanup_rebuild_artifacts(rebuilt)
             return None
+        _cleanup_rebuild_artifacts(rebuilt)
 
-        # Atomic replace. os.replace is atomic within a filesystem; the rebuilt
-        # file is a sibling in the same directory (same filesystem). Still under
-        # the exclusive lock, so no writer can be mid-transaction on the inode.
-        os.replace(str(rebuilt), str(resolved))
+        # Publish in place: drop the user objects and replay the verified dump
+        # into the SAME file, still inside the one EXCLUSIVE transaction. The
+        # inode never changes, so any idle handle opened before this repair sees
+        # the healed data on its next statement instead of writing to a detached
+        # inode. iterdump wraps its output in BEGIN/COMMIT and emits PRAGMA
+        # lines; strip those transaction-control statements so the replay stays
+        # inside our own transaction.
+        user_objects = src.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for obj_type, obj_name in user_objects:
+            if obj_type == "table":
+                src.execute(f'DROP TABLE IF EXISTS "{obj_name}"')
+            elif obj_type == "view":
+                src.execute(f'DROP VIEW IF EXISTS "{obj_name}"')
+        for stmt in dump_statements:
+            head = stmt.lstrip().upper()
+            if head.startswith(("BEGIN", "COMMIT", "PRAGMA")):
+                continue
+            src.execute(stmt)
+
+        # Re-verify the in-place result before we commit. integrity_check runs
+        # inside the transaction against the rewritten pages; if anything is off
+        # we roll back to the intact corrupt original rather than commit a bad
+        # heal.
+        ic = src.execute("PRAGMA integrity_check").fetchone()
+        if not ic or str(ic[0]).strip().lower() != "ok":
+            src.rollback()
+            src_locked = False
+            return None
+        src.commit()
+        src_locked = False
+        published = True
     except sqlite3.OperationalError:
         # Transient `database is locked`/busy (another connection holds a lock,
         # or contention during iterdump) is contention, not corruption. Re-raise
@@ -1978,29 +2032,34 @@ def _attempt_index_only_repair(path: Path) -> Optional[str]:
         _cleanup_rebuild_artifacts(rebuilt)
         return None
     except OSError as exc:
-        _log.warning("kanban repaired-DB swap failed for %s: %s", resolved, exc)
+        _log.warning("kanban repaired-DB rebuild failed for %s: %s", resolved, exc)
         _cleanup_rebuild_artifacts(rebuilt)
         return None
     finally:
         if src is not None:
             if src_locked:
-                # Original is already replaced; rollback just drops the lock on
-                # the now-detached inode (best-effort).
+                # Reached only on an unexpected escape with the lock still held
+                # (no successful commit/rollback above): drop the lock without
+                # publishing so the corrupt original is left intact.
                 try:
                     src.rollback()
                 except sqlite3.Error:
                     pass
             src.close()
 
-    # Drop any stale WAL/SHM sidecars of the ORIGINAL: they belong to the corrupt
-    # file we just replaced and would confuse the next open.
-    for suffix in ("-wal", "-shm"):
-        sidecar = resolved.with_name(resolved.name + suffix)
+    if not published:
+        return None
+
+    # A WAL checkpoint on the healed inode retires the sidecars that predate the
+    # rebuild; truncate so a stale -wal/-shm can't confuse the next open.
+    try:
+        cp = _sqlite_connect(resolved)
         try:
-            if sidecar.exists():
-                sidecar.unlink()
-        except OSError:
-            pass
+            cp.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            cp.close()
+    except sqlite3.Error:
+        pass
     _log.warning(
         "kanban DB %s self-healed via .dump+reload (index-only corruption; "
         "base-table rows preserved)",
