@@ -2767,6 +2767,15 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # FD-headroom preflight (corruption guard). Before opening the shared
+        # kanban.db, `connect()` refuses when the process OR the host is within
+        # this many file descriptors of an FD ceiling — opening a WAL board
+        # under FD starvation is the documented index-desync corruption path
+        # (2026-07-13). A refused connect is self-healing: the dispatcher /
+        # notifier / claim paths already skip a failed tick and retry. Set to 0
+        # to disable the preflight. Bridged by HERMES_KANBAN_FD_HEADROOM (env
+        # override wins) for worker subprocesses / tests.
+        "fd_headroom": 64,
         # Board-wide auto-subscribe. Each entry fans EVERY ticket's terminal
         # events (completed / blocked / gave_up / crashed / timed_out, plus
         # completion artifacts) out to a chat with zero manual
