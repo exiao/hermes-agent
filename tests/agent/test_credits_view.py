@@ -135,7 +135,9 @@ def test_view_fetch_failure_is_logged_out(monkeypatch):
 
 
 class _FakeEvent:
-    pass
+    # Real MessageEvents always carry a .source; the handlers now read it to
+    # scope profile secrets, so the stub must expose one (None = default home).
+    source = None
 
 
 def _make_gateway_stub():

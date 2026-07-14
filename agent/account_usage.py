@@ -264,12 +264,19 @@ def nous_credits_lines(*, markdown: bool = False, timeout: float = 10.0) -> list
         return []
     try:
         import concurrent.futures
+        import contextvars
 
         from hermes_cli.nous_account import get_nous_portal_account_info
 
+        # Propagate the active profile scope (_SECRET_SCOPE / _HERMES_HOME_OVERRIDE)
+        # into the worker thread. asyncio.to_thread carried the context this far,
+        # but a bare ThreadPoolExecutor does NOT propagate ContextVars — without
+        # copy_context the portal fetch would fall back to the default profile's
+        # home/credentials under multiplexing.
+        ctx = contextvars.copy_context()
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             account = pool.submit(
-                get_nous_portal_account_info, force_fresh=True
+                ctx.run, get_nous_portal_account_info, force_fresh=True
             ).result(timeout=timeout)
         snapshot = build_nous_credits_snapshot(account)
         return render_account_usage_lines(snapshot, markdown=markdown)
@@ -375,16 +382,22 @@ def build_credits_view(*, markdown: bool = False, timeout: float = 10.0) -> Cred
 
     try:
         import concurrent.futures
+        import contextvars
 
         from hermes_cli.nous_account import (
             get_nous_portal_account_info,
             nous_portal_topup_url,
         )
 
+        # Propagate the active profile scope into the worker thread — a bare
+        # ThreadPoolExecutor does NOT inherit ContextVars, so without
+        # copy_context the portal fetch would read the default profile's
+        # home/credentials under multiplexing (see nous_credits_lines above).
+        ctx = contextvars.copy_context()
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            account = pool.submit(get_nous_portal_account_info, force_fresh=True).result(
-                timeout=timeout
-            )
+            account = pool.submit(
+                ctx.run, get_nous_portal_account_info, force_fresh=True
+            ).result(timeout=timeout)
     except Exception:
         logger.debug("credits ▸ /credits portal fetch failed (fail-open)", exc_info=True)
         return not_logged_in
