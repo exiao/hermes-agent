@@ -3236,9 +3236,10 @@ def _evict_cached_clients(provider: str) -> None:
             if _normalize_aux_provider(str(key[0])) == normalized
         ]
         for key in stale_keys:
-            client = _client_cache.get(key, (None, None, None))[0]
+            entry = _client_cache.get(key, (None, None, None))
+            client = entry[0]
             if client is not None:
-                _release_cached_client_fds(client)
+                _release_cached_client_fds(client, entry[2])
             _client_cache.pop(key, None)
 
 
@@ -3272,7 +3273,7 @@ def _evict_cached_client_instance(target: Any) -> bool:
                 continue
             real = getattr(cached, "_real_client", None)
             if cached is target or real is target:
-                _release_cached_client_fds(cached)
+                _release_cached_client_fds(cached, entry[2])
                 del _client_cache[key]
                 evicted = True
     return evicted
@@ -5622,7 +5623,7 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
     with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and old_entry[0] is not client:
-            _release_cached_client_fds(old_entry[0])
+            _release_cached_client_fds(old_entry[0], old_entry[2])
         _client_cache[cache_key] = (client, default_model, bound_loop)
 
 
@@ -5813,7 +5814,7 @@ def _close_httpx_pool_sockets_sync(inner_httpx: Any) -> None:
         pass
 
 
-def _release_cached_client_fds(client: Any) -> None:
+def _release_cached_client_fds(client: Any, bound_loop: Any = None) -> None:
     """Actually release the OS sockets held by an evicted/replaced cached client.
 
     Unlike ``_force_close_async_httpx`` (which only marks the async httpx client
@@ -5825,20 +5826,29 @@ def _release_cached_client_fds(client: Any) -> None:
 
     - Sync SDK client (or wrapper): its own ``.close()`` closes the httpx pool.
     - Async SDK client: keep the CLOSED state-mark (the ``__del__`` neuter relies
-      on it) AND sync-close the pool's raw sockets, since no event loop is
-      guaranteed alive to run ``aclose()``.
+      on it). Only sync-close the pool's raw sockets when the client's owning
+      event loop is DEAD (``bound_loop`` is None or closed). If the bound loop is
+      still alive — e.g. eviction fired because a *different but running* loop
+      asked for the same cache key — ripping out the raw sockets from this thread
+      would abort an in-flight request on the original loop; leave the state-mark
+      and let that live loop's own SDK teardown/GC reclaim the fd. The dead-loop
+      case is exactly the FD-leak this fix targets (recycled worker-thread loop
+      that can never run ``aclose()``), so gating on it loses no coverage.
     """
     import inspect
 
     if client is None:
         return
+    loop_dead = bound_loop is None or getattr(bound_loop, "is_closed", lambda: True)()
     for target in (client, getattr(client, "_real_client", None)):
         if target is None:
             continue
         inner = getattr(target, "_client", None)
         if inner is not None and _is_async_httpx_client(inner):
             _force_close_async_httpx(target)  # state-mark (keeps __del__ neuter safe)
-            _close_httpx_pool_sockets_sync(inner)
+            if loop_dead:
+                # Safe: no live loop can hold an in-flight request on these sockets.
+                _close_httpx_pool_sockets_sync(inner)
             continue
         # Sync client (or wrapper): close() releases the httpx pool synchronously.
         try:
@@ -5893,7 +5903,7 @@ def cleanup_stale_async_clients() -> None:
         for key, entry in _client_cache.items():
             client, _default, cached_loop = entry
             if cached_loop is not None and cached_loop.is_closed():
-                _release_cached_client_fds(client)
+                _release_cached_client_fds(client, cached_loop)
                 stale_keys.append(key)
         for key in stale_keys:
             del _client_cache[key]
@@ -5989,7 +5999,10 @@ def _get_cached_client(
                     effective = _compat_model(cached_client, model, cached_default)
                     return cached_client, effective
                 # Stale — evict and fall through to create a new client.
-                _release_cached_client_fds(cached_client)
+                # Pass cached_loop: if it's alive (a different but running loop
+                # holds this cache key) we must NOT rip out its raw sockets and
+                # abort an in-flight request; only reap fds when the loop is dead.
+                _release_cached_client_fds(cached_client, cached_loop)
                 del _client_cache[cache_key]
             else:
                 effective = _compat_model(cached_client, model, cached_default)
@@ -6028,7 +6041,7 @@ def _get_cached_client(
                 # the oldest entries (FIFO — dict preserves insertion order).
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
                     evict_key, evict_entry = next(iter(_client_cache.items()))
-                    _release_cached_client_fds(evict_entry[0])
+                    _release_cached_client_fds(evict_entry[0], evict_entry[2])
                     del _client_cache[evict_key]
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:

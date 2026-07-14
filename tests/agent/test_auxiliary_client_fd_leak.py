@@ -243,3 +243,67 @@ class TestAuxClientFdReleaseProxied:
         _close_connection_socket(conn)
 
         assert sock.fileno() == -1, "proxy socket fd not released after eviction"
+
+
+class TestAuxClientFdReleaseLiveLoop:
+    """A LIVE owning loop must be left alone — reaping its sockets would abort an
+    in-flight request. ``_release_cached_client_fds`` only sync-closes the raw
+    async sockets when the bound loop is dead (None or closed); when eviction
+    fires because a *different but running* loop asked for the same cache key,
+    the client is only state-marked and the live loop's own teardown reclaims it.
+    """
+
+    def _live_loop_client(self, url: str):
+        from types import SimpleNamespace
+
+        loop = asyncio.new_event_loop()
+
+        async def _go():
+            hc = httpx.AsyncClient()
+            await hc.get(url)
+            return hc
+
+        inner = loop.run_until_complete(_go())
+        # loop intentionally left OPEN (alive)
+        return SimpleNamespace(_client=inner), loop
+
+    def test_live_loop_not_reaped_then_dead_loop_reaped(self, local_http_server):
+        from agent.auxiliary_client import _find_network_stream, _release_cached_client_fds
+
+        client, loop = self._live_loop_client(local_http_server)
+        try:
+            conns = list(client._client._transport._pool._connections)
+            assert conns, "expected a pooled socket"
+            stream = _find_network_stream(conns[0])
+            raw = stream._stream
+            holder = getattr(raw, "transport_stream", None) or raw
+            sock = getattr(getattr(holder, "_transport", None), "_sock", None)
+            assert sock is not None and sock.fileno() >= 0
+
+            # Live loop -> socket must stay OPEN (no in-flight abort).
+            _release_cached_client_fds(client, loop)
+            assert sock.fileno() >= 0, "live-loop socket was wrongly closed"
+
+            # Dead loop -> now the fd is safe to reap.
+            loop.close()
+            _release_cached_client_fds(client, loop)
+            assert sock.fileno() == -1, "dead-loop socket not released"
+        finally:
+            if not loop.is_closed():
+                loop.close()
+
+    def test_default_no_loop_still_reaps(self, local_http_server):
+        """Back-compat: callers that pass no loop (default) still reap (loop_dead)."""
+        client, loop = self._live_loop_client(local_http_server)
+        loop.close()  # simulate the common dead-loop eviction
+        from agent.auxiliary_client import _find_network_stream, _release_cached_client_fds
+
+        conns = list(client._client._transport._pool._connections)
+        stream = _find_network_stream(conns[0])
+        raw = stream._stream
+        holder = getattr(raw, "transport_stream", None) or raw
+        sock = getattr(getattr(holder, "_transport", None), "_sock", None)
+        assert sock is not None and sock.fileno() >= 0
+
+        _release_cached_client_fds(client)  # no bound_loop arg -> defaults to reap
+        assert sock.fileno() == -1
