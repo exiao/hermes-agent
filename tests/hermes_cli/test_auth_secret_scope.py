@@ -122,3 +122,44 @@ def test_copilot_named_profile_scope_miss_is_authoritative(monkeypatch, tmp_path
 
     assert raw == ""
     assert source == ""
+
+
+def test_api_key_provider_fails_closed_when_multiplex_active_but_unscoped(
+    monkeypatch,
+):
+    """Codex P1 on #100: when gateway.multiplex_profiles is on but this resolver
+    is reached OUTSIDE a scope (current_secret_scope() is None), the dotenv-
+    preferred read would return the process/default profile's .env key to an
+    unscoped multiplex caller — defeating the fail-closed guard. For an API-key
+    provider (e.g. kimi-coding-cn) it must instead route through get_secret and
+    fail closed, returning no credential."""
+    # get_env_value_prefer_dotenv would return the default profile's .env key —
+    # it must NOT be reached under an unscoped multiplex call.
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value_prefer_dotenv",
+        lambda _name: "default-profile-dotenv-key",
+    )
+    ss.set_multiplex_active(True)
+    # No scope installed.
+    try:
+        credentials = resolve_api_key_provider_credentials("kimi-coding-cn")
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert not credentials.get("api_key"), (
+        "unscoped multiplex call must fail closed, not return the default "
+        "profile's dotenv key"
+    )
+
+
+def test_api_key_provider_single_profile_still_reads_dotenv(monkeypatch):
+    """Single-profile (multiplex OFF, no scope): the dotenv-preferred lookup is
+    unchanged — an ordinary CLI/TUI run still resolves its key from .env."""
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value_prefer_dotenv",
+        lambda _name: "single-profile-dotenv-key",
+    )
+    ss.set_multiplex_active(False)
+    credentials = resolve_api_key_provider_credentials("kimi-coding-cn")
+    assert credentials.get("api_key") == "single-profile-dotenv-key"
+

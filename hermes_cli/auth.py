@@ -643,16 +643,34 @@ def _resolve_api_key_provider_secret(
             pass
         return "", ""
 
-    from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+    from agent.secret_scope import (
+        current_secret_scope,
+        is_multiplex_active as _is_multiplex_active,
+        get_secret as _get_secret,
+        UnscopedSecretError,
+    )
     from hermes_cli.config import get_env_value_prefer_dotenv
 
     for env_var in pconfig.api_key_env_vars:
         # Profile scopes are authoritative. Outside a scope retain the existing
-        # dotenv-over-process lookup used for ordinary single-profile runs.
-        if current_secret_scope() is None:
+        # dotenv-over-process lookup ONLY for ordinary single-profile runs.
+        # Under gateway.multiplex_profiles the dotenv-preferred read would
+        # bypass get_secret's fail-closed guard: an unscoped multiplex call
+        # (reached outside _profile_runtime_scope) would return the process/
+        # default profile's .env key to a caller with no scope installed —
+        # exactly what UnscopedSecretError exists to prevent. So when
+        # multiplexing is active, always route through get_secret: it reads the
+        # installed scope when present and raises UnscopedSecretError (caught
+        # below → skip) when no scope is active, keeping the read fail-closed.
+        if current_secret_scope() is None and not _is_multiplex_active():
             val = (get_env_value_prefer_dotenv(env_var) or "").strip()
         else:
-            val = (_get_secret(env_var, "") or "").strip()
+            try:
+                val = (_get_secret(env_var, "") or "").strip()
+            except UnscopedSecretError:
+                # Multiplexing active, no scope installed: fail closed rather
+                # than leak the default profile's credential.
+                continue
         if has_usable_secret(val):
             return val, env_var
 
