@@ -220,7 +220,13 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
 
         sources_cfg = _load_secrets_config(home)
         source_values = dict(secrets)
-        # Default-profile bootstrap preservation. A source reaches its vault
+        # A named profile (``<home>/profiles/<name>``) is a genuine isolation
+        # boundary under gateway.multiplex_profiles — it must never read the
+        # gateway/default profile's process ``os.environ``. The default profile
+        # IS the process owner, so its own shell/systemd environment is in-scope
+        # (no cross-profile leak). Two behaviours key off this:
+        is_named_profile = home.parent.name == "profiles"
+        # 1. Default-profile bootstrap preservation. A source reaches its vault
         # with a bootstrap credential (e.g. Bitwarden's ``BWS_ACCESS_TOKEN``,
         # exposed via ``protected_env_vars``) that a documented setup supplies
         # from the shell / systemd environment rather than ``.env``. Because
@@ -230,9 +236,8 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
         # default profile only — the same scope that keeps 1Password's
         # ``include_process_auth`` shell fallback — overlay those bootstrap
         # vars from ``os.environ`` when ``.env`` did not already define them.
-        # Named profiles (``<home>/profiles/<name>``) are deliberately NOT
-        # seeded, so they can never borrow the gateway process's vault auth.
-        if home.parent.name != "profiles":
+        # Named profiles are deliberately NOT seeded.
+        if not is_named_profile:
             for src in list_sources():
                 src_cfg = sources_cfg.get(src.name)
                 src_cfg = src_cfg if isinstance(src_cfg, dict) else {}
@@ -248,7 +253,14 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
                     shell_val = os.environ.get(var)
                     if shell_val is not None and shell_val != "":
                         source_values[var] = shell_val
-        report = apply_all(sources_cfg, home, environ=source_values, scoped=True)
+        # 2. Scoped fail-closed applies to NAMED profiles only. There, a legacy
+        # source whose fetch() cannot consume ``environ`` is rejected rather
+        # than run against the process env (another profile's). The default
+        # profile keeps such legacy sources working — running them env-less
+        # reads its own owner environment, the exact bootstrap re-seeded above.
+        report = apply_all(
+            sources_cfg, home, environ=source_values, scoped=is_named_profile
+        )
         # Names the secret-source registry actually applied into the scope, per
         # its own provenance (authoritative even when the resolved value happens
         # to equal a plaintext already in .env). These must not be dropped by

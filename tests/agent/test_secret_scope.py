@@ -364,3 +364,102 @@ class TestEnvFileParsing:
         # never authenticated with the default profile's shell token.
         assert "access_token" not in seen
         assert "STRIPE_KEY" not in scope
+
+    def test_default_profile_still_runs_legacy_env_less_source(
+        self, tmp_path, monkeypatch
+    ):
+        """The scoped fail-closed rejection is for NAMED profiles only. A
+        default-profile legacy source whose fetch() lacks 'environ' must still
+        run (env-less reads the owner's own environment, no cross-profile leak),
+        so its default-profile vault secrets are not dropped."""
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            "secrets:\n  legacy:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+
+        from agent.secret_sources.base import (
+            FetchResult,
+            SECRET_SOURCE_API_VERSION,
+            SecretSource,
+        )
+        from agent.secret_sources import registry as reg
+
+        ran = {}
+
+        class _LegacySrc(SecretSource):
+            # No 'environ' param — a pre-contract / third-party source.
+            def fetch(self, cfg, home_path):
+                ran["hit"] = True
+                res = FetchResult()
+                res.secrets = {"LEGACY_KEY": "sk-legacy"}
+                return res
+
+            def override_existing(self, cfg):
+                return False
+
+            def protected_env_vars(self, cfg):
+                return frozenset()
+
+        _LegacySrc.name = "legacy"
+        _LegacySrc.label = "Legacy"
+        _LegacySrc.shape = "mapped"
+        _LegacySrc.scheme = None
+        _LegacySrc.api_version = SECRET_SOURCE_API_VERSION
+        reg.register_source(_LegacySrc(), replace=True)
+        try:
+            scope = ss.build_profile_secret_scope(tmp_path)
+        finally:
+            reg._reset_registry_for_tests()
+
+        assert ran.get("hit") is True
+        assert scope.get("LEGACY_KEY") == "sk-legacy"
+
+    def test_named_profile_rejects_legacy_env_less_source(
+        self, tmp_path, monkeypatch
+    ):
+        """A named profile must still fail closed on a legacy env-less source
+        (it could otherwise read the gateway/default profile's os.environ)."""
+        profile_home = tmp_path / "profiles" / "beta"
+        profile_home.mkdir(parents=True)
+        (profile_home / ".env").write_text("", encoding="utf-8")
+        (profile_home / "config.yaml").write_text(
+            "secrets:\n  legacy:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+
+        from agent.secret_sources.base import (
+            FetchResult,
+            SECRET_SOURCE_API_VERSION,
+            SecretSource,
+        )
+        from agent.secret_sources import registry as reg
+
+        ran = {}
+
+        class _LegacySrc(SecretSource):
+            def fetch(self, cfg, home_path):
+                ran["hit"] = True
+                res = FetchResult()
+                res.secrets = {"LEGACY_KEY": "sk-legacy"}
+                return res
+
+            def override_existing(self, cfg):
+                return False
+
+            def protected_env_vars(self, cfg):
+                return frozenset()
+
+        _LegacySrc.name = "legacy"
+        _LegacySrc.label = "Legacy"
+        _LegacySrc.shape = "mapped"
+        _LegacySrc.scheme = None
+        _LegacySrc.api_version = SECRET_SOURCE_API_VERSION
+        reg.register_source(_LegacySrc(), replace=True)
+        try:
+            scope = ss.build_profile_secret_scope(profile_home)
+        finally:
+            reg._reset_registry_for_tests()
+
+        assert "hit" not in ran  # failed closed before calling fetch()
+        assert "LEGACY_KEY" not in scope
