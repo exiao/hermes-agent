@@ -283,6 +283,68 @@ def test_fetch_happy_path(monkeypatch, tmp_path):
     assert warnings == []
 
 
+def test_fetch_scoped_env_server_url_wins_over_process_env(monkeypatch, tmp_path):
+    """A multiplexed profile's scoped BWS_SERVER_URL must reach the bws child;
+    the default profile's process-env BWS_SERVER_URL must not leak in."""
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "OPENAI_API_KEY", "value": "sk-b"}])
+
+    # Default profile's endpoint sits in the process env — it must be excluded.
+    monkeypatch.setenv("BWS_SERVER_URL", "https://vault.default.example")
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["server_url"] = kwargs["env"].get("BWS_SERVER_URL")
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    secrets, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.fake.token",
+        project_id="proj-uuid",
+        binary=fake_binary,
+        use_cache=False,
+        server_url="https://vault.profileb.example",
+        scoped_env={
+            "BWS_ACCESS_TOKEN": "0.fake.token",
+            "BWS_SERVER_URL": "https://vault.profileb.example",
+        },
+    )
+    assert secrets == {"OPENAI_API_KEY": "sk-b"}
+    assert captured["server_url"] == "https://vault.profileb.example"
+
+
+def test_fetch_scoped_env_drops_process_server_url_when_scope_unset(
+    monkeypatch, tmp_path
+):
+    """When a scope is active but does not define BWS_SERVER_URL, the default
+    profile's process-env value must not leak into the child."""
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "OPENAI_API_KEY", "value": "sk-b"}])
+
+    monkeypatch.setenv("BWS_SERVER_URL", "https://vault.default.example")
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["server_url"] = kwargs["env"].get("BWS_SERVER_URL")
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    bw.fetch_bitwarden_secrets(
+        access_token="0.fake.token",
+        project_id="proj-uuid",
+        binary=fake_binary,
+        use_cache=False,
+        scoped_env={"BWS_ACCESS_TOKEN": "0.fake.token"},
+    )
+    assert captured["server_url"] is None
+
+
 def test_fetch_skips_invalid_env_names(monkeypatch, tmp_path):
     fake_binary = tmp_path / "bws"
     fake_binary.write_text("")

@@ -357,6 +357,7 @@ def fetch_bitwarden_secrets(
     use_cache: bool = True,
     server_url: str = "",
     home_path: Optional[Path] = None,
+    scoped_env: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Pull the secrets for ``project_id`` from Bitwarden Secrets Manager.
 
@@ -407,7 +408,9 @@ def fetch_bitwarden_secrets(
             "`hermes secrets bitwarden setup`."
         )
 
-    secrets, warnings = _run_bws_list(bws, access_token, project_id, server_url)
+    secrets, warnings = _run_bws_list(
+        bws, access_token, project_id, server_url, scoped_env=scoped_env
+    )
     entry = _CachedFetch(secrets=secrets, fetched_at=time.time())
     _CACHE[cache_key] = entry
     if use_cache:
@@ -416,10 +419,24 @@ def fetch_bitwarden_secrets(
 
 
 def _run_bws_list(
-    bws: Path, access_token: str, project_id: str, server_url: str = ""
+    bws: Path,
+    access_token: str,
+    project_id: str,
+    server_url: str = "",
+    scoped_env: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
     env = os.environ.copy()
+    # Under profile multiplexing the caller passes the profile's scoped env so
+    # the bws child cannot inherit the default profile's BWS_* endpoint/region
+    # from the process environment. Overlay the scoped BWS_* vars (and drop any
+    # process-inherited BWS_SERVER_URL the scope does not define) so the fetch
+    # targets the correct server for this profile.
+    if scoped_env is not None:
+        env.pop("BWS_SERVER_URL", None)
+        for key, value in scoped_env.items():
+            if key.startswith("BWS_") and isinstance(value, str):
+                env[key] = value
     env["BWS_ACCESS_TOKEN"] = access_token
     # Make sure we're not echoing telemetry / colour codes into json.
     env.setdefault("NO_COLOR", "1")
@@ -684,14 +701,26 @@ class BitwardenSource(SecretSource):
         except (TypeError, ValueError):
             ttl = 300.0
 
+        # Resolve the server URL from cfg first, then fall back to the
+        # (possibly scoped) BWS_SERVER_URL so a multiplexed profile that sets
+        # its region/endpoint in its own .env targets the right server and its
+        # cache entry keys off that URL instead of the default profile's.
+        server_url = str(cfg.get("server_url", "") or "").strip()
+        if not server_url:
+            server_url = str(env.get("BWS_SERVER_URL", "") or "").strip()
+        # Under multiplexing pass the scoped env so the bws child cannot inherit
+        # the default profile's BWS_* vars from the process environment.
+        scoped_env = None if environ is None else dict(env)
+
         try:
             secrets, warnings = fetch_bitwarden_secrets(
                 access_token=access_token,
                 project_id=project_id,
                 binary=binary,
                 cache_ttl_seconds=ttl,
-                server_url=str(cfg.get("server_url", "") or "").strip(),
+                server_url=server_url,
                 home_path=home_path,
+                scoped_env=scoped_env,
             )
         except RuntimeError as exc:
             result.error = str(exc)

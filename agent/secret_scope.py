@@ -213,13 +213,25 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
 
     # Secret sources normally populate os.environ. Resolve them into this
     # isolated mapping instead so a multiplexed scope can remain authoritative.
+    registry_resolved: set = set()
     try:
         from hermes_cli.env_loader import _load_secrets_config
         from agent.secret_sources.registry import apply_all
 
         sources_cfg = _load_secrets_config(home)
         source_values = dict(secrets)
+        before = dict(source_values)
         apply_all(sources_cfg, home, environ=source_values)
+        # Names the secret-source registry actually resolved into the scope
+        # (added or overrode with a concrete, non-op:// credential). These must
+        # not be dropped by the fail-closed pass below if the redundant manual
+        # op fetch transiently fails.
+        for name, value in source_values.items():
+            if before.get(name) == value:
+                continue
+            if isinstance(value, str) and value.strip().startswith("op://"):
+                continue
+            registry_resolved.add(name)
         secrets = source_values
     except Exception:
         pass
@@ -319,7 +331,12 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
         if override_existing:
             fail_closed_names.update(configured_refs)
         for name in fail_closed_names:
-            if name not in resolved:
-                secrets.pop(name, None)
+            if name in resolved or name in registry_resolved:
+                # Either the manual op fetch resolved it, or the secret-source
+                # registry (apply_all) already resolved it into a concrete
+                # credential. A transient manual-refetch failure must not drop
+                # a value the registry successfully supplied.
+                continue
+            secrets.pop(name, None)
     return secrets
 

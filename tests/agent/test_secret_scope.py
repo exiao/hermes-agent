@@ -171,6 +171,43 @@ class TestEnvFileParsing:
 
         assert "OPENAI_API_KEY" not in ss.build_profile_secret_scope(tmp_path)
 
+    def test_configured_ref_resolved_by_registry_survives_manual_refetch_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """A configured op:// ref that apply_all already resolved must not be
+        dropped when the redundant manual op fetch transiently fails."""
+        (tmp_path / ".env").write_text(
+            "OPENAI_API_KEY=sk-stale-plaintext\n", encoding="utf-8"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "secrets:\n"
+            "  onepassword:\n"
+            "    enabled: true\n"
+            "    env:\n"
+            "      OPENAI_API_KEY: op://Private/OpenAI/key\n",
+            encoding="utf-8",
+        )
+
+        # apply_all (the secret-source registry) resolves the configured ref
+        # into the isolated scope mapping — as the real 1Password source does
+        # when the op CLI is available.
+        def _fake_apply_all(sources_cfg, home, environ=None):
+            if environ is not None:
+                environ["OPENAI_API_KEY"] = "sk-resolved"
+
+        monkeypatch.setattr(
+            "agent.secret_sources.registry.apply_all", _fake_apply_all
+        )
+        # The redundant manual op re-fetch fails (different auth/cache
+        # fingerprint, transient timeout, etc.).
+        monkeypatch.setattr(
+            "agent.secret_sources.onepassword.fetch_onepassword_secrets",
+            lambda **kwargs: ({}, ["auth failed"]),
+        )
+
+        scope = ss.build_profile_secret_scope(tmp_path)
+        assert scope.get("OPENAI_API_KEY") == "sk-resolved"
+
     def test_configured_onepassword_ref_overrides_raw_env_ref(
         self, tmp_path, monkeypatch
     ):
