@@ -1333,6 +1333,18 @@ def _read_anthropic_secret(name: str) -> str:
     if scope_has_anthropic_secret:
         return ""
 
+    # A profile can intentionally DISABLE an Anthropic path by writing a blank
+    # slot to its .env (``ANTHROPIC_TOKEN=`` / ``ANTHROPIC_API_KEY=``); the setup
+    # helpers do exactly this to zero the OAuth path when switching to an API key
+    # (and vice versa). load_env_file keeps those as present-but-empty scope
+    # keys. That explicit clear must win — falling through to os.environ below
+    # would let a service-level ANTHROPIC_TOKEN override the profile's clear. So
+    # treat any Anthropic slot that is PRESENT in the scope (blank or not) as the
+    # profile having spoken, and suppress the process-env fallback.
+    scope_declares_anthropic_slot = any(key in scope for key in scoped_names)
+    if scope_declares_anthropic_slot:
+        return ""
+
     from agent.secret_scope import is_multiplex_active
 
     if is_multiplex_active():

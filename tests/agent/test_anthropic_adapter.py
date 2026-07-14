@@ -1121,6 +1121,44 @@ class TestResolveAnthropicToken:
             ss.reset_secret_scope(token)
             ss.set_multiplex_active(False)
 
+    def test_default_multiplex_blank_scoped_slot_beats_service_env(
+        self, monkeypatch, tmp_path
+    ):
+        """A profile that explicitly CLEARS an Anthropic slot must not have that
+        clear overridden by the service env.
+
+        The setup helpers write blank slots (``ANTHROPIC_TOKEN=``) to disable a
+        path; load_env_file keeps them as present-but-empty scope keys. A blank
+        scoped Anthropic slot means the profile opted OUT, so the default-profile
+        os.environ fallback must not resurrect a service-level ANTHROPIC_TOKEN.
+        Distinct from the empty-scope ({}) case above, where no slot is declared
+        and the service-env fallback is legitimate.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-SERVICE-SHOULD-NOT-WIN")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+
+        ss.set_multiplex_active(True)
+        # Profile .env explicitly cleared the OAuth token (present but blank).
+        token = ss.set_secret_scope({"ANTHROPIC_TOKEN": ""})
+        try:
+            assert resolve_anthropic_token() is None
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
     def test_nondefault_multiplex_empty_scope_does_not_borrow_service_env(
         self, monkeypatch, tmp_path
     ):
