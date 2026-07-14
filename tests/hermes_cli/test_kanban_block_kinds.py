@@ -553,6 +553,66 @@ def test_dependency_purge_archived_parent_releases_last_parent_park(
         )
 
 
+def test_dependency_partial_unlink_of_unresolved_parent_releases_park(
+    kanban_home: Path,
+) -> None:
+    """Removing only the unresolved edge after the wait, leaving an
+    already-terminal parent, must release the park.
+
+    Child waits on parent A (already done) + parent B (in flight). An operator
+    unlinks the mistaken in-flight B. All remaining parents (just A) are now
+    terminal, so the dependency graph is satisfied and the child must promote
+    rather than stay stranded in todo.
+    """
+    with kb.connect_closing() as conn:
+        parent_a = kb.create_task(conn, title="parent-A-done", assignee="worker")
+        parent_b = kb.create_task(conn, title="parent-B-inflight", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent_a, child_id=child)
+        kb.link_tasks(conn, parent_id=parent_b, child_id=child)
+        # A finishes before the wait; B stays in flight.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent_a,))
+        kb.claim_task(conn, parent_a, claimer="worker")
+        kb.complete_task(conn, parent_a, result="done")
+        kb.block_task(conn, child, reason="wait on A and B", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+        # Operator unlinks the mistaken in-flight parent B.
+        kb.unlink_tasks(conn, parent_id=parent_b, child_id=child)
+        assert kb.get_task(conn, child).status == "ready", (
+            "unlinking the only unresolved parent while an already-done parent "
+            "remains must release the park"
+        )
+
+
+def test_dependency_partial_unlink_leaving_inflight_parent_still_parks(
+    kanban_home: Path,
+) -> None:
+    """Unlinking one parent while another is STILL in flight must keep parking.
+
+    Guards against the partial-unlink release firing when an unresolved parent
+    remains — the child must wait for that parent, not promote early.
+    """
+    with kb.connect_closing() as conn:
+        parent_a = kb.create_task(conn, title="parent-A", assignee="worker")
+        parent_b = kb.create_task(conn, title="parent-B", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent_a, child_id=child)
+        kb.link_tasks(conn, parent_id=parent_b, child_id=child)
+        kb.block_task(conn, child, reason="wait on A and B", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+        # Unlink A, but B is still in flight → must stay parked.
+        kb.unlink_tasks(conn, parent_id=parent_a, child_id=child)
+        assert kb.get_task(conn, child).status == "todo", (
+            "an unresolved in-flight parent still gates the child after a "
+            "partial unlink"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Worker self-block with a rotated run-claim (t_e85f0abe Part B)
 # ---------------------------------------------------------------------------

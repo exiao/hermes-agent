@@ -4078,6 +4078,29 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
         ).fetchone()
         if parent_done:
             return False
+    # Partial-unlink graph repair: an operator may remove only the unresolved
+    # edge after the wait (e.g. `kanban unlink`/delete the mistaken in-flight
+    # parent B) while leaving one or more already-terminal parents (A) linked.
+    # No remaining parent fires a new terminal event, so the checks above can't
+    # see it — but if a post-wait ``unlinked`` event happened AND every parent
+    # that remains is terminal (done/archived), the dependency graph is now
+    # satisfied and the child must release. Requiring the post-wait ``unlinked``
+    # event keeps this distinct from a never-resolved wait (the loop this guard
+    # stops), which has no such edge removal.
+    unlinked_after = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND id > ? AND kind = 'unlinked' LIMIT 1",
+        (task_id, dep_evt_id),
+    ).fetchone()
+    if unlinked_after:
+        unresolved_parent = conn.execute(
+            f"SELECT 1 FROM tasks "
+            f"WHERE id IN ({placeholders}) "
+            f"AND status NOT IN ('done', 'archived') LIMIT 1",
+            tuple(parent_ids),
+        ).fetchone()
+        if not unresolved_parent:
+            return False
     # Parents exist but none resolved since the block (e.g. already-done
     # parent linked before the block, or parents still in flight). Park —
     # promoting now would just re-run the worker that already declared itself
