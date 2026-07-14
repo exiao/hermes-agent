@@ -1971,7 +1971,12 @@ def list_authenticated_providers(
                     _cp_has_creds = True
             except Exception:
                 pass
-        if not _cp_has_creds:
+        # Skipped under a scoped multiplex listing (same reason as the overlay
+        # pass): load_pool() can auto-seed a canonical provider (copilot via
+        # `gh auth`, anthropic via Claude credential files) from process-global
+        # identity, which belongs to the DEFAULT profile — a named profile must
+        # not list it as its own.
+        if not _cp_has_creds and not _scoped_listing:
             try:
                 from agent.credential_pool import load_pool
                 _cp_pool = load_pool(_cp.slug)

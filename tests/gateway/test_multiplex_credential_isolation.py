@@ -694,6 +694,73 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
         rows = self._list_copilot(monkeypatch, pool_has_creds=True)
         assert rows, "single-profile listing must still detect copilot via the pool"
 
+    # --- Canonical cross-check pass (section 2b) ---
+    # The overlay pass above (section 2) and this canonical pass (section 2b,
+    # the CANONICAL_PROVIDERS cross-check) each have their OWN load_pool()
+    # fallback. Codex's P1 on #100 pointed specifically at the canonical
+    # block: when a provider is absent from HERMES_OVERLAYS but present in
+    # CANONICAL_PROVIDERS, listing falls through to load_pool(_cp.slug),
+    # which auto-seeds copilot from the default process's gh identity. The
+    # overlay-pass tests above empty CANONICAL_PROVIDERS, so they never
+    # exercised this path.
+
+    def _list_copilot_via_canonical(self, monkeypatch, *, pool_has_creds: bool):
+        from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.models import ProviderEntry
+
+        # copilot reaches the canonical cross-check (section 2b) only: no
+        # overlay match, no models.dev entry, empty auth store, scoped env
+        # vars absent, and the credential POOL reports credentials (as it
+        # would after auto-seeding from the default profile's gh identity).
+        monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+        monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+        monkeypatch.setattr(
+            "hermes_cli.models.CANONICAL_PROVIDERS",
+            [ProviderEntry("copilot", "GitHub Copilot", "GitHub Copilot")],
+        )
+        monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+        monkeypatch.setattr(
+            "hermes_cli.models.cached_provider_model_ids",
+            lambda *a, **kw: ["gpt-4o-copilot"],
+        )
+
+        class _Pool:
+            def has_credentials(self):
+                return pool_has_creds
+
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda slug: _Pool())
+        providers = list_authenticated_providers(max_models=5)
+        return [p for p in providers if p.get("slug") == "copilot"]
+
+    def test_scoped_profile_canonical_pass_does_not_borrow_default_pool(
+        self, monkeypatch
+    ):
+        """Under a scoped multiplex listing, the CANONICAL cross-check must NOT
+        list copilot from the default profile's pool-seeded gh identity."""
+        for ev in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            monkeypatch.delenv(ev, raising=False)
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-openai"})
+        try:
+            rows = self._list_copilot_via_canonical(monkeypatch, pool_has_creds=True)
+        finally:
+            ss.reset_secret_scope(tok)
+        assert not rows, (
+            "canonical pass must not list copilot from the default profile's "
+            "pool creds under a scoped listing"
+        )
+
+    def test_single_profile_canonical_pass_still_lists_copilot_from_pool(
+        self, monkeypatch
+    ):
+        """Multiplex off / no scope (CLI/TUI): the canonical pool fallback still
+        runs, so copilot lists exactly as before."""
+        ss.set_multiplex_active(False)
+        rows = self._list_copilot_via_canonical(monkeypatch, pool_has_creds=True)
+        assert rows, (
+            "single-profile canonical listing must still detect copilot via the pool"
+        )
+
 
 class TestOpenAIDiscoveryUsesScope:
     """provider_model_ids / fingerprint for openai-api honor the profile scope.
