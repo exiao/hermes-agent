@@ -138,13 +138,28 @@ class GatewaySlashCommandsMixin:
             with _cache_lock:
                 _cached = self._agent_cache.get(session_key)
                 _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
+        # Snapshot the transcript BEFORE eviction. _evict_cached_agent spawns a
+        # daemon soft-release thread that clears agent._session_messages, which
+        # is the same field _cleanup_agent_resources reads to feed the
+        # memory-provider on_session_end hook. Capturing it here (and passing it
+        # through below) keeps session-end memory extraction from racing on an
+        # emptied transcript (#35994 follow-up).
+        from gateway.run import _SESSION_MESSAGES_UNSET
+
+        _messages_snapshot = _SESSION_MESSAGES_UNSET
+        if _old_agent is not None:
+            _live = getattr(_old_agent, "_session_messages", None)
+            if isinstance(_live, list):
+                _messages_snapshot = list(_live)
         self._evict_cached_agent(session_key)
         if _old_agent is not None:
             _bg_tasks = getattr(self, "_background_tasks", None)
             try:
                 _cleanup_task = asyncio.create_task(
                     self._cleanup_agent_resources_off_loop(
-                        _old_agent, context=f"/new reset {session_key}"
+                        _old_agent,
+                        context=f"/new reset {session_key}",
+                        session_messages=_messages_snapshot,
                     )
                 )
                 # Track so shutdown can cancel it; add_done_callback keeps the
@@ -156,7 +171,9 @@ class GatewaySlashCommandsMixin:
                 # No running loop (test fixture / non-async caller) — fall back
                 # to a bounded inline cleanup so resources still get released.
                 try:
-                    self._cleanup_agent_resources(_old_agent)
+                    self._cleanup_agent_resources(
+                        _old_agent, session_messages=_messages_snapshot
+                    )
                 except Exception:
                     pass
 

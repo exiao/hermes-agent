@@ -229,3 +229,35 @@ async def test_reset_schedules_background_cleanup():
     assert result is not None
     _off_loop.assert_awaited_once()
     runner.session_store.reset_session.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reset_snapshots_transcript_before_eviction():
+    """#35994 follow-up P1: the reset must snapshot ``_session_messages``
+    BEFORE ``_evict_cached_agent`` (whose daemon soft-release clears that
+    field) and hand the snapshot to the off-loop cleanup — otherwise
+    session-end memory extraction races on an emptied transcript.
+
+    We give the cached agent a populated transcript, mock the off-loop
+    cleanup, and assert it received the exact pre-eviction messages via the
+    ``session_messages`` kwarg (not the emptied live field)."""
+    transcript = [
+        {"role": "user", "content": "remember my dog is named Biscuit"},
+        {"role": "assistant", "content": "Got it — Biscuit."},
+    ]
+    runner = _make_runner_with_cached_agent(lambda: None)
+    # The cached agent carries a real transcript; eviction will clear it.
+    agent = runner._agent_cache[build_session_key(_make_source())]
+    agent._session_messages = list(transcript)
+
+    with patch.object(
+        runner, "_cleanup_agent_resources_off_loop", AsyncMock()
+    ) as _off_loop:
+        result = await runner._handle_reset_command(_make_event("/new"))
+        await _drain_background_tasks(runner)
+
+    assert result is not None
+    _off_loop.assert_awaited_once()
+    # The snapshot handed to cleanup must be the pre-eviction transcript.
+    _, kwargs = _off_loop.call_args
+    assert kwargs.get("session_messages") == transcript

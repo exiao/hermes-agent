@@ -146,3 +146,64 @@ class TestCleanupAgentResourcesPassesMessages:
         runner._cleanup_agent_resources(agent)
 
         agent.close.assert_called_once()
+
+
+class TestCleanupAgentResourcesSnapshotOverride:
+    """#35994 follow-up: a caller can pass a transcript snapshot to use
+    instead of reading the live ``_session_messages`` off the agent.
+
+    The /new reset path evicts the agent BEFORE scheduling cleanup, and
+    eviction spawns a daemon soft-release thread that sets
+    ``_session_messages = []``. Passing the snapshot captured pre-eviction
+    keeps session-end memory extraction from racing on an emptied transcript.
+    """
+
+    def test_snapshot_forwarded_even_when_live_field_cleared(self):
+        """The core race: the live field has been emptied (soft-release
+        won the race), but an explicit snapshot still reaches the provider."""
+        runner = _make_runner()
+        snapshot = [
+            {"role": "user", "content": "remember my dog is named Biscuit"},
+            {"role": "assistant", "content": "Got it — Biscuit."},
+        ]
+        # Simulate the soft-release having already cleared the live field.
+        agent = _FakeAgent(session_messages=[])
+
+        runner._cleanup_agent_resources(agent, session_messages=snapshot)
+
+        # The provider must see the pre-eviction snapshot, NOT the emptied
+        # live field.
+        agent.shutdown_memory_provider.assert_called_once_with(snapshot)
+
+    def test_snapshot_takes_precedence_over_populated_live_field(self):
+        """An explicit snapshot always wins over the live field."""
+        runner = _make_runner()
+        snapshot = [{"role": "user", "content": "snapshot"}]
+        agent = _FakeAgent(session_messages=[{"role": "user", "content": "live"}])
+
+        runner._cleanup_agent_resources(agent, session_messages=snapshot)
+
+        agent.shutdown_memory_provider.assert_called_once_with(snapshot)
+
+    def test_unset_default_reads_live_field(self):
+        """When no snapshot is passed (the default for other callers), the
+        live ``_session_messages`` is read exactly as before."""
+        runner = _make_runner()
+        transcript = [{"role": "user", "content": "x"}]
+        agent = _FakeAgent(session_messages=transcript)
+
+        # No session_messages kwarg — legacy behaviour.
+        runner._cleanup_agent_resources(agent)
+
+        agent.shutdown_memory_provider.assert_called_once_with(transcript)
+
+    def test_empty_snapshot_is_forwarded_not_dropped(self):
+        """An explicit empty snapshot (session ran no turns before reset)
+        is forwarded as ``[]`` rather than falling through to the no-arg
+        path — matches the observable ``on_session_end([])`` contract."""
+        runner = _make_runner()
+        agent = _FakeAgent(session_messages=[{"role": "user", "content": "live"}])
+
+        runner._cleanup_agent_resources(agent, session_messages=[])
+
+        agent.shutdown_memory_provider.assert_called_once_with([])

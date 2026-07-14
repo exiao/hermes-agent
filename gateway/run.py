@@ -1996,6 +1996,14 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+# Distinguishes "caller did not supply a transcript snapshot, read it off the
+# agent" from an explicit ``None`` / empty snapshot. The /new reset path
+# captures ``_session_messages`` BEFORE evicting the agent (eviction spawns a
+# daemon soft-release that clears the field) and passes the snapshot through so
+# session-end memory extraction never races on an emptied transcript (#35994
+# follow-up).
+_SESSION_MESSAGES_UNSET = object()
+
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
@@ -6182,7 +6190,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _CLEANUP_TIMEOUT_S = 30.0
 
     async def _cleanup_agent_resources_off_loop(
-        self, agent: Any, *, context: str = ""
+        self,
+        agent: Any,
+        *,
+        context: str = "",
+        session_messages: Any = _SESSION_MESSAGES_UNSET,
     ) -> None:
         """Run _cleanup_agent_resources in a worker thread with a bounded wait.
 
@@ -6191,6 +6203,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         block message processing. On timeout the await is cancelled and the
         worker thread is left to finish (or leak) on its own — the caller
         proceeds regardless, exactly as the /new reset path does (#35994).
+
+        ``session_messages`` is forwarded to ``_cleanup_agent_resources`` so a
+        caller that evicts the agent first (which clears ``_session_messages``
+        on a daemon thread) can pass the transcript snapshot it captured before
+        eviction and avoid the empty-transcript race (#35994 follow-up).
         """
         if agent is None:
             return
@@ -6202,7 +6219,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             await asyncio.wait_for(
                 self._run_in_executor_with_context(
-                    self._cleanup_agent_resources, agent
+                    functools.partial(
+                        self._cleanup_agent_resources,
+                        agent,
+                        session_messages=session_messages,
+                    )
                 ),
                 timeout=self._CLEANUP_TIMEOUT_S,
             )
@@ -6221,8 +6242,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cleanup_exc,
             )
 
-    def _cleanup_agent_resources(self, agent: Any) -> None:
-        """Best-effort cleanup for temporary or cached agent instances."""
+    def _cleanup_agent_resources(
+        self, agent: Any, *, session_messages: Any = _SESSION_MESSAGES_UNSET
+    ) -> None:
+        """Best-effort cleanup for temporary or cached agent instances.
+
+        ``session_messages`` lets a caller supply the transcript snapshot to
+        hand ``shutdown_memory_provider`` instead of reading it live off the
+        agent. The /new reset path captures the messages BEFORE eviction (which
+        spawns a daemon soft-release that clears ``_session_messages``) and
+        passes the snapshot here so session-end memory extraction can't race on
+        an emptied transcript (#35994 follow-up). When unset, we read the field
+        off the agent as before.
+        """
         if agent is None:
             return
         try:
@@ -6237,7 +6269,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # absent, so ``getattr`` with a ``None`` default keeps the
                 # call signature-compatible with the pre-fix behaviour
                 # (``shutdown_memory_provider(messages=None)``).
-                session_messages = getattr(agent, "_session_messages", None)
+                if session_messages is _SESSION_MESSAGES_UNSET:
+                    session_messages = getattr(agent, "_session_messages", None)
                 if isinstance(session_messages, list):
                     agent.shutdown_memory_provider(session_messages)
                 else:
