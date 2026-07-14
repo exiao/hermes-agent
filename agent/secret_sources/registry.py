@@ -193,8 +193,16 @@ def _fetch_with_timeout(
     cfg: dict,
     home_path: Path,
     environ: Optional[Dict[str, str]] = None,
+    scoped: bool = False,
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
+
+    ``scoped`` marks a genuine profile-isolation apply (a named profile under
+    ``gateway.multiplex_profiles``): a source whose ``fetch()`` cannot consume
+    ``environ`` is failed closed rather than run against the process
+    ``os.environ`` (which under multiplexing is another profile's env). The
+    generic ``apply_all`` path (``scoped=False``) keeps the legacy env-less
+    call so pre-``environ`` sources still work for single-profile deployments.
 
     The budget is enforced with a daemon worker thread: a source that
     blows its budget is reported as ``TIMEOUT`` and its (eventual)
@@ -210,6 +218,25 @@ def _fetch_with_timeout(
         fetch_params = inspect.signature(source.fetch).parameters
         if "environ" in fetch_params:
             future = executor.submit(source.fetch, cfg, home_path, environ=environ)
+        elif scoped:
+            # Fail closed: a profile-scoped mapping is being applied (a named
+            # profile under gateway.multiplex_profiles) but this source's
+            # fetch() predates the ``environ`` contract and would read bootstrap
+            # credentials from the process ``os.environ`` — which under
+            # multiplexing is the DEFAULT profile's environment. Running it
+            # env-less here would populate the scoped profile from another
+            # profile's vault. Refuse rather than leak; the source author must
+            # accept ``environ`` to participate in scoped resolution.
+            res = FetchResult()
+            res.error = (
+                f"secret source '{source.name}' cannot consume a scoped "
+                "credential environment (its fetch() lacks the 'environ' "
+                "parameter) — skipped in profile-scoped mode to prevent "
+                "cross-profile credential leakage. Update the source to the "
+                "current secret-source API to use it under multiplexing."
+            )
+            res.error_kind = ErrorKind.NOT_CONFIGURED
+            return res
         else:
             future = executor.submit(source.fetch, cfg, home_path)
         try:
@@ -284,10 +311,18 @@ def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
 
 
 def apply_all(secrets_cfg: dict, home_path: Path,
-              environ: Optional[Dict[str, str]] = None) -> ApplyReport:
+              environ: Optional[Dict[str, str]] = None,
+              scoped: bool = False) -> ApplyReport:
     """Fetch from every enabled source and apply the merged result to env.
 
     ``environ`` defaults to ``os.environ``; injectable for tests.
+
+    ``scoped`` marks a genuine profile-isolation build (a named profile under
+    ``gateway.multiplex_profiles``). When true, a source whose ``fetch()``
+    cannot consume ``environ`` is failed closed instead of run against the
+    process environment, so a named profile can never be populated from another
+    profile's vault. Leave ``scoped=False`` for the default single-profile
+    apply path.
 
     Precedence per env var (most-specific intent wins):
 
@@ -330,7 +365,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path, environ)
+        result = _fetch_with_timeout(source, cfg, home_path, environ, scoped=scoped)
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):

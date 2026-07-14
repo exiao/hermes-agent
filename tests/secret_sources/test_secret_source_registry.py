@@ -293,6 +293,67 @@ class TestApplyAll:
         )
         assert env["K"] == "v"
 
+    def test_scoped_apply_fails_closed_on_legacy_source_without_environ(
+        self, tmp_path
+    ):
+        """A profile-scoped apply must NOT run a legacy source whose fetch()
+        lacks the 'environ' param — env-less it would read process os.environ
+        (another profile's env under multiplexing). It fails closed instead."""
+        # _make_source builds a fetch(self, cfg, home_path) — no 'environ' param.
+        reg.register_source(_make_source(secrets={"K": "leaked"}))
+        env: dict = {}
+        report = reg.apply_all(
+            {"dummy": {"enabled": True}}, tmp_path, environ=env, scoped=True
+        )
+        # Value never applied; source reported an error, not a silent env-read.
+        assert "K" not in env
+        assert report.sources[0].result.ok is False
+        assert report.sources[0].result.error_kind is ErrorKind.NOT_CONFIGURED
+
+    def test_scoped_apply_runs_environ_aware_source(self, tmp_path):
+        """A source that DOES accept 'environ' still runs under a scoped apply
+        and receives the scoped mapping (not process os.environ)."""
+        seen = {}
+
+        class _EnvSrc(SecretSource):
+            def fetch(self, cfg, home_path, environ=None):
+                seen["environ"] = environ
+                res = FetchResult()
+                res.secrets = {"K": "scoped-value"}
+                return res
+
+            def override_existing(self, cfg):
+                return False
+
+            def protected_env_vars(self, cfg):
+                return frozenset()
+
+        _EnvSrc.name = "envsrc"
+        _EnvSrc.label = "EnvSrc"
+        _EnvSrc.shape = "mapped"
+        _EnvSrc.scheme = None
+        _EnvSrc.api_version = SECRET_SOURCE_API_VERSION
+        reg.register_source(_EnvSrc())
+
+        env = {"BOOTSTRAP": "tok"}
+        report = reg.apply_all(
+            {"envsrc": {"enabled": True}}, tmp_path, environ=env, scoped=True
+        )
+        assert seen["environ"] is env  # scoped mapping, not os.environ
+        assert env["K"] == "scoped-value"
+        assert report.sources[0].result.ok is True
+
+    def test_default_apply_still_runs_legacy_source_without_environ(self, tmp_path):
+        """Non-scoped (single-profile) apply keeps backward compat: a legacy
+        env-less source still runs so existing deployments are unaffected."""
+        reg.register_source(_make_source(secrets={"K": "v"}))
+        env: dict = {}
+        report = reg.apply_all(
+            {"dummy": {"enabled": True}}, tmp_path, environ=env, scoped=False
+        )
+        assert env["K"] == "v"
+        assert report.sources[0].result.ok is True
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
