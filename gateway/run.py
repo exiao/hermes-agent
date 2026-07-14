@@ -17312,9 +17312,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         terminal sandbox, browser daemon, and tracked bg processes (keyed
         on task_id), because the session may resume with a freshly-built
         agent.  Call sites that want a hard teardown (true conversation
-        boundaries like /new) already call ``_cleanup_agent_resources``
-        before evicting; ``release_clients`` is idempotent and safe to
-        run again after that (the client is already None).
+        boundaries) pair eviction with ``_cleanup_agent_resources``: most
+        run it before evicting, while ``/new`` evicts first and schedules
+        ``_cleanup_agent_resources_off_loop`` as a tracked background task
+        so the reset doesn't block on slow teardown (the soft release here
+        then runs concurrently with that hard cleanup).  Either way
+        ``release_clients`` is idempotent and safe to run again (the client
+        is already None if the hard cleanup won the race).
 
         Cleanup runs on a daemon thread so we never block holding
         ``_agent_cache_lock`` on slow socket teardown — mirrors the
