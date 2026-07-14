@@ -4109,6 +4109,9 @@ class GatewaySlashCommandsMixin:
         credits_lines: list[str] = []
         if provider:
             try:
+                # Slash commands run outside _run_agent's profile scope. Re-enter
+                # the source scope so account lookup uses the same credential as
+                # the session, including the default profile in multiplex mode.
                 with self._profile_secret_scope_for_source(source):
                     account_snapshot = await asyncio.to_thread(
                         fetch_account_usage,
