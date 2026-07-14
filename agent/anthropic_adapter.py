@@ -981,12 +981,12 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         return None
 
     raw = result.stdout.strip()
-    if not raw:
+    if not raw or not isinstance(raw, str):
         return None
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 
@@ -1321,18 +1321,31 @@ def _read_anthropic_secret(name: str) -> str:
     value = (_get_secret(name, "") or "").strip()
     if value or scope is None:
         return value
+
+    scoped_names = (
+        "ANTHROPIC_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    )
+    scope_has_anthropic_secret = any(
+        str(scope.get(key, "") or "").strip() for key in scoped_names
+    )
+    if scope_has_anthropic_secret:
+        return ""
+
     from agent.secret_scope import is_multiplex_active
 
-    if not is_multiplex_active():
-        scoped_names = (
-            "ANTHROPIC_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-        )
-        if any(str(scope.get(key, "") or "").strip() for key in scoped_names):
-            return ""
-        return (os.environ.get(name, "") or "").strip()
-    return ""
+    if is_multiplex_active():
+        # Multiplex scopes are fail-closed for secondary profiles, but the
+        # default profile may legitimately receive its Anthropic credential from
+        # the process/service environment instead of ~/.hermes/.env. When its
+        # profile scope has no Anthropic secret of its own, keep that legacy
+        # default-profile fallback; never borrow it for non-default profiles.
+        if not _scope_is_non_default_profile():
+            return (os.environ.get(name, "") or "").strip()
+        return ""
+
+    return (os.environ.get(name, "") or "").strip()
 
 
 def _scope_is_non_default_profile() -> bool:

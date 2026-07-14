@@ -1084,6 +1084,70 @@ class TestResolveAnthropicToken:
         finally:
             ss.reset_secret_scope(token)
 
+    def test_default_multiplex_empty_scope_falls_back_to_service_env(
+        self, monkeypatch, tmp_path
+    ):
+        """The default profile may get its Anthropic token from the service env.
+
+        ``_profile_runtime_scope`` builds the default profile's secret scope from
+        ``$HERMES_HOME/.env`` only. If the gateway process instead inherited
+        ANTHROPIC_TOKEN from its service environment, the scope is empty while
+        ``os.environ`` still owns the DEFAULT profile's credential. Multiplex
+        fail-closed isolation must block that fallback only for non-default
+        scopes, not for the default profile's own scope.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-DEFAULT-SERVICE")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-DEFAULT-SERVICE"
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+    def test_nondefault_multiplex_empty_scope_does_not_borrow_service_env(
+        self, monkeypatch, tmp_path
+    ):
+        """The default env fallback is not allowed for a secondary profile."""
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-DEFAULT-SERVICE")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            assert resolve_anthropic_token() is None
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
 
 class TestRefreshOauthToken:
     def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
