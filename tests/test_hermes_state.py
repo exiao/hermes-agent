@@ -754,6 +754,37 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    def test_cjk_like_fallback_excludes_rewound_rows(self, tmp_path, monkeypatch):
+        """Regression (Codex P2): the CJK LIKE fallback must hide rewound rows
+        (active=0, compacted=0) by default, like the base + trigram FTS paths.
+        Otherwise disabling trigram leaks messages the user took back."""
+        real_connect = sqlite3.connect
+        db_path = tmp_path / "state.db"
+
+        def connect_without_trigram(*args, **kwargs):
+            kwargs["factory"] = _NoTrigramConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr("hermes_state.sqlite3.connect", connect_without_trigram)
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="大别山项目计划书")
+            # Rewind it the way undo does: active=0, compacted=0.
+            db._conn.execute(
+                "UPDATE messages SET active = 0 WHERE session_id = 's1'"
+            )
+            db._conn.commit()
+
+            # Default search must NOT return the rewound row.
+            assert db.search_messages("大别山") == []
+            # include_inactive=True still finds it.
+            results = db.search_messages("大别山", include_inactive=True)
+            assert len(results) == 1
+            assert "大别山" in results[0]["snippet"]
+        finally:
+            db.close()
+
 
 # =========================================================================
 # Message storage

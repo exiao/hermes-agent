@@ -4842,6 +4842,13 @@ class SessionDB:
                     )
                     like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
                 like_where = [f"({' OR '.join(token_clauses)})"]
+                if not include_inactive:
+                    # Match the base + trigram FTS paths: hide rewound rows
+                    # (active=0, compacted=0). Without this the LIKE fallback
+                    # leaks messages the user took back — reachable for more
+                    # installs now that sessions.trigram_fts can route 3+ char
+                    # CJK queries here by config, not just short-CJK ones.
+                    like_where.append("(m.active = 1 OR m.compacted = 1)")
                 if source_filter is not None:
                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     like_params.extend(source_filter)
