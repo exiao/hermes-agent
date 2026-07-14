@@ -8952,6 +8952,18 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    # Pin the dispatcher's resolved FD-headroom threshold into the worker env.
+    # _spawn_worker rewrites HERMES_HOME to the assignee profile (above), so a
+    # worker's own _resolve_fd_headroom() would read kanban.fd_headroom from
+    # THAT profile's config.yaml, not the dispatching (gateway) profile's. An
+    # operator who raises or disables the guard in the gateway profile expects
+    # every worker on the shared board to honor it; without this pin the worker
+    # silently falls back to its own profile/default threshold and can open the
+    # board inside the intended margin (or refuse despite a disabled guard).
+    # Resolve here (still in the dispatcher's env/HERMES_HOME) and bridge it via
+    # the highest-precedence HERMES_KANBAN_FD_HEADROOM override, matching the
+    # DB/board/workspaces pins just above.
+    env["HERMES_KANBAN_FD_HEADROOM"] = str(_resolve_fd_headroom())
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
