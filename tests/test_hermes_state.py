@@ -647,6 +647,182 @@ class TestSessionLifecycle:
             db.close()
 
 
+class TestExternalContentFtsMigration:
+    """v20: view-backed third-party-content FTS + trigram config gate + WAL watchdog."""
+
+    def _seed_inline_v19(self, db_path):
+        """Create a DB, then rewrite FTS to the pre-v20 INLINE schema at v19.
+
+        Mirrors what an on-disk pre-migration DB looks like: messages_fts /
+        messages_fts_trigram declared WITHOUT content= (a full text copy per
+        table) with DELETE-based triggers, and schema_version pinned to 19.
+        """
+        db = SessionDB(db_path=db_path)
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(
+            "s1", role="assistant", content="hello world",
+            tool_name="web_search", tool_calls='{"q":"kittens"}',
+        )
+        db.append_message("s1", role="user", content="plain text only")
+        db.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS messages_fts_insert;
+            DROP TRIGGER IF EXISTS messages_fts_delete;
+            DROP TRIGGER IF EXISTS messages_fts_update;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+            DROP TABLE IF EXISTS messages_fts;
+            DROP TABLE IF EXISTS messages_fts_trigram;
+            DROP VIEW IF EXISTS messages_search_v;
+            CREATE VIRTUAL TABLE messages_fts USING fts5(content);
+            CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content, tokenize='trigram');
+            INSERT INTO messages_fts(rowid, content)
+                SELECT id, COALESCE(content,'')||' '||COALESCE(tool_name,'')||' '||COALESCE(tool_calls,'')
+                FROM messages;
+            INSERT INTO messages_fts_trigram(rowid, content)
+                SELECT id, COALESCE(content,'')||' '||COALESCE(tool_name,'')||' '||COALESCE(tool_calls,'')
+                FROM messages;
+            UPDATE schema_version SET version = 19;
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    def test_migration_switches_to_external_content_and_preserves_search(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "state.db"
+        self._seed_inline_v19(db_path)
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            # Version advanced and both FTS tables are now external-content
+            # backed by the messages_search_v view (invariant: content= set).
+            version = migrated._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0]
+            assert version == SCHEMA_VERSION
+            fts_sql = migrated._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'"
+            ).fetchone()[0]
+            assert "content=messages_search_v" in fts_sql.replace("'", "")
+            assert migrated._conn.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type='view' AND name='messages_search_v'"
+            ).fetchone()[0] == 1
+
+            # v11 intent preserved: tool_name + tool_calls stay searchable.
+            assert [m["id"] for m in migrated.search_messages("web_search")]
+            assert [m["id"] for m in migrated.search_messages("kittens")]
+            # snippet() still emits highlight markers.
+            hits = migrated.search_messages("hello")
+            assert hits and ">>>" in hits[0]["snippet"]
+
+            # Incremental maintenance through the new 'delete'-command triggers.
+            migrated.append_message(
+                "s1", role="assistant", content="fresh", tool_name="new_tool",
+            )
+            assert [m["id"] for m in migrated.search_messages("new_tool")]
+        finally:
+            migrated.close()
+
+    def test_migration_is_idempotent(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        self._seed_inline_v19(db_path)
+
+        first = SessionDB(db_path=db_path)
+        first.close()
+        # Second open must be a no-op: version stays put and search still works.
+        second = SessionDB(db_path=db_path)
+        try:
+            assert second._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+            assert len(second.search_messages("web_search")) == 1
+        finally:
+            second.close()
+
+    def test_trigram_gate_off_drops_table_and_falls_back_to_like(
+        self, tmp_path, monkeypatch
+    ):
+        # Gate the trigram index off via the config reader (no config file
+        # needed — patch the classmethod the constructor consults).
+        monkeypatch.setattr(
+            SessionDB, "_read_fts_trigram_config", staticmethod(lambda: False)
+        )
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is False
+            # Trigram table must not exist when gated off.
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 0
+
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="大别山项目计划书")
+            # A 3+ CJK query that would normally use trigram must fall back to
+            # LIKE without raising, and still find the row.
+            results = db.search_messages("大别山")
+            assert len(results) == 1
+            assert "大别山" in results[0]["snippet"]
+        finally:
+            db.close()
+
+    def test_trigram_gate_on_keeps_table(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            SessionDB, "_read_fts_trigram_config", staticmethod(lambda: True)
+        )
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is True
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 1
+        finally:
+            db.close()
+
+    def test_wal_watchdog_shrinks_unpinned_wal(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            # Suppress the periodic checkpoint so the WAL is free to grow, then
+            # write enough to push it over a tiny threshold.
+            db._CHECKPOINT_EVERY_N_WRITES = 10 ** 9
+            for i in range(400):
+                db.append_message("s1", role="user", content=("x" * 2000) + str(i))
+
+            before = db._wal_size_bytes()
+            assert before > 0
+            result = db.wal_watchdog(max_mb=0)
+            assert result["checked"] is True
+            assert result["checkpointed"] is True
+            assert result["pinned"] is False
+            # Not pinned -> TRUNCATE follows -> file shrinks to ~0.
+            assert db._wal_size_bytes() < before
+        finally:
+            db.close()
+
+    def test_wal_watchdog_noop_below_threshold(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="tiny")
+            # Huge threshold: watchdog must not touch a small WAL.
+            result = db.wal_watchdog(max_mb=10_000)
+            assert result["checked"] is False
+            assert result["checkpointed"] is False
+        finally:
+            db.close()
+
+
 # =========================================================================
 # Message storage
 # =========================================================================

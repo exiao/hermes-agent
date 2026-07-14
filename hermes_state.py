@@ -122,7 +122,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -812,9 +812,32 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 """
 
+# View that projects each message into the single searchable text column the
+# FTS5 tables index (content || tool_name || tool_calls). Backing the FTS
+# tables with this VIEW as third-party content (content=messages_search_v,
+# content_rowid=id) means the FTS shadow tables store only the index, NOT a
+# second copy of every message body — the v11 duplication bloat (a full
+# content copy per FTS table, ~2.8 GB on the live 9.3 GB DB) is eliminated
+# while preserving the v11 intent that tool_name + tool_calls stay searchable
+# and snippet() keeps working. The '||' concatenation matches the trigger
+# bodies below so 'rebuild' and incremental updates index identical text.
+FTS_VIEW_SQL = """
+CREATE VIEW IF NOT EXISTS messages_search_v(id, content) AS
+    SELECT id,
+        COALESCE(content, '') || ' ' || COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '')
+    FROM messages;
+"""
+
+# External-content FTS5 tables MUST issue explicit 'delete' commands (not
+# ``DELETE FROM``) in the DELETE/UPDATE triggers: with content= set, FTS5
+# cannot re-read the old row from the deleted content source, so it needs the
+# original text handed to it via the special 'delete' command to remove the
+# right index entries. See https://sqlite.org/fts5.html#external_content_tables
 FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    content
+    content,
+    content=messages_search_v,
+    content_rowid=id
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
@@ -825,11 +848,19 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-    DELETE FROM messages_fts WHERE rowid = old.id;
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    DELETE FROM messages_fts WHERE rowid = old.id;
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
@@ -840,10 +871,13 @@ END;
 # Trigram FTS5 table for CJK substring search.  The default unicode61
 # tokenizer splits CJK characters into individual tokens, breaking phrase
 # matching.  The trigram tokenizer creates overlapping 3-byte sequences so
-# substring queries work natively for any script (CJK, Thai, etc.).
+# substring queries work natively for any script (CJK, Thai, etc.).  Backed by
+# the same messages_search_v view as third-party content (see FTS_SQL above).
 FTS_TRIGRAM_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
     content,
+    content=messages_search_v,
+    content_rowid=id,
     tokenize='trigram'
 );
 
@@ -855,11 +889,19 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON message
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
-    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
-    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
@@ -910,6 +952,14 @@ class SessionDB:
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_unavailable_warned = False
+        # Config gate: when sessions.fts_trigram is false the trigram index
+        # (its shadow tables were the single largest consumer on the live DB —
+        # ~5 GB serving substring search) is dropped and never rebuilt, and
+        # CJK/substring search transparently falls back to LIKE. Default true.
+        # Read once at construction; None on any failure so FTS setup keeps the
+        # trigram table (fail-open — never silently lose the index on a config
+        # read hiccup).
+        self._fts_trigram_enabled = self._read_fts_trigram_config()
         self._conn = None
         try:
             if read_only:
@@ -1039,6 +1089,23 @@ class SessionDB:
             exc,
         )
 
+    @staticmethod
+    def _read_fts_trigram_config() -> bool:
+        """Return sessions.fts_trigram (default True) — the trigram gate.
+
+        Best-effort: any failure (config missing, import cycle, malformed
+        YAML) fails OPEN (returns True) so a transient config read never
+        silently drops a working trigram index. Uses the deepcopy-free
+        readonly loader — this runs on every SessionDB() construction.
+        """
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            sess = load_config_readonly().get("sessions") or {}
+            return bool(sess.get("fts_trigram", True))
+        except Exception:
+            return True
+
     def _sqlite_supports_fts5(self, cursor: sqlite3.Cursor) -> bool:
         try:
             cursor.execute("CREATE VIRTUAL TABLE temp._hermes_fts5_probe USING fts5(x)")
@@ -1059,6 +1126,28 @@ class SessionDB:
                 pass
 
     @staticmethod
+    def _drop_trigram_schema(cursor: sqlite3.Cursor) -> None:
+        """Drop the trigram FTS table + its triggers (config-gate off).
+
+        Removes the ~5 GB trigram index and its INSERT/DELETE/UPDATE triggers
+        so a subsequent messages write no longer maintains it. The base
+        messages_fts table and its triggers are untouched. Idempotent.
+        """
+        for trigger in (
+            "messages_fts_trigram_insert",
+            "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+        ):
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        except sqlite3.OperationalError:
+            pass
+
+    @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
         placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
         row = cursor.execute(
@@ -1074,25 +1163,14 @@ class SessionDB:
         *,
         include_trigram: bool = True,
     ) -> None:
-        cursor.execute("DELETE FROM messages_fts")
-        cursor.execute(
-            "INSERT INTO messages_fts(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
+        # External-content tables rebuild straight from messages_search_v via
+        # the special 'rebuild' command — no manual DELETE + INSERT..SELECT and
+        # no second copy of the message text materialised in the shadow tables.
+        cursor.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         if not include_trigram:
             return
-        cursor.execute("DELETE FROM messages_fts_trigram")
         cursor.execute(
-            "INSERT INTO messages_fts_trigram(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
+            "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('rebuild')"
         )
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
@@ -1255,6 +1333,126 @@ class SessionDB:
                 self._conn.close()
                 self._conn = None
 
+    def _wal_size_bytes(self) -> int:
+        """Size of the ``-wal`` sidecar in bytes, or 0 if absent/unreadable."""
+        try:
+            wal = Path(str(self.db_path) + "-wal")
+            return wal.stat().st_size if wal.exists() else 0
+        except OSError:
+            return 0
+
+    def _pids_holding_db(self) -> List[int]:
+        """Best-effort list of PIDs with this state.db open (psutil).
+
+        Used only for the watchdog WARNING when a RESTART checkpoint could
+        not shrink a bloated WAL — a pinned reader is the usual culprit and
+        naming it turns a mystery into an actionable log line. Returns an
+        empty list when psutil is unavailable or the scan fails (never
+        raises); scanning every process' open files is O(procs) so this
+        runs only on the already-rare bloat path, never on the hot path.
+        """
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            return []
+        target = str(self.db_path)
+        pids: List[int] = []
+        for proc in psutil.process_iter(["pid"]):
+            try:
+                for f in proc.open_files():
+                    if f.path == target or f.path.startswith(target + "-"):
+                        pids.append(proc.pid)
+                        break
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+        return pids
+
+    def wal_watchdog(self, max_mb: int = 64) -> Dict[str, Any]:
+        """Bound WAL growth: force-checkpoint an oversized ``-wal``.
+
+        A long-lived read transaction (dashboard/sidebar polling, an
+        unconsumed cursor) pins the WAL so the periodic every-50-writes
+        checkpoint silently no-ops and the ``-wal`` grows without bound
+        (observed live at 3.6 GB atop a 9.3 GB DB). Giant WAL + a hard
+        shutdown is the malformed-image corruption scenario. This watchdog,
+        called at startup and hourly by the gateway, force-checkpoints when
+        the ``-wal`` exceeds *max_mb*.
+
+        Runs ``wal_checkpoint(RESTART)`` to flush every committed frame and
+        restart the WAL write pointer at offset 0 (bounds growth even under
+        steady write load). RESTART alone does not shrink the file, so on a
+        fully-successful checkpoint (no reader pinning) it follows with a
+        TRUNCATE to reclaim the disk. The RESTART return's ``busy`` flag —
+        NOT the post-checkpoint file size — is the authoritative "a reader is
+        pinning it" signal; on ``busy`` it logs a WARNING naming the PIDs
+        holding the DB. Never raises; read-only connections are skipped.
+
+        Returns a dict: ``{"checked": bool, "wal_mb_before": float,
+        "wal_mb_after": float, "checkpointed": bool, "pinned": bool}``.
+        """
+        result: Dict[str, Any] = {
+            "checked": False,
+            "wal_mb_before": 0.0,
+            "wal_mb_after": 0.0,
+            "checkpointed": False,
+            "pinned": False,
+        }
+        if self.read_only or self._conn is None:
+            return result
+        try:
+            before = self._wal_size_bytes()
+            result["wal_mb_before"] = round(before / (1024 * 1024), 1)
+            threshold = max(0, int(max_mb)) * 1024 * 1024
+            if before <= threshold:
+                return result
+            result["checked"] = True
+            with self._lock:
+                try:
+                    # Returns (busy, log_frames, checkpointed_frames). busy=1
+                    # (or checkpointed < log) means a reader blocked a full
+                    # checkpoint — that is the pinned-WAL condition.
+                    row = self._conn.execute(
+                        "PRAGMA wal_checkpoint(RESTART)"
+                    ).fetchone()
+                    busy = int(row[0]) if row else 1
+                    log_frames = int(row[1]) if row and row[1] is not None else -1
+                    ckpt_frames = int(row[2]) if row and row[2] is not None else -1
+                    pinned = busy != 0 or (
+                        log_frames >= 0 and ckpt_frames >= 0 and ckpt_frames < log_frames
+                    )
+                    if not pinned:
+                        # Fully checkpointed — safe to truncate and reclaim disk.
+                        try:
+                            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        except sqlite3.OperationalError:
+                            pass
+                except sqlite3.OperationalError as exc:
+                    logger.warning("WAL watchdog checkpoint failed: %s", exc)
+                    return result
+            result["checkpointed"] = True
+            result["pinned"] = pinned
+            after = self._wal_size_bytes()
+            result["wal_mb_after"] = round(after / (1024 * 1024), 1)
+            if pinned:
+                pids = self._pids_holding_db()
+                logger.warning(
+                    "state.db WAL was %.1f MB (threshold %d MB) and a reader "
+                    "is pinning it — checkpoint could not fully drain the log. "
+                    "PIDs holding the DB: %s",
+                    result["wal_mb_before"],
+                    max_mb,
+                    ", ".join(str(p) for p in pids) if pids else "unknown",
+                )
+            else:
+                logger.info(
+                    "WAL watchdog: checkpointed state.db -wal %.1f MB -> %.1f MB",
+                    result["wal_mb_before"],
+                    result["wal_mb_after"],
+                )
+        except Exception as exc:  # never fatal
+            logger.debug("WAL watchdog skipped: %s", exc)
+        return result
+
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
         """Extract expected columns per table from SCHEMA_SQL.
@@ -1409,6 +1607,13 @@ class SessionDB:
             # continues; if a future runtime has FTS5, _ensure_fts_schema()
             # recreates them.
             self._drop_fts_triggers(cursor)
+        else:
+            # The messages_search_v view is the third-party content source the
+            # external-content FTS tables read on 'rebuild'/integrity-check. It
+            # must exist before any messages_fts* CREATE or 'rebuild' runs, so
+            # create it up front (idempotent). Harmless for FTS5-less builds,
+            # but skipped there since nothing references it.
+            cursor.executescript(FTS_VIEW_SQL)
 
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on
@@ -1553,6 +1758,89 @@ class SessionDB:
                     # means consumers fall back to sessions.json for those
                     # rows until the gateway rewrites them.
                     logger.debug("v18 gateway metadata backfill skipped: %s", exc)
+            if current_version < 20:
+                # v20: switch messages_fts + messages_fts_trigram from INLINE
+                # (v11) to VIEW-backed external-content. Inline FTS stores a
+                # full copy of every message body in each shadow table — on the
+                # live DB that was ~2.8 GB of duplicated text (a content copy
+                # per FTS table) on top of the 2 GB canonical messages. With
+                # content=messages_search_v the shadow tables keep only the
+                # index and read the text from the view on demand, preserving
+                # the v11 intent (tool_name + tool_calls searchable, snippet()
+                # works) while dropping the duplicate copies. Old inline tables
+                # and triggers can't be reused (schema differs, IF NOT EXISTS
+                # won't overwrite), so drop them and let the post-migration
+                # existence checks recreate from FTS_SQL / FTS_TRIGRAM_SQL, then
+                # 'rebuild' the index from the view. VACUUM reclaims the freed
+                # copies; checkpoint before + after bounds WAL growth so a
+                # multi-GB rebuild can't balloon the -wal on a pinned reader.
+                if fts5_available:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except sqlite3.OperationalError:
+                        pass
+                    self._drop_fts_triggers(cursor)
+                    for _tbl in ("messages_fts", "messages_fts_trigram"):
+                        try:
+                            cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
+                        except sqlite3.OperationalError as exc:
+                            if not self._is_fts5_unavailable_error(exc):
+                                raise
+                            if self._is_trigram_unavailable_error(exc):
+                                self._warn_trigram_unavailable(exc)
+                            else:
+                                self._warn_fts5_unavailable(exc)
+                                fts5_available = False
+                                fts_migrations_complete = False
+                            break
+
+                    if fts5_available:
+                        # View must exist before the external-content tables
+                        # 'rebuild' against it (created above for the FTS5 path,
+                        # but re-assert idempotently in case of an odd order).
+                        cursor.executescript(FTS_VIEW_SQL)
+                        base_fts_ok = self._ensure_fts_schema(
+                            cursor, "messages_fts", FTS_SQL
+                        )
+                        if base_fts_ok:
+                            cursor.execute(
+                                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+                            )
+                        else:
+                            fts_migrations_complete = False
+                        # Trigram is gated by config: when disabled we neither
+                        # create nor rebuild it (the drop above already removed
+                        # any prior copy), and CJK search falls back to LIKE.
+                        if self._fts_trigram_enabled:
+                            trigram_ok = self._ensure_fts_schema(
+                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                            )
+                            if trigram_ok:
+                                cursor.execute(
+                                    "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                                    "VALUES('rebuild')"
+                                )
+                            self._trigram_available = trigram_ok
+                        else:
+                            self._trigram_available = False
+                        if fts_migrations_complete:
+                            # Reclaim the dropped inline content copies now,
+                            # before the version bump commits. VACUUM can't run
+                            # in a transaction; checkpoint first to keep the WAL
+                            # bounded, then VACUUM, then checkpoint again.
+                            try:
+                                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                                self._conn.commit()
+                                self._conn.execute("VACUUM")
+                                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                            except sqlite3.OperationalError as exc:
+                                logger.warning(
+                                    "v20 FTS migration VACUUM skipped: %s", exc
+                                )
+                    else:
+                        fts_migrations_complete = False
+                else:
+                    fts_migrations_complete = False
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -1569,25 +1857,44 @@ class SessionDB:
             pass  # Index already exists
 
         if fts5_available:
+            # The external-content FTS tables read their text from this view;
+            # ensure it exists on every open (idempotent) before any FTS DDL
+            # or 'rebuild' so a DB that predates the view still gets it.
+            cursor.executescript(FTS_VIEW_SQL)
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
-            # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            # an earlier no-FTS5 runtime. When the trigram gate is off only the
+            # 3 base triggers should exist, so measure the repair threshold
+            # against the expected count for the active configuration (else the
+            # base rebuild would fire on every open with trigram disabled).
+            _expected_triggers = (
+                len(_FTS_TRIGGERS) if self._fts_trigram_enabled else 3
+            )
+            triggers_need_repair = self._fts_trigger_count(cursor) < _expected_triggers
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
             # to the main FTS table; if it cannot be created, CJK search falls
-            # back to LIKE.
+            # back to LIKE. It is also config-gated (sessions.fts_trigram): when
+            # disabled we drop the table + its triggers and leave trigram
+            # unavailable so the LIKE fallback engages — this is what lets a
+            # user reclaim the multi-GB trigram index by flipping one config.
             if self._fts_enabled:
-                trigram_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
-                self._trigram_available = trigram_enabled
-                if triggers_need_repair:
-                    self._rebuild_fts_indexes(
-                        cursor,
-                        include_trigram=trigram_enabled,
+                if not self._fts_trigram_enabled:
+                    self._drop_trigram_schema(cursor)
+                    self._trigram_available = False
+                    if triggers_need_repair:
+                        self._rebuild_fts_indexes(cursor, include_trigram=False)
+                else:
+                    trigram_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                     )
+                    self._trigram_available = trigram_enabled
+                    if triggers_need_repair:
+                        self._rebuild_fts_indexes(
+                            cursor,
+                            include_trigram=trigram_enabled,
+                        )
 
         self._conn.commit()
 
