@@ -453,6 +453,42 @@ def test_dependency_parent_completing_after_wait_still_promotes(
         )
 
 
+def test_dependency_reopened_parent_recompletion_after_wait_promotes(
+    kanban_home: Path,
+) -> None:
+    """A parent that completed, was REOPENED, then completed again after the
+    wait must release the park.
+
+    The already-terminal check must key off the parent's lifecycle relative to
+    its last reopen — not any historical terminal event. Otherwise the old
+    pre-reopen 'completed' event marks the parent already-terminal and its
+    genuine post-wait recompletion is ignored, stranding the child in todo.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        # Parent completes once.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="done")
+        # Parent is reopened (dashboard drag done -> ready).
+        assert kb.set_status_direct(conn, parent, "ready")
+        # Child dependency-blocks while the reopened parent is in flight.
+        kb.block_task(conn, child, reason="wait on reopened parent", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+        # Parent completes AGAIN, after the wait → genuine new resolution.
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="done again")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready", (
+            "a reopened parent's recompletion after the wait must release the park"
+        )
+
+
 def test_dependency_purge_archived_parent_releases_last_parent_park(
     kanban_home: Path,
 ) -> None:

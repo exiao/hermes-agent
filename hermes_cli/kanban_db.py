@@ -4003,16 +4003,40 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
     # emits a post-wait ``archived`` event even though nothing new resolved, and
     # promoting on that would reintroduce the dependency_wait→promoted respawn
     # loop this guard exists to stop. So we require a post-wait terminal event
-    # on a parent that had NO terminal event at/before the wait.
+    # on a parent that was NOT already terminal at/before the wait.
+    #
+    # "Terminal at wait time" must respect reopens: a parent that completed,
+    # was reopened (``set_status_direct`` back to todo/ready/running emits a
+    # ``status`` event with a non-terminal payload), then re-blocked the child
+    # is NOT terminal at wait time — its later completion IS a new resolution.
+    # So a parent is already-terminal only if its latest terminal event
+    # at/before the wait is more recent than any reopen after it.
     placeholders = ",".join("?" * len(parent_ids))
+    _TERMINAL_STATUSES = {"done", "archived"}
+    last_terminal_id: dict[str, int] = {}
+    last_reopen_id: dict[str, int] = {}
+    for r in conn.execute(
+        f"SELECT id, task_id, kind, payload FROM task_events "
+        f"WHERE task_id IN ({placeholders}) AND id <= ? "
+        f"AND kind IN ('completed', 'archived', 'status') "
+        f"ORDER BY id",
+        (*parent_ids, dep_evt_id),
+    ).fetchall():
+        pid = r["task_id"]
+        if r["kind"] in ("completed", "archived"):
+            last_terminal_id[pid] = r["id"]
+            continue
+        # A 'status' event: a reopen is a move to a non-terminal status.
+        try:
+            status = json.loads(r["payload"]).get("status") if r["payload"] else None
+        except (ValueError, TypeError):
+            status = None
+        if status is not None and status not in _TERMINAL_STATUSES:
+            last_reopen_id[pid] = r["id"]
     already_terminal = {
-        r["task_id"]
-        for r in conn.execute(
-            f"SELECT DISTINCT task_id FROM task_events "
-            f"WHERE task_id IN ({placeholders}) AND id <= ? "
-            f"AND kind IN ('completed', 'archived')",
-            (*parent_ids, dep_evt_id),
-        ).fetchall()
+        pid
+        for pid, term_id in last_terminal_id.items()
+        if term_id > last_reopen_id.get(pid, 0)
     }
     newly_resolved = any(
         r["task_id"] not in already_terminal
