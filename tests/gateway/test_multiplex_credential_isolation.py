@@ -630,17 +630,45 @@ class TestListProvidersEnvProbesUseScope:
 
 
 class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
-    """A named-profile /model listing must NOT mark a provider available via a
+    """A NAMED-profile /model listing must NOT mark a provider available via a
     PROCESS-GLOBAL credential fallback (the credential-pool auto-seed — which
     for copilot runs `gh auth token` / reads COPILOT_GITHUB_TOKEN/GH_TOKEN/
     GITHUB_TOKEN — or the anthropic Claude-Code / Hermes-OAuth credential
     files). Those belong to the DEFAULT profile; attributing them to a named
     profile leaks another profile's identity into its picker.
 
+    But the DEFAULT profile (the process owner) MUST keep those fallbacks even
+    under multiplexing — its gh-auth / Claude-file / pool creds are its own.
+
     Regression for the Codex P1 follow-on on #100: the scoped env-var probe
     correctly left has_creds false, but the same block fell through to
     load_pool(hermes_slug), which auto-seeds copilot from the default process.
+    And the Codex P2 follow-on: _profile_runtime_scope installs a scope for the
+    DEFAULT profile too, so a bare listing must not drop the default's own creds.
     """
+
+    @staticmethod
+    def _named_profile_home(tmp_path):
+        """Context that makes get_hermes_home() resolve to a NAMED profile
+        (<home>/profiles/<name>), mirroring _profile_runtime_scope's home
+        redirect for a secondary profile."""
+        from hermes_constants import (
+            set_hermes_home_override,
+            reset_hermes_home_override,
+        )
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            home = tmp_path / "profiles" / "profileB"
+            home.mkdir(parents=True, exist_ok=True)
+            tok = set_hermes_home_override(str(home))
+            try:
+                yield
+            finally:
+                reset_hermes_home_override(tok)
+
+        return _cm()
 
     def _list_copilot(self, monkeypatch, *, pool_has_creds: bool):
         from hermes_cli.model_switch import list_authenticated_providers
@@ -674,18 +702,49 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
         providers = list_authenticated_providers(max_models=5)
         return [p for p in providers if p.get("slug") in ("copilot", "github-copilot")]
 
-    def test_scoped_profile_does_not_borrow_default_copilot_pool(self, monkeypatch):
-        """Under a scoped multiplex listing, copilot must NOT list from the
-        default profile's pool-seeded gh identity."""
+    def test_scoped_profile_does_not_borrow_default_copilot_pool(
+        self, monkeypatch, tmp_path
+    ):
+        """Under a scoped multiplex listing FOR A NAMED PROFILE, copilot must
+        NOT list from the default profile's pool-seeded gh identity."""
         for ev in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
             monkeypatch.delenv(ev, raising=False)
         ss.set_multiplex_active(True)
         tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-openai"})
         try:
-            rows = self._list_copilot(monkeypatch, pool_has_creds=True)
+            with self._named_profile_home(tmp_path):
+                rows = self._list_copilot(monkeypatch, pool_has_creds=True)
         finally:
             ss.reset_secret_scope(tok)
         assert not rows, "copilot must not list from the default profile's pool creds"
+
+    def test_default_profile_under_multiplex_keeps_copilot_pool(
+        self, monkeypatch, tmp_path
+    ):
+        """Codex P2 on #100: _profile_runtime_scope installs a secret scope for
+        the DEFAULT profile too under multiplexing. A bare `/model` listing for
+        the default (process-owner) profile must KEEP its own pool/gh fallback —
+        the default profile's home is ~/.hermes (parent != 'profiles')."""
+        from hermes_constants import (
+            set_hermes_home_override,
+            reset_hermes_home_override,
+        )
+        for ev in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            monkeypatch.delenv(ev, raising=False)
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir(parents=True, exist_ok=True)
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-default-openai"})
+        home_tok = set_hermes_home_override(str(default_home))
+        try:
+            rows = self._list_copilot(monkeypatch, pool_has_creds=True)
+        finally:
+            reset_hermes_home_override(home_tok)
+            ss.reset_secret_scope(tok)
+        assert rows, (
+            "default profile under multiplexing must still list copilot from its "
+            "own pool creds"
+        )
 
     def test_single_profile_still_lists_copilot_from_pool(self, monkeypatch):
         """Multiplex off / no scope (CLI/TUI): the pool fallback still runs, so
@@ -733,16 +792,20 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
         return [p for p in providers if p.get("slug") == "copilot"]
 
     def test_scoped_profile_canonical_pass_does_not_borrow_default_pool(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
-        """Under a scoped multiplex listing, the CANONICAL cross-check must NOT
-        list copilot from the default profile's pool-seeded gh identity."""
+        """Under a scoped multiplex listing FOR A NAMED PROFILE, the CANONICAL
+        cross-check must NOT list copilot from the default profile's pool-seeded
+        gh identity."""
         for ev in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
             monkeypatch.delenv(ev, raising=False)
         ss.set_multiplex_active(True)
         tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-openai"})
         try:
-            rows = self._list_copilot_via_canonical(monkeypatch, pool_has_creds=True)
+            with self._named_profile_home(tmp_path):
+                rows = self._list_copilot_via_canonical(
+                    monkeypatch, pool_has_creds=True
+                )
         finally:
             ss.reset_secret_scope(tok)
         assert not rows, (

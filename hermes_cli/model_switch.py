@@ -1519,7 +1519,7 @@ def list_authenticated_providers(
         current_secret_scope as _current_secret_scope,
         is_multiplex_active as _is_multiplex_active,
     )
-    # A named-profile listing runs under an installed secret scope while the
+    # A NAMED-profile listing runs under an installed secret scope while the
     # process is multiplexing. In that mode, credential fallbacks that read
     # PROCESS-GLOBAL third-party stores (the credential-pool auto-seeding, which for
     # copilot runs `gh auth token` / reads COPILOT_GITHUB_TOKEN/GH_TOKEN/
@@ -1528,7 +1528,28 @@ def list_authenticated_providers(
     # mis-list it as available. Those fallbacks are gated off when scoped so a
     # secondary profile's provider list reflects only its own scoped creds.
     # Single-profile CLI/TUI (no scope, multiplex off) keeps every fallback.
-    _scoped_listing = _is_multiplex_active() and _current_secret_scope() is not None
+    #
+    # Restricted to NAMED profiles only: under multiplexing, _profile_runtime_scope
+    # installs a secret scope for EVERY profile, including the active/default one —
+    # so `_current_secret_scope() is not None` is also true for the default profile.
+    # The default profile IS the process owner: its own gh-auth / Claude-file /
+    # pool-seeded credentials belong to it, and suppressing them would drop copilot/
+    # anthropic from a bare `/model` listing the moment multiplexing is enabled.
+    # A named profile lives under `<home>/profiles/<name>` (parent dir == "profiles");
+    # the default profile's home (~/.hermes) does not. Matches the is_named_profile
+    # seam in agent/secret_scope.py::build_profile_secret_scope.
+    def _is_named_profile_scope() -> bool:
+        try:
+            from hermes_constants import get_hermes_home
+            return get_hermes_home().parent.name == "profiles"
+        except Exception:
+            return False
+
+    _scoped_listing = (
+        _is_multiplex_active()
+        and _current_secret_scope() is not None
+        and _is_named_profile_scope()
+    )
     from agent.models_dev import (
         PROVIDER_TO_MODELS_DEV,
         fetch_models_dev,
