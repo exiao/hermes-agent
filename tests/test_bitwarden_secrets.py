@@ -345,6 +345,76 @@ def test_fetch_scoped_env_drops_process_server_url_when_scope_unset(
     assert captured["server_url"] is None
 
 
+def test_fetch_scoped_env_excludes_default_profile_provider_secrets(
+    monkeypatch, tmp_path
+):
+    """Codex P2 on #100: a named/multiplexed profile's bws child must NOT
+    inherit the default profile's provider secrets from the process env. The
+    gateway process env is the DEFAULT profile's, so an OPENAI_API_KEY /
+    ANTHROPIC_API_KEY sitting in os.environ must be stripped from the scoped
+    child env, while OS/runtime essentials (PATH) and the scoped BWS_* plumbing
+    survive."""
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "SOME_KEY", "value": "v"}])
+
+    # Default profile's provider secrets sit in the process env.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-default-openai")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-default-anthropic")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    bw.fetch_bitwarden_secrets(
+        access_token="0.fake.token",
+        project_id="proj-uuid",
+        binary=fake_binary,
+        use_cache=False,
+        scoped_env={"BWS_ACCESS_TOKEN": "0.fake.token"},
+    )
+    env = captured["env"]
+    # Cross-profile provider secrets stripped.
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    # Runtime essentials + the access token preserved.
+    assert env.get("PATH") == "/usr/bin:/bin"
+    assert env.get("BWS_ACCESS_TOKEN") == "0.fake.token"
+
+
+def test_fetch_unscoped_env_still_inherits_process_env(monkeypatch, tmp_path):
+    """Single-profile (no scope): the bws child still inherits the full process
+    env so manual shell overrides / proxy vars keep working — unchanged."""
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "SOME_KEY", "value": "v"}])
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-owner-openai")
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    bw.fetch_bitwarden_secrets(
+        access_token="0.fake.token",
+        project_id="proj-uuid",
+        binary=fake_binary,
+        use_cache=False,
+        # No scoped_env → single-profile path.
+    )
+    # Unscoped path inherits the process env (no isolation boundary to enforce).
+    assert captured["env"].get("OPENAI_API_KEY") == "sk-owner-openai"
+
+
 def test_fetch_skips_invalid_env_names(monkeypatch, tmp_path):
     fake_binary = tmp_path / "bws"
     fake_binary.write_text("")

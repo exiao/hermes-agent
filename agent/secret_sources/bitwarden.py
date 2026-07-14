@@ -418,6 +418,43 @@ def fetch_bitwarden_secrets(
     return secrets, warnings
 
 
+def _is_bws_runtime_env(name: str) -> bool:
+    """Return True for OS/runtime env vars the ``bws`` subprocess legitimately
+    needs (to locate itself, reach the network, and validate TLS) — the
+    allowlist for a scoped/named-profile fetch that must NOT inherit the default
+    profile's provider secrets. Anything not matching is dropped from the child
+    env under multiplexing, so cross-profile keys never reach the vault fetch.
+    """
+    if name in _BWS_RUNTIME_ENV_EXACT:
+        return True
+    return any(name.startswith(p) for p in _BWS_RUNTIME_ENV_PREFIXES)
+
+
+# OS/runtime essentials for the bws child process. Deliberately excludes every
+# third-party provider credential — bws authenticates only via BWS_ACCESS_TOKEN.
+_BWS_RUNTIME_ENV_EXACT = frozenset({
+    # Process/loader essentials
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD",
+    "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+    # TLS / cert validation
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    # Proxy plumbing (upper + lower case forms)
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    # Windows loader essentials
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+    "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS",
+    # bws behaviour toggles (not secrets)
+    "NO_COLOR", "RUST_LOG", "RUST_BACKTRACE",
+})
+_BWS_RUNTIME_ENV_PREFIXES = (
+    "LC_",   # locale categories (LC_MESSAGES, LC_NUMERIC, …)
+)
+
+
 def _run_bws_list(
     bws: Path,
     access_token: str,
@@ -426,17 +463,29 @@ def _run_bws_list(
     scoped_env: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
-    env = os.environ.copy()
-    # Under profile multiplexing the caller passes the profile's scoped env so
-    # the bws child cannot inherit the default profile's BWS_* endpoint/region
-    # from the process environment. Overlay the scoped BWS_* vars (and drop any
-    # process-inherited BWS_SERVER_URL the scope does not define) so the fetch
-    # targets the correct server for this profile.
     if scoped_env is not None:
+        # Named-profile isolation under gateway.multiplex_profiles. The gateway
+        # process env is loaded from the DEFAULT profile, so inheriting the full
+        # ``os.environ`` would hand this named profile's ``bws`` subprocess the
+        # default profile's provider secrets (OPENAI_API_KEY, ANTHROPIC_API_KEY,
+        # …) while it resolves a DIFFERENT profile's vault — a cross-profile
+        # leak. Start from a minimal OS/runtime allowlist (what the binary needs
+        # to run + reach the network), NOT the process env, then overlay only
+        # this profile's scoped ``BWS_*`` plumbing. ``bws`` needs no third-party
+        # provider keys, so none are carried over.
+        env: Dict[str, str] = {
+            k: v
+            for k, v in os.environ.items()
+            if isinstance(v, str) and _is_bws_runtime_env(k)
+        }
         env.pop("BWS_SERVER_URL", None)
         for key, value in scoped_env.items():
             if key.startswith("BWS_") and isinstance(value, str):
                 env[key] = value
+    else:
+        # Single-profile (no multiplexing): unchanged — inherit the process env
+        # so manual BWS_* / proxy / cert overrides in the shell keep working.
+        env = os.environ.copy()
     env["BWS_ACCESS_TOKEN"] = access_token
     # Make sure we're not echoing telemetry / colour codes into json.
     env.setdefault("NO_COLOR", "1")
