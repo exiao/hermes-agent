@@ -125,9 +125,12 @@ class TestEnvFileParsing:
 
     def test_build_profile_secret_scope(self, tmp_path):
         (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-profile\n")
-        assert ss.build_profile_secret_scope(tmp_path) == {
-            "ANTHROPIC_API_KEY": "sk-profile"
-        }
+        # tmp_path is a default/root home (parent != "profiles"), so its scope
+        # additionally seeds the process-owner's own os.environ (below .env) —
+        # assert the .env contract rather than exact dict equality, which would
+        # be a change-detector against the ambient shell environment.
+        scope = ss.build_profile_secret_scope(tmp_path)
+        assert scope["ANTHROPIC_API_KEY"] == "sk-profile"
 
     def test_default_scope_keeps_shell_onepassword_auth(self, tmp_path, monkeypatch):
         (tmp_path / ".env").write_text(
@@ -492,3 +495,45 @@ class TestEnvFileParsing:
         (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-root-only\n", encoding="utf-8")
         scope = ss.build_profile_secret_scope(tmp_path)
         assert scope.get("OPENAI_API_KEY") == "sk-root-only"
+
+    def test_default_profile_scope_keeps_shell_only_provider_key(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex P2 on #100: under gateway.multiplex_profiles the default profile
+        also runs inside a secret scope, and get_secret becomes authoritative
+        (no os.environ fallback) once any scope is installed. A default/process-
+        owner profile that supplies a provider key via the shell/systemd env
+        rather than .env (e.g. `export OPENAI_API_KEY=...` in the gateway's
+        shell) must NOT lose it — the default scope seeds the owner's os.environ
+        as its lowest layer."""
+        # No .env at all: the key lives only in the process/shell environment.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-shell-default")
+        scope = ss.build_profile_secret_scope(tmp_path)
+        assert scope.get("OPENAI_API_KEY") == "sk-shell-default"
+
+    def test_default_profile_env_file_overrides_shell(self, tmp_path, monkeypatch):
+        """The os.environ seed is the LOWEST layer — a value in .env still wins
+        over the same key in the process env."""
+        (tmp_path / ".env").write_text(
+            "OPENAI_API_KEY=sk-from-dotenv\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-shell-default")
+        scope = ss.build_profile_secret_scope(tmp_path)
+        assert scope.get("OPENAI_API_KEY") == "sk-from-dotenv"
+
+    def test_named_profile_does_not_seed_process_env(self, tmp_path, monkeypatch):
+        """A NAMED profile is a hard isolation boundary: it must never borrow a
+        provider key from the gateway/default process env, even one absent from
+        its own .env."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-gateway-shell")
+        profile_home = tmp_path / "profiles" / "alpha"
+        profile_home.mkdir(parents=True)
+        (profile_home / ".env").write_text(
+            "ANTHROPIC_API_KEY=sk-alpha\n", encoding="utf-8"
+        )
+        scope = ss.build_profile_secret_scope(profile_home)
+        assert scope.get("ANTHROPIC_API_KEY") == "sk-alpha"
+        assert "OPENAI_API_KEY" not in scope, (
+            "named profile must not seed the default process's shell provider key"
+        )
+

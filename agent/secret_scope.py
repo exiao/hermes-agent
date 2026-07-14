@@ -209,6 +209,7 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     from ``os.environ`` directly, so the scope holds only profile secrets.
     """
     home = Path(hermes_home)
+    is_named_profile = home.parent.name == "profiles"
     # Named profiles inherit the shared root ``~/.hermes/.env`` as a base layer,
     # then override with their own ``.env`` — mirroring ``load_hermes_dotenv``'s
     # root-then-profile merge so a profile with an empty (or partial) ``.env``
@@ -218,6 +219,35 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     # process HERMES_HOME) so a custom/isolated home can't inherit an unrelated
     # ~/.hermes/.env.
     secrets: Dict[str, str] = {}
+    # Default/process-owner base layer. Under gateway.multiplex_profiles the
+    # default profile ALSO runs inside a secret scope (``_profile_runtime_scope``
+    # installs one for every profile), and once any scope is installed
+    # ``get_secret`` is authoritative — it no longer falls back to os.environ.
+    # The default profile IS the process owner, so its own shell/systemd
+    # environment (e.g. a ``OPENAI_API_KEY`` exported in the gateway's shell
+    # rather than written to ``.env``) legitimately belongs to it; dropping it
+    # would make provider credentials vanish from ``/model`` and runtime
+    # resolution the moment multiplexing is enabled. Seed the default scope with
+    # the process env as the lowest layer (below ``.env`` / sources, which still
+    # override), excluding genuinely-global vars (``get_secret`` reads those from
+    # os.environ directly). Named profiles are a hard isolation boundary and get
+    # NO os.environ seed — they must never borrow the gateway/default identity.
+    if not is_named_profile:
+        for _k, _v in os.environ.items():
+            if _v is None or _v == "":
+                continue
+            if _is_global_env(_k):
+                continue
+            # Leave 1Password auth/session plumbing to the dedicated op path
+            # below (it passes token_value=None + include_process_auth=True for
+            # the default profile so the `op` binary uses its own shell/desktop
+            # session). Seeding OP_SERVICE_ACCOUNT_TOKEN / OP_SESSION_* / OP_*
+            # here would flip that to an explicit-token fetch and change the
+            # documented auth contract. Secret-source bootstrap vars (e.g.
+            # BWS_ACCESS_TOKEN) are likewise overlaid by their own pass below.
+            if _k.startswith("OP_") or _k in ("OP_SERVICE_ACCOUNT_TOKEN",):
+                continue
+            secrets[_k] = _v
     try:
         from hermes_constants import get_default_hermes_root
 
@@ -243,7 +273,6 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
         # gateway/default profile's process ``os.environ``. The default profile
         # IS the process owner, so its own shell/systemd environment is in-scope
         # (no cross-profile leak). Two behaviours key off this:
-        is_named_profile = home.parent.name == "profiles"
         # 1. Default-profile bootstrap preservation. A source reaches its vault
         # with a bootstrap credential (e.g. Bitwarden's ``BWS_ACCESS_TOKEN``,
         # exposed via ``protected_env_vars``) that a documented setup supplies
