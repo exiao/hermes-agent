@@ -8057,8 +8057,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # WAL watchdog (hourly): force-checkpoint an oversized
                 # state.db-wal that a long-lived reader has let grow past
                 # sessions.wal_max_mb. Complements the startup pass; a giant
-                # WAL is the malformed-image corruption risk. Runs sync — the
-                # checkpoint is fast and this watcher tolerates a brief block.
+                # WAL is the malformed-image corruption risk. The checkpoint is
+                # a synchronous SQLite call, so offload it to a thread — a
+                # pinned reader can make TRUNCATE block, and this watcher runs
+                # on the gateway event loop.
                 _last_wal_ts = getattr(self, "_last_wal_watchdog_ts", 0.0)
                 if (
                     self._session_db is not None
@@ -8068,7 +8070,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         from hermes_cli.config import load_config as _load_full_config
                         _sess_cfg = (_load_full_config().get("sessions") or {})
                         if _sess_cfg.get("wal_watchdog", True):
-                            self._session_db._db.wal_watchdog(
+                            await asyncio.to_thread(
+                                self._session_db._db.wal_watchdog,
                                 max_mb=int(_sess_cfg.get("wal_max_mb", 64)),
                             )
                     except Exception as _e:

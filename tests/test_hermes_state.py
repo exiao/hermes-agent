@@ -787,14 +787,14 @@ class TestExternalContentFtsMigration:
         finally:
             db.close()
 
-    def test_wal_watchdog_shrinks_unpinned_wal(self, tmp_path):
+    def test_wal_watchdog_shrinks_unpinned_wal(self, tmp_path, monkeypatch):
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
         try:
             db.create_session(session_id="s1", source="cli")
             # Suppress the periodic checkpoint so the WAL is free to grow, then
             # write enough to push it over a tiny threshold.
-            db._CHECKPOINT_EVERY_N_WRITES = 10 ** 9
+            monkeypatch.setattr(SessionDB, "_CHECKPOINT_EVERY_N_WRITES", 10 ** 9)
             for i in range(400):
                 db.append_message("s1", role="user", content=("x" * 2000) + str(i))
 

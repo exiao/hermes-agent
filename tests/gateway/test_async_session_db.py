@@ -123,10 +123,13 @@ _GATEWAY_FILES = ("gateway/run.py", "gateway/slash_commands.py")
 # The only legitimate non-loop paths:
 #   - SessionDB.sanitize_title: pure @staticmethod string cleaning, no DB.
 #   - self._session_db._db.<x>: the sync escape, allowed ONLY where the call is
-#     provably off the event loop — construction (__init__, before the loop
-#     serves) and the run_sync closure (executed in a thread-pool executor).
-#     Three such sites today; a fourth must be justified and this count bumped.
-_ALLOWED_SYNC_DB_ESCAPES = 3
+#     provably off the event loop — construction (__init__ / gateway start,
+#     before the loop serves) and the run_sync closure (executed in a
+#     thread-pool executor). Four such sites today: startup prune+vacuum,
+#     startup WAL watchdog, and two run_sync reads. The hourly WAL watchdog on
+#     the expiry-watcher loop is NOT here — it goes through asyncio.to_thread.
+#     A fifth must be justified and this count bumped.
+_ALLOWED_SYNC_DB_ESCAPES = 4
 
 # Sync helpers that touch SessionDB but are NEVER invoked bare on the loop:
 # every loop-side call wraps them in ``asyncio.to_thread(...)`` and the only

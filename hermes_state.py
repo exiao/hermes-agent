@@ -1336,8 +1336,7 @@ class SessionDB:
     def _wal_size_bytes(self) -> int:
         """Size of the ``-wal`` sidecar in bytes, or 0 if absent/unreadable."""
         try:
-            wal = Path(str(self.db_path) + "-wal")
-            return wal.stat().st_size if wal.exists() else 0
+            return Path(str(self.db_path) + "-wal").stat().st_size
         except OSError:
             return 0
 
@@ -1355,12 +1354,13 @@ class SessionDB:
             import psutil  # type: ignore
         except Exception:
             return []
-        target = str(self.db_path)
+        import os
+        target = os.path.abspath(str(self.db_path))
         pids: List[int] = []
         for proc in psutil.process_iter(["pid"]):
             try:
                 for f in proc.open_files():
-                    if f.path == target or f.path.startswith(target + "-"):
+                    if f.path and (f.path == target or f.path.startswith(target + "-")):
                         pids.append(proc.pid)
                         break
             except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
@@ -1424,9 +1424,9 @@ class SessionDB:
                         # Fully checkpointed — safe to truncate and reclaim disk.
                         try:
                             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                        except sqlite3.OperationalError:
+                        except sqlite3.Error:
                             pass
-                except sqlite3.OperationalError as exc:
+                except sqlite3.Error as exc:
                     logger.warning("WAL watchdog checkpoint failed: %s", exc)
                     return result
             result["checkpointed"] = True
@@ -1846,6 +1846,15 @@ class SessionDB:
                     "UPDATE schema_version SET version = ?",
                     (SCHEMA_VERSION,),
                 )
+            elif current_version < 20 and not fts_migrations_complete:
+                # The v20 migration dropped the inline FTS tables/triggers but
+                # could not recreate the view-backed ones (FTS5 unavailable or a
+                # CREATE failed). _init_schema commits unconditionally at the
+                # end, so without an explicit rollback those DROPs would commit
+                # and leave the DB at v19 with the FTS tables gone entirely.
+                # Roll back to preserve the pre-migration FTS schema; the next
+                # open retries the migration.
+                self._conn.rollback()
 
         # Unique title index — always ensure it exists
         try:
