@@ -674,6 +674,17 @@ def _resolve_api_key_provider_secret(
         if has_usable_secret(val):
             return val, env_var
 
+    # Fail closed on the unscoped multiplex path BEFORE the credential-pool
+    # fallback. Under gateway.multiplex_profiles reached outside a scope, the
+    # pool fallback below can still seed/read from the default profile
+    # (load_pool()._seed_from_env treats current_secret_scope() is None as the
+    # single-profile path and prefers the raw .env value), returning a default-
+    # profile key as ``credential_pool:<provider>`` — the same cross-profile
+    # leak the env-var loop just guarded against. A named/multiplex caller with
+    # no scope installed must resolve nothing here.
+    if current_secret_scope() is None and _is_multiplex_active():
+        return "", ""
+
     # Fallback: try credential pool (e.g. zai key stored via auth.json)
     try:
         from agent.credential_pool import load_pool

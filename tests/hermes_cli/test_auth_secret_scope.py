@@ -152,6 +152,39 @@ def test_api_key_provider_fails_closed_when_multiplex_active_but_unscoped(
     )
 
 
+def test_api_key_provider_unscoped_multiplex_skips_credential_pool(monkeypatch):
+    """Codex P1 follow-on on #100: failing closed on the env-var loop is not
+    enough — execution must return BEFORE the credential-pool fallback, which
+    load_pool()._seed_from_env can still seed from the default profile's .env
+    and return as credential_pool:<provider>. An unscoped multiplex call must
+    resolve nothing at all."""
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value_prefer_dotenv",
+        lambda _name: "",
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def peek(self):
+            return type("E", (), {"access_token": "default-profile-pool-key"})()
+
+    # If the pool fallback is reached, it would return the default profile's key.
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _slug: _Pool())
+
+    ss.set_multiplex_active(True)
+    try:
+        credentials = resolve_api_key_provider_credentials("kimi-coding-cn")
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert not credentials.get("api_key"), (
+        "unscoped multiplex call must not borrow the default profile's "
+        "credential-pool key"
+    )
+
+
 def test_api_key_provider_single_profile_still_reads_dotenv(monkeypatch):
     """Single-profile (multiplex OFF, no scope): the dotenv-preferred lookup is
     unchanged — an ordinary CLI/TUI run still resolves its key from .env."""
