@@ -600,6 +600,61 @@ class TestSessionLifecycle:
         finally:
             restored.close()
 
+    def test_trigram_disabled_still_repairs_missing_base_triggers(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression (reviewer P2): with trigram disabled, a DB missing base
+        FTS triggers must still trigger a base rebuild so word search stays
+        correct. The old 6-tuple count let 3 stale trigram triggers mask 3
+        missing base triggers and skip the rebuild."""
+        db_path = tmp_path / "state.db"
+        # Build a normal DB WITH trigram (default), seed a searchable row.
+        monkeypatch.setattr(SessionDB, "_trigram_fts_enabled", staticmethod(lambda: True))
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="s1", source="cli")
+            seeded.append_message("s1", role="user", content="alpha indexed row")
+            # Simulate base-trigger degradation: drop only the 3 base triggers,
+            # leaving the 3 trigram triggers in place (the exact tie the old
+            # total-count heuristic missed).
+            for trig in (
+                "messages_fts_insert",
+                "messages_fts_delete",
+                "messages_fts_update",
+            ):
+                seeded._conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            seeded._conn.commit()
+            # Write a row while base triggers are gone — it won't be in base FTS.
+            seeded.append_message("s1", role="assistant", content="betaunindexed row")
+        finally:
+            seeded.close()
+
+        # Reopen with trigram DISABLED. base_triggers_ok must be False → repair.
+        monkeypatch.setattr(SessionDB, "_trigram_fts_enabled", staticmethod(lambda: False))
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._trigram_available is False
+            assert reopened._fts_table_exists("messages_fts_trigram") is False
+            # Base triggers restored (3 of them, none trigram).
+            names = {
+                r[0]
+                for r in reopened._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name LIKE 'messages_fts%'"
+                ).fetchall()
+            }
+            assert names == {
+                "messages_fts_insert",
+                "messages_fts_delete",
+                "messages_fts_update",
+            }
+            # The row written during the trigger gap must now be searchable —
+            # proves the base rebuild actually ran (not just trigger recreate).
+            assert len(reopened.search_messages("betaunindexed")) == 1
+            assert len(reopened.search_messages("alpha")) == 1
+        finally:
+            reopened.close()
+
     def test_db_initializes_without_trigram_tokenizer(self, tmp_path, monkeypatch):
         """SessionDB must not crash when FTS5 exists but trigram tokenizer is missing."""
         real_connect = sqlite3.connect

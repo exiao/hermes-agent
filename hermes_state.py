@@ -184,6 +184,16 @@ _TRIGRAM_FTS_TRIGGERS = (
     "messages_fts_trigram_update",
 )
 
+# The base messages_fts triggers, always expected regardless of the trigram
+# flag. Used to detect base-trigger degradation independently of trigram
+# presence (comparing against the 6-tuple total would let a healthy
+# trigram-disabled DB mask 3 missing base triggers).
+_BASE_FTS_TRIGGERS = (
+    "messages_fts_insert",
+    "messages_fts_delete",
+    "messages_fts_update",
+)
+
 
 def _set_last_init_error(msg: Optional[str]) -> None:
     """Record (or clear) the most recent state.db init failure.
@@ -1125,6 +1135,22 @@ class SessionDB:
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
     @staticmethod
+    def _base_fts_trigger_count(cursor: sqlite3.Cursor) -> int:
+        """Count only the base messages_fts triggers (excludes trigram).
+
+        Base-trigger degradation must be detected independently of whether the
+        trigram triggers are present, otherwise a trigram-disabled DB with all
+        3 base triggers missing but 3 trigram triggers still around would tie
+        the 6-tuple total and skip the base rebuild."""
+        placeholders = ",".join("?" for _ in _BASE_FTS_TRIGGERS)
+        row = cursor.execute(
+            f"SELECT COUNT(*) FROM sqlite_master "
+            f"WHERE type = 'trigger' AND name IN ({placeholders})",
+            _BASE_FTS_TRIGGERS,
+        ).fetchone()
+        return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+
+    @staticmethod
     def _rebuild_fts_indexes(
         cursor: sqlite3.Cursor,
         *,
@@ -1550,18 +1576,26 @@ class SessionDB:
                                 "COALESCE(tool_calls, '') "
                                 "FROM messages"
                             )
-                        trigram_ok = self._ensure_fts_schema(
-                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                        )
-                        if trigram_ok:
-                            cursor.execute(
-                                "INSERT INTO messages_fts_trigram(rowid, content) "
-                                "SELECT id, "
-                                "COALESCE(content, '') || ' ' || "
-                                "COALESCE(tool_name, '') || ' ' || "
-                                "COALESCE(tool_calls, '') "
-                                "FROM messages"
+                        trigram_ok = False
+                        if self._trigram_fts_enabled():
+                            trigram_ok = self._ensure_fts_schema(
+                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                             )
+                            if trigram_ok:
+                                cursor.execute(
+                                    "INSERT INTO messages_fts_trigram(rowid, content) "
+                                    "SELECT id, "
+                                    "COALESCE(content, '') || ' ' || "
+                                    "COALESCE(tool_name, '') || ' ' || "
+                                    "COALESCE(tool_calls, '') "
+                                    "FROM messages"
+                                )
+                        else:
+                            # Trigram disabled — don't create/backfill it here
+                            # only to drop it in the runtime FTS block below.
+                            # Saves the full trigram rebuild + WAL churn on the
+                            # opt-out startup. Also drop any pre-existing copy.
+                            self._drop_trigram_fts(cursor)
                         if not base_fts_ok:
                             fts_migrations_complete = False
                         # Track trigram availability for CJK LIKE fallback.
@@ -1629,14 +1663,24 @@ class SessionDB:
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
             trigram_wanted = self._trigram_fts_enabled()
-            # Expected trigger count depends on whether the trigram index is
-            # enabled: with it off we intentionally keep only the 3 base
-            # messages_fts triggers, so comparing against all 6 would falsely
-            # flag a repair (and rebuild base FTS) on every startup.
-            expected_trigger_count = (
-                len(_FTS_TRIGGERS) if trigram_wanted else len(_FTS_TRIGGERS) - len(_TRIGRAM_FTS_TRIGGERS)
+            # Detect trigger degradation on the base and trigram sets
+            # independently. Counting the 6-tuple total would let a healthy
+            # trigram-disabled DB (3 base + 0 trigram) tie a corrupt one
+            # (0 base + 3 stale trigram) and skip the base FTS rebuild.
+            base_triggers_ok = (
+                self._base_fts_trigger_count(cursor) == len(_BASE_FTS_TRIGGERS)
             )
-            triggers_need_repair = self._fts_trigger_count(cursor) < expected_trigger_count
+            trigram_triggers_present = (
+                self._fts_trigger_count(cursor) - self._base_fts_trigger_count(cursor)
+            )
+            if trigram_wanted:
+                triggers_need_repair = (
+                    not base_triggers_ok
+                    or trigram_triggers_present < len(_TRIGRAM_FTS_TRIGGERS)
+                )
+            else:
+                # Trigram intentionally absent — only base health matters.
+                triggers_need_repair = not base_triggers_ok
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
