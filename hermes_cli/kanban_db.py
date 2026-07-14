@@ -1765,6 +1765,181 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+class KanbanFDPressureError(RuntimeError):
+    """Raised when the host is too close to an FD ceiling to open the board safely.
+
+    Opening a SQLite WAL database under file-descriptor starvation is the
+    documented 2026-07-13 corruption path: an ``open()``/``mmap()`` that
+    returns EMFILE while SQLite is extending its ``-wal``/``-shm`` sidecars can
+    leave a b-tree index desynced from its table (``wrong # of entries in index
+    idx_notify_task``). Refusing to connect is recoverable — the dispatcher /
+    notifier / claim paths already tolerate a skipped tick and retry — while a
+    torn index is not. So we fail *closed*, loudly and typed, before touching
+    the DB rather than after.
+    """
+
+
+# Refuse to open the board when either the per-process OR the system-wide FD
+# headroom drops below this many descriptors. Behavioral config (not a secret):
+# lives in ``config.yaml`` under ``kanban.fd_headroom``; the
+# ``HERMES_KANBAN_FD_HEADROOM`` env var is an internal bridge override only
+# (e.g. for a worker subprocess or a test) and takes precedence when set.
+DEFAULT_FD_HEADROOM = 64
+
+
+def _resolve_fd_headroom() -> int:
+    """Return the effective FD-headroom threshold.
+
+    Precedence: ``HERMES_KANBAN_FD_HEADROOM`` env bridge → ``config.yaml``
+    ``kanban.fd_headroom`` → :data:`DEFAULT_FD_HEADROOM`. A value ``<= 0``
+    disables the preflight (headroom can never be below zero), which is the
+    documented escape hatch for environments where the FD counters are
+    misleading.
+    """
+    raw = os.environ.get("HERMES_KANBAN_FD_HEADROOM", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg_val = (load_config_readonly().get("kanban") or {}).get("fd_headroom")
+    except Exception:
+        cfg_val = None
+    if cfg_val is not None:
+        try:
+            return int(cfg_val)
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_FD_HEADROOM
+
+
+def _count_open_fds() -> Optional[int]:
+    """Return this process's open-FD count, or ``None`` if it can't be told.
+
+    Tries ``/proc/<pid>/fd`` (Linux) first, then ``/dev/fd`` (macOS/BSD).
+    Enumerating the directory needs one transient FD; if that itself fails with
+    EMFILE the process is already out of descriptors, so we return a very large
+    count to force the preflight to trip (fail closed) rather than ``None``
+    (fail open). Any other error → ``None`` (can't tell → don't block).
+    """
+    for fd_dir in (f"/proc/{os.getpid()}/fd", "/dev/fd"):
+        try:
+            return len(os.listdir(fd_dir))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            # EMFILE/ENFILE while trying to opendir the fd table == already
+            # starved. Signal maximal pressure so the caller refuses to connect.
+            if exc.errno in (24, 23):  # EMFILE, ENFILE
+                return 1 << 30
+            return None
+    return None
+
+
+def _proc_fd_headroom() -> Optional[int]:
+    """Return ``soft_rlimit - open_fds`` for this process, or ``None``.
+
+    ``None`` when the soft ``RLIMIT_NOFILE`` is unlimited/unreadable or the open
+    count can't be determined — i.e. we can't compute a per-proc headroom.
+    """
+    try:
+        import resource
+
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, ValueError, OSError):
+        return None
+    if soft in (resource.RLIM_INFINITY, -1, 0):
+        return None
+    open_fds = _count_open_fds()
+    if open_fds is None:
+        return None
+    return soft - open_fds
+
+
+def _system_fd_headroom() -> Optional[int]:
+    """Return the SYSTEM-WIDE FD headroom (``max - in_use``), or ``None``.
+
+    This is the binding limit in the real incident: on macOS the wall is
+    ``kern.maxfiles`` (system-wide), NOT the generous per-process
+    ``RLIMIT_NOFILE``, so a purely per-proc check would never fire. We read:
+
+    * macOS/BSD: ``sysctlbyname('kern.maxfiles')`` and ``kern.num_files`` —
+      cheap, no FD opened.
+    * Linux: ``/proc/sys/fs/file-nr`` (``allocated  unused  max``).
+
+    Returns ``None`` on any other platform or on any read failure.
+    """
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            import ctypes.util
+
+            libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+
+            def _sysctl_int(name: str) -> Optional[int]:
+                val = ctypes.c_int(0)
+                size = ctypes.c_size_t(ctypes.sizeof(val))
+                rc = libc.sysctlbyname(
+                    name.encode(), ctypes.byref(val), ctypes.byref(size), None, 0
+                )
+                if rc != 0:
+                    return None
+                return int(val.value)
+
+            maxfiles = _sysctl_int("kern.maxfiles")
+            num_files = _sysctl_int("kern.num_files")
+            if maxfiles is None or num_files is None or maxfiles <= 0:
+                return None
+            return maxfiles - num_files
+        except Exception:
+            return None
+    if sys.platform.startswith("linux"):
+        try:
+            allocated_s, _unused_s, max_s = (
+                Path("/proc/sys/fs/file-nr").read_text().split()
+            )
+            maxf = int(max_s)
+            if maxf <= 0:
+                return None
+            return maxf - int(allocated_s)
+        except Exception:
+            return None
+    return None
+
+
+def _assert_fd_headroom() -> None:
+    """Refuse to open the board when FD headroom is below the threshold.
+
+    Checks BOTH the per-process and the system-wide headroom and trips on
+    whichever is *closer* to its ceiling (the smaller of the two computable
+    values). If neither headroom can be computed, the preflight is a no-op —
+    we never block a connect we can't justify. A configured threshold ``<= 0``
+    also disables the check.
+    """
+    headroom = _resolve_fd_headroom()
+    if headroom <= 0:
+        return
+    proc_h = _proc_fd_headroom()
+    sys_h = _system_fd_headroom()
+    candidates = [
+        (h, scope)
+        for h, scope in ((proc_h, "per-process"), (sys_h, "system-wide"))
+        if h is not None
+    ]
+    if not candidates:
+        return
+    tightest, scope = min(candidates, key=lambda c: c[0])
+    if tightest < headroom:
+        raise KanbanFDPressureError(
+            f"refusing kanban connect: {scope} FD headroom {tightest} "
+            f"< {headroom} required; opening the WAL/SHM board now risks "
+            f"index-desync corruption. Skipping this tick (self-healing)."
+        )
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -1793,6 +1968,13 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # FD-headroom preflight (Layer 2 corruption guard). Before opening the DB —
+    # on BOTH the cached fast path and the first-init path — refuse when the
+    # host/process is within the configured margin of an FD ceiling. Opening a
+    # WAL board under EMFILE is the 2026-07-13 index-desync corruption path; a
+    # refused connect is self-healing (callers skip the tick and retry).
+    _assert_fd_headroom()
 
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
