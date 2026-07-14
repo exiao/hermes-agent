@@ -1743,6 +1743,11 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             base_name,
             newest.name,
         )
+        # Even when reusing a capped clone, fill in any WAL/SHM sidecars the
+        # reused backup is missing: in WAL mode committed state can live only in
+        # the sidecars, so a main-only forensic copy can't reproduce/recover the
+        # board. Mirrors the byte-identical reuse path above.
+        _copy_missing_sidecars(parent, base_name, newest)
         return newest
     try:
         shutil.copy2(resolved, candidate)

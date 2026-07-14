@@ -6118,6 +6118,47 @@ def test_capped_backup_still_returns_a_forensic_path(tmp_path):
     assert len({p.resolve() for p in seen}) <= kb._MAX_CORRUPT_CLONES
 
 
+def test_capped_backup_reuse_still_fills_missing_sidecars(tmp_path):
+    """At the clone cap, reusing an existing backup must still copy a WAL/SHM
+    sidecar that appeared after that backup was made.
+
+    In WAL mode committed rows can live only in kanban.db-wal until a
+    checkpoint, so a main-file-only forensic copy can't reproduce/recover the
+    board. The byte-identical reuse path already fills missing sidecars; the
+    cap-reached reuse path used to early-return the newest clone WITHOUT calling
+    _copy_missing_sidecars, so its backup_path could lack the WAL state.
+    """
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+
+    # Mint clones up to the cap by mutating the corrupt bytes each open.
+    for i in range(kb._MAX_CORRUPT_CLONES + 3):
+        with db_path.open("r+b") as fh:
+            fh.seek(4096)
+            fh.write(bytes([i % 256]) * 96)
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with pytest.raises(kb.KanbanDbCorruptError):
+            kb.connect(db_path=db_path)
+
+    clones = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(clones) == kb._MAX_CORRUPT_CLONES  # cap reached
+
+    # A WAL sidecar now appears next to the live corrupt DB. The next quarantine
+    # is over cap → it reuses the newest clone, but must copy the sidecar too.
+    wal = db_path.with_name(db_path.name + "-wal")
+    wal.write_bytes(b"wal-only-committed-rows")
+
+    with db_path.open("r+b") as fh:
+        fh.seek(4096)
+        fh.write(b"\xab" * 96)  # mutate again so it's still over-cap reuse
+    reused = kb._backup_corrupt_db(db_path)
+    assert reused is not None and reused.exists()
+    assert (tmp_path / (reused.name + "-wal")).exists(), (
+        "capped-reuse backup must gain the newly-present WAL sidecar"
+    )
+
+
+
 # ---------------------------------------------------------------------------
 # First-use tip for scratch workspaces
 # ---------------------------------------------------------------------------
