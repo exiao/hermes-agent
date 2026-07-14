@@ -1515,6 +1515,20 @@ def list_authenticated_providers(
     # reads the installed scope, and falls back to os.environ when no scope is
     # active and multiplexing is off — CLI/TUI single-profile behavior unchanged.
     from agent.secret_scope import get_secret as _get_secret
+    from agent.secret_scope import (
+        current_secret_scope as _current_secret_scope,
+        is_multiplex_active as _is_multiplex_active,
+    )
+    # A named-profile listing runs under an installed secret scope while the
+    # process is multiplexing. In that mode, credential fallbacks that read
+    # PROCESS-GLOBAL third-party stores (the credential-pool auto-seeding, which for
+    # copilot runs `gh auth token` / reads COPILOT_GITHUB_TOKEN/GH_TOKEN/
+    # GITHUB_TOKEN; and the anthropic Claude-Code / Hermes-OAuth credential
+    # files) would attribute the DEFAULT profile's identity to this profile and
+    # mis-list it as available. Those fallbacks are gated off when scoped so a
+    # secondary profile's provider list reflects only its own scoped creds.
+    # Single-profile CLI/TUI (no scope, multiplex off) keeps every fallback.
+    _scoped_listing = _is_multiplex_active() and _current_secret_scope() is not None
     from agent.models_dev import (
         PROVIDER_TO_MODELS_DEV,
         fetch_models_dev,
@@ -1808,10 +1822,15 @@ def list_authenticated_providers(
             except Exception as exc:
                 logger.debug("Auth store check failed for %s: %s", pid, exc)
         # Fallback: check the credential pool with full auto-seeding.
-        # This catches credentials that exist in external stores (e.g.
+        # This catches credentials that exist in third-party stores (e.g.
         # Codex CLI ~/.codex/auth.json) which _seed_from_singletons()
         # imports on demand but aren't in the raw auth.json yet.
-        if not has_creds:
+        # Skipped under a scoped multiplex listing: _seed_from_singletons()
+        # reads process-global creds (for copilot, `gh auth token` /
+        # COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN), which belong to the
+        # DEFAULT profile — attributing them to a named profile would leak
+        # another profile's identity into this list.
+        if not has_creds and not _scoped_listing:
             try:
                 from agent.credential_pool import load_pool
                 pool = load_pool(hermes_slug)
@@ -1826,7 +1845,7 @@ def list_authenticated_providers(
         # But the /model picker is discovery-oriented — we WANT to show
         # providers the user can switch to, even if they aren't currently
         # configured.
-        if not has_creds and hermes_slug == "anthropic":
+        if not has_creds and hermes_slug == "anthropic" and not _scoped_listing:
             try:
                 from agent.anthropic_adapter import (
                     read_claude_code_credentials,
