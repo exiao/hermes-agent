@@ -27,7 +27,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -166,14 +166,17 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
-_FTS_TRIGGERS = (
+_BASE_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+_TRIGRAM_FTS_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+_FTS_TRIGGERS = _BASE_FTS_TRIGGERS + _TRIGRAM_FTS_TRIGGERS
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -1183,12 +1186,15 @@ class SessionDB:
         return table_existed
 
     @staticmethod
-    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+    def _fts_trigger_count(
+        cursor: sqlite3.Cursor,
+        names: Sequence[str] = _FTS_TRIGGERS,
+    ) -> int:
+        placeholders = ",".join("?" for _ in names)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            tuple(names),
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
@@ -1957,14 +1963,24 @@ class SessionDB:
             cursor.executescript(FTS_VIEW_SQL)
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
-            # an earlier no-FTS5 runtime. When the trigram gate is off only the
-            # 3 base triggers should exist, so measure the repair threshold
-            # against the expected count for the active configuration (else the
-            # base rebuild would fire on every open with trigram disabled).
-            _expected_triggers = (
-                len(_FTS_TRIGGERS) if self._fts_trigram_enabled else 3
-            )
-            triggers_need_repair = self._fts_trigger_count(cursor) < _expected_triggers
+            # an earlier no-FTS5 runtime. Count only the trigger set that must
+            # exist for the active configuration: with trigram enabled all six
+            # (base + trigram) must be present; with it disabled we check the
+            # three base triggers *in isolation* — counting the full set would
+            # let leftover trigram triggers from a prior enabled run mask a
+            # missing base trigger, skipping the rebuild and leaving messages
+            # written during the missing-trigger window permanently unsearchable
+            # once the trigram table is dropped below.
+            if self._fts_trigram_enabled:
+                triggers_need_repair = (
+                    self._fts_trigger_count(cursor, _FTS_TRIGGERS)
+                    < len(_FTS_TRIGGERS)
+                )
+            else:
+                triggers_need_repair = (
+                    self._fts_trigger_count(cursor, _BASE_FTS_TRIGGERS)
+                    < len(_BASE_FTS_TRIGGERS)
+                )
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative

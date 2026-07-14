@@ -533,6 +533,53 @@ class TestSessionLifecycle:
         finally:
             restored.close()
 
+    def test_base_fts_rebuilds_when_base_trigger_missing_gate_off(
+        self, tmp_path, monkeypatch
+    ):
+        """Gate-off open must rebuild base FTS when a base trigger is missing.
+
+        Regression: the trigram-disabled open path counted the full six-trigger
+        set against a threshold of 3, so three surviving trigram triggers could
+        mask a dropped base trigger (2 base + 3 trigram = 5 >= 3), skipping the
+        rebuild. Messages written while the base trigger was absent then stayed
+        unsearchable forever once the trigram table was dropped. Scope the count
+        to the base triggers so the deficit is seen.
+        """
+        db_path = tmp_path / "state.db"
+
+        # Phase 1: build with trigram ON so the trigram triggers exist on disk.
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: True)
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="s1", source="cli")
+            seeded.append_message("s1", role="user", content="already indexed")
+            assert seeded._trigram_available is True
+            # Simulate trigger-only degradation from a prior no-FTS5 runtime:
+            # drop exactly ONE base trigger, leaving the three trigram triggers
+            # (and the other two base triggers) intact.
+            seeded._conn.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
+            seeded._conn.commit()
+            # A message written during the missing-base-trigger window is not
+            # indexed by base FTS.
+            seeded.append_message(
+                "s1", role="assistant", content="gap window base needle"
+            )
+        finally:
+            seeded.close()
+
+        # Phase 2: reopen with the gate flipped OFF. The base rebuild must fire
+        # despite the surviving trigram triggers, and the trigram table is
+        # dropped — after which only a rebuilt base index can find the gap msg.
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: False)
+        restored = SessionDB(db_path=db_path)
+        try:
+            assert restored._fts_enabled is True
+            assert restored._trigram_available is False
+            assert restored._fts_table_exists("messages_fts_trigram") is False
+            assert len(restored.search_messages("needle")) == 1
+        finally:
+            restored.close()
+
     def test_is_fts5_unavailable_error_catches_trigram_tokenizer(self):
         """Unit test: _is_fts5_unavailable_error matches 'no such tokenizer: trigram'."""
         fts5_err = sqlite3.OperationalError("no such module: fts5")
