@@ -3996,57 +3996,53 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
             (task_id, dep_evt_id),
         ).fetchone()
         return not unlinked_after
-    # Has any parent reached a terminal state AFTER the dependency_wait? That
-    # is the primary signal that a real dependency resolved since the block.
-    # A parent counts as *newly* resolved only if it was NOT already terminal
-    # at block time: routine cleanup that archives an already-``done`` parent
-    # emits a post-wait ``archived`` event even though nothing new resolved, and
-    # promoting on that would reintroduce the dependency_wait→promoted respawn
-    # loop this guard exists to stop. So we require a post-wait terminal event
-    # on a parent that was NOT already terminal at/before the wait.
+    # Has any parent become NEWLY terminal AFTER the dependency_wait? That is
+    # the primary signal that a real dependency resolved since the block.
     #
-    # "Terminal at wait time" must respect reopens: a parent that completed,
-    # was reopened (``set_status_direct`` back to todo/ready/running emits a
-    # ``status`` event with a non-terminal payload), then re-blocked the child
-    # is NOT terminal at wait time — its later completion IS a new resolution.
-    # So a parent is already-terminal only if its latest terminal event
-    # at/before the wait is more recent than any reopen after it.
+    # We must distinguish a *genuine* new resolution from noise that would
+    # re-promote the parked child and reintroduce the respawn loop this guard
+    # exists to stop:
+    #   * routine cleanup that archives an already-``done`` parent emits a
+    #     post-wait ``archived`` event but resolves nothing new;
+    #   * a parent that was terminal at wait time and stays terminal.
+    # Reopens complicate this: ``set_status_direct`` moving a parent OFF
+    # done/archived emits a ``status`` event with a non-terminal payload, and a
+    # later completion IS a genuine resolution — whether the reopen happened
+    # before OR after the wait.
+    #
+    # The unambiguous rule: replay each parent's lifecycle in id order, tracking
+    # whether it is terminal, and look for a non-terminal→terminal transition
+    # that occurs strictly AFTER the wait. Any such transition is a real,
+    # newly-satisfied dependency; a post-wait terminal event with no preceding
+    # non-terminal state (already terminal, just being tidied) is not.
     placeholders = ",".join("?" * len(parent_ids))
     _TERMINAL_STATUSES = {"done", "archived"}
-    last_terminal_id: dict[str, int] = {}
-    last_reopen_id: dict[str, int] = {}
+    terminal_now: dict[str, bool] = {}
+    newly_resolved = False
     for r in conn.execute(
         f"SELECT id, task_id, kind, payload FROM task_events "
-        f"WHERE task_id IN ({placeholders}) AND id <= ? "
+        f"WHERE task_id IN ({placeholders}) "
         f"AND kind IN ('completed', 'archived', 'status') "
         f"ORDER BY id",
-        (*parent_ids, dep_evt_id),
+        tuple(parent_ids),
     ).fetchall():
         pid = r["task_id"]
         if r["kind"] in ("completed", "archived"):
-            last_terminal_id[pid] = r["id"]
+            became_terminal = not terminal_now.get(pid, False)
+            terminal_now[pid] = True
+            if became_terminal and r["id"] > dep_evt_id:
+                newly_resolved = True
+                break
             continue
-        # A 'status' event: a reopen is a move to a non-terminal status.
+        # A 'status' event: a move to a non-terminal status is a reopen.
         try:
             status = json.loads(r["payload"]).get("status") if r["payload"] else None
         except (ValueError, TypeError):
             status = None
-        if status is not None and status not in _TERMINAL_STATUSES:
-            last_reopen_id[pid] = r["id"]
-    already_terminal = {
-        pid
-        for pid, term_id in last_terminal_id.items()
-        if term_id > last_reopen_id.get(pid, 0)
-    }
-    newly_resolved = any(
-        r["task_id"] not in already_terminal
-        for r in conn.execute(
-            f"SELECT DISTINCT task_id FROM task_events "
-            f"WHERE task_id IN ({placeholders}) AND id > ? "
-            f"AND kind IN ('completed', 'archived')",
-            (*parent_ids, dep_evt_id),
-        ).fetchall()
-    )
+        if status in _TERMINAL_STATUSES:
+            terminal_now[pid] = True
+        elif status is not None:
+            terminal_now[pid] = False
     if newly_resolved:
         return False
     # Graph-repair recovery: if a parent LINK was added AFTER the wait and that

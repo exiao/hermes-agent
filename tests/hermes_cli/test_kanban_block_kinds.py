@@ -489,6 +489,41 @@ def test_dependency_reopened_parent_recompletion_after_wait_promotes(
         )
 
 
+def test_dependency_parent_reopened_after_wait_then_recompletes_promotes(
+    kanban_home: Path,
+) -> None:
+    """A parent that was ``done`` at the wait, then is reopened AND re-completed
+    entirely AFTER the wait, must release the park.
+
+    Distinct from the pre-wait reopen case: here the reopen→recompletion is a
+    genuine non-terminal→terminal transition after the block (a repair workflow
+    where an already-satisfied parent is reopened and re-run), so the child must
+    promote rather than stay stranded in todo.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        # Parent is done BEFORE the wait → terminal at block time.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="done")
+        kb.block_task(conn, child, reason="waiting on done parent", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+        # Repair: reopen the already-done parent AFTER the wait, then re-complete.
+        assert kb.set_status_direct(conn, parent, "ready")
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="repaired")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready", (
+            "a parent reopened and re-completed after the wait is a genuine new "
+            "resolution and must release the park"
+        )
+
+
 def test_dependency_purge_archived_parent_releases_last_parent_park(
     kanban_home: Path,
 ) -> None:
