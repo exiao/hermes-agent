@@ -750,9 +750,9 @@ class TestExternalContentFtsMigration:
         self, tmp_path, monkeypatch
     ):
         # Gate the trigram index off via the config reader (no config file
-        # needed — patch the classmethod the constructor consults).
+        # needed — patch the method the constructor consults).
         monkeypatch.setattr(
-            SessionDB, "_read_fts_trigram_config", staticmethod(lambda: False)
+            SessionDB, "_read_fts_trigram_config", lambda self: False
         )
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
@@ -775,11 +775,46 @@ class TestExternalContentFtsMigration:
 
     def test_trigram_gate_on_keeps_table(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            SessionDB, "_read_fts_trigram_config", staticmethod(lambda: True)
+            SessionDB, "_read_fts_trigram_config", lambda self: True
         )
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
         try:
+            assert db._trigram_available is True
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 1
+        finally:
+            db.close()
+
+    def test_trigram_gate_scoped_to_target_profile(self, tmp_path, monkeypatch):
+        """A cross-profile open reads the TARGET profile's fts_trigram gate.
+
+        Regression: the launch profile's config must not drive destructive
+        trigram DDL on a different profile's DB. Launch profile gates trigram
+        OFF; the opened profile gates it ON — the opened DB must keep trigram.
+        """
+        import yaml
+
+        launch_home = tmp_path / "launch"
+        launch_home.mkdir()
+        (launch_home / "config.yaml").write_text(
+            yaml.safe_dump({"sessions": {"fts_trigram": False}}), encoding="utf-8"
+        )
+        # Active process resolves to the launch profile (trigram OFF).
+        monkeypatch.setattr(hermes_state, "get_hermes_home", lambda: launch_home)
+
+        # Target profile lives elsewhere and gates trigram ON.
+        target_home = tmp_path / "other"
+        target_home.mkdir()
+        (target_home / "config.yaml").write_text(
+            yaml.safe_dump({"sessions": {"fts_trigram": True}}), encoding="utf-8"
+        )
+        db = SessionDB(db_path=target_home / "state.db")
+        try:
+            # Target profile's ON setting wins — trigram table is kept, not
+            # dropped by the launch profile's OFF setting.
+            assert db._fts_trigram_enabled is True
             assert db._trigram_available is True
             assert db._conn.execute(
                 "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"

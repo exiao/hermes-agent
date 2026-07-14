@@ -1089,19 +1089,41 @@ class SessionDB:
             exc,
         )
 
-    @staticmethod
-    def _read_fts_trigram_config() -> bool:
+    def _read_fts_trigram_config(self) -> bool:
         """Return sessions.fts_trigram (default True) — the trigram gate.
+
+        Scoped to the profile that OWNS ``self.db_path``, not the launch
+        profile. A cross-profile open (e.g. the TUI resuming another
+        profile's session via ``SessionDB(db_path=other_home / "state.db")``
+        without overriding ``HERMES_HOME``) must read that profile's setting —
+        the gate drives destructive DDL (``_drop_trigram_schema``), so reading
+        the wrong profile's ``fts_trigram: false`` would silently drop a
+        different profile's trigram index.
 
         Best-effort: any failure (config missing, import cycle, malformed
         YAML) fails OPEN (returns True) so a transient config read never
-        silently drops a working trigram index. Uses the deepcopy-free
-        readonly loader — this runs on every SessionDB() construction.
+        silently drops a working trigram index.
         """
         try:
-            from hermes_cli.config import load_config_readonly
+            target_home = self.db_path.parent
+            # Same profile as the active process → use the fast, cached loader
+            # (this runs on every SessionDB() construction; the same-profile
+            # path is by far the hot one and must stay allocation-cheap).
+            if target_home.resolve() == get_hermes_home().resolve():
+                from hermes_cli.config import load_config_readonly
 
-            sess = load_config_readonly().get("sessions") or {}
+                sess = load_config_readonly().get("sessions") or {}
+                return bool(sess.get("fts_trigram", True))
+            # Cross-profile open: read the TARGET profile's config.yaml directly
+            # so the gate reflects the DB being opened, not the launch profile.
+            import yaml
+
+            cfg_path = target_home / "config.yaml"
+            if not cfg_path.exists():
+                return True
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh) or {}
+            sess = (raw.get("sessions") or {}) if isinstance(raw, dict) else {}
             return bool(sess.get("fts_trigram", True))
         except Exception:
             return True
