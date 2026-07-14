@@ -598,3 +598,53 @@ class TestOnePasswordConformance(SecretSourceConformance):
         monkeypatch.setattr(op, "find_op", lambda *_a, **_kw: None)
         monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
         return op.OnePasswordSource()
+
+
+class TestApplyAllForwardsRawEnviron:
+    """apply_all must forward the RAW ``environ`` (None-preserving) to each
+    source's fetch(), not the materialized os.environ.
+
+    Regression: apply_all passed the materialized ``env`` (which is os.environ
+    when environ=None) into the fetch call, so OnePasswordSource saw a non-None
+    environ and switched to isolated mode (include_process_auth=False) even on
+    the default load_hermes_dotenv path. That dropped an interactive `op`
+    session's process auth at startup. The fetch must receive None on the
+    default path and the explicit dict only for profile-scoped builds.
+    """
+
+    def _recording_source(self):
+        seen = {}
+
+        class _Src(SecretSource):
+            name = "recorder"
+            shape = "bulk"
+
+            def fetch(self, cfg, home_path, *, environ=None):
+                seen["environ"] = environ
+                return FetchResult()
+
+            def override_existing(self, cfg):
+                return False
+
+            def protected_env_vars(self, cfg):
+                return frozenset()
+
+        return _Src(), seen
+
+    def test_default_path_forwards_none(self, tmp_path, monkeypatch):
+        src, seen = self._recording_source()
+        monkeypatch.setattr(
+            reg, "_ordered_enabled_sources", lambda cfg: [src]
+        )
+        # environ omitted → default load_hermes_dotenv path.
+        reg.apply_all({"recorder": {"enabled": True}}, tmp_path)
+        assert seen["environ"] is None
+
+    def test_scoped_path_forwards_the_dict(self, tmp_path, monkeypatch):
+        src, seen = self._recording_source()
+        monkeypatch.setattr(
+            reg, "_ordered_enabled_sources", lambda cfg: [src]
+        )
+        scoped = {"ANTHROPIC_API_KEY": "sk-scoped"}
+        reg.apply_all({"recorder": {"enabled": True}}, tmp_path, environ=scoped)
+        assert seen["environ"] is scoped

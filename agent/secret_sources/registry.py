@@ -302,6 +302,15 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     """
     import os as _os
 
+    # ``env`` is the materialized mapping the merge/precedence phase below reads
+    # and writes (env.get / env[var] = ...). It must NOT be forwarded to the
+    # sources' fetch(): OnePasswordSource treats any non-None ``environ`` as
+    # isolated mode (include_process_auth=False), so passing the materialized
+    # os.environ on the default load_hermes_dotenv path (environ=None) would run
+    # ``op`` with an isolated HOME and drop an interactive 1Password session. The
+    # fetch call forwards the RAW ``environ`` (None-preserving) so process-auth
+    # mode is kept on the default path and isolated only for explicit
+    # profile-scoped builds that pass a real dict.
     env = environ if environ is not None else _os.environ
     report = ApplyReport()
 
@@ -321,7 +330,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path, env)
+        result = _fetch_with_timeout(source, cfg, home_path, environ)
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):
