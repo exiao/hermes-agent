@@ -60,6 +60,15 @@ class _NoTrigramCursor(sqlite3.Cursor):
             raise sqlite3.OperationalError("no such tokenizer: trigram")
         return super().executescript(sql_script)
 
+    def execute(self, sql, *args):
+        # The v20 migration recreates FTS tables via execute() (inside its
+        # explicit transaction), not executescript, so simulate the missing
+        # trigram tokenizer here too — matches real SQLite, which raises on
+        # the CREATE VIRTUAL TABLE regardless of the executor used.
+        if isinstance(sql, str) and "tokenize='trigram'" in sql:
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, *args)
+
 
 class _NoTrigramConnection(sqlite3.Connection):
     def cursor(self, factory=None):
@@ -745,6 +754,46 @@ class TestExternalContentFtsMigration:
             assert len(second.search_messages("web_search")) == 1
         finally:
             second.close()
+
+    def test_failed_v20_migration_rolls_back_and_stays_v19(
+        self, tmp_path, monkeypatch
+    ):
+        """A v20 rebuild failure must NOT commit the inline-FTS DROPs.
+
+        Regression: the connection is in autocommit mode, so without an
+        explicit transaction the DROP TABLE statements commit immediately and
+        a rollback is a no-op — leaving the DB at v19 with the FTS tables gone.
+        Force the base FTS recreate to fail and assert the pre-migration
+        schema (inline messages_fts) survives and the version stays at 19.
+        """
+        db_path = tmp_path / "state.db"
+        self._seed_inline_v19(db_path)
+
+        # Make the external-content recreate fail so fts_migrations_complete
+        # goes False after the inline tables/triggers were dropped.
+        real_ensure = SessionDB._ensure_fts_schema
+
+        def _fail_base(self, cursor, table, sql, in_transaction=False):
+            if table == "messages_fts":
+                return False
+            return real_ensure(self, cursor, table, sql, in_transaction)
+
+        monkeypatch.setattr(SessionDB, "_ensure_fts_schema", _fail_base)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            # Version must NOT have advanced.
+            assert db._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == 19
+            # The pre-migration inline FTS table must still exist — the DROPs
+            # were rolled back, not committed.
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type='table' AND name='messages_fts'"
+            ).fetchone()[0] == 1
+        finally:
+            db.close()
 
     def test_trigram_gate_off_drops_table_and_falls_back_to_like(
         self, tmp_path, monkeypatch

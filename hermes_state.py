@@ -1212,11 +1212,35 @@ class SessionDB:
                 return False
             raise
 
+    @staticmethod
+    def _exec_ddl_no_commit(cursor: sqlite3.Cursor, script: str) -> None:
+        """Run a multi-statement DDL script WITHOUT an implicit commit.
+
+        ``Cursor.executescript`` issues a COMMIT before running, which would
+        defeat an explicit transaction wrapped around a migration (the v20 FTS
+        rebuild). Split the script into complete statements with
+        ``sqlite3.complete_statement`` (aware of trigger ``BEGIN ... END;``
+        bodies) and run each via ``execute`` so the caller's transaction stays
+        open and remains rollback-able.
+        """
+        buf = ""
+        for line in script.splitlines(keepends=True):
+            buf += line
+            if sqlite3.complete_statement(buf):
+                stmt = buf.strip()
+                if stmt:
+                    cursor.execute(stmt)
+                buf = ""
+        tail = buf.strip()
+        if tail:
+            cursor.execute(tail)
+
     def _ensure_fts_schema(
         self,
         cursor: sqlite3.Cursor,
         table_name: str,
         ddl: str,
+        in_transaction: bool = False,
     ) -> bool:
         status = self._fts_table_probe(cursor, table_name)
         if status is None:
@@ -1224,8 +1248,13 @@ class SessionDB:
         try:
             # Run even when the virtual table exists so any dropped or missing
             # triggers are recreated after a previous no-FTS5 runtime disabled
-            # them to keep message writes working.
-            cursor.executescript(ddl)
+            # them to keep message writes working. Inside an explicit
+            # transaction (the v20 rebuild) use the no-commit executor so
+            # executescript's implicit COMMIT can't defeat a later rollback.
+            if in_transaction:
+                self._exec_ddl_no_commit(cursor, ddl)
+            else:
+                cursor.executescript(ddl)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
@@ -1801,6 +1830,18 @@ class SessionDB:
                         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     except sqlite3.OperationalError:
                         pass
+                    # The connection is in autocommit mode (isolation_level=None),
+                    # so each DDL statement would commit immediately and a later
+                    # rollback would be a no-op. Open an explicit transaction
+                    # around the destructive drop + recreate so a failure to
+                    # rebuild the external-content FTS schema restores the
+                    # pre-migration tables instead of leaving the DB at v19 with
+                    # the FTS tables gone. The recreate path uses the no-commit
+                    # DDL executor (executescript would COMMIT this open txn).
+                    try:
+                        self._conn.execute("BEGIN")
+                    except sqlite3.OperationalError:
+                        pass
                     self._drop_fts_triggers(cursor)
                     for _tbl in ("messages_fts", "messages_fts_trigram"):
                         try:
@@ -1820,9 +1861,11 @@ class SessionDB:
                         # View must exist before the external-content tables
                         # 'rebuild' against it (created above for the FTS5 path,
                         # but re-assert idempotently in case of an odd order).
-                        cursor.executescript(FTS_VIEW_SQL)
+                        # Single statement via execute (not executescript) so it
+                        # does not implicitly commit the open v20 transaction.
+                        cursor.execute(FTS_VIEW_SQL)
                         base_fts_ok = self._ensure_fts_schema(
-                            cursor, "messages_fts", FTS_SQL
+                            cursor, "messages_fts", FTS_SQL, in_transaction=True
                         )
                         if base_fts_ok:
                             cursor.execute(
@@ -1835,7 +1878,8 @@ class SessionDB:
                         # any prior copy), and CJK search falls back to LIKE.
                         if self._fts_trigram_enabled:
                             trigram_ok = self._ensure_fts_schema(
-                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL,
+                                in_transaction=True,
                             )
                             if trigram_ok:
                                 cursor.execute(
@@ -1846,13 +1890,14 @@ class SessionDB:
                         else:
                             self._trigram_available = False
                         if fts_migrations_complete:
-                            # Reclaim the dropped inline content copies now,
-                            # before the version bump commits. VACUUM can't run
-                            # in a transaction; checkpoint first to keep the WAL
-                            # bounded, then VACUUM, then checkpoint again.
+                            # Commit the rebuild first to close the explicit
+                            # transaction (VACUUM and a TRUNCATE checkpoint both
+                            # require no open transaction), then reclaim the
+                            # dropped inline content copies. checkpoint before +
+                            # after bounds WAL growth around the VACUUM.
                             try:
-                                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                                 self._conn.commit()
+                                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                                 self._conn.execute("VACUUM")
                                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                             except sqlite3.OperationalError as exc:
@@ -1871,12 +1916,14 @@ class SessionDB:
             elif current_version < 20 and not fts_migrations_complete:
                 # The v20 migration dropped the inline FTS tables/triggers but
                 # could not recreate the view-backed ones (FTS5 unavailable or a
-                # CREATE failed). _init_schema commits unconditionally at the
-                # end, so without an explicit rollback those DROPs would commit
-                # and leave the DB at v19 with the FTS tables gone entirely.
-                # Roll back to preserve the pre-migration FTS schema; the next
-                # open retries the migration.
-                self._conn.rollback()
+                # CREATE failed). The destructive section ran inside an explicit
+                # BEGIN with a no-commit DDL executor, so this rollback actually
+                # restores the pre-migration FTS schema and leaves the DB at
+                # v19; the next open retries the (idempotent) migration.
+                try:
+                    self._conn.rollback()
+                except sqlite3.OperationalError:
+                    pass
 
         # Unique title index — always ensure it exists
         try:
