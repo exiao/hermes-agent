@@ -102,6 +102,26 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    def _profile_secret_scope_for_source(self, source):
+        """Return a context manager scoping secrets/home to ``source``'s profile.
+
+        Slash-command dispatch runs OUTSIDE the per-turn agent scope the
+        multiplexer installs, so account/credit reads that resolve
+        ``get_hermes_home()`` (auth.json) or ``get_secret``-backed provider
+        keys would otherwise read the DEFAULT profile's values — showing a
+        secondary profile its own empty/partial balance instead of its real
+        account. Under ``multiplex_profiles`` this installs
+        ``_profile_runtime_scope`` for the requesting profile; single-profile
+        gateways get a no-op ``nullcontext`` so their behavior is unchanged.
+        """
+        from contextlib import nullcontext
+
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return nullcontext()
+        from gateway.run import _profile_runtime_scope
+
+        return _profile_runtime_scope(self._resolve_profile_home_for_source(source))
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
@@ -3968,7 +3988,8 @@ class GatewaySlashCommandsMixin:
         from agent.account_usage import build_credits_view
 
         try:
-            view = await asyncio.to_thread(build_credits_view, markdown=True)
+            with self._profile_secret_scope_for_source(event.source):
+                view = await asyncio.to_thread(build_credits_view, markdown=True)
         except Exception:
             view = None
 
@@ -4074,12 +4095,13 @@ class GatewaySlashCommandsMixin:
         credits_lines: list[str] = []
         if provider:
             try:
-                account_snapshot = await asyncio.to_thread(
-                    fetch_account_usage,
-                    provider,
-                    base_url=base_url,
-                    api_key=api_key,
-                )
+                with self._profile_secret_scope_for_source(source):
+                    account_snapshot = await asyncio.to_thread(
+                        fetch_account_usage,
+                        provider,
+                        base_url=base_url,
+                        api_key=api_key,
+                    )
             except Exception:
                 account_snapshot = None
             if account_snapshot:
@@ -4096,7 +4118,8 @@ class GatewaySlashCommandsMixin:
         try:
             from agent.account_usage import nous_credits_lines
 
-            credits_lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
+            with self._profile_secret_scope_for_source(source):
+                credits_lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
         except Exception:
             credits_lines = []  # fail-open: never break /usage
 

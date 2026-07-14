@@ -565,15 +565,57 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     return True
 
 
+def _resolve_copilot_raw_token_from_active_scope(
+    pconfig: ProviderConfig,
+) -> Optional[tuple[str, str]]:
+    """Return a scoped Copilot GitHub token, or None when no scope is active.
+
+    Copilot normally has a convenience fallback to ``gh auth token``. In a
+    multiplexed gateway scope that fallback is unsafe for model discovery: it
+    reads the process/default profile identity after listing already decided the
+    requesting profile has scoped Copilot credentials. A present scope is
+    therefore authoritative, matching the generic API-key provider path below.
+    """
+    from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+    from hermes_cli.copilot_auth import validate_copilot_token
+
+    if current_secret_scope() is None:
+        return None
+
+    for env_var in pconfig.api_key_env_vars:
+        val = (_get_secret(env_var, "") or "").strip()
+        if not val:
+            continue
+        valid, msg = validate_copilot_token(val)
+        if not valid:
+            logger.warning("Token from %s is not supported: %s", env_var, msg)
+            continue
+        return val, env_var
+    return "", ""
+
+
+def _resolve_copilot_raw_token(pconfig: ProviderConfig) -> tuple[str, str]:
+    scoped = _resolve_copilot_raw_token_from_active_scope(pconfig)
+    if scoped is not None:
+        return scoped
+
+    from hermes_cli.copilot_auth import resolve_copilot_token
+
+    return resolve_copilot_token()
+
+
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
     if provider_id == "copilot":
-        # Use the dedicated copilot auth module for proper token validation
+        # Use the dedicated copilot auth module for proper token validation and
+        # exchange, but resolve env vars through the active secret scope when
+        # one exists so live catalog fetches cannot borrow the process/gh token.
         try:
-            from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
-            token, source = resolve_copilot_token()
+            from hermes_cli.copilot_auth import get_copilot_api_token
+
+            token, source = _resolve_copilot_raw_token(pconfig)
             if token:
                 api_token, _base_url = get_copilot_api_token(token)
                 return api_token, source
@@ -6462,11 +6504,9 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
         # resolves an empty base URL (#50252).
         base_url = env_url.rstrip("/") if env_url else pconfig.inference_base_url
         try:
-            from hermes_cli.copilot_auth import (
-                resolve_copilot_token,
-                get_copilot_api_token,
-            )
-            raw_token, _ = resolve_copilot_token()
+            from hermes_cli.copilot_auth import get_copilot_api_token
+
+            raw_token, _ = _resolve_copilot_raw_token(pconfig)
             if raw_token:
                 _, resolved = get_copilot_api_token(raw_token)
                 resolved = (resolved or "").strip()

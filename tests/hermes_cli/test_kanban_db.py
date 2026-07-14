@@ -5706,6 +5706,460 @@ def test_init_db_allows_missing_then_healthy(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Clone-storm cap + index-only self-heal (2026-07-13 incident)
+# ---------------------------------------------------------------------------
+
+
+def _corrupt_an_index_page(db_path: Path) -> bool:
+    """Blank a secondary/auto index's b-tree entries while keeping the page
+    structurally valid, so ``PRAGMA integrity_check`` reports the *index* has
+    the wrong entry count (the recoverable index-only class) rather than a
+    page-level "database disk image is malformed".
+
+    Technique: set the index root page's "number of cells" field (2-byte big-
+    endian at page offset 3) to zero and clear the cell-pointer array. SQLite
+    then sees an index b-tree with fewer entries than the base table → "wrong #
+    of entries in index". The base-table b-trees are untouched, so every row is
+    still readable and ``iterdump`` recovers them fully.
+
+    Returns True if an index page was corrupted, False if the DB has no
+    corruptible secondary index (caller should skip). Assumes rollback journal
+    mode with no live WAL sidecars.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        rows = conn.execute(
+            "SELECT name, rootpage FROM sqlite_master "
+            "WHERE type='index' AND rootpage > 0 ORDER BY rootpage"
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return False
+    _name, rootpage = rows[-1]
+    offset = (rootpage - 1) * page_size
+    with db_path.open("r+b") as fh:
+        fh.seek(offset)
+        page = bytearray(fh.read(page_size))
+        page_type = page[0]  # 0x0a leaf index / 0x02 interior index — keep it
+        # Zero the "number of cells" field (offset 3-4) and the cell-pointer
+        # array so the index b-tree reports zero entries while staying parseable.
+        page[3] = 0x00
+        page[4] = 0x00
+        header_len = 8 if page_type in (0x0a, 0x0d) else 12
+        for i in range(header_len, page_size):
+            page[i] = 0x00
+        fh.seek(offset)
+        fh.write(bytes(page))
+    return True
+
+
+def _make_index_corrupt_kanban_db(db_path: Path) -> list[str]:
+    """Build a healthy kanban DB with data, then corrupt one index page.
+
+    Returns the task titles that must survive a repair. Skips (pytest.skip) if
+    the schema has no corruptible secondary index on this SQLite build.
+    """
+    with kb.connect_closing(db_path=db_path) as conn:
+        kb.create_task(conn, title="alpha")
+        kb.create_task(conn, title="beta")
+        kb.create_task(conn, title="gamma")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    # Collapse WAL into the main file and switch to rollback journaling so the
+    # main-file page layout is stable before we corrupt a page by byte offset.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.commit()
+    finally:
+        conn.close()
+    for sidecar in ("-wal", "-shm"):
+        s = db_path.with_name(db_path.name + sidecar)
+        if s.exists():
+            s.unlink()
+    if not _corrupt_an_index_page(db_path):
+        pytest.skip("no corruptible secondary index in kanban schema")
+    return ["alpha", "beta", "gamma"]
+
+
+def test_is_index_only_corruption_classifier():
+    assert kb._is_index_only_corruption(
+        ["wrong # of entries in index idx_notify_task"]
+    )
+    assert kb._is_index_only_corruption(
+        [
+            "row missing from index sqlite_autoindex_kanban_notify_subs_1",
+            "wrong # of entries in index idx_notify_task",
+        ]
+    )
+    # Any non-index problem disqualifies the whole set — never a partial repair.
+    assert not kb._is_index_only_corruption(
+        ["wrong # of entries in index idx_x", "Page 4 is never used"]
+    )
+    assert not kb._is_index_only_corruption(["database disk image is malformed"])
+    assert not kb._is_index_only_corruption([])
+
+
+def test_index_only_corruption_self_heals_and_preserves_rows(tmp_path):
+    """The 2026-07-13 board corruption class (stale indexes, base tables intact)
+    must self-heal on open via REINDEX / .dump+reload with zero row loss —
+    instead of refusing and quarantining a clone."""
+    db_path = tmp_path / "kanban.db"
+    expected = _make_index_corrupt_kanban_db(db_path)
+
+    # Precondition: the DB is genuinely index-corrupt right now.
+    problems = kb._integrity_problems(db_path)
+    assert problems is not None, "expected the injected index corruption to register"
+    assert kb._is_index_only_corruption(problems), problems
+
+    # Clear the one-shot repair claim so the guard actually attempts repair.
+    kb._REPAIR_ATTEMPTED_PATHS.discard(str(db_path.resolve()))
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    # Opening the DB must now recover it in place, not raise.
+    with kb.connect(db_path=db_path) as conn:
+        titles = sorted(t.title for t in kb.list_tasks(conn))
+    assert titles == sorted(expected), "row data must survive the repair"
+
+    # DB is clean afterwards and no forensic clone was kept for a recovered DB.
+    assert kb._integrity_problems(db_path) is None
+    assert list(tmp_path.glob("*.corrupt.*.bak")) == []
+    # The rebuild temp file must not linger.
+    assert list(tmp_path.glob("*.rebuild.tmp")) == []
+
+
+def test_successful_repair_clears_repair_claim(tmp_path):
+    """After a successful in-place repair the path is discarded from
+    _REPAIR_ATTEMPTED_PATHS, so a genuinely fresh corruption on the same path
+    later can be retried (honors the one-shot-claim contract)."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+    resolved = str(db_path.resolve())
+
+    kb._REPAIR_ATTEMPTED_PATHS.discard(resolved)
+    kb._INITIALIZED_PATHS.discard(resolved)
+
+    with kb.connect(db_path=db_path) as conn:
+        kb.list_tasks(conn)
+
+    # Repair succeeded, so the one-shot claim must have been released.
+    with kb._REPAIR_ATTEMPT_LOCK:
+        assert resolved not in kb._REPAIR_ATTEMPTED_PATHS
+
+
+def test_reindex_lock_error_propagates_not_swallowed(tmp_path, monkeypatch):
+    """A `database is locked` OperationalError during REINDEX is transient
+    contention, not corruption. It subclasses DatabaseError but must re-raise
+    (not fall through to the destructive dump+reload swap)."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+
+    real_connect = kb._sqlite_connect
+
+    class _LockOnReindex:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a, **kw):
+            if sql.strip().upper().startswith("REINDEX"):
+                raise sqlite3.OperationalError("database is locked")
+            return self._conn.execute(sql, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _wrapped(path, *a, **kw):
+        return _LockOnReindex(real_connect(path, *a, **kw))
+
+    monkeypatch.setattr(kb, "_sqlite_connect", _wrapped)
+
+    with pytest.raises(sqlite3.OperationalError):
+        kb._attempt_index_only_repair(db_path)
+
+    # It must NOT have fallen through to dump+reload (no rebuild temp file, and
+    # the original corrupt DB is left in place untouched by a destructive swap).
+    assert list(tmp_path.glob("*.rebuild.tmp")) == []
+
+
+def test_transient_lock_during_repair_releases_claim(tmp_path, monkeypatch):
+    """When the guard's self-heal hits a transient `database is locked`, it
+    re-raises AND releases the one-shot repair claim, so the next connect (after
+    the lock clears) re-attempts the heal instead of skipping to backup+refuse
+    and leaving a recoverable board down until restart."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+    resolved = str(db_path.resolve())
+    kb._REPAIR_ATTEMPTED_PATHS.discard(resolved)
+    kb._INITIALIZED_PATHS.discard(resolved)
+
+    def _boom(_path):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(kb, "_attempt_index_only_repair", _boom)
+
+    with pytest.raises(sqlite3.OperationalError):
+        kb._guard_existing_db_is_healthy(db_path)
+
+    # Claim released so a retry can re-attempt the repair.
+    with kb._REPAIR_ATTEMPT_LOCK:
+        assert resolved not in kb._REPAIR_ATTEMPTED_PATHS
+
+
+def test_dump_reload_lock_error_propagates(tmp_path, monkeypatch):
+    """A transient `database is locked` during the dump+reload fallback must
+    re-raise (not be swallowed by the broad DatabaseError->None handler that
+    would trigger backup+refuse of a recoverable board)."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+
+    real_connect = kb._sqlite_connect
+
+    class _LockOnIterdump:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a, **kw):
+            # Force REINDEX to fail structurally so we fall into dump+reload...
+            if sql.strip().upper().startswith("REINDEX"):
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return self._conn.execute(sql, *a, **kw)
+
+        def iterdump(self):
+            # ...then have the dump raise a transient lock.
+            raise sqlite3.OperationalError("database is locked")
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _wrapped(path, *a, **kw):
+        return _LockOnIterdump(real_connect(path, *a, **kw))
+
+    monkeypatch.setattr(kb, "_sqlite_connect", _wrapped)
+
+    with pytest.raises(sqlite3.OperationalError):
+        kb._attempt_index_only_repair(db_path)
+
+    # Rebuild temp must be cleaned up on the transient re-raise.
+    assert list(tmp_path.glob("*.rebuild.tmp")) == []
+
+
+def test_repair_quiesces_writers_before_swap(tmp_path, monkeypatch):
+    """The dump+reload repair must acquire an exclusive lock before swapping.
+    A concurrent connection holding a write lock makes the repair re-raise a
+    transient OperationalError (retry later) rather than publishing a rebuilt
+    DB that could drop the other writer's committed rows."""
+    db_path = tmp_path / "kanban.db"
+    _make_index_corrupt_kanban_db(db_path)
+
+    # Keep the repair's BEGIN EXCLUSIVE from waiting the full default 120s on the
+    # blocker — fail fast so the test is quick and deterministic.
+    monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "200")
+
+    # Hold an exclusive write transaction open on the board from another
+    # connection for the duration of the repair attempt.
+    blocker = sqlite3.connect(str(db_path), isolation_level=None, timeout=0.2)
+    blocker.execute("PRAGMA busy_timeout=200")
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(sqlite3.OperationalError):
+            kb._attempt_index_only_repair(db_path)
+        # Nothing was published: no rebuild temp lingering, original untouched.
+        assert list(tmp_path.glob("*.rebuild.tmp")) == []
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+def test_repair_preserves_inode_so_idle_handle_writes_survive(tmp_path, monkeypatch):
+    """An idle kb.connect() handle opened BEFORE an index-only repair must not
+    write to a detached inode after the heal.
+
+    Regression for the os.replace-swap bug: the dump+reload repair used to
+    publish a rebuilt sibling file via os.replace, giving the board a new
+    inode. A long-lived handle opened before the swap stayed attached to the
+    replaced inode, so a later create through it committed to the detached file
+    and was invisible to fresh connections (silently lost). The in-place
+    rebuild keeps the inode stable, so the idle handle's post-repair write is
+    visible everywhere.
+    """
+    db_path = tmp_path / "kanban.db"
+    survivors = _make_index_corrupt_kanban_db(db_path)
+
+    real_connect = kb._sqlite_connect
+
+    class _ReindexFails:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a, **kw):
+            if sql.strip().upper().startswith("REINDEX"):
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return self._conn.execute(sql, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _wrapped(path, *a, **kw):
+        return _ReindexFails(real_connect(path, *a, **kw))
+
+    def _inode(p: Path) -> int:
+        return p.stat().st_ino
+
+    inode_before = _inode(db_path)
+
+    # A long-lived REAL handle opened BEFORE the repair (the vulnerable one).
+    # Force a fresh open past the per-process init cache so it's a real new fd.
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    idle = kb.connect(db_path=db_path)
+    try:
+        # Force REINDEX (Strategy 1) to fail structurally so the repair falls
+        # into the dump+reload path this test exercises, but only for the repair
+        # call itself — the idle handle above and the verification connections
+        # below use the real, unwrapped opener.
+        monkeypatch.setattr(kb, "_sqlite_connect", _wrapped)
+        strategy = kb._attempt_index_only_repair(db_path)
+        monkeypatch.undo()
+        assert strategy == "dump_reload"
+
+        # Same inode -> pre-existing handles were never detached.
+        assert _inode(db_path) == inode_before
+
+        # The recovered rows survived the heal.
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with kb.connect_closing(db_path=db_path) as verify:
+            titles = {
+                r[0] for r in verify.execute("SELECT title FROM tasks").fetchall()
+            }
+        assert set(survivors).issubset(titles)
+
+        # A write through the idle pre-repair handle must land on the healed
+        # inode and be visible to a brand-new connection.
+        kb.create_task(idle, title="written-through-idle-handle")
+        idle.commit()
+
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with kb.connect_closing(db_path=db_path) as fresh:
+            titles_after = {
+                r[0] for r in fresh.execute("SELECT title FROM tasks").fetchall()
+            }
+        assert "written-through-idle-handle" in titles_after
+    finally:
+        idle.close()
+
+
+def test_reused_backup_fills_in_missing_sidecars(tmp_path):
+    """When the same corrupt main-file hash is quarantined again after a WAL
+    sidecar appears, reusing the existing backup must still copy the sidecar so
+    a WAL-only committed transaction is recoverable from the forensic copy."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+
+    # First quarantine: no sidecars yet.
+    first = kb._backup_corrupt_db(db_path)
+    assert first is not None and first.exists()
+    assert not (tmp_path / (first.name + "-wal")).exists()
+
+    # A WAL sidecar now appears alongside the (byte-identical) corrupt main file.
+    wal = db_path.with_name(db_path.name + "-wal")
+    wal.write_bytes(b"fake-wal-committed-rows")
+
+    # Re-quarantine: same hash → reuses `first`, but must now copy the sidecar.
+    second = kb._backup_corrupt_db(db_path)
+    assert second == first, "byte-identical corruption should reuse the backup"
+    assert (tmp_path / (first.name + "-wal")).exists(), (
+        "reused backup must gain the newly-present WAL sidecar"
+    )
+
+
+def test_corrupt_clone_count_is_capped(tmp_path):
+    """A live WAL DB mutates on every rw probe, so N concurrent opens fingerprint
+    different bytes and each used to write a fresh multi-MB clone (the storm).
+    The per-path clone cap bounds this: the number of .corrupt.*.bak files must
+    never exceed _MAX_CORRUPT_CLONES no matter how many times the bytes change."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+
+    for i in range(12):
+        # Mutate the corrupt bytes each iteration so content-addressing alone
+        # would mint a brand-new clone (this is what the WAL churn did live).
+        with db_path.open("r+b") as fh:
+            fh.seek(4096)
+            fh.write(bytes([i % 256]) * 128)
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with pytest.raises(kb.KanbanDbCorruptError):
+            kb.connect(db_path=db_path)
+
+    clones = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(clones) <= kb._MAX_CORRUPT_CLONES, (
+        f"clone-storm not bounded: {len(clones)} clones "
+        f"(cap {kb._MAX_CORRUPT_CLONES}): {[c.name for c in clones]}"
+    )
+
+
+def test_capped_backup_still_returns_a_forensic_path(tmp_path):
+    """Even at the cap, the raised error carries a real, existing backup path so
+    forensics (and the error message) are never left dangling."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    seen: list[Path] = []
+    for i in range(6):
+        with db_path.open("r+b") as fh:
+            fh.seek(2048)
+            fh.write(bytes([i]) * 64)
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+            kb.connect(db_path=db_path)
+        bp = excinfo.value.backup_path
+        assert bp is not None and bp.exists()
+        seen.append(bp)
+    # At most the cap number of distinct forensic clones exist on disk.
+    assert len({p.resolve() for p in seen}) <= kb._MAX_CORRUPT_CLONES
+
+
+def test_capped_backup_reuse_still_fills_missing_sidecars(tmp_path):
+    """At the clone cap, reusing an existing backup must still copy a WAL/SHM
+    sidecar that appeared after that backup was made.
+
+    In WAL mode committed rows can live only in kanban.db-wal until a
+    checkpoint, so a main-file-only forensic copy can't reproduce/recover the
+    board. The byte-identical reuse path already fills missing sidecars; the
+    cap-reached reuse path used to early-return the newest clone WITHOUT calling
+    _copy_missing_sidecars, so its backup_path could lack the WAL state.
+    """
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+
+    # Mint clones up to the cap by mutating the corrupt bytes each open.
+    for i in range(kb._MAX_CORRUPT_CLONES + 3):
+        with db_path.open("r+b") as fh:
+            fh.seek(4096)
+            fh.write(bytes([i % 256]) * 96)
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with pytest.raises(kb.KanbanDbCorruptError):
+            kb.connect(db_path=db_path)
+
+    clones = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(clones) == kb._MAX_CORRUPT_CLONES  # cap reached
+
+    # A WAL sidecar now appears next to the live corrupt DB. The next quarantine
+    # is over cap → it reuses the newest clone, but must copy the sidecar too.
+    wal = db_path.with_name(db_path.name + "-wal")
+    wal.write_bytes(b"wal-only-committed-rows")
+
+    with db_path.open("r+b") as fh:
+        fh.seek(4096)
+        fh.write(b"\xab" * 96)  # mutate again so it's still over-cap reuse
+    reused = kb._backup_corrupt_db(db_path)
+    assert reused is not None and reused.exists()
+    assert (tmp_path / (reused.name + "-wal")).exists(), (
+        "capped-reuse backup must gain the newly-present WAL sidecar"
+    )
+
+
+
+# ---------------------------------------------------------------------------
 # First-use tip for scratch workspaces
 # ---------------------------------------------------------------------------
 
