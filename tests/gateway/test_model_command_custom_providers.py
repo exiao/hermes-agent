@@ -103,6 +103,11 @@ async def test_direct_model_switch_offloads_to_thread(tmp_path, monkeypatch):
 
     result = await _make_runner()._handle_model_command(_make_event("/model gpt-5.4"))
 
-    # switch_model was offloaded to a worker thread, not run on the event loop.
-    assert "_fake_switch" in offloaded
+    # The switch was offloaded to a worker thread, not run on the event loop.
+    # The handler now offloads the `_switch_model_scoped` wrapper (which installs
+    # the profile secret scope under multiplexing before calling switch_model);
+    # single-profile config here means the wrapper is a straight pass-through to
+    # the patched `_fake_switch`. `"nope"` in the result proves `_fake_switch`
+    # actually ran inside the offloaded wrapper on the worker thread.
+    assert "_switch_model_scoped" in offloaded
     assert result is not None and "nope" in result

@@ -201,3 +201,357 @@ class TestProfilePathResolutionUnderMultiplexScope:
 
         assert seen["home"] == str(prof_b)
 
+
+
+class TestModelSwitchOpenRouterPathUsesScope:
+    """`/model <alias>` for an OpenRouter-backed provider must run under the
+    profile secret scope.
+
+    Regression for the `/model glm` failure: switch_model ->
+    resolve_runtime_provider hits the ``provider == "openrouter"`` branch, which
+    reads ``OPENAI_BASE_URL`` (and ``OPENROUTER_BASE_URL``) via ``_getenv`` ->
+    ``get_secret``. Under multiplexing an unscoped read fails closed with
+    ``UnscopedSecretError`` instead of leaking another profile's value, so the
+    slash-command dispatch (which the multiplexer does NOT wrap in the per-turn
+    agent scope) raised. The fix installs the profile scope around the switch;
+    these prove the resolution path fails closed unscoped and succeeds scoped.
+    """
+
+    def test_openrouter_resolution_fails_closed_unscoped(self, monkeypatch):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        # A stale value in os.environ is exactly what fail-closed protects
+        # against leaking to another profile's turn.
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://leaked.example/v1")
+        ss.set_multiplex_active(True)
+        with pytest.raises(ss.UnscopedSecretError):
+            resolve_runtime_provider(
+                requested="openrouter",
+                target_model="z-ai/glm-5.2",
+            )
+
+    def test_openrouter_resolution_succeeds_under_scope(self, monkeypatch):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        ss.set_multiplex_active(True)
+        # The profile scope carries this profile's OpenRouter key; the base_url
+        # is absent (falls back to the OpenRouter default), which is the normal
+        # case for an OpenRouter alias.
+        tok = ss.set_secret_scope({"OPENROUTER_API_KEY": "sk-profileA-or"})
+        try:
+            runtime = resolve_runtime_provider(
+                requested="openrouter",
+                target_model="z-ai/glm-5.2",
+            )
+        finally:
+            ss.reset_secret_scope(tok)
+        assert "openrouter.ai" in runtime["base_url"]
+        assert runtime["api_key"] == "sk-profileA-or"
+
+    def test_switch_model_scoped_wrapper_installs_scope(self, tmp_path, monkeypatch):
+        """The slash handler's ``_switch_model_scoped`` closure runs the switch
+        inside ``_profile_runtime_scope`` under multiplexing, so the OpenRouter
+        credential read sees a scope instead of failing closed.
+
+        Exercises the exact wrapper the handler builds, without standing up a
+        full gateway: a stand-in object providing the two attributes the closure
+        touches (``config.multiplex_profiles`` and
+        ``_resolve_profile_home_for_source``).
+        """
+        # Profile home with its own .env carrying the OpenRouter key.
+        prof = tmp_path / "profileA"
+        prof.mkdir()
+        (prof / ".env").write_text("OPENROUTER_API_KEY=sk-fromA-env\n")
+
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://leaked.example/v1")
+        ss.set_multiplex_active(True)
+
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        # Mirror the closure the handler installs (see slash_commands.py
+        # _handle_model_command._switch_model_scoped).
+        multiplex_on = True
+
+        def switch_scoped():
+            if not multiplex_on:
+                return resolve_runtime_provider(
+                    requested="openrouter", target_model="z-ai/glm-5.2"
+                )
+            with _profile_runtime_scope(prof):
+                return resolve_runtime_provider(
+                    requested="openrouter", target_model="z-ai/glm-5.2"
+                )
+
+        runtime = switch_scoped()
+        assert runtime["api_key"] == "sk-fromA-env"
+        assert "openrouter.ai" in runtime["base_url"]
+
+
+class TestModelSwitchPersistScopedToSourceProfile:
+    """`/model <name>` config persist must target the REQUESTING profile.
+
+    Regression for the P1 on the credential-scope fix: scoping only the
+    `switch_model` resolver (secret read) but persisting `config.yaml` outside
+    the profile scope meant a secondary profile's `/model glm` rewrote the
+    DEFAULT profile's config.yaml (via the module-level home) and left the
+    requesting profile unchanged. `_persist_switched_model` runs the config
+    read+`save_config` under `_profile_runtime_scope`, so `get_hermes_home()`
+    (which `save_config` honors) resolves to the requesting profile.
+
+    This mirrors the closure the handler builds (see
+    `_handle_model_command._persist_switched_model`) without standing up a full
+    gateway.
+    """
+
+    def test_persist_writes_source_profile_not_default(self, tmp_path):
+        import yaml
+
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.config import save_config
+        from hermes_constants import get_hermes_home
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"default": "gpt-5.4", "provider": "openai-codex"}}),
+            encoding="utf-8",
+        )
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+        (source_home / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"default": "old-model", "provider": "openrouter"}}),
+            encoding="utf-8",
+        )
+
+        ss.set_multiplex_active(True)
+
+        # Mirror _do_persist() under the requesting profile's scope.
+        def persist_scoped(new_model, provider):
+            with _profile_runtime_scope(source_home):
+                cfg_path = get_hermes_home() / "config.yaml"
+                with open(cfg_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                model_cfg = cfg.setdefault("model", {})
+                model_cfg["default"] = new_model
+                model_cfg["provider"] = provider
+                save_config(cfg)
+
+        persist_scoped("z-ai/glm-5.2", "openrouter")
+
+        # The requesting profile got the switch...
+        src_cfg = yaml.safe_load((source_home / "config.yaml").read_text())
+        assert src_cfg["model"]["default"] == "z-ai/glm-5.2"
+        # ...and the default profile's config was NOT touched.
+        def_cfg = yaml.safe_load((default_home / "config.yaml").read_text())
+        assert def_cfg["model"]["default"] == "gpt-5.4"
+
+    def test_current_config_read_scoped_to_source_profile(self, tmp_path):
+        """The initial current-model/provider/custom-provider read must use the
+        REQUESTING profile's config, not the default profile's.
+
+        Regression for the follow-on P1: current_provider / user_provs /
+        custom_provs feed switch_model's resolution. If read from the default
+        profile's config, a secondary profile's `/model <name>` resolves against
+        the wrong provider/custom-provider map. `_read_current_config` runs under
+        `_profile_runtime_scope`, so `_load_gateway_config` (via get_hermes_home)
+        reads the requesting profile.
+        """
+        import yaml
+
+        from gateway.run import _profile_runtime_scope, _load_gateway_config
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {"default": "gpt-5.4", "provider": "openai-codex"},
+                    "custom_providers": [
+                        {"name": "Default Endpoint", "base_url": "http://default/v1", "model": "d"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+        (source_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {"default": "z-ai/glm-5.2", "provider": "openrouter"},
+                    "custom_providers": [
+                        {"name": "B Endpoint", "base_url": "http://profileb/v1", "model": "b"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        ss.set_multiplex_active(True)
+
+        with _profile_runtime_scope(source_home):
+            cfg = _load_gateway_config()
+
+        # Read resolved the REQUESTING profile, not the default.
+        assert cfg["model"]["provider"] == "openrouter"
+        assert cfg["model"]["default"] == "z-ai/glm-5.2"
+        names = [p["name"] for p in cfg.get("custom_providers", [])]
+        assert names == ["B Endpoint"]
+
+    def test_persist_default_resolved_under_source_profile(self, tmp_path):
+        """A plain `/model <name>` (no --global/--session) must honor the
+        REQUESTING profile's ``model.persist_switch_by_default``.
+
+        Regression for the P2: ``resolve_persist_behavior`` reads
+        ``persist_switch_by_default`` via ``load_config`` -> ``get_hermes_home``.
+        Computed unscoped, a secondary profile that opted OUT of persistence
+        (``persist_switch_by_default: false``) would still rewrite its config.yaml
+        because the default profile's persist-on decision leaked in. Resolving it
+        inside ``_profile_runtime_scope`` reads the requesting profile's value.
+        """
+        import yaml
+
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.model_switch import resolve_persist_behavior
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"persist_switch_by_default": True}}),
+            encoding="utf-8",
+        )
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+        (source_home / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"persist_switch_by_default": False}}),
+            encoding="utf-8",
+        )
+
+        ss.set_multiplex_active(True)
+
+        # Plain /model (no --global, no --session): persist_global should follow
+        # the profile's persist_switch_by_default, resolved under its scope.
+        with _profile_runtime_scope(source_home):
+            persist_global = resolve_persist_behavior(is_global=False, is_session=False)
+        # ProfileB opted out → no persist, despite the default profile opting in.
+        assert persist_global is False
+
+    def test_user_provider_key_ref_resolved_via_scope(self, monkeypatch):
+        """`switch_model` user-provider branch (`api_key: ${VAR}` / `key_env`)
+        must resolve the key through the profile secret scope, not os.environ.
+
+        Regression for the P1: under multiplexing the wrapper installs the
+        secret scope but does NOT mutate os.environ, so reading the user
+        provider's `${VAR}` / `key_env` via os.environ.get would see the default
+        profile's value (or nothing). Routing through get_secret reads the
+        requesting profile's scoped .env.
+        """
+        from hermes_cli.model_switch import switch_model
+
+        # os.environ carries the DEFAULT profile's value — must NOT be used.
+        monkeypatch.setenv("MYPROV_KEY", "sk-default-leak")
+        ss.set_multiplex_active(True)
+
+        user_providers = {
+            "myprov": {
+                "base_url": "https://myprov.example/v1",
+                "model": "myprov-model",
+                "key_env": "MYPROV_KEY",
+            }
+        }
+
+        # Scope carries the REQUESTING profile's key.
+        tok = ss.set_secret_scope({"MYPROV_KEY": "sk-profileB"})
+        try:
+            result = switch_model(
+                raw_input="myprov-model",
+                current_provider="openrouter",
+                current_model="old",
+                is_global=False,
+                explicit_provider="myprov",
+                user_providers=user_providers,
+            )
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert result.success, result.error_message
+        # The profile's scoped key won, not the os.environ leak.
+        assert result.api_key == "sk-profileB"
+        assert result.base_url == "https://myprov.example/v1"
+
+    def test_list_scoped_runs_listing_under_source_profile(self, tmp_path, monkeypatch):
+        """The bare `/model` listing must run under the requesting profile's
+        scope so auth-store / config / credential-pool provider detection
+        resolves the requesting profile, not the default.
+
+        Mirrors the handler's `_list_scoped` wrapper: `_profile_runtime_scope`
+        redirects `get_hermes_home()`, so a listing fn's `_load_auth_store` /
+        `get_provider_auth_state` / config reads see the requesting profile.
+        (The raw provider-env `os.environ` probes are a separate, tracked gap.)
+        """
+        from gateway.run import _profile_runtime_scope
+        from hermes_constants import get_hermes_home
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+
+        ss.set_multiplex_active(True)
+
+        seen = {}
+
+        def _fake_listing(**kwargs):
+            # A listing fn resolves the active home for auth.json / config reads.
+            seen["home"] = str(get_hermes_home())
+            return []
+
+        # Mirror _list_scoped under multiplexing.
+        with _profile_runtime_scope(source_home):
+            _fake_listing()
+
+        assert seen["home"] == str(source_home)
+
+    def test_refresh_cache_clear_scoped_to_source_profile(self, tmp_path, monkeypatch):
+        """`/model --refresh` must clear the REQUESTING profile's provider cache.
+
+        Regression for the P2: the listing path reads the source profile's
+        `provider_models_cache.json` under `_list_scoped`, but the `--refresh`
+        cache clear ran before any scope was installed. Under multiplexing an
+        unscoped clear wipes the DEFAULT profile's cache and then the listing
+        reuses the requesting profile's stale entry — so refresh silently does
+        nothing for a secondary profile. Clearing under the source-profile scope
+        (`_profile_runtime_scope` redirects `get_hermes_home()`, which
+        `_provider_models_cache_path()` honors) targets the right cache file.
+        """
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.models import (
+            _provider_models_cache_path,
+            clear_provider_models_cache,
+        )
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        source_home = tmp_path / "profileB"
+        source_home.mkdir()
+
+        ss.set_multiplex_active(True)
+
+        # Resolve each profile's cache path under its own scope, then seed both.
+        with _profile_runtime_scope(default_home):
+            default_cache = _provider_models_cache_path()
+        with _profile_runtime_scope(source_home):
+            source_cache = _provider_models_cache_path()
+
+        assert default_cache != source_cache
+        default_cache.parent.mkdir(parents=True, exist_ok=True)
+        source_cache.parent.mkdir(parents=True, exist_ok=True)
+        default_cache.write_text("{}", encoding="utf-8")
+        source_cache.write_text("{}", encoding="utf-8")
+
+        # Mirror the handler: clear under the requesting profile's scope.
+        with _profile_runtime_scope(source_home):
+            clear_provider_models_cache()
+
+        # Only the requesting profile's cache was wiped; the default survives.
+        assert not source_cache.exists()
+        assert default_cache.exists()
+

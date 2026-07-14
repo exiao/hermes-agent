@@ -1182,15 +1182,24 @@ def switch_model(
             if _user_pdef is None:
                 _user_pdef = _ruser(target_provider, user_providers)
         if _user_pdef is not None and _user_pdef.base_url:
+            # Resolve the user-provider key ref (``api_key: ${VAR}`` /
+            # ``key_env: VAR``) through get_secret rather than os.environ, so
+            # under profile multiplexing it reads the REQUESTING profile's
+            # scoped .env (installed by _switch_model_scoped's
+            # _profile_runtime_scope) instead of the process env, which in a
+            # multiplexer may hold the default profile's value or nothing.
+            # get_secret falls back to os.environ when no scope is active and
+            # multiplexing is off, so single-profile behavior is unchanged.
+            from agent.secret_scope import get_secret as _get_secret
             _ucfg = (user_providers or {}).get(explicit_provider.strip().lower()) \
                 or (user_providers or {}).get(target_provider) or {}
             _ukey = str(_ucfg.get("api_key", "") or "").strip()
             if _ukey.startswith("${") and _ukey.endswith("}"):
-                _ukey = os.environ.get(_ukey[2:-1], "").strip()
+                _ukey = str(_get_secret(_ukey[2:-1], "") or "").strip()
             if not _ukey:
                 _kenv = str(_ucfg.get("key_env", "") or "").strip()
                 if _kenv:
-                    _ukey = os.environ.get(_kenv, "").strip()
+                    _ukey = str(_get_secret(_kenv, "") or "").strip()
             try:
                 runtime = resolve_runtime_provider(
                     requested=target_provider,

@@ -1422,6 +1422,8 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
 
+        source = event.source
+
         # Parse --provider, --global, --session, and --refresh flags
         (
             model_input,
@@ -1430,25 +1432,54 @@ class GatewaySlashCommandsMixin:
             force_refresh,
             is_session,
         ) = parse_model_flags(raw_args)
-        persist_global = resolve_persist_behavior(is_global_flag, is_session)
 
-        # --refresh: bust the disk cache so the picker shows live data.
+        # --refresh: bust the disk cache so the picker shows live data. Under
+        # profile multiplexing this MUST run in the requesting profile's scope:
+        # the listing path below reads that profile's
+        # ``$HERMES_HOME/provider_models_cache.json`` under ``_list_scoped``, so
+        # an unscoped clear here would wipe the DEFAULT profile's cache and then
+        # immediately reuse the requesting profile's stale entry — i.e.
+        # ``/model --refresh`` would silently not refresh for a secondary
+        # profile. Scope is a no-op when multiplexing is off. See #97.
         if force_refresh:
             try:
                 from hermes_cli.models import clear_provider_models_cache
-                clear_provider_models_cache()
+
+                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    from gateway.run import _profile_runtime_scope
+
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        clear_provider_models_cache()
+                else:
+                    clear_provider_models_cache()
             except Exception:
                 pass
 
-        # Read current model/provider from config
+        # Read current model/provider from config AND resolve the persist
+        # default. Under profile multiplexing both MUST run in the requesting
+        # profile's scope: current_provider / current_base_url / user_provs /
+        # custom_provs feed switch_model's resolution, and
+        # resolve_persist_behavior reads ``model.persist_switch_by_default`` —
+        # all via get_hermes_home(). An unscoped read here would resolve a
+        # secondary profile's /model <name> against the DEFAULT profile's
+        # provider/custom-provider map (wrong endpoint) and apply the default
+        # profile's persist-by-default decision to the requesting profile (e.g.
+        # persisting when the secondary profile opted out). Scope is a no-op
+        # when multiplexing is off — single-profile gateways are unchanged.
         current_model = ""
         current_provider = "openrouter"
         current_base_url = ""
         current_api_key = ""
         user_provs = None
         custom_provs = None
-        config_path = _hermes_home / "config.yaml"
-        try:
+        persist_global = resolve_persist_behavior(is_global_flag, is_session)
+
+        def _read_current_config() -> None:
+            nonlocal current_model, current_provider, current_base_url
+            nonlocal user_provs, custom_provs, persist_global
+            persist_global = resolve_persist_behavior(is_global_flag, is_session)
             cfg = _load_gateway_config()
             if cfg:
                 model_cfg = cfg.get("model", {})
@@ -1462,17 +1493,122 @@ class GatewaySlashCommandsMixin:
                     custom_provs = get_compatible_custom_providers(cfg)
                 except Exception:
                     custom_provs = cfg.get("custom_providers")
+
+        try:
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                from gateway.run import _profile_runtime_scope
+                with _profile_runtime_scope(
+                    self._resolve_profile_home_for_source(source)
+                ):
+                    _read_current_config()
+            else:
+                _read_current_config()
         except Exception:
             pass
 
         # Check for session override
-        source = event.source
         # Normalize the source the same way a normal message turn does
         # (Telegram DM topic recovery) before deriving the override key, so
         # the override is stored under the key the next message turn reads
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+
+        def _switch_model_scoped(**kwargs):
+            """Run ``switch_model`` under this source's profile secret scope.
+
+            ``switch_model`` -> ``resolve_runtime_provider`` reads provider
+            credentials via ``get_secret`` (e.g. ``OPENAI_BASE_URL`` on the
+            OpenRouter path). Under ``multiplex_profiles`` an unscoped
+            ``get_secret`` fails closed with ``UnscopedSecretError`` to avoid
+            leaking another profile's value. The multiplexer only installs the
+            secret scope around the agent RUN, not around slash-command
+            dispatch, so ``/model <name>`` for an OpenRouter-backed alias
+            raised instead of switching. Install the scope here, on the same
+            worker thread that reads the secret (contextvars propagate into the
+            ``to_thread`` worker via ``copy_context``). No-op when multiplexing
+            is off — single-profile gateways behave exactly as before.
+            """
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return _switch_model(**kwargs)
+            from gateway.run import _profile_runtime_scope
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                return _switch_model(**kwargs)
+
+        def _list_scoped(_list_fn, **kwargs):
+            """Run a provider-listing fn under this source's profile scope.
+
+            ``list_picker_providers`` / ``list_authenticated_providers`` probe
+            provider availability by reading provider env vars / ``key_env`` /
+            ``base_url_env_var`` via ``os.environ``. Under ``multiplex_profiles``
+            a secondary profile's bare ``/model`` would otherwise probe/display
+            using the DEFAULT profile's credentials. Install the profile scope
+            so those reads resolve the requesting profile (contextvars propagate
+            into the ``to_thread`` worker via ``copy_context``). No-op when
+            multiplexing is off — single-profile gateways are unchanged.
+            """
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return _list_fn(**kwargs)
+            from gateway.run import _profile_runtime_scope
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                return _list_fn(**kwargs)
+
+        def _persist_switched_model(result) -> None:
+            """Persist the resolved switch to this source's profile config.yaml.
+
+            The config read+write must run under the SAME profile scope as the
+            resolver (``_switch_model_scoped``): under ``multiplex_profiles`` a
+            plain ``/model <name>`` from a secondary profile would otherwise
+            read/write the module-level (default) profile's ``config.yaml``,
+            leaving the requesting profile unchanged and corrupting the default
+            profile's active model. ``_profile_runtime_scope`` redirects
+            ``get_hermes_home()`` (which ``_load_gateway_config`` and
+            ``save_config`` both honor), so the config load, ``config_path``,
+            and persist all target the requesting profile. No-op scope when
+            multiplexing is off — single-profile gateways behave as before.
+            """
+            from hermes_constants import get_hermes_home
+            from hermes_cli.config import save_config
+
+            def _do_persist() -> None:
+                cfg_path = get_hermes_home() / "config.yaml"
+                if cfg_path.exists():
+                    with open(cfg_path, encoding="utf-8") as f:
+                        cfg = yaml.safe_load(f) or {}
+                else:
+                    cfg = {}
+                # Coerce scalar/None ``model:`` into a dict before mutation —
+                # otherwise the assignment below raises TypeError when
+                # config.yaml has a flat ``model: <name>`` string.
+                raw_model = cfg.get("model")
+                if isinstance(raw_model, dict):
+                    model_cfg = raw_model
+                elif isinstance(raw_model, str) and raw_model.strip():
+                    model_cfg = {"default": raw_model.strip()}
+                    cfg["model"] = model_cfg
+                else:
+                    model_cfg = {}
+                    cfg["model"] = model_cfg
+                model_cfg["default"] = result.new_model
+                model_cfg["provider"] = result.target_provider
+                if result.base_url:
+                    model_cfg["base_url"] = result.base_url
+                if str(result.target_provider or "").strip().lower() != "custom":
+                    clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
+                save_config(cfg)
+
+            try:
+                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    from gateway.run import _profile_runtime_scope
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        _do_persist()
+                else:
+                    _do_persist()
+            except Exception as e:
+                logger.warning("Failed to persist model switch: %s", e)
+
         override = self._session_model_overrides.get(session_key, {})
         if override:
             current_model = override.get("model", current_model)
@@ -1495,6 +1631,7 @@ class GatewaySlashCommandsMixin:
                     # synchronous urllib HTTP fetch on a stale cache) off the
                     # event loop so the gateway doesn't freeze. See #41289.
                     providers = await asyncio.to_thread(
+                        _list_scoped,
                         list_picker_providers,
                         current_provider=current_provider,
                         current_base_url=current_base_url,
@@ -1529,7 +1666,7 @@ class GatewaySlashCommandsMixin:
                         # (requests.get, 15s timeout) on a cold/expired cache,
                         # which freezes the gateway otherwise. See #20525, #41289.
                         result = await asyncio.to_thread(
-                            _switch_model,
+                            _switch_model_scoped,
                             raw_input=model_id,
                             current_provider=_cur_provider,
                             current_model=_cur_model,
@@ -1650,32 +1787,11 @@ class GatewaySlashCommandsMixin:
                         # Persist to config (default) unless --session opted out,
                         # mirroring the text /model command path above so a picked
                         # model survives across sessions like a typed one (#49066).
+                        # Scoped to the requesting profile under multiplexing so a
+                        # secondary profile's switch doesn't rewrite the default
+                        # profile's config.yaml (see _persist_switched_model).
                         if persist_global:
-                            try:
-                                if config_path.exists():
-                                    with open(config_path, encoding="utf-8") as f:
-                                        _persist_cfg = yaml.safe_load(f) or {}
-                                else:
-                                    _persist_cfg = {}
-                                _raw_model = _persist_cfg.get("model")
-                                if isinstance(_raw_model, dict):
-                                    _persist_model_cfg = _raw_model
-                                elif isinstance(_raw_model, str) and _raw_model.strip():
-                                    _persist_model_cfg = {"default": _raw_model.strip()}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                else:
-                                    _persist_model_cfg = {}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
-                                if result.base_url:
-                                    _persist_model_cfg["base_url"] = result.base_url
-                                if str(result.target_provider or "").strip().lower() != "custom":
-                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
-                            except Exception as e:
-                                logger.warning("Failed to persist model switch: %s", e)
+                            _persist_switched_model(result)
 
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
@@ -1737,6 +1853,7 @@ class GatewaySlashCommandsMixin:
                 # Offload blocking provider-listing off the event loop so the
                 # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
                 providers = await asyncio.to_thread(
+                    _list_scoped,
                     list_authenticated_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,
@@ -1772,7 +1889,7 @@ class GatewaySlashCommandsMixin:
         # timeout) on a cold/expired cache, which freezes the gateway
         # otherwise. See #20525, #41289.
         result = await asyncio.to_thread(
-            _switch_model,
+            _switch_model_scoped,
             raw_input=model_input,
             current_provider=current_provider,
             current_model=current_model,
@@ -1894,39 +2011,12 @@ class GatewaySlashCommandsMixin:
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
 
-            # Persist to config (default) unless --session opted out
+            # Persist to config (default) unless --session opted out. Scoped to
+            # the requesting profile under multiplexing so a secondary profile's
+            # switch doesn't rewrite the default profile's config.yaml (see
+            # _persist_switched_model).
             if persist_global:
-                try:
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            cfg = yaml.safe_load(f) or {}
-                    else:
-                        cfg = {}
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
-                    if str(result.target_provider or "").strip().lower() != "custom":
-                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                    from hermes_cli.config import save_config
-                    save_config(cfg)
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
+                _persist_switched_model(result)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
