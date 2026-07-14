@@ -600,6 +600,39 @@ class TestSessionLifecycle:
         finally:
             restored.close()
 
+    def test_drop_trigram_fts_returns_false_when_drop_thwarted(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression (Codex P2): if DROP TABLE fails (e.g. the DB is locked by
+        another process), _drop_trigram_fts must return False so the caller does
+        NOT log a misleading 'dropped, run VACUUM' hint while the table survives."""
+        db_path = tmp_path / "state.db"
+        monkeypatch.setattr(SessionDB, "_trigram_fts_enabled", staticmethod(lambda: True))
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="the quick brown fox")
+            assert db._fts_table_exists("messages_fts_trigram") is True
+
+            real_conn = db._conn
+
+            class _BlockDropCursor:
+                """Delegates to the real connection but raises on the trigram
+                DROP TABLE, simulating a lock held by another writer."""
+
+                def execute(self, sql, *args, **kwargs):
+                    if "DROP TABLE" in sql and "messages_fts_trigram" in sql:
+                        raise sqlite3.OperationalError("database is locked")
+                    return real_conn.execute(sql, *args, **kwargs)
+
+            dropped = db._drop_trigram_fts(_BlockDropCursor())
+            # The DROP was thwarted → not a real drop.
+            assert dropped is False
+            # And the table really is still present.
+            assert db._fts_table_exists("messages_fts_trigram") is True
+        finally:
+            db.close()
+
     def test_trigram_disabled_still_repairs_missing_base_triggers(
         self, tmp_path, monkeypatch
     ):

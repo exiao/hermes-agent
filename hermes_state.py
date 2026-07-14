@@ -1097,13 +1097,20 @@ class SessionDB:
 
     @staticmethod
     def _drop_trigram_fts(cursor: sqlite3.Cursor) -> bool:
-        """Drop the trigram FTS5 index and its triggers.  Returns True if the
-        virtual table existed and was removed (so the caller knows a VACUUM
-        would reclaim space).  Used when ``sessions.trigram_fts`` is disabled:
-        the trigram index is the single largest object in state.db and fires
-        on every message INSERT, so a heavy user opts out to shrink the DB and
-        speed up writes.  Substring/CJK search falls back to a LIKE scan; the
-        base ``messages_fts`` word index is untouched."""
+        """Drop the trigram FTS5 index and its triggers.  Returns True only if
+        the virtual table existed and was actually removed (so the caller knows
+        a VACUUM would reclaim space).  Used when ``sessions.trigram_fts`` is
+        disabled: the trigram index is the single largest object in state.db and
+        fires on every message INSERT, so a heavy user opts out to shrink the DB
+        and speed up writes.  Substring/CJK search falls back to a LIKE scan; the
+        base ``messages_fts`` word index is untouched.
+
+        A concurrent writer can hold the DB lock during startup (gateway + cron),
+        so ``DROP`` may raise ``database is locked``.  We do NOT treat that as a
+        successful drop: the table/triggers stay in place and writes keep paying
+        the trigram cost until the next uncontended startup, so returning False
+        keeps the caller from logging a misleading "dropped, run VACUUM" hint.
+        """
         for trigger in _TRIGRAM_FTS_TRIGGERS:
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
@@ -1118,11 +1125,22 @@ class SessionDB:
             existed = row is not None
             cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
         except sqlite3.OperationalError:
-            # FTS5 module missing entirely, or the shadow tables are in a
-            # state we can't drop cleanly — leave it be; nothing queries it
-            # when the flag is off.
+            # FTS5 module missing, shadow tables in an undroppable state, or the
+            # DB is locked by another process. Re-check whether the table is
+            # actually gone before claiming success — a swallowed lock error
+            # must NOT report a drop that didn't happen.
             pass
-        return existed
+        if not existed:
+            return False
+        try:
+            still_there = cursor.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'messages_fts_trigram'"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Can't even confirm state (locked) — assume not dropped.
+            return False
+        return still_there is None
 
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
