@@ -1,15 +1,20 @@
-"""Regression test for #35994: Telegram /new confirm-button deadlock.
+"""Regression test for #35994 and its follow-up: /new must not block on
+old-agent cleanup.
 
 The /new confirmation button callback runs the slash-confirm handler on the
 asyncio event loop (see GatewayRunner._request_slash_confirm). That handler
-calls _handle_reset_command, which used to invoke the SYNCHRONOUS, potentially
-long-blocking _cleanup_agent_resources (agent.close() tears down terminal
-sandboxes / browser daemons / background processes; shutdown_memory_provider()
-may make a network call) inline on the loop. A slow teardown wedged the entire
-event loop, so the bot went silent until a manual restart.
+calls _handle_reset_command, which tears down the OLD agent
+(_cleanup_agent_resources: agent.close() tears down terminal sandboxes /
+browser daemons / background processes; shutdown_memory_provider() fires the
+memory-session-end plugin, which makes a network LLM call to extract
+end-of-session memory).
 
-The fix offloads _cleanup_agent_resources to a worker thread with a bounded
-timeout, so the loop is never blocked and a stuck teardown degrades gracefully.
+#35994 first moved that teardown off the event loop (worker thread + bounded
+wait) so a stuck close() couldn't wedge the loop. The follow-up goes further:
+the reset no longer AWAITS the teardown at all. The old agent is already
+invalidated and evicted, so cleanup is scheduled as a tracked background task
+and /new returns as soon as the session is rotated — a slow memory-extraction
+call can no longer delay the fresh session by up to the 30s cleanup cap.
 """
 import asyncio
 import logging
@@ -89,6 +94,16 @@ def _make_runner_with_cached_agent(close_fn):
     return runner
 
 
+async def _drain_background_tasks(runner, timeout=5.0):
+    """Await any cleanup tasks the handler scheduled so no worker thread or
+    coroutine dangles past the test."""
+    tasks = [t for t in getattr(runner, "_background_tasks", set())]
+    if tasks:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=timeout
+        )
+
+
 @pytest.mark.asyncio
 async def test_reset_does_not_block_event_loop_during_cleanup():
     """#35994: a slow agent.close() must NOT block the event loop. A
@@ -134,6 +149,7 @@ async def test_reset_does_not_block_event_loop_during_cleanup():
 
     release.set()
     await reset_task
+    await _drain_background_tasks(runner)
     stop.set()
     await hb
 
@@ -145,56 +161,71 @@ async def test_reset_does_not_block_event_loop_during_cleanup():
 
 
 @pytest.mark.asyncio
-async def test_reset_completes_when_cleanup_raises(caplog):
-    """#35994: if the offloaded cleanup itself raises, the handler swallows it
-    (logs a warning) and still rotates the session — it must not abort /new.
+async def test_reset_returns_before_slow_cleanup_finishes():
+    """Follow-up: /new must not WAIT for the old-agent teardown. The reset
+    result must be produced while a slow close() is still blocking in its
+    worker thread — i.e. cleanup is fire-and-forget, not awaited inline."""
+    close_started = threading.Event()
+    release = threading.Event()
 
-    Note: _cleanup_agent_resources swallows its own internal errors, so to
-    exercise the handler's `except Exception` branch we make the cleanup call
-    itself raise (patched on the instance), then assert the warning fired —
-    proving the branch executed rather than the success path.
-    """
-    runner = _make_runner_with_cached_agent(lambda: None)
+    def slow_close():
+        close_started.set()
+        release.wait(timeout=5)
 
-    def boom_cleanup(_agent):
-        raise RuntimeError("cleanup blew up")
+    runner = _make_runner_with_cached_agent(slow_close)
 
-    runner._cleanup_agent_resources = boom_cleanup
+    reset_task = asyncio.create_task(
+        runner._handle_reset_command(_make_event("/new"))
+    )
 
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        result = await asyncio.wait_for(
-            runner._handle_reset_command(_make_event("/new")), timeout=3
-        )
-
-    assert any(
-        "failed during /new reset" in r.message and "#35994" in r.message
-        for r in caplog.records
-    ), "expected the cleanup-failure warning to be logged (except branch not hit)"
-    runner.session_store.reset_session.assert_called_once()
+    # The handler should complete (session rotated, notice returned) even
+    # though close() is still blocking — it was scheduled, not awaited.
+    result = await asyncio.wait_for(reset_task, timeout=2)
     assert result is not None
+    assert close_started.is_set(), "cleanup was never scheduled"
+    assert not release.is_set(), "test bug: close() released too early"
+    # A tracked background cleanup task exists and is still running.
+    assert any(
+        not t.done() for t in runner._background_tasks
+    ), "expected a pending background cleanup task"
+    runner.session_store.reset_session.assert_called_once()
+
+    release.set()
+    await _drain_background_tasks(runner)
 
 
 @pytest.mark.asyncio
-async def test_reset_completes_when_cleanup_times_out(caplog):
-    """#35994: if cleanup exceeds the bounded timeout, the reset still completes
-    (graceful degradation) and the timeout warning fires."""
-    import gateway.slash_commands as _sc
+async def test_reset_completes_when_cleanup_raises():
+    """A teardown that raises must not abort /new. Because cleanup now runs in
+    a background task, an exception there can never reach the reset path — the
+    session still rotates and a notice is returned."""
+    def boom_close():
+        raise RuntimeError("close blew up")
 
-    # Force the wait_for to time out immediately, closing the offloaded awaitable
-    # so no worker thread dangles past the test.
-    async def _instant_timeout(aw, timeout=None):
-        if asyncio.iscoroutine(aw):
-            aw.close()
-        raise asyncio.TimeoutError
+    runner = _make_runner_with_cached_agent(boom_close)
 
+    result = await asyncio.wait_for(
+        runner._handle_reset_command(_make_event("/new")), timeout=3
+    )
+    assert result is not None
+    runner.session_store.reset_session.assert_called_once()
+    # The old agent is evicted regardless of cleanup outcome.
+    assert not runner._agent_cache
+    await _drain_background_tasks(runner)
+
+
+@pytest.mark.asyncio
+async def test_reset_schedules_background_cleanup():
+    """The handler must schedule the off-loop cleanup as a tracked background
+    task (so shutdown can cancel it) rather than awaiting it inline."""
     runner = _make_runner_with_cached_agent(lambda: None)
 
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        with patch.object(_sc.asyncio, "wait_for", _instant_timeout):
-            result = await runner._handle_reset_command(_make_event("/new"))
+    with patch.object(
+        runner, "_cleanup_agent_resources_off_loop", AsyncMock()
+    ) as _off_loop:
+        result = await runner._handle_reset_command(_make_event("/new"))
+        await _drain_background_tasks(runner)
 
-    assert any(
-        "exceeded" in r.message and "#35994" in r.message for r in caplog.records
-    ), "expected the timeout warning to be logged"
-    runner.session_store.reset_session.assert_called_once()
     assert result is not None
+    _off_loop.assert_awaited_once()
+    runner.session_store.reset_session.assert_called_once()
