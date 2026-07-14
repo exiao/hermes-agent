@@ -575,6 +575,13 @@ def _resolve_copilot_raw_token_from_active_scope(
     reads the process/default profile identity after listing already decided the
     requesting profile has scoped Copilot credentials. A present scope is
     therefore authoritative, matching the generic API-key provider path below.
+
+    The one exception is the DEFAULT profile: under multiplexing every served
+    profile (including the default) gets a scope installed, but the process
+    ``gh`` credential IS the default profile's own identity. So a scoped miss
+    for the default profile must still fall through to ``gh auth token`` (return
+    None), while a scoped miss for a NAMED profile stays authoritative (return
+    ('', '')) so it can never borrow the process/gh token.
     """
     from agent.secret_scope import current_secret_scope, get_secret as _get_secret
     from hermes_cli.copilot_auth import validate_copilot_token
@@ -591,7 +598,18 @@ def _resolve_copilot_raw_token_from_active_scope(
             logger.warning("Token from %s is not supported: %s", env_var, msg)
             continue
         return val, env_var
-    return "", ""
+
+    # Scoped miss. Preserve the gh fallback for the default profile (its scope
+    # wraps its own process identity); a named profile's miss is authoritative.
+    try:
+        from hermes_constants import get_hermes_home
+
+        is_named_profile = get_hermes_home().parent.name == "profiles"
+    except Exception:
+        is_named_profile = False
+    if is_named_profile:
+        return "", ""
+    return None
 
 
 def _resolve_copilot_raw_token(pconfig: ProviderConfig) -> tuple[str, str]:

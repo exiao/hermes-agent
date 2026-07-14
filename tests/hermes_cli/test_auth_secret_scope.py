@@ -67,3 +67,58 @@ def test_copilot_raw_token_falls_back_to_gh_without_scope(monkeypatch):
 
     assert raw == "gho_GH_FALLBACK"
     assert source == "gh_cli"
+
+
+def test_copilot_default_profile_scope_miss_keeps_gh_fallback(monkeypatch, tmp_path):
+    """A scoped miss for the DEFAULT profile must still fall back to gh — the
+    process gh credential is the default profile's own identity."""
+    from hermes_cli.auth import _resolve_copilot_raw_token, PROVIDER_REGISTRY
+
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("gho_DEFAULT_PROFILE_GH", "gh_cli"),
+    )
+    # Default-profile home: NOT under a "profiles/" segment.
+    default_home = tmp_path / ".hermes"
+    default_home.mkdir()
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: default_home)
+    pconfig = PROVIDER_REGISTRY["copilot"]
+
+    ss.set_multiplex_active(True)
+    # Scope active but NO Copilot key present (a miss).
+    token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-other"})
+    try:
+        raw, source = _resolve_copilot_raw_token(pconfig)
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+    assert raw == "gho_DEFAULT_PROFILE_GH"
+    assert source == "gh_cli"
+
+
+def test_copilot_named_profile_scope_miss_is_authoritative(monkeypatch, tmp_path):
+    """A scoped miss for a NAMED profile must be authoritative — it must never
+    borrow the process/gh token (which is another profile's identity)."""
+    from hermes_cli.auth import _resolve_copilot_raw_token, PROVIDER_REGISTRY
+
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("gho_OTHER_PROFILE_GH", "gh_cli"),
+    )
+    # Named-profile home: <root>/profiles/<name>.
+    named_home = tmp_path / ".hermes" / "profiles" / "coder"
+    named_home.mkdir(parents=True)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: named_home)
+    pconfig = PROVIDER_REGISTRY["copilot"]
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-other"})
+    try:
+        raw, source = _resolve_copilot_raw_token(pconfig)
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+    assert raw == ""
+    assert source == ""
