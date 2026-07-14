@@ -4027,21 +4027,30 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
         tuple(parent_ids),
     ).fetchall():
         pid = r["task_id"]
+        # Determine the terminal state this event puts the parent into.
+        #   * 'completed'/'archived' events → terminal.
+        #   * 'status' events → terminal iff the payload status is done/archived
+        #     (``set_status_direct(parent, 'done')`` is a real completion path
+        #     that also calls recompute_ready), otherwise a reopen → non-terminal.
         if r["kind"] in ("completed", "archived"):
+            is_terminal = True
+        else:
+            try:
+                status = json.loads(r["payload"]).get("status") if r["payload"] else None
+            except (ValueError, TypeError):
+                status = None
+            if status is None:
+                continue  # a status event with no status payload — ignore.
+            is_terminal = status in _TERMINAL_STATUSES
+        if is_terminal:
             became_terminal = not terminal_now.get(pid, False)
             terminal_now[pid] = True
+            # A non-terminal→terminal transition strictly after the wait is a
+            # genuine newly-satisfied dependency.
             if became_terminal and r["id"] > dep_evt_id:
                 newly_resolved = True
                 break
-            continue
-        # A 'status' event: a move to a non-terminal status is a reopen.
-        try:
-            status = json.loads(r["payload"]).get("status") if r["payload"] else None
-        except (ValueError, TypeError):
-            status = None
-        if status in _TERMINAL_STATUSES:
-            terminal_now[pid] = True
-        elif status is not None:
+        else:
             terminal_now[pid] = False
     if newly_resolved:
         return False

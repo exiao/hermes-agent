@@ -613,6 +613,33 @@ def test_dependency_partial_unlink_leaving_inflight_parent_still_parks(
         )
 
 
+def test_dependency_parent_marked_done_via_status_after_wait_promotes(
+    kanban_home: Path,
+) -> None:
+    """A parent driven terminal via set_status_direct(parent, 'done') AFTER the
+    wait must release the park.
+
+    set_status_direct accepts 'done' and calls recompute_ready, so this manual
+    dashboard drag-to-done is a genuine completion path — the child must promote
+    rather than stay stranded in todo.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        # Child waits while the parent is still in flight (todo/ready).
+        kb.block_task(conn, child, reason="wait on parent", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+        # Parent is dragged straight to 'done' on the board after the wait.
+        assert kb.set_status_direct(conn, parent, "done")
+        assert kb.get_task(conn, child).status == "ready", (
+            "a parent marked done via set_status_direct after the wait is a "
+            "genuine new resolution and must release the park"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Worker self-block with a rotated run-claim (t_e85f0abe Part B)
 # ---------------------------------------------------------------------------
