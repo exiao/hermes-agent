@@ -392,6 +392,96 @@ def test_dependency_idempotent_link_does_not_release_existing_done_parent(
         )
 
 
+def test_dependency_archive_of_already_done_parent_does_not_promote(
+    kanban_home: Path,
+) -> None:
+    """Routine cleanup must not reintroduce the respawn loop.
+
+    A child dependency-waits while its only parent is already ``done``. The
+    parent was terminal at block time, so the child must park. Later archiving
+    that already-satisfied parent emits a post-wait ``archived`` event, but no
+    dependency became *newly* satisfied — the child must STAY parked, not get
+    promoted by ``archive_task``'s ``recompute_ready``.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        # Parent finishes BEFORE the wait → terminal at block time.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="done")
+        kb.block_task(conn, child, reason="waiting on something else", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+        # Routine cleanup archives the already-done parent.
+        assert kb.archive_task(conn, parent)
+
+        assert kb.get_task(conn, child).status == "todo", (
+            "archiving an already-terminal parent is not a NEW resolution and "
+            "must not promote a parked dependency wait"
+        )
+
+
+def test_dependency_parent_completing_after_wait_still_promotes(
+    kanban_home: Path,
+) -> None:
+    """The healthy path stays intact: a parent that reaches a terminal state
+    AFTER the wait (a genuine new resolution) must release the park."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        # Child waits while the parent is still in flight.
+        kb.block_task(conn, child, reason="wait on parent", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+        # Parent finishes AFTER the wait → genuine new resolution.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="done")
+        kb.recompute_ready(conn)
+
+        assert kb.get_task(conn, child).status == "ready", (
+            "a parent reaching terminal state after the wait must release the park"
+        )
+
+
+def test_dependency_purge_archived_parent_releases_last_parent_park(
+    kanban_home: Path,
+) -> None:
+    """Purging an archived parent must behave like unlinking the last edge.
+
+    ``delete_archived_task`` (the ``kanban archive --rm`` purge path) removes
+    ``task_links`` internally; if it does not emit the same post-wait
+    ``unlinked`` child event as ``delete_task``/``kanban unlink``, the child
+    looks like a never-linked dependency wait and stays parked in ``todo``
+    forever.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="wait on parent", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+        # Archive then purge the parent (kanban archive --rm).
+        assert kb.archive_task(conn, parent)
+        assert kb.delete_archived_task(conn, parent)
+
+        assert kb.get_task(conn, child).status == "ready", (
+            "purging the last (archived) parent after the wait must release the park"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Worker self-block with a rotated run-claim (t_e85f0abe Part B)
 # ---------------------------------------------------------------------------

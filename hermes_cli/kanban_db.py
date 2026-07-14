@@ -3998,15 +3998,32 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
         return not unlinked_after
     # Has any parent reached a terminal state AFTER the dependency_wait? That
     # is the primary signal that a real dependency resolved since the block.
-    # One IN() query instead of a per-parent loop (fewer round-trips).
+    # A parent counts as *newly* resolved only if it was NOT already terminal
+    # at block time: routine cleanup that archives an already-``done`` parent
+    # emits a post-wait ``archived`` event even though nothing new resolved, and
+    # promoting on that would reintroduce the dependency_wait→promoted respawn
+    # loop this guard exists to stop. So we require a post-wait terminal event
+    # on a parent that had NO terminal event at/before the wait.
     placeholders = ",".join("?" * len(parent_ids))
-    resolved_after = conn.execute(
-        f"SELECT 1 FROM task_events "
-        f"WHERE task_id IN ({placeholders}) AND id > ? "
-        f"AND kind IN ('completed', 'archived') LIMIT 1",
-        (*parent_ids, dep_evt_id),
-    ).fetchone()
-    if resolved_after:
+    already_terminal = {
+        r["task_id"]
+        for r in conn.execute(
+            f"SELECT DISTINCT task_id FROM task_events "
+            f"WHERE task_id IN ({placeholders}) AND id <= ? "
+            f"AND kind IN ('completed', 'archived')",
+            (*parent_ids, dep_evt_id),
+        ).fetchall()
+    }
+    newly_resolved = any(
+        r["task_id"] not in already_terminal
+        for r in conn.execute(
+            f"SELECT DISTINCT task_id FROM task_events "
+            f"WHERE task_id IN ({placeholders}) AND id > ? "
+            f"AND kind IN ('completed', 'archived')",
+            (*parent_ids, dep_evt_id),
+        ).fetchall()
+    )
+    if newly_resolved:
         return False
     # Graph-repair recovery: if a parent LINK was added AFTER the wait and that
     # parent is ALREADY terminal, no post-wait 'completed'/'archived' event will
@@ -6171,6 +6188,20 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        # Emit an ``unlinked`` event for each child edge BEFORE dropping the
+        # links (same as ``delete_task``): a dependency-waiting child whose only
+        # parent is this purged task must see the post-wait ``unlinked`` so
+        # ``_dependency_wait_should_park`` releases it instead of stranding it in
+        # ``todo`` forever.
+        removed_child_links = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?",
+            (task_id,),
+        ).fetchall()
+        for r in removed_child_links:
+            _append_event(
+                conn, r["child_id"], "unlinked",
+                {"parent": task_id, "child": r["child_id"], "via": "delete_archived_task"},
+            )
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -6180,7 +6211,11 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+        deleted = cur.rowcount == 1
+    if deleted:
+        # Promote any child freed by the removed edge (mirrors delete_task).
+        recompute_ready(conn)
+    return deleted
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
