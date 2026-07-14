@@ -535,3 +535,36 @@ def test_apply_no_valid_refs_is_noop(monkeypatch):
     assert result.ok
     assert result.applied == []
     assert result.warnings  # the bad mapping warned
+
+
+def test_source_fetch_process_auth_cache_ignores_unrelated_env(monkeypatch, tmp_path):
+    """OnePasswordSource.fetch in process-auth mode (environ=None) must not fold
+    the whole environment into the disk-cache fingerprint: an unrelated env
+    change (PWD, etc.) must still hit the cache, not force a re-run of op."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setattr(op, "find_op", lambda binary_path="": fake_op)
+
+    runs = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        runs["n"] += 1
+        return _ok("sk-value")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+
+    cfg = {"enabled": True, "env": {"OPENAI_API_KEY": "op://Private/OpenAI/key"}}
+    source = op.OnePasswordSource()
+
+    monkeypatch.setenv("PWD", "/somewhere")
+    r1 = source.fetch(cfg, tmp_path, environ=None)
+    assert r1.secrets == {"OPENAI_API_KEY": "sk-value"}
+    assert runs["n"] == 1
+
+    # Unrelated env change; must NOT bust the cache key.
+    monkeypatch.setenv("PWD", "/somewhere-else")
+    monkeypatch.setenv("SOME_UNRELATED_VAR", "changed")
+    r2 = source.fetch(cfg, tmp_path, environ=None)
+    assert r2.secrets == {"OPENAI_API_KEY": "sk-value"}
+    assert runs["n"] == 1  # cache hit, op not re-invoked
+

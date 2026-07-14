@@ -672,17 +672,30 @@ class OnePasswordSource(SecretSource):
             ttl = 300.0
 
         try:
+            token_env_name = str(
+                cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV
+            )
+            # For an isolated scoped environment, pass only the OP auth vars the
+            # child actually uses so the disk-cache fingerprint keys off those,
+            # not the whole environment. In process-auth mode (environ is None)
+            # pass no auth_env at all: _auth_fingerprint already folds in the
+            # relevant os.environ OP vars, and hashing the full environment
+            # would bust the cross-process cache on unrelated changes (PWD, …).
+            scoped_auth_env: Optional[Dict[str, str]] = None
+            if environ is not None:
+                scoped_auth_env = {
+                    key: value
+                    for key, value in env.items()
+                    if key in {"OP_ACCOUNT", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN"}
+                    or key.startswith("OP_SESSION_")
+                }
             secrets, fetch_warnings = fetch_onepassword_secrets(
                 references=valid,
                 account=str(cfg.get("account") or ""),
-                token_env=str(
-                    cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV
-                ),
-                token_value=env.get(
-                    str(cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV), ""
-                ),
+                token_env=token_env_name,
+                token_value=env.get(token_env_name, ""),
                 include_process_auth=environ is None,
-                auth_env=env,
+                auth_env=scoped_auth_env,
                 binary=binary,
                 cache_ttl_seconds=ttl,
                 home_path=home_path,
