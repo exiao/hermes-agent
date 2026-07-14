@@ -709,3 +709,66 @@ class TestApplyAllForwardsRawEnviron:
         scoped = {"ANTHROPIC_API_KEY": "sk-scoped"}
         reg.apply_all({"recorder": {"enabled": True}}, tmp_path, environ=scoped)
         assert seen["environ"] is scoped
+
+
+class TestFetchInheritsProfileContext:
+    """A source's fetch() runs in a ThreadPoolExecutor worker; the profile
+    contextvars (HERMES_HOME override + secret scope) installed by
+    _profile_runtime_scope must propagate into that worker via copy_context().
+
+    Regression for the #100 P2: without copy_context, a source that consults
+    get_hermes_home() internally (e.g. Bitwarden's find_bws -> managed
+    <hermes_home>/bin/bws lookup) resolves the DEFAULT profile's path in the
+    worker thread, so a named profile could miss its own binary / use the
+    default profile's copy.
+    """
+
+    def _home_recording_source(self):
+        seen = {}
+
+        class _Src(SecretSource):
+            name = "homerec"
+            shape = "bulk"
+
+            def fetch(self, cfg, home_path, *, environ=None):
+                # Read the HERMES_HOME contextvar override from INSIDE the
+                # worker thread — exactly what find_bws() does via
+                # _hermes_bin_dir() -> get_hermes_home().
+                from hermes_constants import get_hermes_home
+
+                seen["home"] = str(get_hermes_home())
+                return FetchResult()
+
+            def override_existing(self, cfg):
+                return False
+
+            def protected_env_vars(self, cfg):
+                return frozenset()
+
+        return _Src(), seen
+
+    def test_fetch_worker_sees_hermes_home_override(self, tmp_path, monkeypatch):
+        from hermes_constants import (
+            set_hermes_home_override,
+            reset_hermes_home_override,
+        )
+
+        src, seen = self._home_recording_source()
+        monkeypatch.setattr(reg, "_ordered_enabled_sources", lambda cfg: [src])
+
+        profile_home = tmp_path / ".hermes" / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+
+        # Install the override contextvar in THIS thread, exactly like
+        # _profile_runtime_scope does, then run apply_all (which fetches on a
+        # worker thread). The worker must see the override, not the default.
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            reg.apply_all({"homerec": {"enabled": True}}, profile_home)
+        finally:
+            reset_hermes_home_override(token)
+
+        assert seen["home"] == str(profile_home), (
+            "fetch worker thread must inherit the HERMES_HOME override "
+            "contextvar via copy_context, not fall back to the default profile"
+        )

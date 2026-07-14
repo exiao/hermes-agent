@@ -28,6 +28,7 @@ third-party backends ship as standalone plugin repos implementing
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import inspect
 import logging
 from dataclasses import dataclass, field
@@ -211,13 +212,23 @@ def _fetch_with_timeout(
     an unbounded hang on every ``hermes`` invocation.
     """
     timeout = source.fetch_timeout_seconds(cfg)
+    # Copy the caller's context so the worker thread inherits the profile
+    # contextvars (HERMES_HOME override + active secret scope) installed by
+    # ``_profile_runtime_scope``. Without this, a source whose fetch() consults
+    # ``get_hermes_home()`` internally (e.g. Bitwarden's ``find_bws`` → managed
+    # ``<hermes_home>/bin/bws`` lookup) resolves the DEFAULT profile's path in
+    # the plain ThreadPoolExecutor worker, since ContextVars do not propagate to
+    # pool threads. Mirrors the copy_context() pattern in account_usage.py.
+    ctx = contextvars.copy_context()
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
     try:
         fetch_params = inspect.signature(source.fetch).parameters
         if "environ" in fetch_params:
-            future = executor.submit(source.fetch, cfg, home_path, environ=environ)
+            future = executor.submit(
+                ctx.run, source.fetch, cfg, home_path, environ=environ
+            )
         elif scoped:
             # Fail closed: a profile-scoped mapping is being applied (a named
             # profile under gateway.multiplex_profiles) but this source's
@@ -238,7 +249,7 @@ def _fetch_with_timeout(
             res.error_kind = ErrorKind.NOT_CONFIGURED
             return res
         else:
-            future = executor.submit(source.fetch, cfg, home_path)
+            future = executor.submit(ctx.run, source.fetch, cfg, home_path)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
