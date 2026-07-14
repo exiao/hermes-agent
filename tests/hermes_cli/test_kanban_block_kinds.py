@@ -336,6 +336,62 @@ def test_dependency_unlink_all_parents_recovers(kanban_home: Path) -> None:
         )
 
 
+def test_dependency_delete_parent_releases_last_parent_park(
+    kanban_home: Path,
+) -> None:
+    """Hard-deleting the parent must behave like unlinking the last edge.
+
+    delete_task removes task_links internally; if it does not emit the same
+    post-wait 'unlinked' child event as kanban unlink, the child looks like a
+    never-linked dependency wait and remains parked in todo forever.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="wait on wrong parent", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+        assert kb.delete_task(conn, parent)
+
+        assert kb.get_task(conn, child).status == "ready", (
+            "deleting the last parent after the wait must release the park"
+        )
+
+
+def test_dependency_idempotent_link_does_not_release_existing_done_parent(
+    kanban_home: Path,
+) -> None:
+    """A no-op re-link must not masquerade as a post-wait graph repair.
+
+    If an already-done parent was linked before the dependency wait, the child
+    must park. Re-running the same kanban link is idempotent, so it should not
+    emit a fresh post-wait 'linked' event that releases the park.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        kb.claim_task(conn, parent, claimer="worker")
+        kb.complete_task(conn, parent, result="done")
+        kb.block_task(conn, child, reason="waiting on something else", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.recompute_ready(conn)
+
+        assert kb.get_task(conn, child).status == "todo", (
+            "idempotent re-link of an existing done parent must not release "
+            "a dependency wait"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Worker self-block with a rotated run-claim (t_e85f0abe Part B)
 # ---------------------------------------------------------------------------
