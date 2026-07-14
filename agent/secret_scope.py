@@ -216,11 +216,39 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     registry_resolved: set = set()
     try:
         from hermes_cli.env_loader import _load_secrets_config
-        from agent.secret_sources.registry import apply_all
+        from agent.secret_sources.registry import apply_all, list_sources
 
         sources_cfg = _load_secrets_config(home)
         source_values = dict(secrets)
-        report = apply_all(sources_cfg, home, environ=source_values)
+        # Default-profile bootstrap preservation. A source reaches its vault
+        # with a bootstrap credential (e.g. Bitwarden's ``BWS_ACCESS_TOKEN``,
+        # exposed via ``protected_env_vars``) that a documented setup supplies
+        # from the shell / systemd environment rather than ``.env``. Because
+        # ``apply_all`` runs with an isolated ``environ`` (the parsed ``.env``
+        # only), such a token would be invisible and the source would report
+        # NOT_CONFIGURED, dropping its secrets from the default scope. For the
+        # default profile only — the same scope that keeps 1Password's
+        # ``include_process_auth`` shell fallback — overlay those bootstrap
+        # vars from ``os.environ`` when ``.env`` did not already define them.
+        # Named profiles (``<home>/profiles/<name>``) are deliberately NOT
+        # seeded, so they can never borrow the gateway process's vault auth.
+        if home.parent.name != "profiles":
+            for src in list_sources():
+                src_cfg = sources_cfg.get(src.name)
+                src_cfg = src_cfg if isinstance(src_cfg, dict) else {}
+                if not src.is_enabled(src_cfg):
+                    continue
+                try:
+                    bootstrap_vars = src.protected_env_vars(src_cfg)
+                except Exception:  # noqa: BLE001
+                    bootstrap_vars = frozenset()
+                for var in bootstrap_vars:
+                    if var in source_values:
+                        continue
+                    shell_val = os.environ.get(var)
+                    if shell_val is not None and shell_val != "":
+                        source_values[var] = shell_val
+        report = apply_all(sources_cfg, home, environ=source_values, scoped=True)
         # Names the secret-source registry actually applied into the scope, per
         # its own provenance (authoritative even when the resolved value happens
         # to equal a plaintext already in .env). These must not be dropped by

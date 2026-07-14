@@ -194,7 +194,7 @@ class TestEnvFileParsing:
         # when the resolved value matches a plaintext already in .env.
         from agent.secret_sources.registry import ApplyReport, AppliedVar
 
-        def _fake_apply_all(sources_cfg, home, environ=None):
+        def _fake_apply_all(sources_cfg, home, environ=None, scoped=False):
             if environ is not None:
                 environ["OPENAI_API_KEY"] = "sk-resolved"
             report = ApplyReport()
@@ -239,7 +239,7 @@ class TestEnvFileParsing:
 
         from agent.secret_sources.registry import ApplyReport, AppliedVar
 
-        def _fake_apply_all(sources_cfg, home, environ=None):
+        def _fake_apply_all(sources_cfg, home, environ=None, scoped=False):
             # Resolves to the SAME value already in .env — value inequality
             # would miss this, but provenance records the applied var.
             if environ is not None:
@@ -293,3 +293,74 @@ class TestEnvFileParsing:
         assert ss.build_profile_secret_scope(tmp_path)["OPENAI_API_KEY"] == (
             "sk-configured"
         )
+
+    def test_default_scope_keeps_shell_bitwarden_bootstrap(
+        self, tmp_path, monkeypatch
+    ):
+        """Default profile: a shell/systemd-supplied BWS_ACCESS_TOKEN (absent
+        from .env) must still reach BitwardenSource so its secrets resolve into
+        the scope — mirroring the 1Password process-auth preservation."""
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            "secrets:\n"
+            "  bitwarden:\n"
+            "    enabled: true\n"
+            "    project_id: proj-123\n"
+            "    auto_install: false\n",
+            encoding="utf-8",
+        )
+        # Token comes from the shell env, NOT from .env.
+        monkeypatch.setenv("BWS_ACCESS_TOKEN", "bws-shell-default")
+
+        import agent.secret_sources.bitwarden as bw
+
+        monkeypatch.setattr(bw, "find_bws", lambda **kw: tmp_path / "bws")
+
+        seen = {}
+
+        def _fake_fetch(*, access_token, **kwargs):
+            seen["access_token"] = access_token
+            return {"STRIPE_KEY": "sk-from-vault"}, []
+
+        monkeypatch.setattr(bw, "fetch_bitwarden_secrets", _fake_fetch)
+
+        scope = ss.build_profile_secret_scope(tmp_path)
+        assert seen["access_token"] == "bws-shell-default"
+        assert scope.get("STRIPE_KEY") == "sk-from-vault"
+
+    def test_named_profile_does_not_borrow_shell_bitwarden_bootstrap(
+        self, tmp_path, monkeypatch
+    ):
+        """A named profile must NOT seed its scope from the process/default
+        profile's shell BWS_ACCESS_TOKEN — that would let it borrow another
+        profile's Bitwarden vault under multiplexing."""
+        profile_home = tmp_path / "profiles" / "alpha"
+        profile_home.mkdir(parents=True)
+        (profile_home / ".env").write_text("", encoding="utf-8")
+        (profile_home / "config.yaml").write_text(
+            "secrets:\n"
+            "  bitwarden:\n"
+            "    enabled: true\n"
+            "    project_id: proj-123\n"
+            "    auto_install: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BWS_ACCESS_TOKEN", "bws-shell-default")
+
+        import agent.secret_sources.bitwarden as bw
+
+        monkeypatch.setattr(bw, "find_bws", lambda **kw: profile_home / "bws")
+
+        seen = {}
+
+        def _fake_fetch(*, access_token, **kwargs):
+            seen["access_token"] = access_token
+            return {"STRIPE_KEY": "sk-from-vault"}, []
+
+        monkeypatch.setattr(bw, "fetch_bitwarden_secrets", _fake_fetch)
+
+        scope = ss.build_profile_secret_scope(profile_home)
+        # The named profile supplied no token in its own .env, so the source
+        # never authenticated with the default profile's shell token.
+        assert "access_token" not in seen
+        assert "STRIPE_KEY" not in scope
