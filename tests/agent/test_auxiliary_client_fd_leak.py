@@ -307,3 +307,36 @@ class TestAuxClientFdReleaseLiveLoop:
 
         _release_cached_client_fds(client)  # no bound_loop arg -> defaults to reap
         assert sock.fileno() == -1
+
+    def test_async_wrapper_sync_real_client_not_closed_on_live_loop(self, local_http_server):
+        """Async wrappers (AsyncCodex/AsyncAnthropic) expose a SYNC _real_client.
+        When evicted with a still-alive bound loop it must NOT be closed, else an
+        in-flight to_thread call on that loop breaks; a dead loop closes it."""
+        from types import SimpleNamespace
+        from agent.auxiliary_client import _release_cached_client_fds
+
+        sync_real = httpx.Client()
+        sync_real.get(local_http_server)
+        assert not sync_real.is_closed
+        # Mirror the wrapper shape: no _client httpx on the wrapper itself, a sync
+        # _real_client underneath.
+        wrapper = SimpleNamespace(
+            chat=object(),
+            _real_client=SimpleNamespace(_client=sync_real, close=sync_real.close),
+        )
+
+        live_loop = asyncio.new_event_loop()
+        try:
+            # Live loop -> underlying sync client must stay OPEN.
+            _release_cached_client_fds(wrapper, live_loop)
+            assert not sync_real.is_closed, "live-loop wrapper sync client wrongly closed"
+
+            # Dead loop -> now it is safe to close.
+            live_loop.close()
+            _release_cached_client_fds(wrapper, live_loop)
+            assert sync_real.is_closed, "dead-loop wrapper sync client not closed"
+        finally:
+            if not live_loop.is_closed():
+                live_loop.close()
+            if not sync_real.is_closed:
+                sync_real.close()

@@ -5824,7 +5824,15 @@ def _release_cached_client_fds(client: Any, bound_loop: Any = None) -> None:
     state-marked-but-open socket accumulates until the host hits its fd ceiling
     and corrupts SQLite mmaps (kanban.db tears).
 
-    - Sync SDK client (or wrapper): its own ``.close()`` closes the httpx pool.
+    - Sync SDK client (or wrapper): its own ``.close()`` closes the httpx pool —
+      but only when the entry's bound loop is DEAD. An *async* wrapper
+      (``AsyncCodexAuxiliaryClient`` / ``AsyncAnthropicAuxiliaryClient``) exposes
+      its underlying SDK client via a **synchronous** ``_real_client``; if the
+      cached async entry is being evicted while its bound loop is still alive
+      (a different but running loop asked for the same key), closing that sync
+      ``_real_client`` would tear down a transport the live loop may still be
+      serving via ``asyncio.to_thread`` — the same in-flight-abort hazard as the
+      raw-socket teardown. So the sync close path is also gated on ``loop_dead``.
     - Async SDK client: keep the CLOSED state-mark (the ``__del__`` neuter relies
       on it). Only sync-close the pool's raw sockets when the client's owning
       event loop is DEAD (``bound_loop`` is None or closed). If the bound loop is
@@ -5851,6 +5859,10 @@ def _release_cached_client_fds(client: Any, bound_loop: Any = None) -> None:
                 _close_httpx_pool_sockets_sync(inner)
             continue
         # Sync client (or wrapper): close() releases the httpx pool synchronously.
+        # Skip when the bound loop is still alive — an async wrapper's sync
+        # _real_client may back an in-flight to_thread call on that live loop.
+        if not loop_dead:
+            continue
         try:
             close_fn = getattr(target, "close", None)
             if callable(close_fn) and not inspect.iscoroutinefunction(close_fn):
