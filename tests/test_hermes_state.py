@@ -1933,6 +1933,30 @@ class TestCJKSearchFallback:
         assert len(results) == 1
         assert results[0]["source"] == "telegram"
 
+    def test_cjk_like_fallback_preserves_not_operator(self, db):
+        """NOT in a CJK query must exclude the negated term in the LIKE
+        fallback (reached when sessions.trigram_fts routes long CJK here),
+        not silently OR every term together."""
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        db.append_message("s1", role="user", content="大别山项目进展顺利")
+        db.append_message("s2", role="user", content="大别山项目和桂林项目对比")
+        db._trigram_available = False
+        results = db.search_messages("大别山项目 NOT 桂林项目")
+        session_ids = {r["session_id"] for r in results}
+        assert session_ids == {"s1"}, "NOT term must exclude the 桂林项目 row"
+
+    def test_cjk_like_fallback_preserves_and_operator(self, db):
+        """AND in a CJK query must require both terms in the LIKE fallback."""
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        db.append_message("s1", role="user", content="大别山项目和桂林项目一起讨论")
+        db.append_message("s2", role="user", content="只有大别山项目被提到")
+        db._trigram_available = False
+        results = db.search_messages("大别山项目 AND 桂林项目")
+        session_ids = {r["session_id"] for r in results}
+        assert session_ids == {"s1"}, "AND must require both terms"
+
 
 # =========================================================================
 # Session search and listing

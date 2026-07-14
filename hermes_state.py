@@ -1701,8 +1701,17 @@ class SessionDB:
                             include_trigram=trigram_enabled,
                         )
                 else:
-                    self._drop_trigram_fts(cursor)
+                    dropped = self._drop_trigram_fts(cursor)
                     self._trigram_available = False
+                    if dropped:
+                        # The trigram index can be multiple GB. Dropping it
+                        # frees pages but SQLite won't shrink the file on disk
+                        # automatically — point the user at VACUUM.
+                        logger.info(
+                            "Dropped the trigram FTS index (sessions.trigram_fts "
+                            "disabled). Run VACUUM on state.db to reclaim the "
+                            "freed disk space."
+                        )
                     if triggers_need_repair:
                         # Base FTS only — trigram is intentionally absent.
                         self._rebuild_fts_indexes(cursor, include_trigram=False)
@@ -4826,28 +4835,61 @@ class SessionDB:
             if not _trigram_succeeded:
                 # Short / mixed CJK query, trigram unavailable, or trigram
                 # <3 CJK chars. Fall back to LIKE substring search.
-                # For multi-token OR queries (e.g. "广西 OR 桂林 OR 漓江"),
-                # build one LIKE condition per non-operator token so each term
-                # is matched independently (#20494).
-                non_op_tokens = [
-                    t for t in raw_query.split()
-                    if t.upper() not in {"AND", "OR", "NOT"}
-                ] or [raw_query]
-                token_clauses = []
+                # Preserve the query's boolean structure (#20494): walk the
+                # tokens left-to-right, honoring AND / OR / NOT operators so
+                # `A NOT B` excludes B and `A AND B` requires both — the flat
+                # OR-everything shape silently over-matched when this fallback
+                # became the only path for disabled-trigram installs.
                 like_params: list = []
-                for tok in non_op_tokens:
+
+                def _term_clause(tok: str) -> str:
                     esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    token_clauses.append(
-                        "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
+                    like_params.extend([f"%{esc}%", f"%{esc}%", f"%{esc}%"])
+                    # COALESCE to '' so a NULL column yields FALSE (not NULL)
+                    # under LIKE — critical for the `AND NOT (...)` branch,
+                    # where `NOT (FALSE OR NULL)` would otherwise be NULL and
+                    # silently drop every row (tool_name/tool_calls are NULL on
+                    # plain user/assistant messages).
+                    return (
+                        "(COALESCE(m.content, '') LIKE ? ESCAPE '\\' "
+                        "OR COALESCE(m.tool_name, '') LIKE ? ESCAPE '\\' "
+                        "OR COALESCE(m.tool_calls, '') LIKE ? ESCAPE '\\')"
                     )
-                    like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-                like_where = [f"({' OR '.join(token_clauses)})"]
+
+                tokens = raw_query.split()
+                non_op_tokens = [
+                    t for t in tokens if t.upper() not in {"AND", "OR", "NOT"}
+                ] or [raw_query]
+                # Build the boolean expression. Adjacent terms without an
+                # explicit operator default to AND (FTS5 semantics). NOT
+                # attaches to the following term as `AND NOT (...)`.
+                expr_parts: list = []
+                pending_op = None  # None | "AND" | "OR" | "NOT"
+                for tok in tokens:
+                    upper = tok.upper()
+                    if upper in {"AND", "OR", "NOT"}:
+                        pending_op = upper
+                        continue
+                    clause = _term_clause(tok)
+                    if not expr_parts:
+                        expr_parts.append(clause)
+                    elif pending_op == "OR":
+                        expr_parts.append(f"OR {clause}")
+                    elif pending_op == "NOT":
+                        expr_parts.append(f"AND NOT {clause}")
+                    else:  # explicit AND or implicit adjacency
+                        expr_parts.append(f"AND {clause}")
+                    pending_op = None
+                if not expr_parts:
+                    # No CJK/word tokens survived (pure operators or empty) —
+                    # match the raw query as a single substring.
+                    expr_parts.append(_term_clause(raw_query))
+                like_where = [f"({' '.join(expr_parts)})"]
                 if not include_inactive:
-                    # Match the base + trigram FTS paths: hide rewound rows
-                    # (active=0, compacted=0). Without this the LIKE fallback
-                    # leaks messages the user took back — reachable for more
-                    # installs now that sessions.trigram_fts can route 3+ char
-                    # CJK queries here by config, not just short-CJK ones.
+                    # Mirror the FTS/trigram paths: hide rewound/undo rows
+                    # (active=0, compacted=0) while keeping compaction-archived
+                    # rows discoverable. Without this the LIKE fallback leaked
+                    # deactivated messages for disabled-trigram installs.
                     like_where.append("(m.active = 1 OR m.compacted = 1)")
                 if source_filter is not None:
                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
