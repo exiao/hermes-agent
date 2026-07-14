@@ -944,6 +944,50 @@ class TestResolveAnthropicToken:
             ss.set_multiplex_active(False)
         assert calls == [True]
 
+    def test_default_multiplex_scope_prefers_manual_pool_to_scoped_api_key(
+        self, monkeypatch
+    ):
+        """The DEFAULT profile under multiplexing keeps source-#4 pool precedence.
+
+        Regression for the default-profile gap: when the multiplexed gateway
+        handles the default profile whose ``.env`` sets ``ANTHROPIC_API_KEY``,
+        ``scope_has_api_key`` is true while ``nondefault_scope`` is false. The
+        pool-consult gate must still run ``_resolve_anthropic_pool_token`` so a
+        manually-added OAuth entry retains its documented precedence over the
+        scoped API key — matching both the no-scope default path and the
+        non-default multiplex path. Before the fix the gate short-circuited and
+        returned the API key, silently dropping the manual OAuth credential.
+        """
+        from agent import secret_scope as ss
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+        calls = []
+
+        def _pool_token(*, profile_only=False):
+            calls.append(profile_only)
+            return "sk-ant-oat01-DEFAULT-MANUAL"
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_anthropic_pool_token", _pool_token
+        )
+        ss.set_multiplex_active(True)
+        scope_token = ss.set_secret_scope(
+            {"ANTHROPIC_API_KEY": "sk-ant-api03-DEFAULT"}
+        )
+        try:
+            assert resolve_anthropic_token() == "sk-ant-oat01-DEFAULT-MANUAL"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
+        # Default profile owns ~/.hermes, so its own pool is read directly
+        # (profile_only=True under the active scope), never the borrowed root.
+        assert calls == [True]
+
     def test_nondefault_scope_preserves_profile_local_hermes_pkce(
         self, monkeypatch, tmp_path
     ):

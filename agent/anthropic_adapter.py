@@ -1603,8 +1603,22 @@ def resolve_anthropic_token() -> Optional[str]:
     # 4. Hermes credential_pool OAuth entry. A scoped request must use only
     # its local pool, but valid manual OAuth entries retain their documented
     # precedence over a scoped ANTHROPIC_API_KEY.
+    #
+    # The pool is consulted whenever there is no scoped API key (the no-scope
+    # and OAuth-only paths) OR whenever a MULTIPLEX scope is active — including
+    # the DEFAULT profile's own scope. Under multiplexing the default profile
+    # owns ~/.hermes/auth.json, so a manually-added OAuth entry there keeps the
+    # same source-#4-before-#5 precedence it has on the no-scope default path;
+    # gating the pool out for a default multiplex scope that happens to carry an
+    # API key silently dropped that manual credential and returned the API key
+    # instead. A NON-multiplex single-profile cron scope is intentionally
+    # excluded: its scoped API key stays authoritative and must not pick up a
+    # borrowed global pool token. ``_resolve_anthropic_pool_token(profile_only
+    # =...)`` isolates each caller's pool (dropping borrowed/claude_code/
+    # auto-seeded entries), so it is always safe to consult here.
+    scope_under_multiplex = scope is not None and is_multiplex_active()
     resolved_pool_token = None
-    if not scope_has_api_key or nondefault_scope:
+    if not scope_has_api_key or scope_under_multiplex:
         resolved_pool_token = _resolve_anthropic_pool_token(
             profile_only=suppress_global_creds
         )
