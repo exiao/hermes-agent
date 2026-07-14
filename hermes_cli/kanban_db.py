@@ -3964,17 +3964,28 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
     #     re-run/re-activated. Without this, a stale dependency_wait from a
     #     prior run (there is no 'unblocked' after a completion) would keep the
     #     revived task parked forever.
+    #   * a terminal 'status' move — the task was marked done/archived via the
+    #     dashboard/direct path (``set_status_direct`` records a 'status' event,
+    #     not 'completed'/'archived'). A later reopen must not leave the old
+    #     dependency_wait treated as active. Mirrors the parent-side terminal
+    #     'status' handling in the lifecycle replay below.
     # We deliberately do NOT treat a later 'promoted'/'claimed' as superseding:
     # those are exactly the loop this guard exists to stop (a prior bad
     # auto-promotion must not disable the guard on the next tick).
-    superseded_after = conn.execute(
-        "SELECT 1 FROM task_events "
+    for r in conn.execute(
+        "SELECT kind, payload FROM task_events "
         "WHERE task_id = ? AND id > ? "
-        "AND kind IN ('unblocked', 'completed', 'archived') LIMIT 1",
+        "AND kind IN ('unblocked', 'completed', 'archived', 'status')",
         (task_id, dep_evt_id),
-    ).fetchone()
-    if superseded_after:
-        return False
+    ).fetchall():
+        if r["kind"] != "status":
+            return False
+        try:
+            status = json.loads(r["payload"]).get("status") if r["payload"] else None
+        except (ValueError, TypeError):
+            status = None
+        if status in {"done", "archived"}:
+            return False
     # Does the task have any parent link at all? No parents → nothing to wait
     # on → park (the named dependency isn't a task_link).
     parent_ids = [

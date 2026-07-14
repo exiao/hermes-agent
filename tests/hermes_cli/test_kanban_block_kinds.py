@@ -286,6 +286,30 @@ def test_dependency_rerun_after_completion_not_parked(kanban_home: Path) -> None
         )
 
 
+def test_dependency_rerun_after_status_done_not_parked(kanban_home: Path) -> None:
+    """A task marked done via the dashboard/direct path (a 'status' event, not
+    'completed') after a no-parent dependency_wait, then reopened, must not be
+    re-parked by that stale wait — mirroring the 'completed' supersession.
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="wait", kind="dependency")
+        assert kb.get_task(conn, tid).status == "todo"
+        # Operator drags the parked card straight to 'done' on the board.
+        assert kb.set_status_direct(conn, tid, "done")
+        assert kb.get_task(conn, tid).status == "done"
+        # Reopen it back into todo and run the gate — the terminal 'status'
+        # move must supersede the stale dependency_wait.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+        for _ in range(5):
+            kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "ready", (
+            "a task marked done via a terminal status move must not be re-parked "
+            "by its stale dependency_wait after being reopened"
+        )
+
+
 def test_dependency_link_done_parent_recovers(kanban_home: Path) -> None:
     """Graph repair: a parked wait with no parent recovers when an
     ALREADY-done parent is linked AFTER the block via `kanban link`. No new
