@@ -220,18 +220,15 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
 
         sources_cfg = _load_secrets_config(home)
         source_values = dict(secrets)
-        before = dict(source_values)
-        apply_all(sources_cfg, home, environ=source_values)
-        # Names the secret-source registry actually resolved into the scope
-        # (added or overrode with a concrete, non-op:// credential). These must
-        # not be dropped by the fail-closed pass below if the redundant manual
-        # op fetch transiently fails.
-        for name, value in source_values.items():
-            if before.get(name) == value:
-                continue
-            if isinstance(value, str) and value.strip().startswith("op://"):
-                continue
-            registry_resolved.add(name)
+        report = apply_all(sources_cfg, home, environ=source_values)
+        # Names the secret-source registry actually applied into the scope, per
+        # its own provenance (authoritative even when the resolved value happens
+        # to equal a plaintext already in .env). These must not be dropped by
+        # the fail-closed pass below if the redundant manual op fetch transiently
+        # fails, since the registry already supplied a valid credential.
+        provenance = getattr(report, "provenance", None)
+        if isinstance(provenance, dict):
+            registry_resolved.update(provenance.keys())
         secrets = source_values
     except Exception:
         pass

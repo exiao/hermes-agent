@@ -190,10 +190,21 @@ class TestEnvFileParsing:
 
         # apply_all (the secret-source registry) resolves the configured ref
         # into the isolated scope mapping — as the real 1Password source does
-        # when the op CLI is available.
+        # when the op CLI is available — and reports it in its provenance, even
+        # when the resolved value matches a plaintext already in .env.
+        from agent.secret_sources.registry import ApplyReport, AppliedVar
+
         def _fake_apply_all(sources_cfg, home, environ=None):
             if environ is not None:
                 environ["OPENAI_API_KEY"] = "sk-resolved"
+            report = ApplyReport()
+            report.provenance["OPENAI_API_KEY"] = AppliedVar(
+                name="OPENAI_API_KEY",
+                source="onepassword",
+                shape="mapped",
+                overrode_env=True,
+            )
+            return report
 
         monkeypatch.setattr(
             "agent.secret_sources.registry.apply_all", _fake_apply_all
@@ -207,6 +218,51 @@ class TestEnvFileParsing:
 
         scope = ss.build_profile_secret_scope(tmp_path)
         assert scope.get("OPENAI_API_KEY") == "sk-resolved"
+
+    def test_registry_resolved_ref_survives_manual_refetch_even_if_value_matches_env(
+        self, tmp_path, monkeypatch
+    ):
+        """Provenance — not value inequality — decides registry resolution: a
+        configured ref that resolves to the SAME plaintext already in .env must
+        still survive a transient manual-refetch failure."""
+        (tmp_path / ".env").write_text(
+            "OPENAI_API_KEY=sk-same\n", encoding="utf-8"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "secrets:\n"
+            "  onepassword:\n"
+            "    enabled: true\n"
+            "    env:\n"
+            "      OPENAI_API_KEY: op://Private/OpenAI/key\n",
+            encoding="utf-8",
+        )
+
+        from agent.secret_sources.registry import ApplyReport, AppliedVar
+
+        def _fake_apply_all(sources_cfg, home, environ=None):
+            # Resolves to the SAME value already in .env — value inequality
+            # would miss this, but provenance records the applied var.
+            if environ is not None:
+                environ["OPENAI_API_KEY"] = "sk-same"
+            report = ApplyReport()
+            report.provenance["OPENAI_API_KEY"] = AppliedVar(
+                name="OPENAI_API_KEY",
+                source="onepassword",
+                shape="mapped",
+                overrode_env=True,
+            )
+            return report
+
+        monkeypatch.setattr(
+            "agent.secret_sources.registry.apply_all", _fake_apply_all
+        )
+        monkeypatch.setattr(
+            "agent.secret_sources.onepassword.fetch_onepassword_secrets",
+            lambda **kwargs: ({}, ["auth failed"]),
+        )
+
+        scope = ss.build_profile_secret_scope(tmp_path)
+        assert scope.get("OPENAI_API_KEY") == "sk-same"
 
     def test_configured_onepassword_ref_overrides_raw_env_ref(
         self, tmp_path, monkeypatch
