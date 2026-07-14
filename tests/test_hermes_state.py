@@ -836,6 +836,76 @@ class TestExternalContentFtsMigration:
         finally:
             db.close()
 
+    def test_trigram_gate_flip_off_vacuums_and_reclaims_disk(
+        self, tmp_path, monkeypatch
+    ):
+        """Flipping fts_trigram false on an already-built DB must VACUUM.
+
+        Regression: the config-gate open path drops the ~5 GB trigram table but
+        only moves its pages to the freelist. Without a VACUUM the on-disk file
+        never shrinks, so the knob's advertised disk recovery wouldn't happen.
+        Assert the reopen returns freed pages to the OS (file shrinks, freelist
+        empty), and that a no-drop reopen reports nothing to reclaim (so the
+        VACUUM is not run on every open).
+        """
+        db_path = tmp_path / "state.db"
+
+        # Phase 1: build a DB with the trigram index populated.
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: True)
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            for i in range(400):
+                db.append_message(
+                    "s1", role="user", content=f"大别山项目计划书 chunk {i} " * 8
+                )
+            assert db._trigram_available is True
+        finally:
+            db.close()
+        size_with_trigram = db_path.stat().st_size
+
+        # Phase 2: reopen with the gate flipped OFF — the drop path must VACUUM
+        # so the freed trigram pages are returned to the OS.
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: False)
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is False
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 0
+            # VACUUM rebuilds the file with an empty freelist.
+            assert db._conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+            # CJK search still works via the LIKE fallback.
+            assert len(db.search_messages("大别山")) >= 1
+        finally:
+            db.close()
+        size_after_drop = db_path.stat().st_size
+        assert size_after_drop < size_with_trigram, (
+            f"trigram-disable did not reclaim disk: "
+            f"{size_with_trigram} -> {size_after_drop}"
+        )
+
+        # Phase 3: a subsequent gate-off reopen has no trigram table to drop, so
+        # _drop_trigram_schema must report nothing reclaimable (False) — the
+        # signal that gates the VACUUM off on every steady-state open.
+        drop_results = []
+        real_drop = SessionDB._drop_trigram_schema
+
+        def spy_drop(cursor):
+            res = real_drop(cursor)
+            drop_results.append(res)
+            return res
+
+        monkeypatch.setattr(SessionDB, "_drop_trigram_schema", staticmethod(spy_drop))
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is False
+        finally:
+            db.close()
+        assert drop_results == [False], (
+            f"gate-off reopen should have nothing to reclaim, got {drop_results}"
+        )
+
     def test_trigram_gate_scoped_to_target_profile(self, tmp_path, monkeypatch):
         """A cross-profile open reads the TARGET profile's fts_trigram gate.
 

@@ -1148,13 +1148,25 @@ class SessionDB:
                 pass
 
     @staticmethod
-    def _drop_trigram_schema(cursor: sqlite3.Cursor) -> None:
+    def _drop_trigram_schema(cursor: sqlite3.Cursor) -> bool:
         """Drop the trigram FTS table + its triggers (config-gate off).
 
         Removes the ~5 GB trigram index and its INSERT/DELETE/UPDATE triggers
         so a subsequent messages write no longer maintains it. The base
         messages_fts table and its triggers are untouched. Idempotent.
+
+        Returns ``True`` when the trigram table actually existed and was
+        dropped (its pages are now on the freelist and a ``VACUUM`` will
+        return them to the OS), ``False`` when there was nothing to drop — so
+        callers can vacuum only when there is real space to reclaim rather
+        than on every open with trigram disabled.
         """
+        table_existed = bool(
+            cursor.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'messages_fts_trigram'"
+            ).fetchone()
+        )
         for trigger in (
             "messages_fts_trigram_insert",
             "messages_fts_trigram_delete",
@@ -1167,7 +1179,8 @@ class SessionDB:
         try:
             cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
         except sqlite3.OperationalError:
-            pass
+            return False
+        return table_existed
 
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
@@ -1651,6 +1664,9 @@ class SessionDB:
 
         fts5_available = self._sqlite_supports_fts5(cursor)
         fts_migrations_complete = True
+        # True once a real trigram table was dropped on this open (config gate
+        # flipped off on an already-migrated DB) — drives the reclaim VACUUM.
+        trigram_pages_freed = False
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
             # even though the current sqlite runtime cannot read the virtual
@@ -1959,7 +1975,7 @@ class SessionDB:
             # user reclaim the multi-GB trigram index by flipping one config.
             if self._fts_enabled:
                 if not self._fts_trigram_enabled:
-                    self._drop_trigram_schema(cursor)
+                    trigram_pages_freed = self._drop_trigram_schema(cursor)
                     self._trigram_available = False
                     if triggers_need_repair:
                         self._rebuild_fts_indexes(cursor, include_trigram=False)
@@ -1975,6 +1991,20 @@ class SessionDB:
                         )
 
         self._conn.commit()
+
+        # Reclaim the ~5 GB freed by dropping the trigram index when the config
+        # gate was flipped off on an already-migrated DB. The DROP only moves
+        # its pages to the freelist; without VACUUM the on-disk file never
+        # shrinks, so the advertised disk recovery wouldn't happen (the v20
+        # migration path vacuums for the same reason). Only runs when a real
+        # table was dropped, and checkpoints bound WAL growth around the VACUUM.
+        if fts5_available and self._fts_enabled and trigram_pages_freed:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._conn.execute("VACUUM")
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.OperationalError as exc:
+                logger.warning("trigram-disable VACUUM skipped: %s", exc)
 
     # =========================================================================
     # Session lifecycle
