@@ -3236,15 +3236,10 @@ def _evict_cached_clients(provider: str) -> None:
             if _normalize_aux_provider(str(key[0])) == normalized
         ]
         for key in stale_keys:
-            client = _client_cache.get(key, (None, None, None))[0]
+            entry = _client_cache.get(key, (None, None, None))
+            client = entry[0]
             if client is not None:
-                _force_close_async_httpx(client)
-                try:
-                    close_fn = getattr(client, "close", None)
-                    if callable(close_fn):
-                        close_fn()
-                except Exception:
-                    pass
+                _release_cached_client_fds(client, entry[2])
             _client_cache.pop(key, None)
 
 
@@ -3278,6 +3273,7 @@ def _evict_cached_client_instance(target: Any) -> bool:
                 continue
             real = getattr(cached, "_real_client", None)
             if cached is target or real is target:
+                _release_cached_client_fds(cached, entry[2])
                 del _client_cache[key]
                 evicted = True
     return evicted
@@ -5627,13 +5623,7 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
     with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and old_entry[0] is not client:
-            _force_close_async_httpx(old_entry[0])
-            try:
-                close_fn = getattr(old_entry[0], "close", None)
-                if callable(close_fn):
-                    close_fn()
-            except Exception:
-                pass
+            _release_cached_client_fds(old_entry[0], old_entry[2])
         _client_cache[cache_key] = (client, default_model, bound_loop)
 
 
@@ -5725,6 +5715,11 @@ def _force_close_async_httpx(client: Any) -> None:
 
     We intentionally do NOT run the full async close path — the
     connections will be dropped by the OS when the process exits.
+
+    NOTE: state-marking alone leaves the underlying OS sockets OPEN. That is
+    fine at process exit (``shutdown_cached_clients``), but for *eviction* in a
+    long-lived process (gateway/kanban workers) use ``_release_cached_client_fds``
+    instead — it actually frees the file descriptors.
     """
     try:
         from httpx._client import ClientState
@@ -5733,6 +5728,151 @@ def _force_close_async_httpx(client: Any) -> None:
             inner._state = ClientState.CLOSED
     except Exception:
         pass
+
+
+def _is_async_httpx_client(inner: Any) -> bool:
+    try:
+        import httpx
+        return isinstance(inner, httpx.AsyncClient)
+    except Exception:
+        return False
+
+
+def _find_network_stream(conn: Any) -> Any:
+    """Descend an httpcore pool entry to the leaf connection's ``_network_stream``.
+
+    A direct pool entry is an ``AsyncHTTPConnection`` whose ``._connection`` is
+    the ``AsyncHTTP11Connection`` that actually holds ``_network_stream``. But a
+    **proxied** pool entry (``AsyncForwardHTTPConnection`` /
+    ``AsyncTunnelHTTPConnection``, used whenever ``HTTP_PROXY``/``ALL_PROXY`` is
+    set) wraps another ``AsyncHTTPConnection`` in ``._connection``, so the real
+    ``_network_stream`` is one hop deeper. Walk the ``._connection`` chain until
+    we reach the object that carries ``_network_stream`` rather than assuming a
+    fixed depth. Bounded to avoid pathological cycles.
+    """
+    node = conn
+    for _ in range(6):  # depth guard: direct=1, forward/tunnel proxy=2, headroom to spare
+        if node is None:
+            return None
+        stream = getattr(node, "_network_stream", None)
+        if stream is not None:
+            return stream
+        node = getattr(node, "_connection", None)
+    return None
+
+
+def _close_connection_socket(conn: Any) -> None:
+    """Close the raw OS socket behind one httpcore pool connection.
+
+    Finds the leaf connection's anyio asyncio ``SocketStream`` (one extra
+    ``.transport_stream`` hop for TLS) and closes its ``_transport._sock`` — a
+    real ``socket.socket``. This frees the fd synchronously without invoking the
+    (possibly dead) event loop the async transport is bound to. Best-effort
+    against httpx/httpcore/anyio internals; handles direct and proxied pool
+    entries alike via ``_find_network_stream``.
+    """
+    try:
+        stream = _find_network_stream(conn)
+        raw = getattr(stream, "_stream", None)
+        if raw is None:
+            return
+        # TLS wraps the socket stream one level deeper.
+        holder = getattr(raw, "transport_stream", None) or raw
+        transport = getattr(holder, "_transport", None)
+        sock = getattr(transport, "_sock", None)
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _close_httpx_pool_sockets_sync(inner_httpx: Any) -> None:
+    """Synchronously close every OS socket held by an httpx client's pool.
+
+    Releases the file descriptors WITHOUT touching the event loop the async
+    transport is bound to — required when that loop is dead (recycled gateway
+    worker-thread loop) or when we are retiring the client at eviction time.
+    """
+    try:
+        transports: List[Any] = []
+        base = getattr(inner_httpx, "_transport", None)
+        if base is not None:
+            transports.append(base)
+        for mt in (getattr(inner_httpx, "_mounts", {}) or {}).values():
+            if mt is not None:
+                transports.append(mt)
+        for transport in transports:
+            pool = getattr(transport, "_pool", None)
+            if pool is None:
+                continue
+            for conn in list(getattr(pool, "_connections", []) or []):
+                _close_connection_socket(conn)
+    except Exception:
+        pass
+
+
+def _release_cached_client_fds(client: Any, bound_loop: Any = None) -> None:
+    """Actually release the OS sockets held by an evicted/replaced cached client.
+
+    Unlike ``_force_close_async_httpx`` (which only marks the async httpx client
+    ``CLOSED`` so the SDK ``__del__`` can't schedule ``aclose()`` on a dead loop,
+    leaving the fd stranded), this frees the file descriptors — required at every
+    eviction path in long-lived processes (gateway, kanban workers) where a
+    state-marked-but-open socket accumulates until the host hits its fd ceiling
+    and corrupts SQLite mmaps (kanban.db tears).
+
+    - Sync SDK client (or wrapper): its own ``.close()`` closes the httpx pool —
+      but only when the entry's bound loop is DEAD. An *async* wrapper
+      (``AsyncCodexAuxiliaryClient`` / ``AsyncAnthropicAuxiliaryClient``) exposes
+      its underlying SDK client via a **synchronous** ``_real_client``; if the
+      cached async entry is being evicted while its bound loop is still alive
+      (a different but running loop asked for the same key), closing that sync
+      ``_real_client`` would tear down a transport the live loop may still be
+      serving via ``asyncio.to_thread`` — the same in-flight-abort hazard as the
+      raw-socket teardown. So the sync close path is also gated on ``loop_dead``.
+    - Async SDK client: keep the CLOSED state-mark (the ``__del__`` neuter relies
+      on it). Only sync-close the pool's raw sockets when the client's owning
+      event loop is DEAD (``bound_loop`` is None or closed). If the bound loop is
+      still alive — e.g. eviction fired because a *different but running* loop
+      asked for the same cache key — ripping out the raw sockets from this thread
+      would abort an in-flight request on the original loop; leave the state-mark
+      and let that live loop's own SDK teardown/GC reclaim the fd. The dead-loop
+      case is exactly the FD-leak this fix targets (recycled worker-thread loop
+      that can never run ``aclose()``), so gating on it loses no coverage.
+    """
+    import inspect
+
+    if client is None:
+        return
+    loop_dead = bound_loop is None or getattr(bound_loop, "is_closed", lambda: True)()
+    for target in (client, getattr(client, "_real_client", None)):
+        if target is None:
+            continue
+        inner = getattr(target, "_client", None)
+        if inner is not None and _is_async_httpx_client(inner):
+            _force_close_async_httpx(target)  # state-mark (keeps __del__ neuter safe)
+            if loop_dead:
+                # Safe: no live loop can hold an in-flight request on these sockets.
+                _close_httpx_pool_sockets_sync(inner)
+            continue
+        # Sync client (or wrapper): close() releases the httpx pool synchronously.
+        # Skip when the bound loop is still alive — an async wrapper's sync
+        # _real_client may back an in-flight to_thread call on that live loop.
+        if not loop_dead:
+            continue
+        try:
+            close_fn = getattr(target, "close", None)
+            if callable(close_fn) and not inspect.iscoroutinefunction(close_fn):
+                close_fn()
+            elif inner is not None:
+                inner_close = getattr(inner, "close", None)
+                if callable(inner_close) and not inspect.iscoroutinefunction(inner_close):
+                    inner_close()
+        except Exception:
+            pass
 
 
 def shutdown_cached_clients() -> None:
@@ -5775,7 +5915,7 @@ def cleanup_stale_async_clients() -> None:
         for key, entry in _client_cache.items():
             client, _default, cached_loop = entry
             if cached_loop is not None and cached_loop.is_closed():
-                _force_close_async_httpx(client)
+                _release_cached_client_fds(client, cached_loop)
                 stale_keys.append(key)
         for key in stale_keys:
             del _client_cache[key]
@@ -5871,7 +6011,10 @@ def _get_cached_client(
                     effective = _compat_model(cached_client, model, cached_default)
                     return cached_client, effective
                 # Stale — evict and fall through to create a new client.
-                _force_close_async_httpx(cached_client)
+                # Pass cached_loop: if it's alive (a different but running loop
+                # holds this cache key) we must NOT rip out its raw sockets and
+                # abort an in-flight request; only reap fds when the loop is dead.
+                _release_cached_client_fds(cached_client, cached_loop)
                 del _client_cache[cache_key]
             else:
                 effective = _compat_model(cached_client, model, cached_default)
@@ -5910,7 +6053,7 @@ def _get_cached_client(
                 # the oldest entries (FIFO — dict preserves insertion order).
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
                     evict_key, evict_entry = next(iter(_client_cache.items()))
-                    _force_close_async_httpx(evict_entry[0])
+                    _release_cached_client_fds(evict_entry[0], evict_entry[2])
                     del _client_cache[evict_key]
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:
