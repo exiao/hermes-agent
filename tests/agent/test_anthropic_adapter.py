@@ -13,6 +13,7 @@ from agent.anthropic_adapter import (
     _is_azure_anthropic_endpoint,
     _is_oauth_token,
     _refresh_oauth_token,
+    _resolve_anthropic_pool_token,
     _to_plain_data,
     _write_claude_code_credentials,
     build_anthropic_client,
@@ -1147,6 +1148,71 @@ class TestResolveAnthropicToken:
         finally:
             ss.reset_secret_scope(token)
             ss.set_multiplex_active(False)
+
+    def test_profile_only_pool_prunes_stale_env_oauth_under_explicit_api_key(
+        self, monkeypatch, tmp_path
+    ):
+        """A non-default profile that switched OAuth -> API key must not let a
+        stale auto-seeded env OAuth pool entry survive on the profile_only pool
+        path.
+
+        Regression: the profile_only reader dropped only ``hermes_pkce`` when an
+        explicit API key was present, so an ``env:ANTHROPIC_TOKEN`` /
+        ``env:CLAUDE_CODE_OAUTH_TOKEN`` OAuth singleton left in the profile
+        auth.json could still be returned by source #4, reviving the Claude Code
+        masquerade the API-key path opted out of. It must prune every
+        auto-seeded OAuth entry (env:* + hermes_pkce + claude_code) while
+        keeping manual entries.
+        """
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        profile_auth = {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "env:ANTHROPIC_TOKEN",
+                        "source": "env:ANTHROPIC_TOKEN",
+                        "auth_type": "oauth",
+                        "access_token": "sk-ant-oat01-STALE-ENV-OAUTH",
+                        "priority": 0,
+                    },
+                    {
+                        "id": "manual:keep",
+                        "source": "manual:keep",
+                        "auth_type": "api_key",
+                        "access_token": "sk-ant-api-MANUAL-KEPT",
+                        "priority": 1,
+                    },
+                ]
+            },
+        }
+        (profile / "auth.json").write_text(json.dumps(profile_auth), encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
+        )
+
+        home_token = set_hermes_home_override(str(profile))
+        ss.set_multiplex_active(True)
+        # Explicit API-key path: API key set, no OAuth env tokens.
+        scope_token = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-ant-api-SCOPED"})
+        try:
+            token = _resolve_anthropic_pool_token(profile_only=True)
+            # The stale env OAuth token must never be what resolves here.
+            assert token != "sk-ant-oat01-STALE-ENV-OAUTH"
+        finally:
+            ss.reset_secret_scope(scope_token)
+            ss.set_multiplex_active(False)
+            reset_hermes_home_override(home_token)
 
 
 class TestRefreshOauthToken:

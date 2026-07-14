@@ -1430,12 +1430,31 @@ def _resolve_anthropic_pool_token(*, profile_only: bool = False) -> Optional[str
             ]
             profile_api_key_explicit = bool(
                 (_get_secret("ANTHROPIC_API_KEY", "") or "").strip()
+                and not (_get_secret("ANTHROPIC_TOKEN", "") or "").strip()
+                and not (_get_secret("CLAUDE_CODE_OAUTH_TOKEN", "") or "").strip()
             )
             if profile_api_key_explicit:
-                # Match load_pool(): an explicit API-key setup suppresses stale
-                # auto-seeded OAuth singletons, while manual pool entries remain.
+                # Match load_pool()'s api_key_path_explicit pruning: an explicit
+                # API-key setup suppresses stale AUTO-SEEDED OAuth credentials so
+                # rotation on a transient 401/429 can't silently flip the session
+                # onto an OAuth identity (which forces the Claude Code masquerade).
+                # That means not just hermes_pkce/claude_code but the env-seeded
+                # OAuth singletons too (source ``env:ANTHROPIC_TOKEN`` /
+                # ``env:CLAUDE_CODE_OAUTH_TOKEN``) — otherwise source #4 can still
+                # return the stale env OAuth token here. Manual pool entries
+                # (source ``manual:*``) are independent user-added credentials and
+                # are kept; api_key entries are kept.
+                _auto_oauth = ("hermes_pkce", "claude_code")
                 entries = [
-                    entry for entry in entries if entry.source != "hermes_pkce"
+                    entry
+                    for entry in entries
+                    if not (
+                        entry.auth_type == AUTH_TYPE_OAUTH
+                        and (
+                            entry.source in _auto_oauth
+                            or str(entry.source or "").startswith("env:")
+                        )
+                    )
                 ]
             elif (
                 not pkce_suppressed
