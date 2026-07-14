@@ -1878,6 +1878,19 @@ def _system_fd_headroom() -> Optional[int]:
             import ctypes.util
 
             libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+            # Pin the signature explicitly. Without argtypes/restype ctypes
+            # defaults every arg and the return to 32-bit ``c_int``, which
+            # truncates the pointer arguments on 64-bit macOS and yields
+            # undefined behavior. int sysctlbyname(const char *, void *,
+            # size_t *, const void *, size_t).
+            libc.sysctlbyname.restype = ctypes.c_int
+            libc.sysctlbyname.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
 
             def _sysctl_int(name: str) -> Optional[int]:
                 val = ctypes.c_int(0)
@@ -1899,7 +1912,7 @@ def _system_fd_headroom() -> Optional[int]:
     if sys.platform.startswith("linux"):
         try:
             allocated_s, _unused_s, max_s = (
-                Path("/proc/sys/fs/file-nr").read_text().split()
+                Path("/proc/sys/fs/file-nr").read_text(encoding="utf-8").split()
             )
             maxf = int(max_s)
             if maxf <= 0:
