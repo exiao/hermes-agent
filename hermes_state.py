@@ -1169,27 +1169,69 @@ class SessionDB:
         return them to the OS), ``False`` when there was nothing to drop — so
         callers can vacuum only when there is real space to reclaim rather
         than on every open with trigram disabled.
+
+        The trigger + table drops fail closed. A concurrent writer can hold
+        the DB lock during startup (gateway + cron), and swallowing that lock
+        on a trigger or table DROP could leave a stale trigram trigger pointing
+        at a missing table (or report a drop that did not happen). Acquire a
+        write transaction up front so the sequence commits as a unit; suppress
+        only known FTS-unavailable errors and propagate lock/unrelated failures.
         """
-        table_existed = bool(
-            cursor.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'messages_fts_trigram'"
-            ).fetchone()
-        )
-        for trigger in (
-            "messages_fts_trigram_insert",
-            "messages_fts_trigram_delete",
-            "messages_fts_trigram_update",
-        ):
-            try:
-                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            except sqlite3.OperationalError:
-                pass
+        started_transaction = False
         try:
+            cursor.execute("BEGIN IMMEDIATE")
+            started_transaction = True
+            for trigger in (
+                "messages_fts_trigram_insert",
+                "messages_fts_trigram_delete",
+                "messages_fts_trigram_update",
+            ):
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            table_existed = bool(
+                cursor.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'messages_fts_trigram'"
+                ).fetchone()
+            )
             cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
-        except sqlite3.OperationalError:
-            return False
-        return table_existed
+            cursor.execute("COMMIT")
+            started_transaction = False
+            return table_existed
+        except sqlite3.OperationalError as exc:
+            if started_transaction:
+                try:
+                    cursor.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+            if SessionDB._is_fts5_unavailable_error(exc):
+                # The DROP TABLE needs to load the vtable module/tokenizer, so a
+                # build missing the trigram tokenizer raises here and the
+                # rollback above also undid the (tokenizer-free) trigger drops.
+                # Leaving the triggers in place means every message INSERT fires
+                # messages_fts_trigram_insert against the unusable vtable and
+                # crashes. DROP TRIGGER does not need the tokenizer, so drop them
+                # in a standalone committed step and degrade to the base
+                # FTS/LIKE path. The orphaned trigram table is harmless without
+                # triggers.
+                try:
+                    cursor.execute("BEGIN IMMEDIATE")
+                    for trigger in (
+                        "messages_fts_trigram_insert",
+                        "messages_fts_trigram_delete",
+                        "messages_fts_trigram_update",
+                    ):
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                    cursor.execute("COMMIT")
+                except sqlite3.OperationalError:
+                    # Locked/unavailable while dropping the triggers alone; roll
+                    # back the partial drop and report no drop so a later
+                    # uncontended startup retries.
+                    try:
+                        cursor.execute("ROLLBACK")
+                    except sqlite3.OperationalError:
+                        pass
+                return False
+            raise
 
     @staticmethod
     def _fts_trigger_count(
@@ -5145,22 +5187,56 @@ class SessionDB:
             if not _trigram_succeeded:
                 # Short / mixed CJK query, trigram unavailable, or trigram
                 # <3 CJK chars. Fall back to LIKE substring search.
-                # For multi-token OR queries (e.g. "广西 OR 桂林 OR 漓江"),
-                # build one LIKE condition per non-operator token so each term
-                # is matched independently (#20494).
-                non_op_tokens = [
-                    t for t in raw_query.split()
-                    if t.upper() not in {"AND", "OR", "NOT"}
-                ] or [raw_query]
-                token_clauses = []
+                # Preserve the query's boolean structure (#20494): walk the
+                # tokens left-to-right, honoring AND / OR / NOT operators so
+                # `A NOT B` excludes B and `A AND B` requires both. The old
+                # flat OR-everything shape silently over-matched once this
+                # fallback became the only path for disabled-trigram installs.
                 like_params: list = []
-                for tok in non_op_tokens:
+
+                def _term_clause(tok: str) -> str:
                     esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    token_clauses.append(
-                        "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
+                    like_params.extend([f"%{esc}%", f"%{esc}%", f"%{esc}%"])
+                    # COALESCE to '' so a NULL column yields FALSE (not NULL)
+                    # under LIKE — critical for the `AND NOT (...)` branch,
+                    # where `NOT (FALSE OR NULL)` would otherwise be NULL and
+                    # silently drop every row (tool_name/tool_calls are NULL on
+                    # plain user/assistant messages).
+                    return (
+                        "(COALESCE(m.content, '') LIKE ? ESCAPE '\\' "
+                        "OR COALESCE(m.tool_name, '') LIKE ? ESCAPE '\\' "
+                        "OR COALESCE(m.tool_calls, '') LIKE ? ESCAPE '\\')"
                     )
-                    like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-                like_where = [f"({' OR '.join(token_clauses)})"]
+
+                tokens = raw_query.split()
+                non_op_tokens = [
+                    t for t in tokens if t.upper() not in {"AND", "OR", "NOT"}
+                ] or [raw_query]
+                # Build the boolean expression. Adjacent terms without an
+                # explicit operator default to AND (FTS5 semantics). NOT
+                # attaches to the following term as `AND NOT (...)`.
+                expr_parts: list = []
+                pending_op = None  # None | "AND" | "OR" | "NOT"
+                for tok in tokens:
+                    upper = tok.upper()
+                    if upper in {"AND", "OR", "NOT"}:
+                        pending_op = upper
+                        continue
+                    clause = _term_clause(tok)
+                    if not expr_parts:
+                        expr_parts.append(clause)
+                    elif pending_op == "OR":
+                        expr_parts.append(f"OR {clause}")
+                    elif pending_op == "NOT":
+                        expr_parts.append(f"AND NOT {clause}")
+                    else:  # explicit AND or implicit adjacency
+                        expr_parts.append(f"AND {clause}")
+                    pending_op = None
+                if not expr_parts:
+                    # No word tokens survived (pure operators or empty) — match
+                    # the raw query as a single substring.
+                    expr_parts.append(_term_clause(raw_query))
+                like_where = [f"({' '.join(expr_parts)})"]
                 if source_filter is not None:
                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     like_params.extend(source_filter)

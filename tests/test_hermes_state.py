@@ -869,6 +869,135 @@ class TestExternalContentFtsMigration:
         finally:
             db.close()
 
+    def test_trigram_off_like_fallback_honors_boolean_operators(
+        self, tmp_path, monkeypatch
+    ):
+        """With trigram gated off, the LIKE fallback must honor AND/NOT.
+
+        Regression: the old fallback OR-joined every non-operator token, so
+        `A NOT B` returned rows containing B and `A AND B` returned rows
+        matching only A. Once trigram is disabled this fallback is the only
+        CJK/substring path, so the boolean structure has to be preserved.
+        """
+        monkeypatch.setattr(
+            SessionDB, "_read_fts_trigram_config", lambda self: False
+        )
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="a", source="cli")
+            db.append_message("a", role="user", content="大别山项目 概述")
+            db.create_session(session_id="ab", source="cli")
+            db.append_message("ab", role="user", content="大别山项目 桂林项目 联合")
+            db.create_session(session_id="ac", source="cli")
+            db.append_message("ac", role="user", content="大别山项目 武汉分部")
+
+            # NOT excludes the second term.
+            not_results = db.search_messages("大别山项目 NOT 桂林项目", limit=10)
+            assert {r["session_id"] for r in not_results} == {"a", "ac"}
+
+            # AND requires both terms.
+            and_results = db.search_messages("大别山项目 AND 桂林项目", limit=10)
+            assert {r["session_id"] for r in and_results} == {"ab"}
+
+            # OR still unions.
+            or_results = db.search_messages("武汉分部 OR 桂林项目", limit=10)
+            assert {r["session_id"] for r in or_results} == {"ab", "ac"}
+        finally:
+            db.close()
+
+    def test_drop_trigram_schema_drops_triggers_when_tokenizer_missing(
+        self, tmp_path, monkeypatch
+    ):
+        """When the SQLite build lacks the trigram tokenizer, the DROP TABLE
+        raises 'no such tokenizer: trigram' and the transactional rollback
+        undoes the (tokenizer-free) trigger drops. Leaving the triggers behind
+        makes every later message INSERT fire messages_fts_trigram_insert
+        against the unusable vtable and crash. The drop must still remove the
+        triggers so writes degrade to the base FTS/LIKE path.
+        """
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: True)
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="the quick brown fox")
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 1
+
+            real_conn = db._conn
+
+            class _NoTokenizerCursor:
+                def execute(self, sql, *args, **kwargs):
+                    normalized = sql.upper()
+                    if "DROP TABLE" in normalized and "MESSAGES_FTS_TRIGRAM" in normalized:
+                        raise sqlite3.OperationalError("no such tokenizer: trigram")
+                    return real_conn.execute(sql, *args, **kwargs)
+
+            # Tokenizer-missing is a known FTS-unavailable error, so the drop
+            # reports False (nothing reclaimable) but must NOT leave stale
+            # triggers pointing at the unusable vtable.
+            assert db._drop_trigram_schema(_NoTokenizerCursor()) is False
+
+            triggers = {
+                row[0]
+                for row in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name LIKE 'messages_fts_trigram_%'"
+                ).fetchall()
+            }
+            assert triggers == set()
+
+            # With the triggers gone, a new message INSERT no longer crashes on
+            # the unusable trigram vtable.
+            db.append_message("s1", role="user", content="second message after drop")
+        finally:
+            db.close()
+
+    def test_drop_trigram_schema_propagates_locked_drop(
+        self, tmp_path, monkeypatch
+    ):
+        """A locked trigram DROP must fail closed, not be swallowed.
+
+        The drop is transactional, so a lock on the table DROP rolls the
+        trigger drops back too — table + triggers stay together for the next
+        uncontended startup instead of leaving a stale trigger pointing at a
+        missing table.
+        """
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: True)
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="the quick brown fox")
+            real_conn = db._conn
+
+            class _BlockTableDropCursor:
+                def execute(self, sql, *args, **kwargs):
+                    normalized = sql.upper()
+                    if "DROP TABLE" in normalized and "MESSAGES_FTS_TRIGRAM" in normalized:
+                        raise sqlite3.OperationalError("database is locked")
+                    return real_conn.execute(sql, *args, **kwargs)
+
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                db._drop_trigram_schema(_BlockTableDropCursor())
+
+            # Failed closed: table and trigram triggers stay together.
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 1
+            triggers = {
+                row[0]
+                for row in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name LIKE 'messages_fts_trigram_%'"
+                ).fetchall()
+            }
+            assert triggers == set(hermes_state._TRIGRAM_FTS_TRIGGERS)
+        finally:
+            db.close()
+
     def test_trigram_gate_on_keeps_table(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             SessionDB, "_read_fts_trigram_config", lambda self: True
