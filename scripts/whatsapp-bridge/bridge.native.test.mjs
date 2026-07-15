@@ -55,6 +55,13 @@ import {
   console.log('  ✓ persistent failures enter the 12-hour backoff');
 }
 
+{
+  const transientRetry = reconnectPlan({ reason: 500, reconnectAttempts: 10, random: () => 0.5 });
+  assert.deepEqual(transientRetry, { delay: 151500, reconnectAttempts: 11 },
+    'transient failures continue capped reconnects instead of entering the 12-hour backoff');
+  console.log('  ✓ transient failures do not enter the 12-hour backoff');
+}
+
 // -- quoted outbound text -------------------------------------------------
 {
   const store = createBoundedMessageStore(2);

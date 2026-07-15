@@ -28,7 +28,7 @@ export function reconnectPlan({ reason, reconnectAttempts, random = Math.random 
   }
 
   const nextAttempts = reconnectAttempts + 1;
-  if (nextAttempts > RECONNECT_GIVEUP_AFTER) {
+  if (reason === 405 && nextAttempts > RECONNECT_GIVEUP_AFTER) {
     return { delay: RECONNECT_LONG_MS, reconnectAttempts: nextAttempts };
   }
 

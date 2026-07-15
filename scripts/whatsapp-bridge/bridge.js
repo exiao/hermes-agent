@@ -447,12 +447,12 @@ async function startSocket() {
         if (reason === 515) {
           if (!PAIR_JSON) console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
         } else {
-          if (reconnectAttempts > RECONNECT_GIVEUP_AFTER) {
+          if (reason === 405 && reconnectAttempts > RECONNECT_GIVEUP_AFTER) {
             // Persistent failure: after 10 straight attempts, stop trying for
             // a full 12h. Anything wrong at this point (stale client, banned
             // handshake) won't fix itself in minutes, and continuing to retry
             // only risks the account. Any successful connect resets the count.
-            if (!PAIR_JSON) console.log(`⛔ ${reconnectAttempts - 1} reconnects failed (reason: ${reason}). Backing off for 12h.`);
+            if (!PAIR_JSON) console.log(`⛔ ${reconnectAttempts} reconnects failed (reason: ${reason}). Backing off for 12h.`);
           } else {
             if (!PAIR_JSON) console.log(`⚠️  Connection closed (reason: ${reason}). Reconnect attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s...`);
           }
