@@ -2739,15 +2739,13 @@ def _is_named_profile_scope() -> bool:
     stay fail-closed.
     """
     try:
-        import os as _os
-
         from hermes_constants import get_hermes_home
 
         # Absolutize (os.path.abspath, NOT Path.resolve — avoid following
         # symlinks per repo rules) so a relative HERMES_HOME can't dodge the
         # named-profile check and let a named profile borrow the process
         # owner's Claude-file fallback.
-        home = Path(_os.path.abspath(get_hermes_home()))
+        home = Path(os.path.abspath(get_hermes_home()))
         return home.parent.name == "profiles"
     except Exception:
         return False
