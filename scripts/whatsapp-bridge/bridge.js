@@ -378,6 +378,9 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
+let reconnectAttempts = 0;
+const RECONNECT_BASE_MS = 3000;
+const RECONNECT_MAX_MS = 300000; // cap at 5 min so a persistent-failure loop can't look like a spam bot
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
@@ -433,19 +436,28 @@ async function startSocket() {
         }
         process.exit(1);
       } else {
-        // 515 = restart requested (common after pairing). Always reconnect.
+        // 515 = restart requested (common after pairing) - legit and fast.
+        // Everything else uses exponential backoff + jitter so a persistent
+        // failure (e.g. 405 from a rejected handshake) does not hammer
+        // WhatsApp's servers and risk the account being flagged as abusive.
         emitPairEvent({ event: 'disconnected', reason });
-        if (!PAIR_JSON) {
-          if (reason === 515) {
-            console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
-          } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
-          }
+        let delay;
+        if (reason === 515) {
+          delay = 1000;
+          reconnectAttempts = 0;
+          if (!PAIR_JSON) console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
+        } else {
+          reconnectAttempts += 1;
+          const backoff = Math.min(RECONNECT_BASE_MS * 2 ** (reconnectAttempts - 1), RECONNECT_MAX_MS);
+          const jitter = Math.floor(Math.random() * 1000);
+          delay = backoff + jitter;
+          if (!PAIR_JSON) console.log(`⚠️  Connection closed (reason: ${reason}). Reconnect attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s...`);
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        setTimeout(startSocket, delay);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      reconnectAttempts = 0;
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
