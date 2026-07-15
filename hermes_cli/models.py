@@ -2728,6 +2728,29 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
         pass
 
 
+def _is_named_profile_scope() -> bool:
+    """True when the active HERMES_HOME is a named profile, not the default.
+
+    A named profile lives under ``<home>/profiles/<name>`` (parent dir ==
+    ``profiles``); the default/process-owner home (``~/.hermes``) does not.
+    Matches the seam in ``model_switch._is_named_profile_scope`` and
+    ``secret_scope.build_profile_secret_scope`` so the default profile keeps its
+    process-owned credential fallbacks under multiplexing while named profiles
+    stay fail-closed.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        # Absolutize (os.path.abspath, NOT Path.resolve — avoid following
+        # symlinks per repo rules) so a relative HERMES_HOME can't dodge the
+        # named-profile check and let a named profile borrow the process
+        # owner's Claude-file fallback.
+        home = Path(os.path.abspath(get_hermes_home()))
+        return home.parent.name == "profiles"
+    except Exception:
+        return False
+
+
 def _scoped_anthropic_pool_token() -> str:
     """Return a token persisted in the active profile's auth store only."""
     try:
@@ -2780,8 +2803,14 @@ def _fetch_anthropic_models(
         return None
 
     active_scope = current_secret_scope()
+    explicit_key = (api_key or "").strip()
     scoped_token = ""
-    if active_scope is not None:
+    # An explicit api_key always wins (see the `token = explicit_key or ...`
+    # line below), so skip every scoped-resolution probe when one is supplied —
+    # a multiplexed /model probe against a config-specified Anthropic key must
+    # not trigger resolve_anthropic_token() (which would read the process
+    # Claude file, the wrong credential source for an explicit-key caller).
+    if not explicit_key and active_scope is not None:
         for secret_name in (
             "ANTHROPIC_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
@@ -2792,7 +2821,27 @@ def _fetch_anthropic_models(
                 break
         if not scoped_token:
             scoped_token = _scoped_anthropic_pool_token()
-    token = (api_key or "").strip() or (
+    # A scope is installed for EVERY profile under gateway.multiplex_profiles
+    # (_profile_runtime_scope wraps the listing), so `active_scope is not None`
+    # is also true for the DEFAULT profile. The default profile IS the process
+    # owner: an Anthropic identity that lives only in ~/.claude.json /
+    # ~/.claude/.credentials.json (Claude Code login) — which the scope's env
+    # vars + auth.json pool do NOT carry — legitimately belongs to it. Without a
+    # fallback, a bare /model would drop the default profile's live Anthropic
+    # catalog to the static list the moment multiplexing turns on. Mirror the
+    # named-vs-default seam from #100 (model_switch._is_named_profile_scope /
+    # secret_scope.build_profile_secret_scope): for the default profile only,
+    # fall back to resolve_anthropic_token() (Claude-file auto-discovery). NAMED
+    # profiles (<home>/profiles/<name>) stay fail-closed — reading the process
+    # Claude file would attribute the gateway's identity to a secondary profile.
+    if (
+        not explicit_key
+        and active_scope is not None
+        and not scoped_token
+        and not _is_named_profile_scope()
+    ):
+        scoped_token = (resolve_anthropic_token() or "").strip()
+    token = explicit_key or (
         scoped_token if active_scope is not None else resolve_anthropic_token()
     )
     if not token:
