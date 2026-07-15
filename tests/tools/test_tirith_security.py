@@ -1399,6 +1399,31 @@ class TestAppTldSuppression:
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
+    def test_modal_run_lookalike_domain_suppressed(self, mock_cfg, mock_run):
+        """modal.run and its subdomains are trusted .run false positives."""
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld",
+                     "evidence": [{"raw": "cpe-research--cpe-web.modal.run"}],
+                     "message": "Domain uses '.run' TLD"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".run TLD warning"))
+        result = check_command_security("curl https://cpe-research--cpe-web.modal.run")
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_arbitrary_run_lookalike_tld_preserved(self, mock_cfg, mock_run):
+        """Regression: .run is generic/open and must not be blanket-suppressed."""
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld", "value": "malicious-installer.run",
+                     "message": "Domain uses '.run' TLD"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".run TLD warning"))
+        result = check_command_security("curl https://malicious-installer.run")
+        assert result["action"] == "warn"
+        assert len(result["findings"]) == 1
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
     def test_mov_lookalike_tld_preserved(self, mock_cfg, mock_run):
         """.mov collides with real filenames and stays flagged."""
         mock_cfg.return_value = _CFG
@@ -1451,42 +1476,46 @@ class TestIsSafeLookalikeTldFinding:
     def test_matching_dev_tld(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".dev"})
 
-    def test_bare_run_tld_not_matched(self):
-        """A bare .run TLD token is the whole public Identity Digital registry,
-        not Modal — it must NOT be suppressed (only modal.run is)."""
+    def test_bare_run_tld_not_suppressed(self):
+        """A bare .run token is not enough: .run is an open generic TLD."""
         assert not self.fn({"rule_id": "lookalike_tld", "value": ".run"})
 
-    def test_run_message_field_not_matched(self):
-        """A generic '.run' TLD warning is not a Modal endpoint; keep the warn."""
+    def test_run_message_field_not_suppressed_without_trusted_domain(self):
+        """Generic '.run' warnings stay active without modal.run evidence."""
         assert not self.fn({"rule_id": "lookalike_tld",
-                             "message": "Domain uses '.run' TLD"})
+                            "message": "Domain uses '.run' TLD"})
 
-    def test_arbitrary_run_host_not_matched(self):
-        """An arbitrary .run host (potential phishing) is not suppressed."""
+    def test_arbitrary_run_host_not_suppressed(self):
+        """Regression: arbitrary .run hosts still warn (not blanket-safe)."""
         assert not self.fn({"rule_id": "lookalike_tld", "value": "attacker.run"})
+        assert not self.fn({"rule_id": "lookalike_tld", "value": "evil.run"})
 
     def test_matching_modal_run_domain(self):
         assert self.fn({"rule_id": "lookalike_tld",
                         "value": "cpe-research--cpe-web.modal.run"})
 
+    def test_matching_modal_run_subdomain(self):
+        assert self.fn({"rule_id": "lookalike_tld", "value": "foo.modal.run"})
+
     def test_matching_bare_modal_run_domain(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": "modal.run"})
 
-    def test_lookalike_modal_run_suffix_not_matched(self):
-        """A host that only ends the label with ...notmodal.run is not Modal."""
+    def test_evilmodal_run_not_suppressed(self):
+        """Only modal.run's registrable domain and subdomains are trusted."""
         assert not self.fn({"rule_id": "lookalike_tld", "value": "evilmodal.run"})
 
-    def test_modal_run_deeper_suffix_not_matched(self):
-        """modal.run followed by a further risky TLD must not be suppressed."""
+    def test_run_deeper_suffix_not_matched(self):
+        """A terminal .run followed by a further risky TLD must not be
+        suppressed — the real TLD is .zip, not .run."""
         assert not self.fn({"rule_id": "lookalike_tld", "value": "modal.run.evil.zip"})
 
     def test_run_as_subdomain_label_not_matched(self):
         """`.run` as a non-terminal label does not count as safe."""
         assert not self.fn({"rule_id": "lookalike_tld", "value": "foo.run.example.zip"})
 
-    def test_real_tirith_schema_modal_run_evidence(self):
+    def test_real_tirith_schema_run_evidence_suppressed_for_modal(self):
         """Real Tirith schema-v3 output: the host lives in evidence[].raw and
-        the description is generic, so the Modal carve-out must read evidence."""
+        the description is generic. A modal.run host is suppressed."""
         finding = {
             "rule_id": "lookalike_tld",
             "severity": "MEDIUM",
@@ -1496,8 +1525,8 @@ class TestIsSafeLookalikeTldFinding:
         }
         assert self.fn(finding)
 
-    def test_real_tirith_schema_arbitrary_run_evidence_not_matched(self):
-        """Same schema, but an arbitrary .run host in evidence stays warned."""
+    def test_real_tirith_schema_arbitrary_run_evidence_not_suppressed(self):
+        """Same schema, arbitrary .run host in evidence — still warns."""
         finding = {
             "rule_id": "lookalike_tld",
             "severity": "MEDIUM",
