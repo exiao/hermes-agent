@@ -218,7 +218,7 @@ def _host_derived_api_key(base_url: str) -> str:
     return (_getenv(env_name, "") or "").strip()
 
 
-def _anthropic_base_url_override_ok(base_url: str) -> bool:
+def _anthropic_base_url_override_ok(base_url: str, *, allow_loopback: bool = False) -> bool:
     """Decide whether a configured ``model.base_url`` may back native Anthropic.
 
     Native ``provider: anthropic`` resolution honors ``model.base_url`` so users
@@ -251,17 +251,10 @@ def _anthropic_base_url_override_ok(base_url: str) -> bool:
     # signal _detect_api_mode_for_url() uses to pick anthropic_messages.
     if _detect_api_mode_for_url(candidate) == "anthropic_messages":
         return True
-    # Local loopback proxy (e.g. the Hermes billing proxy on 127.0.0.1:18801).
-    # A loopback URL cannot be the "stale non-Anthropic aggregator" leak the
-    # guard defends against (OpenRouter/Z.ai are never loopback); it is a
-    # deliberate local Anthropic-Messages proxy. Honoring it here is what lets
-    # ``providers.anthropic.base_url: http://127.0.0.1:18801`` route through the
-    # proxy for EVERY process (main, subagents, kanban workers, cron) instead of
-    # depending on the ANTHROPIC_BASE_URL env var being present in that process.
-    # This branch is only ever reached when the configured provider is
-    # ``anthropic`` (all three call sites gate on ``cfg_provider == "anthropic"``),
-    # so it can never redirect codex/openai traffic through the proxy.
-    if _loopback_hostname(hostname):
+    # A loopback proxy is trusted only when it came from the dedicated
+    # ``providers.anthropic`` entry. A raw ``model.base_url`` can be left over
+    # from Ollama/LM Studio after a provider change and does not speak Messages.
+    if allow_loopback and _loopback_hostname(hostname):
         return True
     # Bare api.kimi.com without the /coding path is not an Anthropic endpoint.
     return False
@@ -321,6 +314,7 @@ def _get_model_config() -> Dict[str, Any]:
                 )
                 if provider_base_url:
                     cfg["base_url"] = str(provider_base_url).strip()
+                    cfg["_base_url_from_provider_config"] = True
             if not str(cfg.get("api_key") or "").strip():
                 provider_api_key = provider_cfg.get("api_key") or ""
                 if provider_api_key:
@@ -486,7 +480,10 @@ def _resolve_runtime_from_pool_entry(
         cfg_base_url = ""
         if cfg_provider == "anthropic":
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
-            if not _anthropic_base_url_override_ok(cfg_base_url):
+            if not _anthropic_base_url_override_ok(
+                cfg_base_url,
+                allow_loopback=bool(model_cfg.get("_base_url_from_provider_config")),
+            ):
                 cfg_base_url = ""
         # Honor ANTHROPIC_BASE_URL (the Anthropic SDK's own env fallback) when
         # neither config nor a pool entry supplies a base_url. Env-only proxy
@@ -1430,7 +1427,10 @@ def _resolve_explicit_runtime(
         cfg_base_url = ""
         if cfg_provider == "anthropic":
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
-            if not _anthropic_base_url_override_ok(cfg_base_url):
+            if not _anthropic_base_url_override_ok(
+                cfg_base_url,
+                allow_loopback=bool(model_cfg.get("_base_url_from_provider_config")),
+            ):
                 cfg_base_url = ""
         base_url = explicit_base_url or cfg_base_url or "https://api.anthropic.com"
         api_key = explicit_api_key
@@ -1928,7 +1928,10 @@ def resolve_runtime_provider(
         cfg_base_url = ""
         if cfg_provider == "anthropic":
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
-            if not _anthropic_base_url_override_ok(cfg_base_url):
+            if not _anthropic_base_url_override_ok(
+                cfg_base_url,
+                allow_loopback=bool(model_cfg.get("_base_url_from_provider_config")),
+            ):
                 cfg_base_url = ""
         # When config omits a base_url, honor ANTHROPIC_BASE_URL (the Anthropic
         # SDK's own env fallback) before defaulting to native. Env-only proxy

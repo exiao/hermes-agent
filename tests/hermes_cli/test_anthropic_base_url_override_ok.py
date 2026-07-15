@@ -32,7 +32,7 @@ from hermes_cli.runtime_provider import _anthropic_base_url_override_ok
     ],
 )
 def test_accepts_anthropic_and_loopback(url):
-    assert _anthropic_base_url_override_ok(url) is True
+    assert _anthropic_base_url_override_ok(url, allow_loopback=True) is True
 
 
 @pytest.mark.parametrize(
@@ -46,4 +46,17 @@ def test_accepts_anthropic_and_loopback(url):
     ],
 )
 def test_rejects_non_anthropic_endpoints(url):
+    assert _anthropic_base_url_override_ok(url) is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:11434/v1",
+        "http://localhost:1234/v1",
+        "http://[::1]:1234/v1",
+    ],
+)
+def test_rejects_loopback_model_base_url_without_anthropic_provider_config(url):
+    """A leftover local OpenAI endpoint must not become an Anthropic proxy."""
     assert _anthropic_base_url_override_ok(url) is False
