@@ -1859,6 +1859,7 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
     return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
 
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
