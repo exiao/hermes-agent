@@ -378,9 +378,8 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
-let reconnectAttempts = 0;
-const RECONNECT_BASE_MS = 3000;
-const RECONNECT_MAX_MS = 300000; // cap at 5 min so a persistent-failure loop can't look like a spam bot
+const RECONNECT_MIN_MS = 3 * 60 * 1000;   // 3 min
+const RECONNECT_MAX_MS = 30 * 60 * 1000;  // 30 min
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
@@ -444,23 +443,20 @@ async function startSocket() {
         let delay;
         if (reason === 515) {
           delay = 1000;
-          reconnectAttempts = 0;
           if (!PAIR_JSON) console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
         } else {
-          reconnectAttempts += 1;
-          const backoff = Math.min(RECONNECT_BASE_MS * 2 ** (reconnectAttempts - 1), RECONNECT_MAX_MS);
-          // Full jitter: spread the reconnect uniformly across the ENTIRE
-          // backoff window (0..backoff) instead of a fixed +0-1s, so retries
-          // never settle into a regular machine cadence a bot-detector flags.
-          const jitter = Math.floor(Math.random() * backoff);
-          delay = RECONNECT_BASE_MS + jitter;
-          if (!PAIR_JSON) console.log(`⚠️  Connection closed (reason: ${reason}). Reconnect attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s...`);
+          // Pick a fresh UNIFORM-RANDOM delay in [3min, 30min] on every retry.
+          // Deliberately non-monotonic (e.g. 3m, 15m, 4m, 30m, ...) so the
+          // reconnect cadence looks nothing like a machine and a persistent
+          // failure (e.g. a 405 rejected handshake) can't hammer WhatsApp or
+          // get the account flagged as an abusive client.
+          delay = RECONNECT_MIN_MS + Math.floor(Math.random() * (RECONNECT_MAX_MS - RECONNECT_MIN_MS + 1));
+          if (!PAIR_JSON) console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in ${Math.round(delay / 60000)}m...`);
         }
         setTimeout(startSocket, delay);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
-      reconnectAttempts = 0;
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
