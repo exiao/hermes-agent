@@ -862,13 +862,11 @@ def check_command_security(command: str) -> dict:
 # Google-operated, HTTPS-only gTLDs on the HSTS preload list (browsers force
 # HTTPS), used by many production services (e.g. *.workers.dev, *.web.app).
 #
-# .run is included by operator request: this agent routinely hits .run hosts
-# (Modal endpoints like *.modal.run, plus other .run services), and the
-# "can be confused with a file extension" heuristic fires on every one. The
-# terminal-token match below still refuses to suppress a deeper unsafe suffix
-# (e.g. ``foo.run.evil.zip`` — the real TLD there is ``.zip``), so genuine
-# filename-collision phishing TLDs (.zip, .mov) remain flagged.
-_SAFE_LOOKALIKE_TLDS = (".app", ".dev", ".run")
+# Do not blanket-suppress generic open registries such as .run: those collide
+# with common executable extensions (installer.run, setup.run).  Trusted .run
+# services must be allowlisted by registrable domain below instead.
+_SAFE_LOOKALIKE_TLDS = (".app", ".dev")
+_SAFE_LOOKALIKE_DOMAINS = ("modal.run",)
 
 # Match a safe gTLD only as a complete TLD token, never as a substring of a
 # longer label. Without the trailing boundary, a substring check would let a
@@ -882,21 +880,32 @@ _SAFE_TLD_RE = re.compile(
     r"(?![A-Za-z0-9_-])(?!\.\w)"
 )
 
+# Match trusted registrable domains, plus any subdomain, only when the trusted
+# domain is the terminal host suffix.  This suppresses ``modal.run`` and
+# ``foo.modal.run`` but not ``evilmodal.run`` or ``modal.run.evil.zip``.
+_SAFE_DOMAIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"(?:[A-Za-z0-9-]+\.)*(?:"
+    + "|".join(re.escape(domain) for domain in _SAFE_LOOKALIKE_DOMAINS)
+    + r")"
+    r"(?![A-Za-z0-9_-])(?!\.\w)"
+)
+
 
 def _is_safe_lookalike_tld_finding(finding: dict) -> bool:
     """Return True if this finding is a lookalike_tld warning we treat as a
-    known false positive: a terminal ``.app`` / ``.dev`` / ``.run`` TLD (see
-    ``_SAFE_LOOKALIKE_TLDS``).
+    known false positive: a terminal ``.app``/``.dev`` TLD or a trusted
+    registrable domain such as ``modal.run`` and its subdomains.
 
     Inspects the top-level string fields Tirith may use to carry the TLD/host
     (``value``/``tld``/``detail``/``description``/``message``) AND the
     ``evidence`` list, whose entries carry the actual matched host in a
     ``raw``/``value``/``url`` field (real Tirith schema v3 output puts the host
     only in ``evidence[].raw`` — the ``description`` is generic, e.g. "Domain
-    uses '.run' TLD ...", so reading evidence is required). The safe TLD must
-    appear as a distinct terminal token; substrings like ``example.dev.zip`` or
-    ``foo.run.evil.zip`` (where ``.zip`` is the real, unsafe TLD) are not
-    suppressed.
+    uses '.run' TLD ...", so reading evidence is required). The safe TLD/domain
+    must appear as a distinct terminal token; substrings like
+    ``example.dev.zip``, ``evilmodal.run``, or ``foo.run.evil.zip`` (where
+    ``.zip`` is the real, unsafe TLD) are not suppressed.
     """
     if not isinstance(finding, dict):
         return False
@@ -907,7 +916,7 @@ def _is_safe_lookalike_tld_finding(finding: dict) -> bool:
         if val is None:
             return False
         text = str(val).lower()
-        return bool(_SAFE_TLD_RE.search(text))
+        return bool(_SAFE_TLD_RE.search(text) or _SAFE_DOMAIN_RE.search(text))
 
     for field in ("value", "tld", "detail", "description", "message"):
         if _is_safe_text(finding.get(field)):
