@@ -1105,42 +1105,37 @@ class SessionDB:
         and speed up writes.  Substring/CJK search falls back to a LIKE scan; the
         base ``messages_fts`` word index is untouched.
 
-        A concurrent writer can hold the DB lock during startup (gateway + cron),
-        so ``DROP`` may raise ``database is locked``.  We do NOT treat that as a
-        successful drop: the table/triggers stay in place and writes keep paying
-        the trigram cost until the next uncontended startup, so returning False
-        keeps the caller from logging a misleading "dropped, run VACUUM" hint.
+        The trigger + table drops must fail closed. A concurrent writer can hold
+        the DB lock during startup (gateway + cron), and swallowing that lock on
+        a trigger or table DROP can leave a stale trigram trigger pointing at a
+        missing table (or log that the table was dropped when it was not). Acquire
+        a write transaction up front so the sequence commits as a unit; suppress
+        only known FTS-unavailable errors and propagate lock/unrelated failures.
         """
-        for trigger in _TRIGRAM_FTS_TRIGGERS:
-            try:
-                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            except sqlite3.OperationalError:
-                pass
-        existed = False
+        started_transaction = False
         try:
+            cursor.execute("BEGIN IMMEDIATE")
+            started_transaction = True
+            for trigger in _TRIGRAM_FTS_TRIGGERS:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             row = cursor.execute(
                 "SELECT 1 FROM sqlite_master "
                 "WHERE type = 'table' AND name = 'messages_fts_trigram'"
             ).fetchone()
             existed = row is not None
             cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
-        except sqlite3.OperationalError:
-            # FTS5 module missing, shadow tables in an undroppable state, or the
-            # DB is locked by another process. Re-check whether the table is
-            # actually gone before claiming success — a swallowed lock error
-            # must NOT report a drop that didn't happen.
-            pass
-        if not existed:
-            return False
-        try:
-            still_there = cursor.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'messages_fts_trigram'"
-            ).fetchone()
-        except sqlite3.OperationalError:
-            # Can't even confirm state (locked) — assume not dropped.
-            return False
-        return still_there is None
+            cursor.execute("COMMIT")
+            started_transaction = False
+            return existed
+        except sqlite3.OperationalError as exc:
+            if started_transaction:
+                try:
+                    cursor.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+            if SessionDB._is_fts5_unavailable_error(exc):
+                return False
+            raise
 
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:

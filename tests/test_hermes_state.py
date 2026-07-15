@@ -600,12 +600,48 @@ class TestSessionLifecycle:
         finally:
             restored.close()
 
-    def test_drop_trigram_fts_returns_false_when_drop_thwarted(
+    def test_trigram_disabled_cjk_like_fallback_preserves_boolean_ops(
         self, tmp_path, monkeypatch
     ):
-        """Regression (Codex P2): if DROP TABLE fails (e.g. the DB is locked by
-        another process), _drop_trigram_fts must return False so the caller does
-        NOT log a misleading 'dropped, run VACUUM' hint while the table survives."""
+        """CJK LIKE fallback must keep FTS boolean semantics when trigram is off."""
+        monkeypatch.setattr(SessionDB, "_trigram_fts_enabled", staticmethod(lambda: False))
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            rows = {
+                "a": "大别山项目 预算复盘",
+                "ab": "大别山项目 桂林项目 联合简报",
+                "b": "桂林项目 单独计划",
+                "ac": "大别山项目 长江大桥 施工方案",
+            }
+            for sid, content in rows.items():
+                db.create_session(session_id=sid, source="cli")
+                db.append_message(sid, role="user", content=content)
+
+            assert db._trigram_available is False
+            assert db._fts_table_exists("messages_fts_trigram") is False
+
+            not_results = db.search_messages(
+                "大别山项目 NOT 桂林项目", limit=10
+            )
+            assert {row["session_id"] for row in not_results} == {"a", "ac"}
+
+            and_results = db.search_messages(
+                "大别山项目 AND 桂林项目", limit=10
+            )
+            assert {row["session_id"] for row in and_results} == {"ab"}
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("blocked_sql", ["DROP TRIGGER", "DROP TABLE"])
+    def test_drop_trigram_fts_propagates_locked_drop_failures(
+        self, tmp_path, monkeypatch, blocked_sql
+    ):
+        """A locked trigram trigger/table DROP must not be swallowed.
+
+        The drop sequence is transactional, so a table DROP lock after trigger
+        drops rolls back the trigger drops instead of leaving stale/partial FTS
+        state behind.
+        """
         db_path = tmp_path / "state.db"
         monkeypatch.setattr(SessionDB, "_trigram_fts_enabled", staticmethod(lambda: True))
         db = SessionDB(db_path=db_path)
@@ -617,19 +653,27 @@ class TestSessionLifecycle:
             real_conn = db._conn
 
             class _BlockDropCursor:
-                """Delegates to the real connection but raises on the trigram
-                DROP TABLE, simulating a lock held by another writer."""
-
                 def execute(self, sql, *args, **kwargs):
-                    if "DROP TABLE" in sql and "messages_fts_trigram" in sql:
+                    normalized = sql.upper()
+                    if blocked_sql in normalized and "MESSAGES_FTS_TRIGRAM" in normalized:
                         raise sqlite3.OperationalError("database is locked")
                     return real_conn.execute(sql, *args, **kwargs)
 
-            dropped = db._drop_trigram_fts(_BlockDropCursor())
-            # The DROP was thwarted → not a real drop.
-            assert dropped is False
-            # And the table really is still present.
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                db._drop_trigram_fts(_BlockDropCursor())
+
+            # The whole sequence failed closed: table and trigram triggers stay
+            # together, so later writes neither lie about a drop nor hit a stale
+            # trigger pointing at a missing table.
             assert db._fts_table_exists("messages_fts_trigram") is True
+            triggers = {
+                row[0]
+                for row in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name LIKE 'messages_fts_trigram_%'"
+                ).fetchall()
+            }
+            assert triggers == set(hermes_state._TRIGRAM_FTS_TRIGGERS)
         finally:
             db.close()
 
