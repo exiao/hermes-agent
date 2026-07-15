@@ -1540,7 +1540,23 @@ def resolve_anthropic_token() -> Optional[str]:
 
     Returns the token string or None.
     """
-    creds = read_claude_code_credentials()
+    # Respect an explicit user suppression of the claude_code source BEFORE
+    # touching the Claude file / Keychain. The user can `hermes auth remove
+    # anthropic` the Claude Code credential, which does NOT delete
+    # ~/.claude/.credentials.json (Claude Code still owns it) but records a
+    # suppression marker so Hermes stops reading it. Honor that marker for EVERY
+    # profile, including the default/process-owner: skip the read entirely so a
+    # suppressed source never touches the file or the macOS Keychain, and never
+    # resurrects the removed credential at source #3 or via the
+    # _prefer_refreshable_claude_code_token shadowing at sources #1/#2.
+    try:
+        from hermes_cli.auth import is_source_suppressed
+
+        claude_code_suppressed = is_source_suppressed("anthropic", "claude_code")
+    except Exception:
+        claude_code_suppressed = False
+
+    creds = None if claude_code_suppressed else read_claude_code_credentials()
 
     # Reads route through get_secret so a multiplexed gateway resolves the
     # requesting profile's token (via the active _SECRET_SCOPE) instead of the
@@ -1578,6 +1594,12 @@ def resolve_anthropic_token() -> Optional[str]:
     from agent.secret_scope import is_multiplex_active
 
     nondefault_scope = _scope_is_non_default_profile() and is_multiplex_active()
+    # NOTE: claude_code suppression is deliberately NOT folded into
+    # suppress_global_creds. suppress_global_creds also drives
+    # `profile_only=` on the pool lookup below; a profile that suppressed only
+    # the Claude-file source must still get the pool's global-root fallback for a
+    # valid inherited/manual OAuth pool entry. The Claude-file read is already
+    # gated above by claude_code_suppressed.
     suppress_global_creds = nondefault_scope or scope_has_api_key
     if suppress_global_creds:
         creds = None
@@ -1602,8 +1624,11 @@ def resolve_anthropic_token() -> Optional[str]:
     # this reads the host's global default-profile ~/.claude record, which must
     # not resolve for another profile (passing creds=None here would just re-read
     # that global file — see _resolve_claude_code_token_from_credentials). The
-    # default profile owns ~/.claude, so it still resolves here as before.
-    if not suppress_global_creds:
+    # default profile owns ~/.claude, so it still resolves here as before — UNLESS
+    # the user suppressed the claude_code source, in which case even the default
+    # profile must not re-read the file here (creds=None above does NOT stop this
+    # resolver from re-reading the global file on its own).
+    if not suppress_global_creds and not claude_code_suppressed:
         resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
         if resolved_claude_token:
             return resolved_claude_token

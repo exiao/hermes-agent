@@ -1631,6 +1631,59 @@ def test_singleton_seed_does_not_clobber_manual_oauth_entry(tmp_path, monkeypatc
     assert {entry.source for entry in entries} == {"manual:hermes_pkce", "hermes_pkce"}
 
 
+def test_load_pool_does_not_read_claude_code_when_suppressed(tmp_path, monkeypatch):
+    """A suppressed claude_code source must not be READ during pool seeding.
+
+    Regression: _seed_from_singletons evaluated read_claude_code_credentials()
+    when building the (source, creds) list, before checking suppression, so the
+    Claude file / macOS Keychain was still touched despite the suppression
+    marker. Suppression must be checked before the read.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "suppressed_sources": {"anthropic": ["claude_code"]},
+        },
+    )
+
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        lambda: None,
+    )
+
+    def _boom():
+        raise AssertionError(
+            "read_claude_code_credentials must not be called when claude_code is suppressed"
+        )
+
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials", _boom
+    )
+    # Reach the auto-discovery read loop: it is gated on the provider being
+    # explicitly configured, and skipped when the API-key path is explicit.
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_provider_explicitly_configured",
+        lambda provider: provider == "anthropic",
+    )
+
+    from agent.credential_pool import PooledCredential, _seed_from_singletons
+
+    entries: list[PooledCredential] = []
+    # _seed_from_singletons builds the (source, reader) list and, before this
+    # fix, eagerly called read_claude_code_credentials() there — _boom would
+    # fire even though claude_code is suppressed. After the fix, suppression is
+    # checked first and the reader is never called.
+    changed, active = _seed_from_singletons("anthropic", entries)
+    assert "claude_code" not in active
+    assert "claude_code" not in {entry.source for entry in entries}
+
+
 def test_load_pool_prefers_anthropic_env_token_over_file_backed_oauth(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
