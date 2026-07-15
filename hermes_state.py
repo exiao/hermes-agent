@@ -3849,6 +3849,25 @@ class SessionDB:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
+            # Idempotency guard against re-persist duplication (#860 / #42039):
+            # the gateway re-flushes reloaded/deep-copied history whose in-memory
+            # _DB_PERSISTED_MARKER was stripped by the wire sanitizer, so the SAME
+            # logical message can reach append_message repeatedly. A byte-identical
+            # row on the natural key (session, role, timestamp, content, tool ids)
+            # is a re-persist, not a distinct message — new messages always get a
+            # fresh time.time() timestamp. Return the existing id without inserting
+            # or double-counting. Runs inside BEGIN IMMEDIATE so check+insert is
+            # atomic under the single writer.
+            _dup = conn.execute(
+                """SELECT id FROM messages
+                   WHERE session_id = ? AND role = ? AND timestamp = ?
+                     AND content IS ? AND tool_call_id IS ? AND tool_calls IS ?
+                   LIMIT 1""",
+                (session_id, role, message_timestamp, stored_content,
+                 tool_call_id, tool_calls_json),
+            ).fetchone()
+            if _dup is not None:
+                return _dup[0]
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
