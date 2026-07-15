@@ -20,6 +20,40 @@ def test_api_key_provider_prefers_active_secret_scope(monkeypatch):
     assert credentials["api_key"] == "profile-scoped-key"
 
 
+def test_credential_pool_seed_prefers_active_scope_over_raw_dotenv(monkeypatch):
+    """Pool env seeding must use the resolved active scope, not raw .env.
+
+    Regression for the #100 P2s on raw ``op://`` refs and stale plaintext .env
+    values: ``_profile_runtime_scope`` has already resolved the correct profile
+    value into ``get_secret``. If the pool seed prefers the file value first, it
+    can persist ``op://...`` or stale plaintext instead of the scoped secret.
+    """
+    import agent.credential_pool as credential_pool
+
+    monkeypatch.setattr(
+        credential_pool,
+        "load_env",
+        lambda: {"OPENROUTER_API_KEY": "op://Private/Stale/key"},
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-default-leak")
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_source_suppressed", lambda _p, _s: False
+    )
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({"OPENROUTER_API_KEY": "sk-profile-resolved"})
+    try:
+        entries = []
+        changed, sources = credential_pool._seed_from_env("openrouter", entries)
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+    assert changed
+    assert sources == {"env:OPENROUTER_API_KEY"}
+    assert entries[0].access_token == "sk-profile-resolved"
+
+
 def test_copilot_catalog_token_uses_active_scope_not_gh_fallback(monkeypatch):
     """The Copilot catalog fetch must resolve its GitHub token from the active
     profile scope, not the process env / ``gh auth token`` fallback.

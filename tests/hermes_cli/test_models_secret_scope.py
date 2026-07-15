@@ -175,3 +175,36 @@ def test_ollama_catalog_uses_scoped_credentials(monkeypatch):
         "base_url": "https://profile-b.example/v1",
         "timeout": 8.0,
     }
+
+
+def test_openai_catalog_uses_scoped_base_url_not_environ(monkeypatch):
+    """OpenAI discovery must keep the scoped key and scoped base URL together."""
+    captured = {}
+
+    def _fetch(api_key, base_url, *args, **kwargs):
+        captured.update(api_key=api_key, base_url=base_url)
+        return ["profile-only-model"]
+
+    monkeypatch.setattr(models, "fetch_api_models", _fetch)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-default-leak")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://default.example/v1")
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope(
+        {
+            "OPENAI_API_KEY": "sk-profile-b",
+            "OPENAI_BASE_URL": "https://profile-b.example/v1",
+        }
+    )
+    try:
+        assert models.provider_model_ids("openai-api", force_refresh=True) == [
+            "profile-only-model"
+        ]
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+    assert captured == {
+        "api_key": "sk-profile-b",
+        "base_url": "https://profile-b.example/v1",
+    }

@@ -617,6 +617,71 @@ class TestListProvidersEnvProbesUseScope:
 
         assert not rows, "os.environ deepseek key must not leak into profile B's listing"
 
+    def test_scoped_miss_does_not_pool_seed_default_key_into_profile(
+        self, monkeypatch, tmp_path
+    ):
+        """A named-profile scoped miss must stop before credential-pool seeding.
+
+        Regression for the #100 P1: the Section-1 scoped env probe correctly
+        missed (profile B has no DEEPSEEK_API_KEY), but the listing then fell
+        through to ``load_pool()``, whose env auto-seed could persist the DEFAULT
+        profile's process key into profile B's auth store. Simulate that unsafe
+        fallback and prove the listing never reaches it.
+        """
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile_home = tmp_path / "profiles" / "profileB"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-default-leak")
+        ss.set_multiplex_active(True)
+
+        # If the old pool fallback is reached, it would write the default
+        # profile's env key into profile B's auth.json and mark the row present.
+        def _unsafe_load_pool(_slug):
+            import json
+
+            auth_path = profile_home / "auth.json"
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "credential_pool": {
+                            "deepseek": [
+                                {
+                                    "source": "env:DEEPSEEK_API_KEY",
+                                    "access_token": "sk-default-leak",
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class _Pool:
+                def has_credentials(self):
+                    return True
+
+            return _Pool()
+
+        monkeypatch.setattr("agent.credential_pool.load_pool", _unsafe_load_pool)
+
+        home_token = set_hermes_home_override(str(profile_home))
+        scope_token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-openai"})
+        try:
+            rows = self._list_deepseek(monkeypatch)
+        finally:
+            ss.reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+
+        assert not rows, "scoped miss must not list via default-profile pool seed"
+        assert not (profile_home / "auth.json").exists(), (
+            "scoped miss must not persist the default profile's env key into "
+            "the named profile auth store"
+        )
+
     def test_single_profile_reads_environ_unchanged(self, monkeypatch):
         """Multiplex off, no scope (CLI/TUI): get_secret falls back to
         os.environ, so an env-var provider still lists exactly as before."""
