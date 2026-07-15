@@ -1866,13 +1866,19 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 
         from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
 
-        for source_name, creds in (
-            ("hermes_pkce", read_hermes_oauth_credentials()),
-            ("claude_code", read_claude_code_credentials()),
+        # Check suppression BEFORE reading each source: read_claude_code_credentials()
+        # touches ~/.claude / the macOS Keychain, so a suppressed claude_code
+        # source must not be read at all (see resolve_anthropic_token's
+        # "not even read" contract). Pair each source with a lazy reader and
+        # only call it when the source is not suppressed.
+        for source_name, _reader in (
+            ("hermes_pkce", read_hermes_oauth_credentials),
+            ("claude_code", read_claude_code_credentials),
         ):
+            if _is_suppressed(provider, source_name):
+                continue
+            creds = _reader()
             if creds and creds.get("accessToken"):
-                if _is_suppressed(provider, source_name):
-                    continue
                 active_sources.add(source_name)
                 # Honor user-configured proxy base_url so that rotations to
                 # this entry keep traffic on the proxy.  Otherwise the entry
