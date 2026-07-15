@@ -449,8 +449,11 @@ async function startSocket() {
         } else {
           reconnectAttempts += 1;
           const backoff = Math.min(RECONNECT_BASE_MS * 2 ** (reconnectAttempts - 1), RECONNECT_MAX_MS);
-          const jitter = Math.floor(Math.random() * 1000);
-          delay = backoff + jitter;
+          // Full jitter: spread the reconnect uniformly across the ENTIRE
+          // backoff window (0..backoff) instead of a fixed +0-1s, so retries
+          // never settle into a regular machine cadence a bot-detector flags.
+          const jitter = Math.floor(Math.random() * backoff);
+          delay = RECONNECT_BASE_MS + jitter;
           if (!PAIR_JSON) console.log(`⚠️  Connection closed (reason: ${reason}). Reconnect attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s...`);
         }
         setTimeout(startSocket, delay);
