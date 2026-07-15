@@ -451,6 +451,30 @@ class TestResolveAnthropicToken:
         )
         assert resolve_anthropic_token() is None
 
+    def test_suppressed_claude_code_source_is_not_even_read(self, monkeypatch, tmp_path):
+        """Suppression must be checked BEFORE read_claude_code_credentials so a
+        suppressed source never touches the Claude file / macOS Keychain at all.
+        """
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.auth.is_source_suppressed",
+            lambda provider, source: provider == "anthropic" and source == "claude_code",
+        )
+        calls = {"n": 0}
+
+        def _boom():
+            calls["n"] += 1
+            raise AssertionError("read_claude_code_credentials must not be called when suppressed")
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", _boom
+        )
+        assert resolve_anthropic_token() is None
+        assert calls["n"] == 0
+
     def test_returns_none_with_no_creds(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
