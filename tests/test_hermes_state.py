@@ -903,6 +903,14 @@ class TestExternalContentFtsMigration:
             # OR still unions.
             or_results = db.search_messages("武汉分部 OR 桂林项目", limit=10)
             assert {r["session_id"] for r in or_results} == {"ab", "ac"}
+
+            # OR NOT keeps the OR connector (must not collapse to AND NOT):
+            # "桂林项目 OR NOT 武汉分部" = rows with 桂林项目, OR rows without
+            # 武汉分部. Session "a" has neither 桂林项目 nor 武汉分部, so the
+            # NOT arm includes it; "ab" matches the OR arm; "ac" has 武汉分部
+            # and not 桂林项目, so it is excluded.
+            or_not_results = db.search_messages("桂林项目 OR NOT 武汉分部", limit=10)
+            assert {r["session_id"] for r in or_not_results} == {"a", "ab"}
         finally:
             db.close()
 
@@ -952,6 +960,45 @@ class TestExternalContentFtsMigration:
             # With the triggers gone, a new message INSERT no longer crashes on
             # the unusable trigram vtable.
             db.append_message("s1", role="user", content="second message after drop")
+        finally:
+            db.close()
+
+    def test_drop_trigram_schema_fails_closed_if_tokenizer_fallback_locked(
+        self, tmp_path, monkeypatch
+    ):
+        """Tokenizer-missing recovery must itself fail closed on a lock.
+
+        When DROP TABLE raises 'no such tokenizer: trigram', the fallback
+        re-drops the triggers in a standalone transaction. If THAT is blocked
+        (a concurrent gateway/cron holds the write lock), swallowing it would
+        leave a stale trigger firing against the unusable vtable on the next
+        INSERT. The lock must propagate so a later uncontended startup retries.
+        """
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: True)
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="the quick brown fox")
+            real_conn = db._conn
+
+            class _TokenizerThenLockCursor:
+                def __init__(self):
+                    self._table_drop_seen = False
+
+                def execute(self, sql, *args, **kwargs):
+                    normalized = sql.upper()
+                    if "DROP TABLE" in normalized and "MESSAGES_FTS_TRIGRAM" in normalized:
+                        self._table_drop_seen = True
+                        raise sqlite3.OperationalError("no such tokenizer: trigram")
+                    # After the tokenizer failure, the standalone trigger-drop
+                    # BEGIN IMMEDIATE is blocked by a concurrent writer.
+                    if self._table_drop_seen and "BEGIN IMMEDIATE" in normalized:
+                        raise sqlite3.OperationalError("database is locked")
+                    return real_conn.execute(sql, *args, **kwargs)
+
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                db._drop_trigram_schema(_TokenizerThenLockCursor())
         finally:
             db.close()
 

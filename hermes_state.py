@@ -1222,14 +1222,19 @@ class SessionDB:
                     ):
                         cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
                     cursor.execute("COMMIT")
-                except sqlite3.OperationalError:
-                    # Locked/unavailable while dropping the triggers alone; roll
-                    # back the partial drop and report no drop so a later
-                    # uncontended startup retries.
+                except sqlite3.OperationalError as cleanup_exc:
+                    # Roll back the partial trigger drop, then FAIL CLOSED: if the
+                    # standalone cleanup was itself blocked (e.g. a concurrent
+                    # gateway/cron holds the write lock), swallowing it would
+                    # leave a stale messages_fts_trigram_* trigger firing against
+                    # the unusable vtable on the next INSERT. Propagate so the
+                    # caller aborts and a later uncontended startup retries the
+                    # whole drop, exactly like the main lock path below.
                     try:
                         cursor.execute("ROLLBACK")
                     except sqlite3.OperationalError:
                         pass
+                    raise cleanup_exc
                 return False
             raise
 
@@ -5214,24 +5219,34 @@ class SessionDB:
                 ] or [raw_query]
                 # Build the boolean expression. Adjacent terms without an
                 # explicit operator default to AND (FTS5 semantics). NOT
-                # attaches to the following term as `AND NOT (...)`.
+                # attaches to the following term as `AND NOT (...)`; a preceding
+                # OR/AND is kept as the connector, so `A OR NOT B` stays
+                # `A OR NOT B` rather than collapsing to `A AND NOT B`.
                 expr_parts: list = []
-                pending_op = None  # None | "AND" | "OR" | "NOT"
+                pending_conn = None  # None | "AND" | "OR"  (connector)
+                pending_negate = False  # a NOT applies to the next term
                 for tok in tokens:
                     upper = tok.upper()
-                    if upper in {"AND", "OR", "NOT"}:
-                        pending_op = upper
+                    if upper in {"AND", "OR"}:
+                        pending_conn = upper
+                        continue
+                    if upper == "NOT":
+                        pending_negate = True
                         continue
                     clause = _term_clause(tok)
                     if not expr_parts:
-                        expr_parts.append(clause)
-                    elif pending_op == "OR":
-                        expr_parts.append(f"OR {clause}")
-                    elif pending_op == "NOT":
-                        expr_parts.append(f"AND NOT {clause}")
-                    else:  # explicit AND or implicit adjacency
-                        expr_parts.append(f"AND {clause}")
-                    pending_op = None
+                        # First term: a leading NOT still excludes.
+                        expr_parts.append(f"NOT {clause}" if pending_negate else clause)
+                    else:
+                        # Default connector between adjacent terms is AND
+                        # (FTS5 semantics); an explicit OR/AND overrides it.
+                        conn = pending_conn or "AND"
+                        if pending_negate:
+                            expr_parts.append(f"{conn} NOT {clause}")
+                        else:
+                            expr_parts.append(f"{conn} {clause}")
+                    pending_conn = None
+                    pending_negate = False
                 if not expr_parts:
                     # No word tokens survived (pure operators or empty) — match
                     # the raw query as a single substring.
