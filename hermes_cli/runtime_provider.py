@@ -251,6 +251,18 @@ def _anthropic_base_url_override_ok(base_url: str) -> bool:
     # signal _detect_api_mode_for_url() uses to pick anthropic_messages.
     if _detect_api_mode_for_url(candidate) == "anthropic_messages":
         return True
+    # Local loopback proxy (e.g. the Hermes billing proxy on 127.0.0.1:18801).
+    # A loopback URL cannot be the "stale non-Anthropic aggregator" leak the
+    # guard defends against (OpenRouter/Z.ai are never loopback); it is a
+    # deliberate local Anthropic-Messages proxy. Honoring it here is what lets
+    # ``providers.anthropic.base_url: http://127.0.0.1:18801`` route through the
+    # proxy for EVERY process (main, subagents, kanban workers, cron) instead of
+    # depending on the ANTHROPIC_BASE_URL env var being present in that process.
+    # This branch is only ever reached when the configured provider is
+    # ``anthropic`` (all three call sites gate on ``cfg_provider == "anthropic"``),
+    # so it can never redirect codex/openai traffic through the proxy.
+    if _loopback_hostname(hostname):
+        return True
     # Bare api.kimi.com without the /coding path is not an Anthropic endpoint.
     return False
 
