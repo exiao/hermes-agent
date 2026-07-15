@@ -43,6 +43,7 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  reconnectPlan,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -379,10 +380,7 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 let reconnectAttempts = 0;
-const RECONNECT_MIN_MS = 3 * 60 * 1000;    // 3 min
-const RECONNECT_MAX_MS = 30 * 60 * 1000;   // 30 min
 const RECONNECT_GIVEUP_AFTER = 10;         // after this many straight failures, back off hard
-const RECONNECT_LONG_MS = 12 * 60 * 60 * 1000; // 12 hours
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
@@ -439,31 +437,24 @@ async function startSocket() {
         process.exit(1);
       } else {
         // 515 = restart requested (common after pairing) - legit and fast.
-        // Everything else uses exponential backoff + jitter so a persistent
+        // Everything else uses capped exponential backoff + jitter so a persistent
         // failure (e.g. 405 from a rejected handshake) does not hammer
         // WhatsApp's servers and risk the account being flagged as abusive.
         emitPairEvent({ event: 'disconnected', reason });
-        let delay;
+        const plan = reconnectPlan({ reason, reconnectAttempts });
+        reconnectAttempts = plan.reconnectAttempts;
+        const { delay } = plan;
         if (reason === 515) {
-          delay = 1000;
           if (!PAIR_JSON) console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
         } else {
-          reconnectAttempts += 1;
           if (reconnectAttempts > RECONNECT_GIVEUP_AFTER) {
             // Persistent failure: after 10 straight attempts, stop trying for
             // a full 12h. Anything wrong at this point (stale client, banned
             // handshake) won't fix itself in minutes, and continuing to retry
             // only risks the account. Any successful connect resets the count.
-            delay = RECONNECT_LONG_MS;
             if (!PAIR_JSON) console.log(`⛔ ${reconnectAttempts - 1} reconnects failed (reason: ${reason}). Backing off for 12h.`);
           } else {
-            // Pick a fresh UNIFORM-RANDOM delay in [3min, 30min] on every retry.
-            // Deliberately non-monotonic (e.g. 3m, 15m, 4m, 30m, ...) so the
-            // reconnect cadence looks nothing like a machine and a persistent
-            // failure (e.g. a 405 rejected handshake) can't hammer WhatsApp or
-            // get the account flagged as an abusive client.
-            delay = RECONNECT_MIN_MS + Math.floor(Math.random() * (RECONNECT_MAX_MS - RECONNECT_MIN_MS + 1));
-            if (!PAIR_JSON) console.log(`⚠️  Connection closed (reason: ${reason}). Reconnect attempt ${reconnectAttempts} in ${Math.round(delay / 60000)}m...`);
+            if (!PAIR_JSON) console.log(`⚠️  Connection closed (reason: ${reason}). Reconnect attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s...`);
           }
         }
         setTimeout(startSocket, delay);

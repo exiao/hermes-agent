@@ -17,11 +17,43 @@ import {
   buildTextSendPayload,
   createBoundedMessageStore,
   appendMediaFailureNote,
+  reconnectPlan,
   extractBridgeEvent,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- reconnect policy ----------------------------------------------------
+{
+  const restarted = reconnectPlan({ reason: 515, reconnectAttempts: 10 });
+  assert.deepEqual(restarted, { delay: 1000, reconnectAttempts: 0 },
+    'WhatsApp-requested restarts clear prior failure state');
+  console.log('  ✓ 515 reconnect clears the consecutive-failure counter');
+}
+
+{
+  const firstRetry = reconnectPlan({ reason: 405, reconnectAttempts: 0, random: () => 0 });
+  assert.equal(firstRetry.reconnectAttempts, 1);
+  assert.equal(firstRetry.delay, 3000,
+    'the first ordinary reconnect stays seconds-scale');
+  console.log('  ✓ first reconnect is seconds-scale instead of minutes');
+}
+
+{
+  const cappedRetry = reconnectPlan({ reason: 405, reconnectAttempts: 9, random: () => 0.5 });
+  assert.equal(cappedRetry.reconnectAttempts, 10);
+  assert.equal(cappedRetry.delay, 151500,
+    'repeated failures use capped exponential jitter');
+  console.log('  ✓ repeated reconnects use capped exponential jitter');
+}
+
+{
+  const giveUp = reconnectPlan({ reason: 405, reconnectAttempts: 10 });
+  assert.deepEqual(giveUp, { delay: 12 * 60 * 60 * 1000, reconnectAttempts: 11 },
+    'the eleventh consecutive failure enters the 12-hour backoff');
+  console.log('  ✓ persistent failures enter the 12-hour backoff');
+}
 
 // -- quoted outbound text -------------------------------------------------
 {

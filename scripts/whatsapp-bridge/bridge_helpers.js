@@ -13,6 +13,32 @@ export const MIME_MAP = {
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 };
 
+const RECONNECT_BASE_MS = 3 * 1000;
+const RECONNECT_MAX_MS = 5 * 60 * 1000;
+const RECONNECT_GIVEUP_AFTER = 10;
+const RECONNECT_LONG_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Return the next reconnect delay and consecutive-failure count without
+ * importing the live bridge (which creates a socket and HTTP server).
+ */
+export function reconnectPlan({ reason, reconnectAttempts, random = Math.random }) {
+  if (reason === 515) {
+    return { delay: 1000, reconnectAttempts: 0 };
+  }
+
+  const nextAttempts = reconnectAttempts + 1;
+  if (nextAttempts > RECONNECT_GIVEUP_AFTER) {
+    return { delay: RECONNECT_LONG_MS, reconnectAttempts: nextAttempts };
+  }
+
+  const exponent = Math.min(nextAttempts - 1, 10);
+  const backoff = Math.min(RECONNECT_BASE_MS * (2 ** exponent), RECONNECT_MAX_MS);
+  const delay = RECONNECT_BASE_MS
+    + Math.floor(random() * (backoff - RECONNECT_BASE_MS + 1));
+  return { delay, reconnectAttempts: nextAttempts };
+}
+
 export function normalizeWhatsAppId(value) {
   if (!value) return '';
   return String(value).replace(':', '@');
