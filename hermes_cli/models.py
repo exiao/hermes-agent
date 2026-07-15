@@ -2382,9 +2382,18 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         if live:
             return live
     if normalized in ("openai", "openai-api"):
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        # Resolve via the active profile secret scope (get_secret) rather than
+        # os.getenv. Under gateway profile multiplexing the /model listing marks
+        # the openai-api row available from the requesting profile's scoped
+        # OPENAI_API_KEY; discovery must use that SAME key/base_url so profile
+        # B's picker never calls /models with profile A's OpenAI credential.
+        # get_secret falls back to os.environ when unscoped + multiplex off, so
+        # single-profile CLI/TUI behavior is byte-identical.
+        from agent.secret_scope import get_secret as _get_secret
+
+        api_key = (_get_secret("OPENAI_API_KEY", "") or "").strip()
         if api_key:
-            base_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+            base_raw = (_get_secret("OPENAI_BASE_URL", "") or "").strip().rstrip("/")
             base = base_raw or "https://api.openai.com/v1"
             # Custom OpenAI-compatible endpoints (proxies, gateways, self-hosted)
             # may serve a small curated catalog — use the live list verbatim so
@@ -2557,6 +2566,13 @@ def _credential_fingerprint(provider: str) -> str:
     import hashlib
     import os as _os
 
+    # Read credential env-var VALUES through the active profile secret scope so
+    # the fingerprint is per-profile under gateway multiplexing: profile B's
+    # cache entry keys off profile B's OPENAI_API_KEY, never profile A's value
+    # sitting in os.environ. get_secret falls back to os.environ when unscoped +
+    # multiplex off, so single-profile fingerprints are byte-identical.
+    from agent.secret_scope import get_secret as _get_secret
+
     parts: list[str] = []
 
     # Env vars from PROVIDER_REGISTRY for this slug
@@ -2565,10 +2581,10 @@ def _credential_fingerprint(provider: str) -> str:
         pcfg = PROVIDER_REGISTRY.get(provider)
         if pcfg is not None:
             for ev in getattr(pcfg, "api_key_env_vars", ()) or ():
-                parts.append(f"{ev}={_os.environ.get(ev, '')}")
+                parts.append(f"{ev}={_get_secret(ev, '') or ''}")
             bev = getattr(pcfg, "base_url_env_var", "") or ""
             if bev:
-                parts.append(f"{bev}={_os.environ.get(bev, '')}")
+                parts.append(f"{bev}={_get_secret(bev, '') or ''}")
     except Exception:
         pass
 
@@ -2712,6 +2728,39 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
         pass
 
 
+def _scoped_anthropic_pool_token() -> str:
+    """Return a token persisted in the active profile's auth store only."""
+    try:
+        from agent.credential_pool import (
+            PooledCredential,
+            STATUS_DEAD,
+            _exhausted_until,
+        )
+        import time
+        from hermes_cli.auth import _load_auth_store
+
+        raw_pool = _load_auth_store().get("credential_pool")
+        entries = raw_pool.get("anthropic", []) if isinstance(raw_pool, dict) else []
+        if not isinstance(entries, list):
+            return ""
+        now = time.time()
+        for raw_entry in entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = PooledCredential.from_dict("anthropic", raw_entry)
+            if entry.last_status == STATUS_DEAD:
+                continue
+            exhausted_until = _exhausted_until(entry)
+            if exhausted_until is not None and exhausted_until > now:
+                continue
+            token = str(entry.access_token or "").strip()
+            if token:
+                return token
+    except Exception:
+        pass
+    return ""
+
+
 def _fetch_anthropic_models(
     timeout: float = 5.0,
     *,
@@ -2726,10 +2775,26 @@ def _fetch_anthropic_models(
     """
     try:
         from agent.anthropic_adapter import resolve_anthropic_token, _is_oauth_token
+        from agent.secret_scope import current_secret_scope, get_secret
     except ImportError:
         return None
 
-    token = (api_key or "").strip() or resolve_anthropic_token()
+    active_scope = current_secret_scope()
+    scoped_token = ""
+    if active_scope is not None:
+        for secret_name in (
+            "ANTHROPIC_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ):
+            scoped_token = str(get_secret(secret_name, "") or "").strip()
+            if scoped_token:
+                break
+        if not scoped_token:
+            scoped_token = _scoped_anthropic_pool_token()
+    token = (api_key or "").strip() or (
+        scoped_token if active_scope is not None else resolve_anthropic_token()
+    )
     if not token:
         return None
 
@@ -3723,9 +3788,18 @@ def fetch_ollama_cloud_models(
 
     # 2. Live API probe
     if not api_key:
-        api_key = os.getenv("OLLAMA_API_KEY", "")
+        try:
+            from agent.secret_scope import get_secret
+            api_key = get_secret("OLLAMA_API_KEY", "") or ""
+        except ImportError:
+            api_key = os.getenv("OLLAMA_API_KEY", "")
     if not base_url:
-        base_url = os.getenv("OLLAMA_BASE_URL", "") or "https://ollama.com/v1"
+        try:
+            from agent.secret_scope import get_secret
+            base_url = get_secret("OLLAMA_BASE_URL", "") or ""
+        except ImportError:
+            base_url = os.getenv("OLLAMA_BASE_URL", "")
+        base_url = base_url or "https://ollama.com/v1"
 
     live_models: list[str] = []
     if api_key:

@@ -357,6 +357,7 @@ def fetch_bitwarden_secrets(
     use_cache: bool = True,
     server_url: str = "",
     home_path: Optional[Path] = None,
+    scoped_env: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Pull the secrets for ``project_id`` from Bitwarden Secrets Manager.
 
@@ -407,7 +408,9 @@ def fetch_bitwarden_secrets(
             "`hermes secrets bitwarden setup`."
         )
 
-    secrets, warnings = _run_bws_list(bws, access_token, project_id, server_url)
+    secrets, warnings = _run_bws_list(
+        bws, access_token, project_id, server_url, scoped_env=scoped_env
+    )
     entry = _CachedFetch(secrets=secrets, fetched_at=time.time())
     _CACHE[cache_key] = entry
     if use_cache:
@@ -415,11 +418,74 @@ def fetch_bitwarden_secrets(
     return secrets, warnings
 
 
+def _is_bws_runtime_env(name: str) -> bool:
+    """Return True for OS/runtime env vars the ``bws`` subprocess legitimately
+    needs (to locate itself, reach the network, and validate TLS) — the
+    allowlist for a scoped/named-profile fetch that must NOT inherit the default
+    profile's provider secrets. Anything not matching is dropped from the child
+    env under multiplexing, so cross-profile keys never reach the vault fetch.
+    """
+    if name in _BWS_RUNTIME_ENV_EXACT:
+        return True
+    return any(name.startswith(p) for p in _BWS_RUNTIME_ENV_PREFIXES)
+
+
+# OS/runtime essentials for the bws child process. Deliberately excludes every
+# third-party provider credential — bws authenticates only via BWS_ACCESS_TOKEN.
+_BWS_RUNTIME_ENV_EXACT = frozenset({
+    # Process/loader essentials
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD",
+    "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+    # TLS / cert validation
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    # Proxy plumbing (upper + lower case forms)
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    # Windows loader essentials
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+    "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS",
+    # bws behaviour toggles (not secrets)
+    "NO_COLOR", "RUST_LOG", "RUST_BACKTRACE",
+})
+_BWS_RUNTIME_ENV_PREFIXES = (
+    "LC_",   # locale categories (LC_MESSAGES, LC_NUMERIC, …)
+)
+
+
 def _run_bws_list(
-    bws: Path, access_token: str, project_id: str, server_url: str = ""
+    bws: Path,
+    access_token: str,
+    project_id: str,
+    server_url: str = "",
+    scoped_env: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
-    env = os.environ.copy()
+    if scoped_env is not None:
+        # Named-profile isolation under gateway.multiplex_profiles. The gateway
+        # process env is loaded from the DEFAULT profile, so inheriting the full
+        # ``os.environ`` would hand this named profile's ``bws`` subprocess the
+        # default profile's provider secrets (OPENAI_API_KEY, ANTHROPIC_API_KEY,
+        # …) while it resolves a DIFFERENT profile's vault — a cross-profile
+        # leak. Start from a minimal OS/runtime allowlist (what the binary needs
+        # to run + reach the network), NOT the process env, then overlay only
+        # this profile's scoped ``BWS_*`` plumbing. ``bws`` needs no third-party
+        # provider keys, so none are carried over.
+        env: Dict[str, str] = {
+            k: v
+            for k, v in os.environ.items()
+            if isinstance(v, str) and _is_bws_runtime_env(k)
+        }
+        env.pop("BWS_SERVER_URL", None)
+        for key, value in scoped_env.items():
+            if key.startswith("BWS_") and isinstance(value, str):
+                env[key] = value
+    else:
+        # Single-profile (no multiplexing): unchanged — inherit the process env
+        # so manual BWS_* / proxy / cert overrides in the shell keep working.
+        env = os.environ.copy()
     env["BWS_ACCESS_TOKEN"] = access_token
     # Make sure we're not echoing telemetry / colour codes into json.
     env.setdefault("NO_COLOR", "1")
@@ -639,12 +705,18 @@ class BitwardenSource(SecretSource):
             },
         }
 
-    def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
+    def fetch(
+        self,
+        cfg: dict,
+        home_path: Path,
+        environ: Optional[Dict[str, str]] = None,
+    ) -> FetchResult:
         cfg = cfg if isinstance(cfg, dict) else {}
+        env = os.environ if environ is None else environ
         result = FetchResult()
 
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
-        access_token = os.environ.get(access_token_env, "").strip()
+        access_token = env.get(access_token_env, "").strip()
         if not access_token:
             result.error = (
                 f"secrets.bitwarden.enabled is true but {access_token_env} is "
@@ -678,14 +750,26 @@ class BitwardenSource(SecretSource):
         except (TypeError, ValueError):
             ttl = 300.0
 
+        # Resolve the server URL from cfg first, then fall back to the
+        # (possibly scoped) BWS_SERVER_URL so a multiplexed profile that sets
+        # its region/endpoint in its own .env targets the right server and its
+        # cache entry keys off that URL instead of the default profile's.
+        server_url = str(cfg.get("server_url", "") or "").strip()
+        if not server_url:
+            server_url = str(env.get("BWS_SERVER_URL", "") or "").strip()
+        # Under multiplexing pass the scoped env so the bws child cannot inherit
+        # the default profile's BWS_* vars from the process environment.
+        scoped_env = None if environ is None else dict(env)
+
         try:
             secrets, warnings = fetch_bitwarden_secrets(
                 access_token=access_token,
                 project_id=project_id,
                 binary=binary,
                 cache_ttl_seconds=ttl,
-                server_url=str(cfg.get("server_url", "") or "").strip(),
+                server_url=server_url,
                 home_path=home_path,
+                scoped_env=scoped_env,
             )
         except RuntimeError as exc:
             result.error = str(exc)

@@ -565,15 +565,90 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     return True
 
 
+def _resolve_copilot_raw_token_from_active_scope(
+    pconfig: ProviderConfig,
+) -> Optional[tuple[str, str]]:
+    """Return a scoped Copilot GitHub token, or None when no scope is active.
+
+    Copilot normally has a convenience fallback to ``gh auth token``. In a
+    multiplexed gateway scope that fallback is unsafe for model discovery: it
+    reads the process/default profile identity after listing already decided the
+    requesting profile has scoped Copilot credentials. A present scope is
+    therefore authoritative, matching the generic API-key provider path below.
+
+    The one exception is the DEFAULT profile: under multiplexing every served
+    profile (including the default) gets a scope installed, but the process
+    ``gh`` credential IS the default profile's own identity. So a scoped miss
+    for the default profile must still fall through to ``gh auth token`` (return
+    None), while a scoped miss for a NAMED profile stays authoritative (return
+    ('', '')) so it can never borrow the process/gh token.
+    """
+    from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+    from hermes_cli.copilot_auth import validate_copilot_token
+
+    if current_secret_scope() is None:
+        return None
+
+    for env_var in pconfig.api_key_env_vars:
+        val = (_get_secret(env_var, "") or "").strip()
+        if not val:
+            continue
+        valid, msg = validate_copilot_token(val)
+        if not valid:
+            logger.warning("Token from %s is not supported: %s", env_var, msg)
+            continue
+        return val, env_var
+
+    # Scoped miss. Preserve the gh fallback for the default profile (its scope
+    # wraps its own process identity); a named profile's miss is authoritative.
+    try:
+        from hermes_constants import get_hermes_home
+
+        is_named_profile = get_hermes_home().parent.name == "profiles"
+    except Exception:
+        is_named_profile = False
+    if is_named_profile:
+        return "", ""
+    return None
+
+
+def _resolve_copilot_raw_token(pconfig: ProviderConfig) -> tuple[str, str]:
+    scoped = _resolve_copilot_raw_token_from_active_scope(pconfig)
+    if scoped is not None:
+        return scoped
+
+    # Fail closed on the unscoped multiplex path, mirroring the generic API-key
+    # resolver: with gateway.multiplex_profiles active but reached OUTSIDE a
+    # scope (current_secret_scope() is None, so the scoped helper returned None),
+    # resolve_copilot_token() would read the process env / ``gh auth token`` —
+    # the DEFAULT profile's GitHub identity — and hand it to a caller with no
+    # scope installed. That is the same cross-profile token leak the generic
+    # path guards against, so return no token instead of the gh fallback.
+    from agent.secret_scope import (
+        current_secret_scope as _current_secret_scope,
+        is_multiplex_active as _is_multiplex_active,
+    )
+
+    if _current_secret_scope() is None and _is_multiplex_active():
+        return "", ""
+
+    from hermes_cli.copilot_auth import resolve_copilot_token
+
+    return resolve_copilot_token()
+
+
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
     if provider_id == "copilot":
-        # Use the dedicated copilot auth module for proper token validation
+        # Use the dedicated copilot auth module for proper token validation and
+        # exchange, but resolve env vars through the active secret scope when
+        # one exists so live catalog fetches cannot borrow the process/gh token.
         try:
-            from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
-            token, source = resolve_copilot_token()
+            from hermes_cli.copilot_auth import get_copilot_api_token
+
+            token, source = _resolve_copilot_raw_token(pconfig)
             if token:
                 api_token, _base_url = get_copilot_api_token(token)
                 return api_token, source
@@ -583,14 +658,47 @@ def _resolve_api_key_provider_secret(
             pass
         return "", ""
 
+    from agent.secret_scope import (
+        current_secret_scope,
+        is_multiplex_active as _is_multiplex_active,
+        get_secret as _get_secret,
+        UnscopedSecretError,
+    )
     from hermes_cli.config import get_env_value_prefer_dotenv
+
     for env_var in pconfig.api_key_env_vars:
-        # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation
-        # in the user's .env file isn't shadowed by a stale shell export
-        # inherited from a parent process (Codex CLI, test runners, etc.).
-        val = (get_env_value_prefer_dotenv(env_var) or "").strip()
+        # Profile scopes are authoritative. Outside a scope retain the existing
+        # dotenv-over-process lookup ONLY for ordinary single-profile runs.
+        # Under gateway.multiplex_profiles the dotenv-preferred read would
+        # bypass get_secret's fail-closed guard: an unscoped multiplex call
+        # (reached outside _profile_runtime_scope) would return the process/
+        # default profile's .env key to a caller with no scope installed —
+        # exactly what UnscopedSecretError exists to prevent. So when
+        # multiplexing is active, always route through get_secret: it reads the
+        # installed scope when present and raises UnscopedSecretError (caught
+        # below → skip) when no scope is active, keeping the read fail-closed.
+        if current_secret_scope() is None and not _is_multiplex_active():
+            val = (get_env_value_prefer_dotenv(env_var) or "").strip()
+        else:
+            try:
+                val = (_get_secret(env_var, "") or "").strip()
+            except UnscopedSecretError:
+                # Multiplexing active, no scope installed: fail closed rather
+                # than leak the default profile's credential.
+                continue
         if has_usable_secret(val):
             return val, env_var
+
+    # Fail closed on the unscoped multiplex path BEFORE the credential-pool
+    # fallback. Under gateway.multiplex_profiles reached outside a scope, the
+    # pool fallback below can still seed/read from the default profile
+    # (load_pool()._seed_from_env treats current_secret_scope() is None as the
+    # single-profile path and prefers the raw .env value), returning a default-
+    # profile key as ``credential_pool:<provider>`` — the same cross-profile
+    # leak the env-var loop just guarded against. A named/multiplex caller with
+    # no scope installed must resolve nothing here.
+    if current_secret_scope() is None and _is_multiplex_active():
+        return "", ""
 
     # Fallback: try credential pool (e.g. zai key stored via auth.json)
     try:
@@ -6434,7 +6542,32 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+        # Resolve the base URL through the active profile secret scope so a
+        # multiplexed secondary profile's scoped *_BASE_URL override is honored
+        # instead of the default profile's value in os.environ. This keeps the
+        # /model listing→discovery path (cached_provider_model_ids ->
+        # provider_model_ids -> here) fetching from the requesting profile's
+        # endpoint, aligned with its scoped api key. get_secret falls back to
+        # os.environ when unscoped + multiplex off, so single-profile
+        # runtime/discovery is byte-identical.
+        from agent.secret_scope import (
+            get_secret as _get_secret,
+            current_secret_scope as _current_secret_scope,
+            is_multiplex_active as _is_multiplex_active,
+            UnscopedSecretError as _UnscopedSecretError,
+        )
+
+        # Fail closed on the unscoped multiplex path: without a scope installed,
+        # get_secret raises UnscopedSecretError. The credential already failed
+        # closed above, so leave the base URL empty rather than crashing (or
+        # reading the default profile's *_BASE_URL from os.environ).
+        if _current_secret_scope() is None and _is_multiplex_active():
+            env_url = ""
+        else:
+            try:
+                env_url = (_get_secret(pconfig.base_url_env_var, "") or "").strip()
+            except _UnscopedSecretError:
+                env_url = ""
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -6448,11 +6581,9 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
         # resolves an empty base URL (#50252).
         base_url = env_url.rstrip("/") if env_url else pconfig.inference_base_url
         try:
-            from hermes_cli.copilot_auth import (
-                resolve_copilot_token,
-                get_copilot_api_token,
-            )
-            raw_token, _ = resolve_copilot_token()
+            from hermes_cli.copilot_auth import get_copilot_api_token
+
+            raw_token, _ = _resolve_copilot_raw_token(pconfig)
             if raw_token:
                 _, resolved = get_copilot_api_token(raw_token)
                 resolved = (resolved or "").strip()

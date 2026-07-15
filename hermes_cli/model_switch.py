@@ -1507,7 +1507,49 @@ def list_authenticated_providers(
     matches the active provider without blocking on every saved/offline custom
     endpoint.
     """
-    import os
+    # Resolve provider-credential env vars through the profile secret scope.
+    # Under gateway profile multiplexing the /model listing runs inside
+    # _profile_runtime_scope (installed by _list_scoped), which does NOT mutate
+    # os.environ, so a raw os.environ.get here would probe the DEFAULT profile's
+    # keys and mis-list a secondary profile's available providers. get_secret
+    # reads the installed scope, and falls back to os.environ when no scope is
+    # active and multiplexing is off — CLI/TUI single-profile behavior unchanged.
+    from agent.secret_scope import get_secret as _get_secret
+    from agent.secret_scope import (
+        current_secret_scope as _current_secret_scope,
+        is_multiplex_active as _is_multiplex_active,
+    )
+    # A NAMED-profile listing runs under an installed secret scope while the
+    # process is multiplexing. In that mode, credential fallbacks that read
+    # PROCESS-GLOBAL third-party stores (the credential-pool auto-seeding, which for
+    # copilot runs `gh auth token` / reads COPILOT_GITHUB_TOKEN/GH_TOKEN/
+    # GITHUB_TOKEN; and the anthropic Claude-Code / Hermes-OAuth credential
+    # files) would attribute the DEFAULT profile's identity to this profile and
+    # mis-list it as available. Those fallbacks are gated off when scoped so a
+    # secondary profile's provider list reflects only its own scoped creds.
+    # Single-profile CLI/TUI (no scope, multiplex off) keeps every fallback.
+    #
+    # Restricted to NAMED profiles only: under multiplexing, _profile_runtime_scope
+    # installs a secret scope for EVERY profile, including the active/default one —
+    # so `_current_secret_scope() is not None` is also true for the default profile.
+    # The default profile IS the process owner: its own gh-auth / Claude-file /
+    # pool-seeded credentials belong to it, and suppressing them would drop copilot/
+    # anthropic from a bare `/model` listing the moment multiplexing is enabled.
+    # A named profile lives under `<home>/profiles/<name>` (parent dir == "profiles");
+    # the default profile's home (~/.hermes) does not. Matches the is_named_profile
+    # seam in agent/secret_scope.py::build_profile_secret_scope.
+    def _is_named_profile_scope() -> bool:
+        try:
+            from hermes_constants import get_hermes_home
+            return get_hermes_home().parent.name == "profiles"
+        except Exception:
+            return False
+
+    _scoped_listing = (
+        _is_multiplex_active()
+        and _current_secret_scope() is not None
+        and _is_named_profile_scope()
+    )
     from agent.models_dev import (
         PROVIDER_TO_MODELS_DEV,
         fetch_models_dev,
@@ -1566,7 +1608,7 @@ def list_authenticated_providers(
             return
         url = ""
         if getattr(pcfg, "base_url_env_var", ""):
-            url = os.environ.get(pcfg.base_url_env_var, "") or ""
+            url = _get_secret(pcfg.base_url_env_var, "") or ""
         if not url:
             url = getattr(pcfg, "inference_base_url", "") or ""
         normed = _norm_url(url)
@@ -1580,7 +1622,18 @@ def list_authenticated_providers(
         picker/model-switch discovery can run for non-Bedrock providers, and
         botocore may otherwise probe EC2 IMDS (169.254.169.254) on local
         machines before returning no credentials.
+
+        Reads ``os.environ`` directly rather than the profile secret scope: the
+        Bedrock runtime (``agent.bedrock_adapter`` → ``boto3.client(...)`` with
+        no explicit credentials) authenticates via boto3's default chain, which
+        reads process-global ``os.environ``, NOT the per-profile scope. Probing
+        the scope here would advertise Bedrock as available from a secondary
+        profile's scoped AWS creds that the runtime can't actually use — so we
+        keep this listing signal aligned with what the runtime will authenticate
+        with. (Codex #100.)
         """
+        import os
+
         if os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip():
             return True
         if (
@@ -1634,19 +1687,19 @@ def list_authenticated_providers(
     # On auth rejection or unreachable server, fall back to the caller-supplied
     # current model so the picker still shows something when offline / mis-keyed.
     if "lmstudio" not in curated and (
-        os.environ.get("LM_API_KEY") or os.environ.get("LM_BASE_URL") or current_provider.strip().lower() == "lmstudio"
+        _get_secret("LM_API_KEY") or _get_secret("LM_BASE_URL") or current_provider.strip().lower() == "lmstudio"
     ):
         from hermes_cli.models import fetch_lmstudio_models
         from hermes_cli.auth import AuthError
         is_current_lmstudio = current_provider.strip().lower() == "lmstudio"
         lm_base = (
-            os.environ.get("LM_BASE_URL")
+            _get_secret("LM_BASE_URL")
             or (current_base_url if is_current_lmstudio and current_base_url else None)
             or "http://127.0.0.1:1234/v1"
         )
         try:
             live = fetch_lmstudio_models(
-                api_key=os.environ.get("LM_API_KEY", ""),
+                api_key=_get_secret("LM_API_KEY", ""),
                 base_url=lm_base,
                 timeout=1.5, # Smaller timeout for picker
             )
@@ -1700,7 +1753,7 @@ def list_authenticated_providers(
                 continue
 
         # Check if any env var is set
-        has_creds = any(os.environ.get(ev) for ev in env_vars)
+        has_creds = any(_get_secret(ev) for ev in env_vars)
         if not has_creds:
             try:
                 from hermes_cli.auth import _load_auth_store
@@ -1767,13 +1820,13 @@ def list_authenticated_providers(
         if overlay.auth_type == "aws_sdk":
             has_creds = _has_aws_sdk_creds_for_listing(hermes_slug)
         elif overlay.extra_env_vars:
-            has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
+            has_creds = any(_get_secret(ev) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
         if not has_creds and overlay.auth_type == "api_key":
             for _key in (pid, hermes_slug):
                 pcfg = _auth_registry.get(_key)
                 if pcfg and pcfg.api_key_env_vars:
-                    if any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
+                    if any(_get_secret(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
                         break
         # Check auth store and credential pool for non-env-var credentials.
@@ -1790,10 +1843,15 @@ def list_authenticated_providers(
             except Exception as exc:
                 logger.debug("Auth store check failed for %s: %s", pid, exc)
         # Fallback: check the credential pool with full auto-seeding.
-        # This catches credentials that exist in external stores (e.g.
+        # This catches credentials that exist in third-party stores (e.g.
         # Codex CLI ~/.codex/auth.json) which _seed_from_singletons()
         # imports on demand but aren't in the raw auth.json yet.
-        if not has_creds:
+        # Skipped under a scoped multiplex listing: _seed_from_singletons()
+        # reads process-global creds (for copilot, `gh auth token` /
+        # COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN), which belong to the
+        # DEFAULT profile — attributing them to a named profile would leak
+        # another profile's identity into this list.
+        if not has_creds and not _scoped_listing:
             try:
                 from agent.credential_pool import load_pool
                 pool = load_pool(hermes_slug)
@@ -1808,7 +1866,7 @@ def list_authenticated_providers(
         # But the /model picker is discovery-oriented — we WANT to show
         # providers the user can switch to, even if they aren't currently
         # configured.
-        if not has_creds and hermes_slug == "anthropic":
+        if not has_creds and hermes_slug == "anthropic" and not _scoped_listing:
             try:
                 from agent.anthropic_adapter import (
                     read_claude_code_credentials,
@@ -1923,7 +1981,7 @@ def list_authenticated_providers(
         _cp_config = _auth_registry.get(_cp.slug)
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
-            _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
+            _cp_has_creds = any(_get_secret(ev) for ev in _cp_config.api_key_env_vars)
         # Also check auth store and credential pool
         if not _cp_has_creds:
             try:
@@ -1934,7 +1992,12 @@ def list_authenticated_providers(
                     _cp_has_creds = True
             except Exception:
                 pass
-        if not _cp_has_creds:
+        # Skipped under a scoped multiplex listing (same reason as the overlay
+        # pass): load_pool() can auto-seed a canonical provider (copilot via
+        # `gh auth`, anthropic via Claude credential files) from process-global
+        # identity, which belongs to the DEFAULT profile — a named profile must
+        # not list it as its own.
+        if not _cp_has_creds and not _scoped_listing:
             try:
                 from agent.credential_pool import load_pool
                 _cp_pool = load_pool(_cp.slug)
@@ -2042,7 +2105,7 @@ def list_authenticated_providers(
             api_key = str(ep_cfg.get("api_key", "") or "").strip()
             if not api_key:
                 key_env = str(ep_cfg.get("key_env", "") or "").strip()
-                api_key = os.environ.get(key_env, "").strip() if key_env else ""
+                api_key = (_get_secret(key_env, "") or "").strip() if key_env else ""
             discover = ep_cfg.get("discover_models", True)
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
@@ -2173,7 +2236,7 @@ def list_authenticated_providers(
             inline_api_key = (entry.get("api_key") or "").strip()
             key_env = (entry.get("key_env") or "").strip()
             api_key = inline_api_key or (
-                os.environ.get(key_env, "").strip() if key_env else ""
+                (_get_secret(key_env, "") or "").strip() if key_env else ""
             )
             api_mode = str(
                 entry.get("api_mode")

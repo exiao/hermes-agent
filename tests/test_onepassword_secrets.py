@@ -130,6 +130,59 @@ def test_fetch_uses_option_terminator_and_account(monkeypatch, tmp_path):
     assert cmd[-2:] == ["--", "op://V/I/F"]
 
 
+def test_fetch_isolates_named_profile_auth_paths(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    profile_home = tmp_path / "profiles" / "profileB"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", "/Users/gateway-owner")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/Users/gateway-owner/.config")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/tmp/gateway-owner-runtime")
+    monkeypatch.setenv("OP_SESSION_owner", "global-session")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return _ok("value")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op.fetch_onepassword_secrets(
+        references={"K": "op://V/I/F"},
+        token_value="ops-profileB",
+        include_process_auth=False,
+        auth_env={
+            "OP_CONNECT_HOST": "https://connect.profileb.test",
+            "OP_CONNECT_TOKEN": "connect-profileB",
+        },
+        binary=fake_op,
+        use_cache=False,
+        home_path=profile_home,
+    )
+
+    child_env = captured["env"]
+    assert child_env["HOME"] == str(profile_home)
+    assert child_env["XDG_CONFIG_HOME"] == str(profile_home / ".config")
+    assert "XDG_RUNTIME_DIR" not in child_env
+    assert "OP_SESSION_owner" not in child_env
+    assert child_env["OP_CONNECT_TOKEN"] == "connect-profileB"
+
+
+def test_auth_fingerprint_tracks_process_auth_path(monkeypatch):
+    monkeypatch.delenv("OP_ACCOUNT", raising=False)
+    for key in list(op.os.environ):
+        if key.startswith("OP_SESSION_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HOME", "/Users/owner-a")
+    first = op._auth_fingerprint(
+        "OP_SERVICE_ACCOUNT_TOKEN", include_process_auth=True
+    )
+    monkeypatch.setenv("HOME", "/Users/owner-b")
+    second = op._auth_fingerprint(
+        "OP_SERVICE_ACCOUNT_TOKEN", include_process_auth=True
+    )
+    assert first != second
+
+
 def test_fetch_empty_rc0_does_not_clobber(monkeypatch, tmp_path):
     """returncode 0 with empty stdout must surface as a warning, not a value."""
     fake_op = tmp_path / "op"
@@ -482,3 +535,36 @@ def test_apply_no_valid_refs_is_noop(monkeypatch):
     assert result.ok
     assert result.applied == []
     assert result.warnings  # the bad mapping warned
+
+
+def test_source_fetch_process_auth_cache_ignores_unrelated_env(monkeypatch, tmp_path):
+    """OnePasswordSource.fetch in process-auth mode (environ=None) must not fold
+    the whole environment into the disk-cache fingerprint: an unrelated env
+    change (PWD, etc.) must still hit the cache, not force a re-run of op."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setattr(op, "find_op", lambda binary_path="": fake_op)
+
+    runs = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        runs["n"] += 1
+        return _ok("sk-value")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+
+    cfg = {"enabled": True, "env": {"OPENAI_API_KEY": "op://Private/OpenAI/key"}}
+    source = op.OnePasswordSource()
+
+    monkeypatch.setenv("PWD", "/somewhere")
+    r1 = source.fetch(cfg, tmp_path, environ=None)
+    assert r1.secrets == {"OPENAI_API_KEY": "sk-value"}
+    assert runs["n"] == 1
+
+    # Unrelated env change; must NOT bust the cache key.
+    monkeypatch.setenv("PWD", "/somewhere-else")
+    monkeypatch.setenv("SOME_UNRELATED_VAR", "changed")
+    r2 = source.fetch(cfg, tmp_path, environ=None)
+    assert r2.secrets == {"OPENAI_API_KEY": "sk-value"}
+    assert runs["n"] == 1  # cache hit, op not re-invoked
+

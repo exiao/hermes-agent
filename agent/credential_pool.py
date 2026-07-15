@@ -2145,6 +2145,18 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     def _get_env_prefer_dotenv(key: str) -> str:
         env_file = load_env()
         raw = env_file.get(key, "").strip()
+        # Under gateway profile multiplexing a scope is installed; os.environ
+        # holds the DEFAULT profile's shell env, which must NOT seed (and then
+        # persist into) the requesting profile's credential pool. When a scope
+        # is active, get_secret is authoritative and the raw os.environ fallback
+        # is dropped, so a scoped miss stays a miss instead of leaking + writing
+        # another profile's key. Single-profile (no scope): os.environ fallback
+        # is preserved exactly as before.
+        from agent.secret_scope import current_secret_scope as _current_scope
+
+        scoped = _current_scope() is not None
+        if scoped:
+            return (_get_secret(key, "") or "").strip()
         env_val = os.environ.get(key, "").strip()
         # If .env contains an unresolved op:// reference, prefer the
         # already-resolved value from os.environ (set by
@@ -2155,9 +2167,10 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         # references straight into .env rather than the secrets.onepassword
         # config block.  For every non-op:// value the original
         # .env-takes-precedence behaviour is preserved unchanged.
-        if raw.startswith("op://") and env_val:
-            return env_val
-        return raw or _get_secret(key, "") or env_val
+        if raw.startswith("op://"):
+            resolved = (_get_secret(key, "") or "").strip()
+            return resolved or env_val or ("" if scoped else raw)
+        return raw or (_get_secret(key, "") or "") or env_val
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it

@@ -555,3 +555,496 @@ class TestModelSwitchPersistScopedToSourceProfile:
         assert not source_cache.exists()
         assert default_cache.exists()
 
+
+class TestListProvidersEnvProbesUseScope:
+    """Bare `/model` provider listing must probe env-var provider credentials
+    through the profile secret scope, not the process `os.environ`.
+
+    Regression for the display-only gap left after the `_list_scoped` fix:
+    `_profile_runtime_scope` installs the profile secret scope but intentionally
+    does NOT mutate `os.environ`, so `list_authenticated_providers`' raw
+    `os.environ.get(...)` provider-credential probes still saw the DEFAULT
+    profile's keys. Under multiplexing a secondary profile's `/model` therefore
+    listed an env-var provider as available using the default profile's key.
+    Routing those probes through `get_secret` reads the requesting profile's
+    scope; with no scope + multiplexing off (CLI/TUI) it falls back to
+    `os.environ`, so single-profile listing is unchanged.
+    """
+
+    def _list_deepseek(self, monkeypatch):
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        # Isolate the section-1 direct env-var probe: mock the models.dev catalog
+        # to a single api_key provider (deepseek), and disable the overlay /
+        # canonical detection paths (which resolve credentials via the separate
+        # credential-pool auto-seed, out of scope for this fix). Keep the listing
+        # hermetic — no live model fetch.
+        monkeypatch.setattr("agent.models_dev.fetch_models_dev",
+                            lambda: {"deepseek": {"env": ["DEEPSEEK_API_KEY"]}})
+        monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+        monkeypatch.setattr("hermes_cli.models.CANONICAL_PROVIDERS", [])
+        monkeypatch.setattr("hermes_cli.models.cached_provider_model_ids",
+                            lambda *a, **kw: ["deepseek-chat"])
+        providers = list_authenticated_providers(max_models=5)
+        return [p for p in providers if p.get("slug") == "deepseek"]
+
+    def test_scoped_profile_env_provider_detected_no_environ_leak(self, monkeypatch):
+        """Profile B's scoped DEEPSEEK_API_KEY makes deepseek list even when
+        os.environ has NO deepseek key (the default profile's env)."""
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        ss.set_multiplex_active(True)
+
+        tok = ss.set_secret_scope({"DEEPSEEK_API_KEY": "sk-profileB-deepseek"})
+        try:
+            rows = self._list_deepseek(monkeypatch)
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert rows, "deepseek should list from the profile's scoped key"
+
+    def test_default_profile_environ_not_leaked_to_scoped_profile(self, monkeypatch):
+        """os.environ carries the DEFAULT profile's deepseek key, but a
+        secondary profile whose scope lacks it must NOT list deepseek."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-default-leak")
+        ss.set_multiplex_active(True)
+
+        # Profile B's scope has a different provider's key, not deepseek's.
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-openai"})
+        try:
+            rows = self._list_deepseek(monkeypatch)
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert not rows, "os.environ deepseek key must not leak into profile B's listing"
+
+    def test_scoped_miss_does_not_pool_seed_default_key_into_profile(
+        self, monkeypatch, tmp_path
+    ):
+        """A named-profile scoped miss must stop before credential-pool seeding.
+
+        Regression for the #100 P1: the Section-1 scoped env probe correctly
+        missed (profile B has no DEEPSEEK_API_KEY), but the listing then fell
+        through to ``load_pool()``, whose env auto-seed could persist the DEFAULT
+        profile's process key into profile B's auth store. Simulate that unsafe
+        fallback and prove the listing never reaches it.
+        """
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile_home = tmp_path / "profiles" / "profileB"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-default-leak")
+        ss.set_multiplex_active(True)
+
+        # If the old pool fallback is reached, it would write the default
+        # profile's env key into profile B's auth.json and mark the row present.
+        def _unsafe_load_pool(_slug):
+            import json
+
+            auth_path = profile_home / "auth.json"
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "credential_pool": {
+                            "deepseek": [
+                                {
+                                    "source": "env:DEEPSEEK_API_KEY",
+                                    "access_token": "sk-default-leak",
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class _Pool:
+                def has_credentials(self):
+                    return True
+
+            return _Pool()
+
+        monkeypatch.setattr("agent.credential_pool.load_pool", _unsafe_load_pool)
+
+        home_token = set_hermes_home_override(str(profile_home))
+        scope_token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-openai"})
+        try:
+            rows = self._list_deepseek(monkeypatch)
+        finally:
+            ss.reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+
+        assert not rows, "scoped miss must not list via default-profile pool seed"
+        assert not (profile_home / "auth.json").exists(), (
+            "scoped miss must not persist the default profile's env key into "
+            "the named profile auth store"
+        )
+
+    def test_single_profile_reads_environ_unchanged(self, monkeypatch):
+        """Multiplex off, no scope (CLI/TUI): get_secret falls back to
+        os.environ, so an env-var provider still lists exactly as before."""
+        ss.set_multiplex_active(False)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-cli-user")
+
+        rows = self._list_deepseek(monkeypatch)
+
+        assert rows, "single-profile CLI listing must still detect the env-var provider"
+
+
+
+class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
+    """A NAMED-profile /model listing must NOT mark a provider available via a
+    PROCESS-GLOBAL credential fallback (the credential-pool auto-seed — which
+    for copilot runs `gh auth token` / reads COPILOT_GITHUB_TOKEN/GH_TOKEN/
+    GITHUB_TOKEN — or the anthropic Claude-Code / Hermes-OAuth credential
+    files). Those belong to the DEFAULT profile; attributing them to a named
+    profile leaks another profile's identity into its picker.
+
+    But the DEFAULT profile (the process owner) MUST keep those fallbacks even
+    under multiplexing — its gh-auth / Claude-file / pool creds are its own.
+
+    Regression for the Codex P1 follow-on on #100: the scoped env-var probe
+    correctly left has_creds false, but the same block fell through to
+    load_pool(hermes_slug), which auto-seeds copilot from the default process.
+    And the Codex P2 follow-on: _profile_runtime_scope installs a scope for the
+    DEFAULT profile too, so a bare listing must not drop the default's own creds.
+    """
+
+    @staticmethod
+    def _named_profile_home(tmp_path):
+        """Context that makes get_hermes_home() resolve to a NAMED profile
+        (<home>/profiles/<name>), mirroring _profile_runtime_scope's home
+        redirect for a secondary profile."""
+        from hermes_constants import (
+            set_hermes_home_override,
+            reset_hermes_home_override,
+        )
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            home = tmp_path / "profiles" / "profileB"
+            home.mkdir(parents=True, exist_ok=True)
+            tok = set_hermes_home_override(str(home))
+            try:
+                yield
+            finally:
+                reset_hermes_home_override(tok)
+
+        return _cm()
+
+    def _list_copilot(self, monkeypatch, *, pool_has_creds: bool):
+        from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.providers import HermesOverlay
+
+        # Only copilot in the catalog; its scoped env vars are absent, the auth
+        # store is empty, and the credential POOL reports credentials (as it
+        # would after auto-seeding from the default profile's gh identity).
+        monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+        monkeypatch.setattr(
+            "hermes_cli.providers.HERMES_OVERLAYS",
+            {"github-copilot": HermesOverlay(
+                transport="openai_chat",
+                extra_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN"),
+            )},
+        )
+        monkeypatch.setattr("hermes_cli.models.CANONICAL_PROVIDERS", [])
+        monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+        monkeypatch.setattr(
+            "hermes_cli.models.cached_provider_model_ids",
+            lambda *a, **kw: ["gpt-4o-copilot"],
+        )
+
+        class _Pool:
+            def has_credentials(self):
+                return pool_has_creds
+
+        monkeypatch.setattr(
+            "agent.credential_pool.load_pool", lambda slug: _Pool()
+        )
+        providers = list_authenticated_providers(max_models=5)
+        return [p for p in providers if p.get("slug") in ("copilot", "github-copilot")]
+
+    def test_scoped_profile_does_not_borrow_default_copilot_pool(
+        self, monkeypatch, tmp_path
+    ):
+        """Under a scoped multiplex listing FOR A NAMED PROFILE, copilot must
+        NOT list from the default profile's pool-seeded gh identity."""
+        for ev in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            monkeypatch.delenv(ev, raising=False)
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-openai"})
+        try:
+            with self._named_profile_home(tmp_path):
+                rows = self._list_copilot(monkeypatch, pool_has_creds=True)
+        finally:
+            ss.reset_secret_scope(tok)
+        assert not rows, "copilot must not list from the default profile's pool creds"
+
+    def test_default_profile_under_multiplex_keeps_copilot_pool(
+        self, monkeypatch, tmp_path
+    ):
+        """Codex P2 on #100: _profile_runtime_scope installs a secret scope for
+        the DEFAULT profile too under multiplexing. A bare `/model` listing for
+        the default (process-owner) profile must KEEP its own pool/gh fallback —
+        the default profile's home is ~/.hermes (parent != 'profiles')."""
+        from hermes_constants import (
+            set_hermes_home_override,
+            reset_hermes_home_override,
+        )
+        for ev in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            monkeypatch.delenv(ev, raising=False)
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir(parents=True, exist_ok=True)
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-default-openai"})
+        home_tok = set_hermes_home_override(str(default_home))
+        try:
+            rows = self._list_copilot(monkeypatch, pool_has_creds=True)
+        finally:
+            reset_hermes_home_override(home_tok)
+            ss.reset_secret_scope(tok)
+        assert rows, (
+            "default profile under multiplexing must still list copilot from its "
+            "own pool creds"
+        )
+
+    def test_single_profile_still_lists_copilot_from_pool(self, monkeypatch):
+        """Multiplex off / no scope (CLI/TUI): the pool fallback still runs, so
+        copilot lists exactly as before."""
+        ss.set_multiplex_active(False)
+        rows = self._list_copilot(monkeypatch, pool_has_creds=True)
+        assert rows, "single-profile listing must still detect copilot via the pool"
+
+    # --- Canonical cross-check pass (section 2b) ---
+    # The overlay pass above (section 2) and this canonical pass (section 2b,
+    # the CANONICAL_PROVIDERS cross-check) each have their OWN load_pool()
+    # fallback. Codex's P1 on #100 pointed specifically at the canonical
+    # block: when a provider is absent from HERMES_OVERLAYS but present in
+    # CANONICAL_PROVIDERS, listing falls through to load_pool(_cp.slug),
+    # which auto-seeds copilot from the default process's gh identity. The
+    # overlay-pass tests above empty CANONICAL_PROVIDERS, so they never
+    # exercised this path.
+
+    def _list_copilot_via_canonical(self, monkeypatch, *, pool_has_creds: bool):
+        from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.models import ProviderEntry
+
+        # copilot reaches the canonical cross-check (section 2b) only: no
+        # overlay match, no models.dev entry, empty auth store, scoped env
+        # vars absent, and the credential POOL reports credentials (as it
+        # would after auto-seeding from the default profile's gh identity).
+        monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+        monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+        monkeypatch.setattr(
+            "hermes_cli.models.CANONICAL_PROVIDERS",
+            [ProviderEntry("copilot", "GitHub Copilot", "GitHub Copilot")],
+        )
+        monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+        monkeypatch.setattr(
+            "hermes_cli.models.cached_provider_model_ids",
+            lambda *a, **kw: ["gpt-4o-copilot"],
+        )
+
+        class _Pool:
+            def has_credentials(self):
+                return pool_has_creds
+
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda slug: _Pool())
+        providers = list_authenticated_providers(max_models=5)
+        return [p for p in providers if p.get("slug") == "copilot"]
+
+    def test_scoped_profile_canonical_pass_does_not_borrow_default_pool(
+        self, monkeypatch, tmp_path
+    ):
+        """Under a scoped multiplex listing FOR A NAMED PROFILE, the CANONICAL
+        cross-check must NOT list copilot from the default profile's pool-seeded
+        gh identity."""
+        for ev in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            monkeypatch.delenv(ev, raising=False)
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB-openai"})
+        try:
+            with self._named_profile_home(tmp_path):
+                rows = self._list_copilot_via_canonical(
+                    monkeypatch, pool_has_creds=True
+                )
+        finally:
+            ss.reset_secret_scope(tok)
+        assert not rows, (
+            "canonical pass must not list copilot from the default profile's "
+            "pool creds under a scoped listing"
+        )
+
+    def test_single_profile_canonical_pass_still_lists_copilot_from_pool(
+        self, monkeypatch
+    ):
+        """Multiplex off / no scope (CLI/TUI): the canonical pool fallback still
+        runs, so copilot lists exactly as before."""
+        ss.set_multiplex_active(False)
+        rows = self._list_copilot_via_canonical(monkeypatch, pool_has_creds=True)
+        assert rows, (
+            "single-profile canonical listing must still detect copilot via the pool"
+        )
+
+
+class TestOpenAIDiscoveryUsesScope:
+    """provider_model_ids / fingerprint for openai-api honor the profile scope.
+
+    Regression for the Codex P2 on #100: the /model listing marks the
+    openai-api row available from the requesting profile's scoped
+    OPENAI_API_KEY, but downstream live discovery + the disk-cache
+    fingerprint read os.getenv/os.environ directly, so profile B's picker
+    could call /models and cache model availability using profile A's key.
+    """
+
+    def _capture_discovery_key(self, monkeypatch):
+        """Return the api_key fetch_api_models is called with for openai-api."""
+        from hermes_cli import models as m
+
+        seen = {}
+
+        def _fake_fetch(api_key, base_url, *a, **kw):
+            seen["api_key"] = api_key
+            seen["base_url"] = base_url
+            # Return a model that survives the default-endpoint curated filter.
+            return list(m._PROVIDER_MODELS.get("openai-api", [])) or ["gpt-5"]
+
+        monkeypatch.setattr(m, "fetch_api_models", _fake_fetch)
+        m.provider_model_ids("openai-api", force_refresh=True)
+        return seen
+
+    def test_discovery_uses_scoped_key_not_environ(self, monkeypatch):
+        """Under multiplex, discovery must fetch with profile B's scoped key,
+        never the default profile's OPENAI_API_KEY in os.environ."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-default-leak")
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        ss.set_multiplex_active(True)
+
+        tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-profileB"})
+        try:
+            seen = self._capture_discovery_key(monkeypatch)
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert seen.get("api_key") == "sk-profileB"
+
+    def test_discovery_resolves_profile_onepassword_reference(
+        self, monkeypatch, tmp_path
+    ):
+        """The gateway-built scope must not pass a raw op:// ref to /models."""
+        profile = tmp_path / "profiles" / "profileB"
+        profile.mkdir(parents=True)
+        (profile / ".env").write_text(
+            "OPENAI_API_KEY=op://Private/ProfileB/key\n", encoding="utf-8"
+        )
+        (profile / ".op.env").write_text(
+            "OP_SERVICE_ACCOUNT_TOKEN=ops-profileB\n"
+            "OP_CONNECT_HOST=https://connect.profileb.test\n"
+            "OP_CONNECT_TOKEN=connect-profileB\n",
+            encoding="utf-8",
+        )
+
+        def _fake_fetch(**kwargs):
+            assert kwargs["token_value"] == "ops-profileB"
+            assert kwargs["include_process_auth"] is False
+            assert kwargs["auth_env"] == {
+                "OP_CONNECT_HOST": "https://connect.profileb.test",
+                "OP_CONNECT_TOKEN": "connect-profileB",
+            }
+            assert kwargs["home_path"] == profile
+            return {"OPENAI_API_KEY": "  sk-profileB-resolved  "}, []
+
+        monkeypatch.setattr(
+            "agent.secret_sources.onepassword.fetch_onepassword_secrets",
+            _fake_fetch,
+        )
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        ss.set_multiplex_active(True)
+
+        tok = ss.set_secret_scope(ss.build_profile_secret_scope(profile))
+        try:
+            seen = self._capture_discovery_key(monkeypatch)
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert seen.get("api_key") == "sk-profileB-resolved"
+
+    def test_discovery_single_profile_reads_environ(self, monkeypatch):
+        """Multiplex off, no scope (CLI/TUI): discovery falls back to
+        os.environ, byte-identical to the legacy os.getenv behavior."""
+        ss.set_multiplex_active(False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-cli-user")
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+        seen = self._capture_discovery_key(monkeypatch)
+
+        assert seen.get("api_key") == "sk-cli-user"
+
+    def test_fingerprint_isolated_between_profiles(self, monkeypatch):
+        """The cache fingerprint must differ per scoped key so profile B
+        never hits profile A's cached openai-api entry."""
+        from hermes_cli.models import _credential_fingerprint
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-default-leak")
+        ss.set_multiplex_active(True)
+
+        tok_a = ss.set_secret_scope({"OPENAI_API_KEY": "sk-A"})
+        try:
+            fp_a = _credential_fingerprint("openai-api")
+        finally:
+            ss.reset_secret_scope(tok_a)
+
+        tok_b = ss.set_secret_scope({"OPENAI_API_KEY": "sk-B"})
+        try:
+            fp_b = _credential_fingerprint("openai-api")
+        finally:
+            ss.reset_secret_scope(tok_b)
+
+        assert fp_a != fp_b, "distinct scoped keys must produce distinct fingerprints"
+
+
+class TestApiKeyProviderBaseUrlUsesScope:
+    """resolve_api_key_provider_credentials resolves *_BASE_URL via the scope.
+
+    Regression for the follow-on Codex P2 on #100: the scoped listing admits a
+    scoped API-key provider (e.g. deepseek/stepfun with a scoped *_BASE_URL),
+    then discovery calls cached_provider_model_ids -> provider_model_ids ->
+    resolve_api_key_provider_credentials, which read the base URL with
+    os.getenv(base_url_env_var). So /model could fetch the catalog from the
+    default profile's base URL while using the secondary profile's api key.
+    """
+
+    def test_base_url_reads_scope_under_multiplex(self, monkeypatch):
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+
+        # deepseek: api_key via DEEPSEEK_API_KEY, base_url via DEEPSEEK_BASE_URL.
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://default-profile.example/v1")
+        ss.set_multiplex_active(True)
+
+        tok = ss.set_secret_scope({
+            "DEEPSEEK_API_KEY": "sk-profileB",
+            "DEEPSEEK_BASE_URL": "https://profileB.example/v1",
+        })
+        try:
+            creds = resolve_api_key_provider_credentials("deepseek")
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert creds["base_url"] == "https://profileB.example/v1", (
+            "scoped base URL must win over the default profile's os.environ value"
+        )
+
+    def test_base_url_single_profile_reads_environ(self, monkeypatch):
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+
+        ss.set_multiplex_active(False)
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://cli-user.example/v1")
+
+        creds = resolve_api_key_provider_credentials("deepseek")
+
+        assert creds["base_url"] == "https://cli-user.example/v1", (
+            "single-profile base URL must still read os.environ, byte-identical"
+        )

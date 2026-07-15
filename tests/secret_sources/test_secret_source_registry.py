@@ -293,6 +293,67 @@ class TestApplyAll:
         )
         assert env["K"] == "v"
 
+    def test_scoped_apply_fails_closed_on_legacy_source_without_environ(
+        self, tmp_path
+    ):
+        """A profile-scoped apply must NOT run a legacy source whose fetch()
+        lacks the 'environ' param — env-less it would read process os.environ
+        (another profile's env under multiplexing). It fails closed instead."""
+        # _make_source builds a fetch(self, cfg, home_path) — no 'environ' param.
+        reg.register_source(_make_source(secrets={"K": "leaked"}))
+        env: dict = {}
+        report = reg.apply_all(
+            {"dummy": {"enabled": True}}, tmp_path, environ=env, scoped=True
+        )
+        # Value never applied; source reported an error, not a silent env-read.
+        assert "K" not in env
+        assert report.sources[0].result.ok is False
+        assert report.sources[0].result.error_kind is ErrorKind.NOT_CONFIGURED
+
+    def test_scoped_apply_runs_environ_aware_source(self, tmp_path):
+        """A source that DOES accept 'environ' still runs under a scoped apply
+        and receives the scoped mapping (not process os.environ)."""
+        seen = {}
+
+        class _EnvSrc(SecretSource):
+            def fetch(self, cfg, home_path, environ=None):
+                seen["environ"] = environ
+                res = FetchResult()
+                res.secrets = {"K": "scoped-value"}
+                return res
+
+            def override_existing(self, cfg):
+                return False
+
+            def protected_env_vars(self, cfg):
+                return frozenset()
+
+        _EnvSrc.name = "envsrc"
+        _EnvSrc.label = "EnvSrc"
+        _EnvSrc.shape = "mapped"
+        _EnvSrc.scheme = None
+        _EnvSrc.api_version = SECRET_SOURCE_API_VERSION
+        reg.register_source(_EnvSrc())
+
+        env = {"BOOTSTRAP": "tok"}
+        report = reg.apply_all(
+            {"envsrc": {"enabled": True}}, tmp_path, environ=env, scoped=True
+        )
+        assert seen["environ"] is env  # scoped mapping, not os.environ
+        assert env["K"] == "scoped-value"
+        assert report.sources[0].result.ok is True
+
+    def test_default_apply_still_runs_legacy_source_without_environ(self, tmp_path):
+        """Non-scoped (single-profile) apply keeps backward compat: a legacy
+        env-less source still runs so existing deployments are unaffected."""
+        reg.register_source(_make_source(secrets={"K": "v"}))
+        env: dict = {}
+        report = reg.apply_all(
+            {"dummy": {"enabled": True}}, tmp_path, environ=env, scoped=False
+        )
+        assert env["K"] == "v"
+        assert report.sources[0].result.ok is True
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -598,3 +659,116 @@ class TestOnePasswordConformance(SecretSourceConformance):
         monkeypatch.setattr(op, "find_op", lambda *_a, **_kw: None)
         monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
         return op.OnePasswordSource()
+
+
+class TestApplyAllForwardsRawEnviron:
+    """apply_all must forward the RAW ``environ`` (None-preserving) to each
+    source's fetch(), not the materialized os.environ.
+
+    Regression: apply_all passed the materialized ``env`` (which is os.environ
+    when environ=None) into the fetch call, so OnePasswordSource saw a non-None
+    environ and switched to isolated mode (include_process_auth=False) even on
+    the default load_hermes_dotenv path. That dropped an interactive `op`
+    session's process auth at startup. The fetch must receive None on the
+    default path and the explicit dict only for profile-scoped builds.
+    """
+
+    def _recording_source(self):
+        seen = {}
+
+        class _Src(SecretSource):
+            name = "recorder"
+            shape = "bulk"
+
+            def fetch(self, cfg, home_path, *, environ=None):
+                seen["environ"] = environ
+                return FetchResult()
+
+            def override_existing(self, cfg):
+                return False
+
+            def protected_env_vars(self, cfg):
+                return frozenset()
+
+        return _Src(), seen
+
+    def test_default_path_forwards_none(self, tmp_path, monkeypatch):
+        src, seen = self._recording_source()
+        monkeypatch.setattr(
+            reg, "_ordered_enabled_sources", lambda cfg: [src]
+        )
+        # environ omitted → default load_hermes_dotenv path.
+        reg.apply_all({"recorder": {"enabled": True}}, tmp_path)
+        assert seen["environ"] is None
+
+    def test_scoped_path_forwards_the_dict(self, tmp_path, monkeypatch):
+        src, seen = self._recording_source()
+        monkeypatch.setattr(
+            reg, "_ordered_enabled_sources", lambda cfg: [src]
+        )
+        scoped = {"ANTHROPIC_API_KEY": "sk-scoped"}
+        reg.apply_all({"recorder": {"enabled": True}}, tmp_path, environ=scoped)
+        assert seen["environ"] is scoped
+
+
+class TestFetchInheritsProfileContext:
+    """A source's fetch() runs in a ThreadPoolExecutor worker; the profile
+    contextvars (HERMES_HOME override + secret scope) installed by
+    _profile_runtime_scope must propagate into that worker via copy_context().
+
+    Regression for the #100 P2: without copy_context, a source that consults
+    get_hermes_home() internally (e.g. Bitwarden's find_bws -> managed
+    <hermes_home>/bin/bws lookup) resolves the DEFAULT profile's path in the
+    worker thread, so a named profile could miss its own binary / use the
+    default profile's copy.
+    """
+
+    def _home_recording_source(self):
+        seen = {}
+
+        class _Src(SecretSource):
+            name = "homerec"
+            shape = "bulk"
+
+            def fetch(self, cfg, home_path, *, environ=None):
+                # Read the HERMES_HOME contextvar override from INSIDE the
+                # worker thread — exactly what find_bws() does via
+                # _hermes_bin_dir() -> get_hermes_home().
+                from hermes_constants import get_hermes_home
+
+                seen["home"] = str(get_hermes_home())
+                return FetchResult()
+
+            def override_existing(self, cfg):
+                return False
+
+            def protected_env_vars(self, cfg):
+                return frozenset()
+
+        return _Src(), seen
+
+    def test_fetch_worker_sees_hermes_home_override(self, tmp_path, monkeypatch):
+        from hermes_constants import (
+            set_hermes_home_override,
+            reset_hermes_home_override,
+        )
+
+        src, seen = self._home_recording_source()
+        monkeypatch.setattr(reg, "_ordered_enabled_sources", lambda cfg: [src])
+
+        profile_home = tmp_path / ".hermes" / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+
+        # Install the override contextvar in THIS thread, exactly like
+        # _profile_runtime_scope does, then run apply_all (which fetches on a
+        # worker thread). The worker must see the override, not the default.
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            reg.apply_all({"homerec": {"enabled": True}}, profile_home)
+        finally:
+            reset_hermes_home_override(token)
+
+        assert seen["home"] == str(profile_home), (
+            "fetch worker thread must inherit the HERMES_HOME override "
+            "contextvar via copy_context, not fall back to the default profile"
+        )

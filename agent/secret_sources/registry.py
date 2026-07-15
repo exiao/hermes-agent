@@ -28,6 +28,8 @@ third-party backends ship as standalone plugin repos implementing
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
+import inspect
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -188,9 +190,20 @@ def _reset_registry_for_tests() -> None:
 
 
 def _fetch_with_timeout(
-    source: SecretSource, cfg: dict, home_path: Path
+    source: SecretSource,
+    cfg: dict,
+    home_path: Path,
+    environ: Optional[Dict[str, str]] = None,
+    scoped: bool = False,
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
+
+    ``scoped`` marks a genuine profile-isolation apply (a named profile under
+    ``gateway.multiplex_profiles``): a source whose ``fetch()`` cannot consume
+    ``environ`` is failed closed rather than run against the process
+    ``os.environ`` (which under multiplexing is another profile's env). The
+    generic ``apply_all`` path (``scoped=False``) keeps the legacy env-less
+    call so pre-``environ`` sources still work for single-profile deployments.
 
     The budget is enforced with a daemon worker thread: a source that
     blows its budget is reported as ``TIMEOUT`` and its (eventual)
@@ -199,11 +212,44 @@ def _fetch_with_timeout(
     an unbounded hang on every ``hermes`` invocation.
     """
     timeout = source.fetch_timeout_seconds(cfg)
+    # Copy the caller's context so the worker thread inherits the profile
+    # contextvars (HERMES_HOME override + active secret scope) installed by
+    # ``_profile_runtime_scope``. Without this, a source whose fetch() consults
+    # ``get_hermes_home()`` internally (e.g. Bitwarden's ``find_bws`` → managed
+    # ``<hermes_home>/bin/bws`` lookup) resolves the DEFAULT profile's path in
+    # the plain ThreadPoolExecutor worker, since ContextVars do not propagate to
+    # pool threads. Mirrors the copy_context() pattern in account_usage.py.
+    ctx = contextvars.copy_context()
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
     try:
-        future = executor.submit(source.fetch, cfg, home_path)
+        fetch_params = inspect.signature(source.fetch).parameters
+        if "environ" in fetch_params:
+            future = executor.submit(
+                ctx.run, source.fetch, cfg, home_path, environ=environ
+            )
+        elif scoped:
+            # Fail closed: a profile-scoped mapping is being applied (a named
+            # profile under gateway.multiplex_profiles) but this source's
+            # fetch() predates the ``environ`` contract and would read bootstrap
+            # credentials from the process ``os.environ`` — which under
+            # multiplexing is the DEFAULT profile's environment. Running it
+            # env-less here would populate the scoped profile from another
+            # profile's vault. Refuse rather than leak; the source author must
+            # accept ``environ`` to participate in scoped resolution.
+            res = FetchResult()
+            res.error = (
+                f"secret source '{source.name}' cannot consume a scoped "
+                "credential environment (its fetch() lacks the 'environ' "
+                "parameter) — skipped in profile-scoped mode to prevent "
+                "cross-profile credential leakage. Update the source to the "
+                "current secret-source API to use it under multiplexing."
+            )
+            res.error_kind = ErrorKind.NOT_CONFIGURED
+            return res
+        else:
+            future = executor.submit(ctx.run, source.fetch, cfg, home_path)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -276,10 +322,18 @@ def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
 
 
 def apply_all(secrets_cfg: dict, home_path: Path,
-              environ: Optional[Dict[str, str]] = None) -> ApplyReport:
+              environ: Optional[Dict[str, str]] = None,
+              scoped: bool = False) -> ApplyReport:
     """Fetch from every enabled source and apply the merged result to env.
 
     ``environ`` defaults to ``os.environ``; injectable for tests.
+
+    ``scoped`` marks a genuine profile-isolation build (a named profile under
+    ``gateway.multiplex_profiles``). When true, a source whose ``fetch()``
+    cannot consume ``environ`` is failed closed instead of run against the
+    process environment, so a named profile can never be populated from another
+    profile's vault. Leave ``scoped=False`` for the default single-profile
+    apply path.
 
     Precedence per env var (most-specific intent wins):
 
@@ -294,6 +348,15 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     """
     import os as _os
 
+    # ``env`` is the materialized mapping the merge/precedence phase below reads
+    # and writes (env.get / env[var] = ...). It must NOT be forwarded to the
+    # sources' fetch(): OnePasswordSource treats any non-None ``environ`` as
+    # isolated mode (include_process_auth=False), so passing the materialized
+    # os.environ on the default load_hermes_dotenv path (environ=None) would run
+    # ``op`` with an isolated HOME and drop an interactive 1Password session. The
+    # fetch call forwards the RAW ``environ`` (None-preserving) so process-auth
+    # mode is kept on the default path and isolated only for explicit
+    # profile-scoped builds that pass a real dict.
     env = environ if environ is not None else _os.environ
     report = ApplyReport()
 
@@ -313,7 +376,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path)
+        result = _fetch_with_timeout(source, cfg, home_path, environ, scoped=scoped)
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):
