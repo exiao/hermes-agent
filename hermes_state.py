@@ -1108,26 +1108,32 @@ class SessionDB:
         silently drops a working trigram index.
         """
         try:
+            from hermes_cli.config import cfg_get, load_config_readonly
+
             target_home = self.db_path.parent
             # Same profile as the active process → use the fast, cached loader
             # (this runs on every SessionDB() construction; the same-profile
             # path is by far the hot one and must stay allocation-cheap).
             if target_home.resolve() == get_hermes_home().resolve():
-                from hermes_cli.config import load_config_readonly
-
-                sess = load_config_readonly().get("sessions") or {}
-                return bool(sess.get("fts_trigram", True))
+                return bool(
+                    cfg_get(
+                        load_config_readonly(),
+                        "sessions",
+                        "fts_trigram",
+                        default=True,
+                    )
+                )
             # Cross-profile open: read the TARGET profile's config.yaml directly
             # so the gate reflects the DB being opened, not the launch profile.
-            import yaml
+            from utils import fast_safe_load
 
             cfg_path = target_home / "config.yaml"
-            if not cfg_path.exists():
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as fh:
+                    raw = fast_safe_load(fh) or {}
+            except FileNotFoundError:
                 return True
-            with open(cfg_path, "r", encoding="utf-8") as fh:
-                raw = yaml.safe_load(fh) or {}
-            sess = (raw.get("sessions") or {}) if isinstance(raw, dict) else {}
-            return bool(sess.get("fts_trigram", True))
+            return bool(cfg_get(raw, "sessions", "fts_trigram", default=True))
         except Exception:
             return True
 
