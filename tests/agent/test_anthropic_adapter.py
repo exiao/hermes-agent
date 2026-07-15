@@ -415,6 +415,42 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         assert resolve_anthropic_token() == "sk-ant-oat01-mytoken"
 
+    def test_suppressed_claude_code_source_is_not_read(self, monkeypatch, tmp_path):
+        """A user-suppressed claude_code source must not resolve, even for the
+        default profile. `hermes auth remove anthropic` leaves the Claude file
+        in place (Claude Code owns it) but records a suppression marker; the
+        Claude-file read (source #3) must honor it rather than resurrect the
+        removed credential.
+        """
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        # A valid, non-expired Claude Code credential file exists on disk.
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-claudefile",
+                "refreshToken": "r",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        # Without suppression it resolves the Claude file token (control).
+        monkeypatch.setattr(
+            "hermes_cli.auth.is_source_suppressed",
+            lambda provider, source: False,
+        )
+        assert resolve_anthropic_token() == "sk-ant-oat01-claudefile"
+
+        # With the claude_code source suppressed, it must NOT be read.
+        monkeypatch.setattr(
+            "hermes_cli.auth.is_source_suppressed",
+            lambda provider, source: provider == "anthropic" and source == "claude_code",
+        )
+        assert resolve_anthropic_token() is None
+
     def test_returns_none_with_no_creds(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)

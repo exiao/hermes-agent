@@ -1578,7 +1578,23 @@ def resolve_anthropic_token() -> Optional[str]:
     from agent.secret_scope import is_multiplex_active
 
     nondefault_scope = _scope_is_non_default_profile() and is_multiplex_active()
-    suppress_global_creds = nondefault_scope or scope_has_api_key
+    # Respect an explicit user suppression of the claude_code source. The user
+    # can `hermes auth remove anthropic` the Claude Code credential, which does
+    # NOT delete ~/.claude/.credentials.json (Claude Code still owns it) but
+    # records a suppression marker so Hermes stops reading it. Honor that marker
+    # here for EVERY profile, including the default/process-owner: the global
+    # Claude file read (source #3, and the _prefer_refreshable_claude_code_token
+    # shadowing at sources #1/#2) must not resurrect a credential the user
+    # explicitly removed.
+    try:
+        from hermes_cli.auth import is_source_suppressed
+
+        claude_code_suppressed = is_source_suppressed("anthropic", "claude_code")
+    except Exception:
+        claude_code_suppressed = False
+    suppress_global_creds = (
+        nondefault_scope or scope_has_api_key or claude_code_suppressed
+    )
     if suppress_global_creds:
         creds = None
 
