@@ -3246,13 +3246,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
                         sessions_dir=self.config.sessions_dir,
                     )
-                # WAL watchdog: force-checkpoint an oversized state.db-wal at
-                # startup (and hourly, see _start_gateway_housekeeping). Bounds
-                # the WAL a pinned reader would otherwise let grow to GBs.
-                if _sess_cfg.get("wal_watchdog", True):
-                    self._session_db._db.wal_watchdog(
-                        max_mb=int(_sess_cfg.get("wal_max_mb", 64)),
-                    )
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
 
@@ -8086,30 +8079,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as _e:
                         logger.debug("SessionStore prune failed: %s", _e)
                     self._last_session_store_prune_ts = time.time()
-
-                # WAL watchdog (hourly): force-checkpoint an oversized
-                # state.db-wal that a long-lived reader has let grow past
-                # sessions.wal_max_mb. Complements the startup pass; a giant
-                # WAL is the malformed-image corruption risk. The checkpoint is
-                # a synchronous SQLite call, so offload it to a thread — a
-                # pinned reader can make TRUNCATE block, and this watcher runs
-                # on the gateway event loop.
-                _last_wal_ts = getattr(self, "_last_wal_watchdog_ts", 0.0)
-                if (
-                    self._session_db is not None
-                    and time.time() - _last_wal_ts > 3600.0
-                ):
-                    try:
-                        from hermes_cli.config import load_config as _load_full_config
-                        _sess_cfg = (_load_full_config().get("sessions") or {})
-                        if _sess_cfg.get("wal_watchdog", True):
-                            await asyncio.to_thread(
-                                self._session_db._db.wal_watchdog,
-                                max_mb=int(_sess_cfg.get("wal_max_mb", 64)),
-                            )
-                    except Exception as _e:
-                        logger.debug("WAL watchdog tick failed: %s", _e)
-                    self._last_wal_watchdog_ts = time.time()
             except Exception as e:
                 logger.debug("Session expiry watcher error: %s", e)
             # Sleep in small increments so we can stop quickly

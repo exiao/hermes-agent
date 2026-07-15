@@ -27,9 +27,27 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
+
+
+def workspace_key(row: Dict[str, Any]) -> Optional[str]:
+    """A session's workspace grouping key: its git repo root when known, else
+    its cwd.
+
+    Branch is deliberately excluded so checking out a new branch doesn't
+    fragment a workspace's session history. Returns None for cwd-less (unbound)
+    sessions. Both fields are already recorded on ``sessions`` — this just picks
+    the coarser identity for grouping/filtering.
+    """
+    root = (row.get("git_repo_root") or "").strip()
+    if root:
+        return root
+
+    cwd = (row.get("cwd") or "").strip()
+    return cwd or None
+
 
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
@@ -122,7 +140,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -166,17 +184,14 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
-_BASE_FTS_TRIGGERS = (
+_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
-)
-_TRIGRAM_FTS_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
-_FTS_TRIGGERS = _BASE_FTS_TRIGGERS + _TRIGRAM_FTS_TRIGGERS
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -341,6 +356,36 @@ def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
         pass
 
 
+def _enforce_macos_synchronous_full(conn: sqlite3.Connection) -> None:
+    """Enforce ``PRAGMA synchronous=FULL`` on macOS to prevent btree corruption.
+
+    On Darwin, the default ``synchronous=NORMAL`` only calls ``fsync()``,
+    which Apple's fsync(2) man page explicitly states does *not* guarantee
+    data-on-platter or write-ordering. During a WAL checkpoint race with
+    process termination (e.g., launchd shutdown), this can leave the main
+    DB with half-written btree pages → ``btreeInitPage error 11``.
+
+    WAL mode's durability guarantee assumes the OS honors fsync barriers;
+    macOS does not unless we explicitly set ``synchronous=FULL``, which issues
+    a real ``fsync()`` on every transaction commit.  The ``F_FULLFSYNC``
+    barrier at checkpoint boundaries is handled separately by
+    :func:`_apply_macos_checkpoint_barrier`.
+
+    This function is called after any successful WAL activation (either
+    from ``apply_wal_with_fallback()`` setting a fresh WAL or when probing
+    an existing WAL mode). It ensures macOS connections always use FULL
+    synchronous mode, even if a prior connection set ``synchronous=NORMAL``.
+
+    Best-effort: never raises.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        conn.execute("PRAGMA synchronous=FULL")
+    except sqlite3.OperationalError:
+        pass
+
+
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
@@ -372,6 +417,7 @@ def apply_wal_with_fallback(
         current_mode = conn.execute("PRAGMA journal_mode").fetchone()
         if current_mode and current_mode[0] == "wal":
             _apply_macos_checkpoint_barrier(conn)
+            _enforce_macos_synchronous_full(conn)
             return "wal"
     except sqlite3.OperationalError:
         pass
@@ -379,6 +425,7 @@ def apply_wal_with_fallback(
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         _apply_macos_checkpoint_barrier(conn)
+        _enforce_macos_synchronous_full(conn)
         return "wal"
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
@@ -743,6 +790,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_error TEXT,
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
@@ -756,6 +804,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,
+    effect_disposition TEXT,
     timestamp REAL NOT NULL,
     token_count INTEGER,
     finish_reason TEXT,
@@ -768,6 +817,27 @@ CREATE TABLE IF NOT EXISTS messages (
     observed INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS session_model_usage (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    billing_provider TEXT NOT NULL DEFAULT '',
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    billing_mode TEXT NOT NULL DEFAULT '',
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    actual_cost_usd REAL NOT NULL DEFAULT 0,
+    cost_status TEXT,
+    cost_source TEXT,
+    first_seen REAL,
+    last_seen REAL,
+    PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode)
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -790,12 +860,37 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS async_delegations (
+    delegation_id TEXT PRIMARY KEY,
+    origin_session TEXT NOT NULL,
+    origin_ui_session_id TEXT NOT NULL DEFAULT '',
+    parent_session_id TEXT,
+    state TEXT NOT NULL,
+    dispatched_at REAL NOT NULL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    event_json TEXT,
+    result_json TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    task_json TEXT,
+    delivery_claim TEXT,
+    delivery_claimed_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
+    ON async_delegations(delivery_state, completed_at);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -815,32 +910,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 """
 
-# View that projects each message into the single searchable text column the
-# FTS5 tables index (content || tool_name || tool_calls). Backing the FTS
-# tables with this VIEW as third-party content (content=messages_search_v,
-# content_rowid=id) means the FTS shadow tables store only the index, NOT a
-# second copy of every message body — the v11 duplication bloat (a full
-# content copy per FTS table, ~2.8 GB on the live 9.3 GB DB) is eliminated
-# while preserving the v11 intent that tool_name + tool_calls stay searchable
-# and snippet() keeps working. The '||' concatenation matches the trigger
-# bodies below so 'rebuild' and incremental updates index identical text.
-FTS_VIEW_SQL = """
-CREATE VIEW IF NOT EXISTS messages_search_v(id, content) AS
-    SELECT id,
-        COALESCE(content, '') || ' ' || COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '')
-    FROM messages;
-"""
-
-# External-content FTS5 tables MUST issue explicit 'delete' commands (not
-# ``DELETE FROM``) in the DELETE/UPDATE triggers: with content= set, FTS5
-# cannot re-read the old row from the deleted content source, so it needs the
-# original text handed to it via the special 'delete' command to remove the
-# right index entries. See https://sqlite.org/fts5.html#external_content_tables
 FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    content,
-    content=messages_search_v,
-    content_rowid=id
+    content
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
@@ -851,19 +923,11 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
-        'delete',
-        old.id,
-        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
-    );
+    DELETE FROM messages_fts WHERE rowid = old.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
-        'delete',
-        old.id,
-        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
-    );
+    DELETE FROM messages_fts WHERE rowid = old.id;
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
@@ -874,13 +938,10 @@ END;
 # Trigram FTS5 table for CJK substring search.  The default unicode61
 # tokenizer splits CJK characters into individual tokens, breaking phrase
 # matching.  The trigram tokenizer creates overlapping 3-byte sequences so
-# substring queries work natively for any script (CJK, Thai, etc.).  Backed by
-# the same messages_search_v view as third-party content (see FTS_SQL above).
+# substring queries work natively for any script (CJK, Thai, etc.).
 FTS_TRIGRAM_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
     content,
-    content=messages_search_v,
-    content_rowid=id,
     tokenize='trigram'
 );
 
@@ -892,19 +953,11 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON message
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES (
-        'delete',
-        old.id,
-        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
-    );
+    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES (
-        'delete',
-        old.id,
-        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
-    );
+    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
@@ -933,7 +986,7 @@ class SessionDB:
     _WRITE_MAX_RETRIES = 15
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
-    # Attempt a PASSIVE WAL checkpoint every N successful writes.
+    # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Merge fragmented FTS5 segments every N successful writes. The message
     # triggers append one segment per insert; left unmaintained these grow
@@ -945,6 +998,15 @@ class SessionDB:
     # pays almost nothing; the cadence is deliberately coarse so the one-off
     # merge cost is amortised far below the checkpoint cadence.
     _OPTIMIZE_EVERY_N_WRITES = 1000
+    # Session imports intentionally use a lower cap than exports: import holds
+    # one BEGIN IMMEDIATE transaction, so bounded batches avoid starving live
+    # gateway/CLI writers. The dashboard accepts one exported JSON/JSONL file
+    # at a time, so these still cover normal history restores.
+    _IMPORT_MAX_SESSIONS = 500
+    _IMPORT_MAX_MESSAGES_PER_SESSION = 10_000
+    _IMPORT_MAX_TOTAL_MESSAGES = 50_000
+    _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
+    _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -955,14 +1017,6 @@ class SessionDB:
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_unavailable_warned = False
-        # Config gate: when sessions.fts_trigram is false the trigram index
-        # (its shadow tables were the single largest consumer on the live DB —
-        # ~5 GB serving substring search) is dropped and never rebuilt, and
-        # CJK/substring search transparently falls back to LIKE. Default true.
-        # Read once at construction; None on any failure so FTS setup keeps the
-        # trigram table (fail-open — never silently lose the index on a config
-        # read hiccup).
-        self._fts_trigram_enabled = self._read_fts_trigram_config()
         self._conn = None
         try:
             if read_only:
@@ -1092,51 +1146,6 @@ class SessionDB:
             exc,
         )
 
-    def _read_fts_trigram_config(self) -> bool:
-        """Return sessions.fts_trigram (default True) — the trigram gate.
-
-        Scoped to the profile that OWNS ``self.db_path``, not the launch
-        profile. A cross-profile open (e.g. the TUI resuming another
-        profile's session via ``SessionDB(db_path=other_home / "state.db")``
-        without overriding ``HERMES_HOME``) must read that profile's setting —
-        the gate drives destructive DDL (``_drop_trigram_schema``), so reading
-        the wrong profile's ``fts_trigram: false`` would silently drop a
-        different profile's trigram index.
-
-        Best-effort: any failure (config missing, import cycle, malformed
-        YAML) fails OPEN (returns True) so a transient config read never
-        silently drops a working trigram index.
-        """
-        try:
-            from hermes_cli.config import cfg_get, load_config_readonly
-
-            target_home = self.db_path.parent
-            # Same profile as the active process → use the fast, cached loader
-            # (this runs on every SessionDB() construction; the same-profile
-            # path is by far the hot one and must stay allocation-cheap).
-            if target_home.resolve() == get_hermes_home().resolve():
-                return bool(
-                    cfg_get(
-                        load_config_readonly(),
-                        "sessions",
-                        "fts_trigram",
-                        default=True,
-                    )
-                )
-            # Cross-profile open: read the TARGET profile's config.yaml directly
-            # so the gate reflects the DB being opened, not the launch profile.
-            from utils import fast_safe_load
-
-            cfg_path = target_home / "config.yaml"
-            try:
-                with open(cfg_path, "r", encoding="utf-8") as fh:
-                    raw = fast_safe_load(fh) or {}
-            except FileNotFoundError:
-                return True
-            return bool(cfg_get(raw, "sessions", "fts_trigram", default=True))
-        except Exception:
-            return True
-
     def _sqlite_supports_fts5(self, cursor: sqlite3.Cursor) -> bool:
         try:
             cursor.execute("CREATE VIRTUAL TABLE temp._hermes_fts5_probe USING fts5(x)")
@@ -1157,97 +1166,12 @@ class SessionDB:
                 pass
 
     @staticmethod
-    def _drop_trigram_schema(cursor: sqlite3.Cursor) -> bool:
-        """Drop the trigram FTS table + its triggers (config-gate off).
-
-        Removes the ~5 GB trigram index and its INSERT/DELETE/UPDATE triggers
-        so a subsequent messages write no longer maintains it. The base
-        messages_fts table and its triggers are untouched. Idempotent.
-
-        Returns ``True`` when the trigram table actually existed and was
-        dropped (its pages are now on the freelist and a ``VACUUM`` will
-        return them to the OS), ``False`` when there was nothing to drop — so
-        callers can vacuum only when there is real space to reclaim rather
-        than on every open with trigram disabled.
-
-        The trigger + table drops fail closed. A concurrent writer can hold
-        the DB lock during startup (gateway + cron), and swallowing that lock
-        on a trigger or table DROP could leave a stale trigram trigger pointing
-        at a missing table (or report a drop that did not happen). Acquire a
-        write transaction up front so the sequence commits as a unit; suppress
-        only known FTS-unavailable errors and propagate lock/unrelated failures.
-        """
-        started_transaction = False
-        try:
-            cursor.execute("BEGIN IMMEDIATE")
-            started_transaction = True
-            for trigger in (
-                "messages_fts_trigram_insert",
-                "messages_fts_trigram_delete",
-                "messages_fts_trigram_update",
-            ):
-                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            table_existed = bool(
-                cursor.execute(
-                    "SELECT 1 FROM sqlite_master "
-                    "WHERE type = 'table' AND name = 'messages_fts_trigram'"
-                ).fetchone()
-            )
-            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
-            cursor.execute("COMMIT")
-            started_transaction = False
-            return table_existed
-        except sqlite3.OperationalError as exc:
-            if started_transaction:
-                try:
-                    cursor.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
-            if SessionDB._is_fts5_unavailable_error(exc):
-                # The DROP TABLE needs to load the vtable module/tokenizer, so a
-                # build missing the trigram tokenizer raises here and the
-                # rollback above also undid the (tokenizer-free) trigger drops.
-                # Leaving the triggers in place means every message INSERT fires
-                # messages_fts_trigram_insert against the unusable vtable and
-                # crashes. DROP TRIGGER does not need the tokenizer, so drop them
-                # in a standalone committed step and degrade to the base
-                # FTS/LIKE path. The orphaned trigram table is harmless without
-                # triggers.
-                try:
-                    cursor.execute("BEGIN IMMEDIATE")
-                    for trigger in (
-                        "messages_fts_trigram_insert",
-                        "messages_fts_trigram_delete",
-                        "messages_fts_trigram_update",
-                    ):
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-                    cursor.execute("COMMIT")
-                except sqlite3.OperationalError as cleanup_exc:
-                    # Roll back the partial trigger drop, then FAIL CLOSED: if the
-                    # standalone cleanup was itself blocked (e.g. a concurrent
-                    # gateway/cron holds the write lock), swallowing it would
-                    # leave a stale messages_fts_trigram_* trigger firing against
-                    # the unusable vtable on the next INSERT. Propagate so the
-                    # caller aborts and a later uncontended startup retries the
-                    # whole drop, exactly like the main lock path below.
-                    try:
-                        cursor.execute("ROLLBACK")
-                    except sqlite3.OperationalError:
-                        pass
-                    raise cleanup_exc
-                return False
-            raise
-
-    @staticmethod
-    def _fts_trigger_count(
-        cursor: sqlite3.Cursor,
-        names: Sequence[str] = _FTS_TRIGGERS,
-    ) -> int:
-        placeholders = ",".join("?" for _ in names)
+    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
+        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            tuple(names),
+            _FTS_TRIGGERS,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
@@ -1257,14 +1181,25 @@ class SessionDB:
         *,
         include_trigram: bool = True,
     ) -> None:
-        # External-content tables rebuild straight from messages_search_v via
-        # the special 'rebuild' command — no manual DELETE + INSERT..SELECT and
-        # no second copy of the message text materialised in the shadow tables.
-        cursor.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        cursor.execute("DELETE FROM messages_fts")
+        cursor.execute(
+            "INSERT INTO messages_fts(rowid, content) "
+            "SELECT id, "
+            "COALESCE(content, '') || ' ' || "
+            "COALESCE(tool_name, '') || ' ' || "
+            "COALESCE(tool_calls, '') "
+            "FROM messages"
+        )
         if not include_trigram:
             return
+        cursor.execute("DELETE FROM messages_fts_trigram")
         cursor.execute(
-            "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('rebuild')"
+            "INSERT INTO messages_fts_trigram(rowid, content) "
+            "SELECT id, "
+            "COALESCE(content, '') || ' ' || "
+            "COALESCE(tool_name, '') || ' ' || "
+            "COALESCE(tool_calls, '') "
+            "FROM messages"
         )
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
@@ -1284,35 +1219,11 @@ class SessionDB:
                 return False
             raise
 
-    @staticmethod
-    def _exec_ddl_no_commit(cursor: sqlite3.Cursor, script: str) -> None:
-        """Run a multi-statement DDL script WITHOUT an implicit commit.
-
-        ``Cursor.executescript`` issues a COMMIT before running, which would
-        defeat an explicit transaction wrapped around a migration (the v20 FTS
-        rebuild). Split the script into complete statements with
-        ``sqlite3.complete_statement`` (aware of trigger ``BEGIN ... END;``
-        bodies) and run each via ``execute`` so the caller's transaction stays
-        open and remains rollback-able.
-        """
-        buf = ""
-        for line in script.splitlines(keepends=True):
-            buf += line
-            if sqlite3.complete_statement(buf):
-                stmt = buf.strip()
-                if stmt:
-                    cursor.execute(stmt)
-                buf = ""
-        tail = buf.strip()
-        if tail:
-            cursor.execute(tail)
-
     def _ensure_fts_schema(
         self,
         cursor: sqlite3.Cursor,
         table_name: str,
         ddl: str,
-        in_transaction: bool = False,
     ) -> bool:
         status = self._fts_table_probe(cursor, table_name)
         if status is None:
@@ -1320,13 +1231,8 @@ class SessionDB:
         try:
             # Run even when the virtual table exists so any dropped or missing
             # triggers are recreated after a previous no-FTS5 runtime disabled
-            # them to keep message writes working. Inside an explicit
-            # transaction (the v20 rebuild) use the no-commit executor so
-            # executescript's implicit COMMIT can't defeat a later rollback.
-            if in_transaction:
-                self._exec_ddl_no_commit(cursor, ddl)
-            else:
-                cursor.executescript(ddl)
+            # them to keep message writes working.
+            cursor.executescript(ddl)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
@@ -1395,35 +1301,34 @@ class SessionDB:
         )
 
     def _try_wal_checkpoint(self) -> None:
-        """Best-effort TRUNCATE WAL checkpoint.  Never raises.
+        """Best-effort PASSIVE WAL checkpoint.  Never raises.
 
-        Flushes committed WAL frames back into the main DB file and
-        truncates the WAL file to zero bytes.  Keeps the WAL from
-        growing unbounded when many processes hold persistent
-        connections.
+        Flushes committed WAL frames back into the main DB file without
+        requiring an exclusive lock.  PASSIVE is safe for frequent
+        periodic use because it does not block concurrent writers and
+        cannot corrupt B-tree pages under I/O pressure.
 
-        PASSIVE checkpoint was previously used here, but it never
-        truncates the WAL file — the file stays at its high-water
-        mark until an explicit TRUNCATE is called (which only
-        happened inside the infrequent vacuum()).
+        PASSIVE does not truncate the WAL file — it stays at its
+        high-water mark.  WAL truncation happens in :meth:`close`
+        (TRUNCATE) and pre-VACUUM checkpoints, which run infrequently
+        under controlled conditions.
 
-        TRUNCATE may block writers briefly while checkpointing, but
-        _try_wal_checkpoint is called off the hot path (every 50
-        writes) and already runs under ``self._lock``, so the
-        additional hold time is negligible.
+        Previous TRUNCATE strategy caused B-tree corruption on large
+        databases (65K+ pages) due to the exclusive-lock I/O pressure
+        from checkpointing thousands of frames at once (issue #45383).
         """
         try:
             with self._lock:
                 result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                    "PRAGMA wal_checkpoint(PASSIVE)"
                 ).fetchone()
                 if result and result[1] > 0:
                     logger.debug(
                         "WAL checkpoint: %d/%d pages checkpointed",
                         result[2], result[1],
                     )
-        except Exception:
-            pass  # Best effort — never fatal.
+        except Exception as exc:
+            logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
     def _try_optimize_fts(self) -> None:
         """Best-effort FTS5 segment merge. Never raises.
@@ -1451,130 +1356,10 @@ class SessionDB:
             if self._conn:
                 try:
                     self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
-
-    def _wal_size_bytes(self) -> int:
-        """Size of the ``-wal`` sidecar in bytes, or 0 if absent/unreadable."""
-        try:
-            return Path(str(self.db_path) + "-wal").stat().st_size
-        except OSError:
-            return 0
-
-    def _pids_holding_db(self) -> List[int]:
-        """Best-effort list of PIDs with this state.db open (psutil).
-
-        Used only for the watchdog WARNING when a RESTART checkpoint could
-        not shrink a bloated WAL — a pinned reader is the usual culprit and
-        naming it turns a mystery into an actionable log line. Returns an
-        empty list when psutil is unavailable or the scan fails (never
-        raises); scanning every process' open files is O(procs) so this
-        runs only on the already-rare bloat path, never on the hot path.
-        """
-        try:
-            import psutil  # type: ignore
-        except Exception:
-            return []
-        import os
-        target = os.path.abspath(str(self.db_path))
-        pids: List[int] = []
-        for proc in psutil.process_iter(["pid"]):
-            try:
-                for f in proc.open_files():
-                    if f.path and (f.path == target or f.path.startswith(target + "-")):
-                        pids.append(proc.pid)
-                        break
-            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                continue
-        return pids
-
-    def wal_watchdog(self, max_mb: int = 64) -> Dict[str, Any]:
-        """Bound WAL growth: force-checkpoint an oversized ``-wal``.
-
-        A long-lived read transaction (dashboard/sidebar polling, an
-        unconsumed cursor) pins the WAL so the periodic every-50-writes
-        checkpoint silently no-ops and the ``-wal`` grows without bound
-        (observed live at 3.6 GB atop a 9.3 GB DB). Giant WAL + a hard
-        shutdown is the malformed-image corruption scenario. This watchdog,
-        called at startup and hourly by the gateway, force-checkpoints when
-        the ``-wal`` exceeds *max_mb*.
-
-        Runs ``wal_checkpoint(RESTART)`` to flush every committed frame and
-        restart the WAL write pointer at offset 0 (bounds growth even under
-        steady write load). RESTART alone does not shrink the file, so on a
-        fully-successful checkpoint (no reader pinning) it follows with a
-        TRUNCATE to reclaim the disk. The RESTART return's ``busy`` flag —
-        NOT the post-checkpoint file size — is the authoritative "a reader is
-        pinning it" signal; on ``busy`` it logs a WARNING naming the PIDs
-        holding the DB. Never raises; read-only connections are skipped.
-
-        Returns a dict: ``{"checked": bool, "wal_mb_before": float,
-        "wal_mb_after": float, "checkpointed": bool, "pinned": bool}``.
-        """
-        result: Dict[str, Any] = {
-            "checked": False,
-            "wal_mb_before": 0.0,
-            "wal_mb_after": 0.0,
-            "checkpointed": False,
-            "pinned": False,
-        }
-        if self.read_only or self._conn is None:
-            return result
-        try:
-            before = self._wal_size_bytes()
-            result["wal_mb_before"] = round(before / (1024 * 1024), 1)
-            threshold = max(0, int(max_mb)) * 1024 * 1024
-            if before <= threshold:
-                return result
-            result["checked"] = True
-            with self._lock:
-                try:
-                    # Returns (busy, log_frames, checkpointed_frames). busy=1
-                    # (or checkpointed < log) means a reader blocked a full
-                    # checkpoint — that is the pinned-WAL condition.
-                    row = self._conn.execute(
-                        "PRAGMA wal_checkpoint(RESTART)"
-                    ).fetchone()
-                    busy = int(row[0]) if row else 1
-                    log_frames = int(row[1]) if row and row[1] is not None else -1
-                    ckpt_frames = int(row[2]) if row and row[2] is not None else -1
-                    pinned = busy != 0 or (
-                        log_frames >= 0 and ckpt_frames >= 0 and ckpt_frames < log_frames
-                    )
-                    if not pinned:
-                        # Fully checkpointed — safe to truncate and reclaim disk.
-                        try:
-                            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                        except sqlite3.Error:
-                            pass
-                except sqlite3.Error as exc:
-                    logger.warning("WAL watchdog checkpoint failed: %s", exc)
-                    return result
-            result["checkpointed"] = True
-            result["pinned"] = pinned
-            after = self._wal_size_bytes()
-            result["wal_mb_after"] = round(after / (1024 * 1024), 1)
-            if pinned:
-                pids = self._pids_holding_db()
-                logger.warning(
-                    "state.db WAL was %.1f MB (threshold %d MB) and a reader "
-                    "is pinning it — checkpoint could not fully drain the log. "
-                    "PIDs holding the DB: %s",
-                    result["wal_mb_before"],
-                    max_mb,
-                    ", ".join(str(p) for p in pids) if pids else "unknown",
-                )
-            else:
-                logger.info(
-                    "WAL watchdog: checkpointed state.db -wal %.1f MB -> %.1f MB",
-                    result["wal_mb_before"],
-                    result["wal_mb_after"],
-                )
-        except Exception as exc:  # never fatal
-            logger.debug("WAL watchdog skipped: %s", exc)
-        return result
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -1723,9 +1508,6 @@ class SessionDB:
 
         fts5_available = self._sqlite_supports_fts5(cursor)
         fts_migrations_complete = True
-        # True once a real trigram table was dropped on this open (config gate
-        # flipped off on an already-migrated DB) — drives the reclaim VACUUM.
-        trigram_pages_freed = False
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
             # even though the current sqlite runtime cannot read the virtual
@@ -1733,13 +1515,6 @@ class SessionDB:
             # continues; if a future runtime has FTS5, _ensure_fts_schema()
             # recreates them.
             self._drop_fts_triggers(cursor)
-        else:
-            # The messages_search_v view is the third-party content source the
-            # external-content FTS tables read on 'rebuild'/integrity-check. It
-            # must exist before any messages_fts* CREATE or 'rebuild' runs, so
-            # create it up front (idempotent). Harmless for FTS5-less builds,
-            # but skipped there since nothing references it.
-            cursor.executescript(FTS_VIEW_SQL)
 
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on
@@ -1885,120 +1660,54 @@ class SessionDB:
                     # rows until the gateway rewrites them.
                     logger.debug("v18 gateway metadata backfill skipped: %s", exc)
             if current_version < 20:
-                # v20: switch messages_fts + messages_fts_trigram from INLINE
-                # (v11) to VIEW-backed external-content. Inline FTS stores a
-                # full copy of every message body in each shadow table — on the
-                # live DB that was ~2.8 GB of duplicated text (a content copy
-                # per FTS table) on top of the 2 GB canonical messages. With
-                # content=messages_search_v the shadow tables keep only the
-                # index and read the text from the view on demand, preserving
-                # the v11 intent (tool_name + tool_calls searchable, snippet()
-                # works) while dropping the duplicate copies. Old inline tables
-                # and triggers can't be reused (schema differs, IF NOT EXISTS
-                # won't overwrite), so drop them and let the post-migration
-                # existence checks recreate from FTS_SQL / FTS_TRIGRAM_SQL, then
-                # 'rebuild' the index from the view. VACUUM reclaims the freed
-                # copies; checkpoint before + after bounds WAL growth so a
-                # multi-GB rebuild can't balloon the -wal on a pinned reader.
-                if fts5_available:
-                    try:
-                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    except sqlite3.OperationalError:
-                        pass
-                    # The connection is in autocommit mode (isolation_level=None),
-                    # so each DDL statement would commit immediately and a later
-                    # rollback would be a no-op. Open an explicit transaction
-                    # around the destructive drop + recreate so a failure to
-                    # rebuild the external-content FTS schema restores the
-                    # pre-migration tables instead of leaving the DB at v19 with
-                    # the FTS tables gone. The recreate path uses the no-commit
-                    # DDL executor (executescript would COMMIT this open txn).
-                    try:
-                        self._conn.execute("BEGIN")
-                    except sqlite3.OperationalError:
-                        pass
-                    self._drop_fts_triggers(cursor)
-                    for _tbl in ("messages_fts", "messages_fts_trigram"):
-                        try:
-                            cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
-                        except sqlite3.OperationalError as exc:
-                            if not self._is_fts5_unavailable_error(exc):
-                                raise
-                            if self._is_trigram_unavailable_error(exc):
-                                self._warn_trigram_unavailable(exc)
-                            else:
-                                self._warn_fts5_unavailable(exc)
-                                fts5_available = False
-                                fts_migrations_complete = False
-                            break
-
-                    if fts5_available:
-                        # View must exist before the external-content tables
-                        # 'rebuild' against it (created above for the FTS5 path,
-                        # but re-assert idempotently in case of an odd order).
-                        # Single statement via execute (not executescript) so it
-                        # does not implicitly commit the open v20 transaction.
-                        cursor.execute(FTS_VIEW_SQL)
-                        base_fts_ok = self._ensure_fts_schema(
-                            cursor, "messages_fts", FTS_SQL, in_transaction=True
-                        )
-                        if base_fts_ok:
-                            cursor.execute(
-                                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
-                            )
-                        else:
-                            fts_migrations_complete = False
-                        # Trigram is gated by config: when disabled we neither
-                        # create nor rebuild it (the drop above already removed
-                        # any prior copy), and CJK search falls back to LIKE.
-                        if self._fts_trigram_enabled:
-                            trigram_ok = self._ensure_fts_schema(
-                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL,
-                                in_transaction=True,
-                            )
-                            if trigram_ok:
-                                cursor.execute(
-                                    "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
-                                    "VALUES('rebuild')"
-                                )
-                            self._trigram_available = trigram_ok
-                        else:
-                            self._trigram_available = False
-                        if fts_migrations_complete:
-                            # Commit the rebuild first to close the explicit
-                            # transaction (VACUUM and a TRUNCATE checkpoint both
-                            # require no open transaction), then reclaim the
-                            # dropped inline content copies. checkpoint before +
-                            # after bounds WAL growth around the VACUUM.
-                            try:
-                                self._conn.commit()
-                                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                                self._conn.execute("VACUUM")
-                                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                            except sqlite3.OperationalError as exc:
-                                logger.warning(
-                                    "v20 FTS migration VACUUM skipped: %s", exc
-                                )
-                    else:
-                        fts_migrations_complete = False
-                else:
-                    fts_migrations_complete = False
+                # v20: per-model usage attribution (issue #51607). Going
+                # forward update_token_counts() records each API call into
+                # session_model_usage keyed by the live model, but existing
+                # sessions only have their aggregate totals on the sessions
+                # row. Seed one usage row per historical session from those
+                # aggregates so insights reads uniformly from the new table.
+                # INSERT OR IGNORE keeps it idempotent: if newer code already
+                # wrote a (session_id, model, provider) row for a session, the
+                # PK conflict skips the stale aggregate rather than doubling it.
+                try:
+                    cursor.execute(
+                        """INSERT OR IGNORE INTO session_model_usage (
+                               session_id, model, billing_provider,
+                               billing_base_url, billing_mode,
+                               api_call_count, input_tokens,
+                               output_tokens, cache_read_tokens,
+                               cache_write_tokens, reasoning_tokens,
+                               estimated_cost_usd, actual_cost_usd,
+                               cost_status, cost_source, first_seen, last_seen
+                           )
+                           SELECT id, COALESCE(model, 'unknown'),
+                                  COALESCE(billing_provider, ''),
+                                  COALESCE(billing_base_url, ''),
+                                  COALESCE(billing_mode, ''),
+                                  COALESCE(api_call_count, 0),
+                                  COALESCE(input_tokens, 0),
+                                  COALESCE(output_tokens, 0),
+                                  COALESCE(cache_read_tokens, 0),
+                                  COALESCE(cache_write_tokens, 0),
+                                  COALESCE(reasoning_tokens, 0),
+                                  COALESCE(estimated_cost_usd, 0),
+                                  COALESCE(actual_cost_usd, 0),
+                                  cost_status, cost_source,
+                                  started_at, COALESCE(ended_at, started_at)
+                           FROM sessions
+                           WHERE COALESCE(input_tokens, 0)
+                                 + COALESCE(output_tokens, 0)
+                                 + COALESCE(cache_read_tokens, 0)
+                                 + COALESCE(cache_write_tokens, 0)
+                                 + COALESCE(reasoning_tokens, 0) > 0"""
+                    )
+                except sqlite3.OperationalError:
+                    pass
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
                     (SCHEMA_VERSION,),
                 )
-            elif current_version < 20 and not fts_migrations_complete:
-                # The v20 migration dropped the inline FTS tables/triggers but
-                # could not recreate the view-backed ones (FTS5 unavailable or a
-                # CREATE failed). The destructive section ran inside an explicit
-                # BEGIN with a no-commit DDL executor, so this rollback actually
-                # restores the pre-migration FTS schema and leaves the DB at
-                # v19; the next open retries the (idempotent) migration.
-                try:
-                    self._conn.rollback()
-                except sqlite3.OperationalError:
-                    pass
 
         # Unique title index — always ensure it exists
         try:
@@ -2010,70 +1719,27 @@ class SessionDB:
             pass  # Index already exists
 
         if fts5_available:
-            # The external-content FTS tables read their text from this view;
-            # ensure it exists on every open (idempotent) before any FTS DDL
-            # or 'rebuild' so a DB that predates the view still gets it.
-            cursor.executescript(FTS_VIEW_SQL)
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
-            # an earlier no-FTS5 runtime. Count only the trigger set that must
-            # exist for the active configuration: with trigram enabled all six
-            # (base + trigram) must be present; with it disabled we check the
-            # three base triggers *in isolation* — counting the full set would
-            # let leftover trigram triggers from a prior enabled run mask a
-            # missing base trigger, skipping the rebuild and leaving messages
-            # written during the missing-trigger window permanently unsearchable
-            # once the trigram table is dropped below.
-            if self._fts_trigram_enabled:
-                triggers_need_repair = (
-                    self._fts_trigger_count(cursor, _FTS_TRIGGERS)
-                    < len(_FTS_TRIGGERS)
-                )
-            else:
-                triggers_need_repair = (
-                    self._fts_trigger_count(cursor, _BASE_FTS_TRIGGERS)
-                    < len(_BASE_FTS_TRIGGERS)
-                )
+            # an earlier no-FTS5 runtime.
+            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
             # to the main FTS table; if it cannot be created, CJK search falls
-            # back to LIKE. It is also config-gated (sessions.fts_trigram): when
-            # disabled we drop the table + its triggers and leave trigram
-            # unavailable so the LIKE fallback engages — this is what lets a
-            # user reclaim the multi-GB trigram index by flipping one config.
+            # back to LIKE.
             if self._fts_enabled:
-                if not self._fts_trigram_enabled:
-                    trigram_pages_freed = self._drop_trigram_schema(cursor)
-                    self._trigram_available = False
-                    if triggers_need_repair:
-                        self._rebuild_fts_indexes(cursor, include_trigram=False)
-                else:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                trigram_enabled = self._ensure_fts_schema(
+                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                )
+                self._trigram_available = trigram_enabled
+                if triggers_need_repair:
+                    self._rebuild_fts_indexes(
+                        cursor,
+                        include_trigram=trigram_enabled,
                     )
-                    self._trigram_available = trigram_enabled
-                    if triggers_need_repair:
-                        self._rebuild_fts_indexes(
-                            cursor,
-                            include_trigram=trigram_enabled,
-                        )
 
         self._conn.commit()
-
-        # Reclaim the ~5 GB freed by dropping the trigram index when the config
-        # gate was flipped off on an already-migrated DB. The DROP only moves
-        # its pages to the freelist; without VACUUM the on-disk file never
-        # shrinks, so the advertised disk recovery wouldn't happen (the v20
-        # migration path vacuums for the same reason). Only runs when a real
-        # table was dropped, and checkpoints bound WAL growth around the VACUUM.
-        if fts5_available and self._fts_enabled and trigram_pages_freed:
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                self._conn.execute("VACUUM")
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.OperationalError as exc:
-                logger.warning("trigram-disable VACUUM skipped: %s", exc)
 
     # =========================================================================
     # Session lifecycle
@@ -2446,9 +2112,10 @@ class SessionDB:
         pruned after process-level restart bugs.  New gateway sessions persist
         the deterministic ``session_key`` on the durable session row so the
         mapping can be rebuilt exactly.  Rows ended only by older gateway
-        cleanup's ``agent_close`` bug are treated as recoverable; explicit
-        conversation boundaries such as /new, /resume switches, and compression
-        splits are not.
+        cleanup's ``agent_close`` bug or a mistaken TUI ``ws_orphan_reap``
+        (dashboard viewer disconnect before #60609) are treated as recoverable;
+        explicit conversation boundaries such as /new, /resume switches, and
+        compression splits are not.
         """
         if not session_key:
             return None
@@ -2458,7 +2125,7 @@ class SessionDB:
                 SELECT * FROM sessions
                 WHERE session_key = ?
                   AND source = ?
-                  AND (ended_at IS NULL OR end_reason = 'agent_close')
+                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
@@ -2483,7 +2150,7 @@ class SessionDB:
                   AND COALESCE(chat_id, '') = COALESCE(?, '')
                   AND COALESCE(chat_type, '') = COALESCE(?, '')
                   AND COALESCE(thread_id, '') = COALESCE(?, '')
-                  AND (ended_at IS NULL OR end_reason = 'agent_close')
+                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
@@ -2661,6 +2328,45 @@ class SessionDB:
                 "clear_compression_failure_cooldown(%s) failed: %s",
                 session_id, exc,
             )
+
+    def get_compression_fallback_streak(self, session_id: str) -> int:
+        """Return the persisted deterministic-fallback streak."""
+        if not session_id:
+            return 0
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return 0
+            row = conn.execute(
+                "SELECT compression_fallback_streak FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return 0
+        value = (
+            row["compression_fallback_streak"]
+            if isinstance(row, sqlite3.Row)
+            else row[0]
+        )
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None:
+        """Persist the deterministic-fallback streak for one session."""
+        if not session_id:
+            return
+        normalized = max(0, int(streak))
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compression_fallback_streak = ? WHERE id = ?",
+                (normalized, session_id),
+            )
+
+        self._execute_write(_do)
+
     # ──────────────────────────────────────────────────────────────────────
     # Compression locks
     # ──────────────────────────────────────────────────────────────────────
@@ -2964,6 +2670,11 @@ class SessionDB:
                    model = COALESCE(model, ?),
                    api_call_count = COALESCE(api_call_count, 0) + ?
                    WHERE id = ?"""
+        has_accounted_usage = bool(
+            input_tokens or output_tokens or cache_read_tokens
+            or cache_write_tokens or reasoning_tokens or api_call_count
+            or estimated_cost_usd or actual_cost_usd
+        )
         params = (
             input_tokens,
             output_tokens,
@@ -2976,16 +2687,166 @@ class SessionDB:
             cost_status,
             cost_source,
             pricing_version,
-            billing_provider,
-            billing_base_url,
-            billing_mode,
-            model,
+            billing_provider if has_accounted_usage else None,
+            billing_base_url if has_accounted_usage else None,
+            billing_mode if has_accounted_usage else None,
+            model if has_accounted_usage else None,
             api_call_count,
             session_id,
         )
+        # Per-model usage attribution.  ``update_token_counts`` is the single
+        # chokepoint every per-API-call delta flows through (CLI, gateway, cron,
+        # delegated runs — see conversation_loop / codex_runtime), and each call
+        # carries the model/provider *active at the time of that call*.  The
+        # ``sessions`` row only keeps one (model, billing_provider) pair, so a
+        # mid-session ``/model`` switch otherwise attributes every token to the
+        # initial model (issue #51607).  Recording the per-call delta into
+        # session_model_usage keyed by the live model preserves an accurate
+        # per-model breakdown regardless of how many times the user switches.
+        #
+        # Only the incremental path records here. Absolute cumulative updates
+        # cannot be split back into routes; Insights reconciles any positive
+        # residual against the aggregate session row instead.
+        record_model_usage = (not absolute) and (
+            input_tokens or output_tokens or cache_read_tokens
+            or cache_write_tokens or reasoning_tokens or api_call_count
+            or estimated_cost_usd
+        )
+
         def _do(conn):
+            row = conn.execute(
+                "SELECT model, billing_provider, api_call_count FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            existing_model = row["model"] if row is not None else None
+            existing_provider = row["billing_provider"] if row is not None else None
+            existing_api_calls = int((row["api_call_count"] if row is not None else 0) or 0)
+
+            # Session creation records the requested primary route before any API
+            # call. If it fails and fallback succeeds, the first accounted usage
+            # event is the first authoritative route. After that, preserve the
+            # legacy row: one row cannot represent mixed-provider usage.
+            first_accounted_route = (
+                existing_api_calls == 0
+                and has_accounted_usage
+                and bool(model)
+                and bool(billing_provider)
+                and (existing_model != model or existing_provider != billing_provider)
+            )
+            if first_accounted_route:
+                conn.execute(
+                    """UPDATE sessions
+                       SET model = ?, billing_provider = ?,
+                       billing_base_url = ?, billing_mode = ?
+                       WHERE id = ?""",
+                    (model, billing_provider, billing_base_url, billing_mode, session_id),
+                )
             conn.execute(sql, params)
+            if record_model_usage:
+                self._record_model_usage(
+                    conn,
+                    session_id,
+                    model=model,
+                    billing_provider=billing_provider,
+                    billing_base_url=billing_base_url,
+                    billing_mode=billing_mode,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    estimated_cost_usd=estimated_cost_usd,
+                    actual_cost_usd=actual_cost_usd,
+                    cost_status=cost_status,
+                    cost_source=cost_source,
+                    api_call_count=api_call_count,
+                )
         self._execute_write(_do)
+
+    def _record_model_usage(
+        self,
+        conn,
+        session_id: str,
+        *,
+        model: Optional[str],
+        billing_provider: Optional[str],
+        billing_base_url: Optional[str],
+        billing_mode: Optional[str],
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        reasoning_tokens: int,
+        estimated_cost_usd: Optional[float],
+        actual_cost_usd: Optional[float],
+        cost_status: Optional[str],
+        cost_source: Optional[str],
+        api_call_count: int,
+    ) -> None:
+        """Accumulate a per-API-call usage delta into session_model_usage.
+
+        Runs inside the caller's write transaction (after the ``sessions``
+        UPDATE) so the per-model rows stay consistent with the summary row.
+        When the caller omits the model/provider (some paths only pass token
+        deltas), fall back to the values already recorded on the session row —
+        the same COALESCE-from-session behaviour the summary update uses.
+        """
+        row = conn.execute(
+            "SELECT model, billing_provider, billing_base_url, billing_mode "
+            "FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        sess_model = row["model"] if row is not None else None
+        sess_provider = row["billing_provider"] if row is not None else None
+        sess_base_url = row["billing_base_url"] if row is not None else None
+        sess_billing_mode = row["billing_mode"] if row is not None else None
+
+        eff_model = model or sess_model or "unknown"
+        eff_provider = billing_provider or sess_provider or ""
+        eff_base_url = billing_base_url or sess_base_url or ""
+        eff_billing_mode = billing_mode or sess_billing_mode or ""
+        now = time.time()
+        conn.execute(
+            """INSERT INTO session_model_usage (
+                   session_id, model, billing_provider, billing_base_url, billing_mode,
+                   api_call_count, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
+                   first_seen, last_seen
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode)
+               DO UPDATE SET
+                   api_call_count = api_call_count + excluded.api_call_count,
+                   input_tokens = input_tokens + excluded.input_tokens,
+                   output_tokens = output_tokens + excluded.output_tokens,
+                   cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                   cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                   estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                   actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
+                   cost_status = COALESCE(excluded.cost_status, cost_status),
+                   cost_source = COALESCE(excluded.cost_source, cost_source),
+                   last_seen = excluded.last_seen""",
+            (
+                session_id,
+                eff_model,
+                eff_provider,
+                eff_base_url,
+                eff_billing_mode,
+                api_call_count or 0,
+                input_tokens or 0,
+                output_tokens or 0,
+                cache_read_tokens or 0,
+                cache_write_tokens or 0,
+                reasoning_tokens or 0,
+                float(estimated_cost_usd or 0.0),
+                float(actual_cost_usd or 0.0),
+                cost_status,
+                cost_source,
+                now,
+                now,
+            ),
+        )
 
     def ensure_session(
         self,
@@ -3939,6 +3800,7 @@ class SessionDB:
         codex_message_items: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
+        effect_disposition: Optional[str] = None,
         timestamp: Any = None,
     ) -> int:
         """
@@ -3989,10 +3851,10 @@ class SessionDB:
         def _do(conn):
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, timestamp, token_count, finish_reason,
+                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -4000,6 +3862,7 @@ class SessionDB:
                     tool_call_id,
                     tool_calls_json,
                     tool_name,
+                    effect_disposition,
                     message_timestamp,
                     token_count,
                     finish_reason,
@@ -4081,10 +3944,10 @@ class SessionDB:
 
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, timestamp, token_count, finish_reason,
+                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -4092,6 +3955,7 @@ class SessionDB:
                     msg.get("tool_call_id"),
                     tool_calls_json,
                     msg.get("tool_name"),
+                    msg.get("effect_disposition"),
                     message_timestamp,
                     msg.get("token_count"),
                     msg.get("finish_reason"),
@@ -4587,7 +4451,7 @@ class SessionDB:
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
+                "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
                 f"FROM messages WHERE session_id IN ({placeholders})"
@@ -4615,6 +4479,8 @@ class SessionDB:
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:
                 msg["tool_name"] = row["tool_name"]
+            if row["effect_disposition"]:
+                msg["effect_disposition"] = row["effect_disposition"]
             if row["tool_calls"]:
                 try:
                     msg["tool_calls"] = json.loads(row["tool_calls"])
@@ -5192,66 +5058,22 @@ class SessionDB:
             if not _trigram_succeeded:
                 # Short / mixed CJK query, trigram unavailable, or trigram
                 # <3 CJK chars. Fall back to LIKE substring search.
-                # Preserve the query's boolean structure (#20494): walk the
-                # tokens left-to-right, honoring AND / OR / NOT operators so
-                # `A NOT B` excludes B and `A AND B` requires both. The old
-                # flat OR-everything shape silently over-matched once this
-                # fallback became the only path for disabled-trigram installs.
-                like_params: list = []
-
-                def _term_clause(tok: str) -> str:
-                    esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    like_params.extend([f"%{esc}%", f"%{esc}%", f"%{esc}%"])
-                    # COALESCE to '' so a NULL column yields FALSE (not NULL)
-                    # under LIKE — critical for the `AND NOT (...)` branch,
-                    # where `NOT (FALSE OR NULL)` would otherwise be NULL and
-                    # silently drop every row (tool_name/tool_calls are NULL on
-                    # plain user/assistant messages).
-                    return (
-                        "(COALESCE(m.content, '') LIKE ? ESCAPE '\\' "
-                        "OR COALESCE(m.tool_name, '') LIKE ? ESCAPE '\\' "
-                        "OR COALESCE(m.tool_calls, '') LIKE ? ESCAPE '\\')"
-                    )
-
-                tokens = raw_query.split()
+                # For multi-token OR queries (e.g. "广西 OR 桂林 OR 漓江"),
+                # build one LIKE condition per non-operator token so each term
+                # is matched independently (#20494).
                 non_op_tokens = [
-                    t for t in tokens if t.upper() not in {"AND", "OR", "NOT"}
+                    t for t in raw_query.split()
+                    if t.upper() not in {"AND", "OR", "NOT"}
                 ] or [raw_query]
-                # Build the boolean expression. Adjacent terms without an
-                # explicit operator default to AND (FTS5 semantics). NOT
-                # attaches to the following term as `AND NOT (...)`; a preceding
-                # OR/AND is kept as the connector, so `A OR NOT B` stays
-                # `A OR NOT B` rather than collapsing to `A AND NOT B`.
-                expr_parts: list = []
-                pending_conn = None  # None | "AND" | "OR"  (connector)
-                pending_negate = False  # a NOT applies to the next term
-                for tok in tokens:
-                    upper = tok.upper()
-                    if upper in {"AND", "OR"}:
-                        pending_conn = upper
-                        continue
-                    if upper == "NOT":
-                        pending_negate = True
-                        continue
-                    clause = _term_clause(tok)
-                    if not expr_parts:
-                        # First term: a leading NOT still excludes.
-                        expr_parts.append(f"NOT {clause}" if pending_negate else clause)
-                    else:
-                        # Default connector between adjacent terms is AND
-                        # (FTS5 semantics); an explicit OR/AND overrides it.
-                        conn = pending_conn or "AND"
-                        if pending_negate:
-                            expr_parts.append(f"{conn} NOT {clause}")
-                        else:
-                            expr_parts.append(f"{conn} {clause}")
-                    pending_conn = None
-                    pending_negate = False
-                if not expr_parts:
-                    # No word tokens survived (pure operators or empty) — match
-                    # the raw query as a single substring.
-                    expr_parts.append(_term_clause(raw_query))
-                like_where = [f"({' '.join(expr_parts)})"]
+                token_clauses = []
+                like_params: list = []
+                for tok in non_op_tokens:
+                    esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    token_clauses.append(
+                        "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
+                    )
+                    like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
+                like_where = [f"({' OR '.join(token_clauses)})"]
                 if source_filter is not None:
                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     like_params.extend(source_filter)
@@ -5560,13 +5382,16 @@ class SessionDB:
             return [session_id] if session else []
 
         root = session
+        ancestors = {root["id"]}
         while self._is_compression_child_row(root):
             parent = self.get_session(root["parent_session_id"])
-            if not parent:
+            if not parent or parent["id"] in ancestors:
                 break
             root = parent
+            ancestors.add(root["id"])
 
         lineage = [root["id"]]
+        seen = {root["id"]}
         current = root
         while current.get("end_reason") == "compression":
             with self._lock:
@@ -5584,9 +5409,10 @@ class SessionDB:
                 if not self._is_branch_child_row(candidate):
                     next_child = candidate
                     break
-            if not next_child:
+            if not next_child or next_child["id"] in seen:
                 break
             lineage.append(next_child["id"])
+            seen.add(next_child["id"])
             current = next_child
             if current["id"] == session_id:
                 # Continue to include later compression tips only when the
@@ -5633,6 +5459,403 @@ class SessionDB:
             messages = self.get_messages(session["id"])
             results.append({**session, "messages": messages})
         return results
+
+    @staticmethod
+    def _import_text_or_none(value: Any, field: str) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        raise ValueError(f"{field} must be a string")
+
+    @staticmethod
+    def _import_json_object_or_none(value: Any, field: str) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{field} must be valid JSON") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(f"{field} must be a JSON object")
+            return value
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be a JSON object")
+        try:
+            return json.dumps(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be JSON serializable") from exc
+
+    @staticmethod
+    def _float_or_none(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _import_int_or_none(value: Any, field: str) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be an integer") from exc
+
+    @staticmethod
+    def _int_or_default(value: Any, default: int = 0) -> int:
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _reasoning_json_value(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return value
+
+    @staticmethod
+    def _import_error(index: int, session_id: str, error: str) -> Dict[str, Any]:
+        item: Dict[str, Any] = {"index": index, "error": error}
+        if session_id:
+            item["session_id"] = session_id
+        return item
+
+    def import_sessions(self, sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Import sessions exported by :meth:`export_session` or ``export_all``.
+
+        Existing session IDs are skipped. Imported child sessions keep their
+        parent only when that parent already exists or is included in the same
+        import payload; otherwise the child is detached so partial imports don't
+        fail foreign-key validation. Gateway routing, handoff, rewind, and other
+        live runtime state are intentionally reset: this restores conversation
+        history, not ownership of a live channel or process.
+        """
+        if not isinstance(sessions, list):
+            raise ValueError("sessions must be a list")
+        if len(sessions) > self._IMPORT_MAX_SESSIONS:
+            raise ValueError(
+                f"sessions must contain at most {self._IMPORT_MAX_SESSIONS} entries"
+            )
+
+        normalized: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        total_messages = 0
+        total_bytes = 0
+        session_text_fields = (
+            "source",
+            "user_id",
+            "model",
+            "system_prompt",
+            "end_reason",
+            "cwd",
+            "git_branch",
+            "git_repo_root",
+            "billing_provider",
+            "billing_base_url",
+            "billing_mode",
+            "cost_status",
+            "cost_source",
+            "pricing_version",
+            "title",
+        )
+        message_text_fields = (
+            "role",
+            "tool_call_id",
+            "tool_name",
+            "effect_disposition",
+            "finish_reason",
+            "reasoning",
+            "reasoning_content",
+            "platform_message_id",
+            "message_id",
+        )
+
+        for index, raw in enumerate(sessions):
+            if not isinstance(raw, dict):
+                errors.append(self._import_error(index, "", "session must be an object"))
+                continue
+            session_id = str(raw.get("id") or "").strip()
+            if not session_id:
+                errors.append(self._import_error(index, "", "session id is required"))
+                continue
+            if session_id in seen_ids:
+                errors.append(self._import_error(index, session_id, "duplicate session id"))
+                continue
+            messages = raw.get("messages") or []
+            if not isinstance(messages, list):
+                errors.append(self._import_error(index, session_id, "messages must be a list"))
+                continue
+            if len(messages) > self._IMPORT_MAX_MESSAGES_PER_SESSION:
+                errors.append(
+                    self._import_error(
+                        index,
+                        session_id,
+                        "messages exceeds the per-session import limit",
+                    )
+                )
+                continue
+            if any(not isinstance(msg, dict) for msg in messages):
+                errors.append(
+                    self._import_error(
+                        index,
+                        session_id,
+                        "messages must contain only objects",
+                    )
+                )
+                continue
+
+            try:
+                session_bytes = len(
+                    json.dumps(raw, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                )
+            except (TypeError, ValueError):
+                errors.append(
+                    self._import_error(index, session_id, "session must be JSON serializable")
+                )
+                continue
+            if session_bytes > self._IMPORT_MAX_SESSION_BYTES:
+                errors.append(
+                    self._import_error(index, session_id, "session exceeds the import size limit")
+                )
+                continue
+            total_bytes += session_bytes
+            if total_bytes > self._IMPORT_MAX_TOTAL_BYTES:
+                errors.append(
+                    self._import_error(index, session_id, "import exceeds the total size limit")
+                )
+                continue
+
+            try:
+                clean_session = dict(raw)
+                clean_session["id"] = session_id
+                clean_session["model_config"] = self._import_json_object_or_none(
+                    clean_session.get("model_config"), "model_config"
+                )
+                clean_session["parent_session_id"] = self._import_text_or_none(
+                    clean_session.get("parent_session_id"), "parent_session_id"
+                )
+                for field in session_text_fields:
+                    clean_session[field] = self._import_text_or_none(
+                        clean_session.get(field), field
+                    )
+
+                clean_messages: List[Dict[str, Any]] = []
+                for message_index, message in enumerate(messages):
+                    clean_message = dict(message)
+                    role = clean_message.get("role")
+                    if not isinstance(role, str) or not role:
+                        raise ValueError(f"messages[{message_index}].role must be a non-empty string")
+                    for field in message_text_fields:
+                        if field == "role":
+                            continue
+                        clean_message[field] = self._import_text_or_none(
+                            clean_message.get(field), field
+                        )
+                    clean_message["token_count"] = self._import_int_or_none(
+                        clean_message.get("token_count"), "token_count"
+                    )
+                    clean_messages.append(clean_message)
+            except ValueError as exc:
+                errors.append(self._import_error(index, session_id, str(exc)))
+                continue
+
+            total_messages += len(clean_messages)
+            if total_messages > self._IMPORT_MAX_TOTAL_MESSAGES:
+                errors.append(
+                    self._import_error(
+                        index,
+                        session_id,
+                        "messages exceeds the total import limit",
+                    )
+                )
+                continue
+            seen_ids.add(session_id)
+            normalized.append(
+                {"index": index, "session": clean_session, "messages": clean_messages}
+            )
+
+        if errors:
+            return {
+                "ok": False,
+                "imported": 0,
+                "skipped": 0,
+                "detached": 0,
+                "errors": errors,
+            }
+
+        def _do(conn):
+            imported_ids: List[str] = []
+            skipped_ids: List[str] = []
+            parent_updates: List[tuple[str, str]] = []
+            detached = 0
+
+            for item in normalized:
+                raw = item["session"]
+                messages = item["messages"]
+                session_id = str(raw.get("id") or "").strip()
+                exists = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if exists:
+                    skipped_ids.append(session_id)
+                    continue
+
+                started_at = self._float_or_none(raw.get("started_at"))
+                if started_at is None:
+                    started_at = time.time()
+                archived = 1 if raw.get("archived") else 0
+
+                conn.execute(
+                    """INSERT INTO sessions (
+                           id, source, user_id, model, model_config, system_prompt,
+                           parent_session_id, started_at, ended_at, end_reason,
+                           message_count, tool_call_count, input_tokens, output_tokens,
+                           cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                           cwd, git_branch, git_repo_root,
+                           billing_provider, billing_base_url, billing_mode,
+                           estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
+                           pricing_version, title, api_call_count, archived
+                       )
+                       VALUES (
+                           :id, :source, :user_id, :model, :model_config,
+                           :system_prompt, NULL, :started_at, :ended_at,
+                           :end_reason, 0, 0, :input_tokens, :output_tokens,
+                           :cache_read_tokens, :cache_write_tokens,
+                           :reasoning_tokens, :cwd, :git_branch, :git_repo_root,
+                           :billing_provider, :billing_base_url, :billing_mode,
+                           :estimated_cost_usd, :actual_cost_usd, :cost_status,
+                           :cost_source, :pricing_version, :title,
+                           :api_call_count, :archived
+                       )""",
+                    {
+                        "id": session_id,
+                        "source": str(raw.get("source") or "import"),
+                        "user_id": raw.get("user_id"),
+                        "model": raw.get("model"),
+                        "model_config": raw.get("model_config"),
+                        "system_prompt": raw.get("system_prompt"),
+                        "started_at": started_at,
+                        "ended_at": self._float_or_none(raw.get("ended_at")),
+                        "end_reason": raw.get("end_reason"),
+                        "input_tokens": self._int_or_default(raw.get("input_tokens")),
+                        "output_tokens": self._int_or_default(raw.get("output_tokens")),
+                        "cache_read_tokens": self._int_or_default(
+                            raw.get("cache_read_tokens")
+                        ),
+                        "cache_write_tokens": self._int_or_default(
+                            raw.get("cache_write_tokens")
+                        ),
+                        "reasoning_tokens": self._int_or_default(
+                            raw.get("reasoning_tokens")
+                        ),
+                        "cwd": raw.get("cwd"),
+                        "git_branch": raw.get("git_branch"),
+                        "git_repo_root": raw.get("git_repo_root"),
+                        "billing_provider": raw.get("billing_provider"),
+                        "billing_base_url": raw.get("billing_base_url"),
+                        "billing_mode": raw.get("billing_mode"),
+                        "estimated_cost_usd": self._float_or_none(
+                            raw.get("estimated_cost_usd")
+                        ),
+                        "actual_cost_usd": self._float_or_none(
+                            raw.get("actual_cost_usd")
+                        ),
+                        "cost_status": raw.get("cost_status"),
+                        "cost_source": raw.get("cost_source"),
+                        "pricing_version": raw.get("pricing_version"),
+                        "title": raw.get("title"),
+                        "api_call_count": self._int_or_default(raw.get("api_call_count")),
+                        "archived": archived,
+                    },
+                )
+
+                sanitized_messages: List[Dict[str, Any]] = []
+                for msg in messages:
+                    clean = dict(msg)
+                    for key in (
+                        "reasoning_details",
+                        "codex_reasoning_items",
+                        "codex_message_items",
+                    ):
+                        clean[key] = self._reasoning_json_value(clean.get(key))
+                    sanitized_messages.append(clean)
+
+                total_messages, total_tool_calls = self._insert_message_rows(
+                    conn,
+                    session_id,
+                    sanitized_messages,
+                )
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                    (total_messages, total_tool_calls, session_id),
+                )
+
+                parent_id = str(raw.get("parent_session_id") or "").strip()
+                if parent_id:
+                    parent_updates.append((session_id, parent_id))
+                imported_ids.append(session_id)
+
+            parent_by_child = dict(parent_updates)
+
+            def _would_create_cycle(session_id: str, parent_id: str) -> bool:
+                seen = {session_id}
+                current = parent_id
+                while current:
+                    if current in seen:
+                        return True
+                    seen.add(current)
+                    if current in parent_by_child:
+                        current = parent_by_child[current]
+                        continue
+                    row = conn.execute(
+                        "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1",
+                        (current,),
+                    ).fetchone()
+                    if row is None:
+                        return False
+                    current = row["parent_session_id"]
+                return False
+
+            for session_id, parent_id in parent_updates:
+                parent_exists = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                    (parent_id,),
+                ).fetchone()
+                if parent_exists and not _would_create_cycle(session_id, parent_id):
+                    conn.execute(
+                        "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+                        (parent_id, session_id),
+                    )
+                else:
+                    # Drop only the closing edge. Later entries can still attach
+                    # to this now-root session, preserving the acyclic portion
+                    # of a malformed imported lineage.
+                    parent_by_child.pop(session_id, None)
+                    detached += 1
+
+            return {
+                "ok": True,
+                "imported": len(imported_ids),
+                "skipped": len(skipped_ids),
+                "detached": detached,
+                "imported_ids": imported_ids,
+                "skipped_ids": skipped_ids,
+                "errors": [],
+            }
+
+        return self._execute_write(_do)
 
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
@@ -6791,8 +7014,8 @@ class SessionDB:
             # Best-effort WAL checkpoint first, then VACUUM.
             try:
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("WAL checkpoint (TRUNCATE) before VACUUM failed: %s", exc)
             self._conn.execute("VACUUM")
         return optimized
 
