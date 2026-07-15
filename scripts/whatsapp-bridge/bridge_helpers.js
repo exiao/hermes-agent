@@ -22,21 +22,31 @@ const RECONNECT_LONG_MS = 12 * 60 * 60 * 1000;
  * Return the next reconnect delay and consecutive-failure count without
  * importing the live bridge (which creates a socket and HTTP server).
  */
-export function reconnectPlan({ reason, reconnectAttempts, random = Math.random }) {
+export function reconnectPlan({
+  reason,
+  reconnectAttempts,
+  handshakeFailures = 0,
+  random = Math.random,
+}) {
   if (reason === 515) {
-    return { delay: 1000, reconnectAttempts: 0 };
+    return { delay: 1000, reconnectAttempts: 0, handshakeFailures: 0 };
   }
 
   const nextAttempts = reconnectAttempts + 1;
-  if (reason === 405 && nextAttempts > RECONNECT_GIVEUP_AFTER) {
-    return { delay: RECONNECT_LONG_MS, reconnectAttempts: nextAttempts };
+  const nextHandshakeFailures = reason === 405 ? handshakeFailures + 1 : 0;
+  if (nextHandshakeFailures > RECONNECT_GIVEUP_AFTER) {
+    return {
+      delay: RECONNECT_LONG_MS,
+      reconnectAttempts: nextAttempts,
+      handshakeFailures: nextHandshakeFailures,
+    };
   }
 
   const exponent = Math.min(nextAttempts - 1, 10);
   const backoff = Math.min(RECONNECT_BASE_MS * (2 ** exponent), RECONNECT_MAX_MS);
   const delay = RECONNECT_BASE_MS
     + Math.floor(random() * (backoff - RECONNECT_BASE_MS + 1));
-  return { delay, reconnectAttempts: nextAttempts };
+  return { delay, reconnectAttempts: nextAttempts, handshakeFailures: nextHandshakeFailures };
 }
 
 export function normalizeWhatsAppId(value) {

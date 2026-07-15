@@ -380,6 +380,7 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 let reconnectAttempts = 0;
+let handshakeFailures = 0;
 const RECONNECT_GIVEUP_AFTER = 10;         // after this many straight failures, back off hard
 
 function emitPairEvent(event) {
@@ -441,13 +442,14 @@ async function startSocket() {
         // failure (e.g. 405 from a rejected handshake) does not hammer
         // WhatsApp's servers and risk the account being flagged as abusive.
         emitPairEvent({ event: 'disconnected', reason });
-        const plan = reconnectPlan({ reason, reconnectAttempts });
+        const plan = reconnectPlan({ reason, reconnectAttempts, handshakeFailures });
         reconnectAttempts = plan.reconnectAttempts;
+        handshakeFailures = plan.handshakeFailures;
         const { delay } = plan;
         if (reason === 515) {
           if (!PAIR_JSON) console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
         } else {
-          if (reason === 405 && reconnectAttempts > RECONNECT_GIVEUP_AFTER) {
+          if (handshakeFailures > RECONNECT_GIVEUP_AFTER) {
             // Persistent failure: after 10 straight attempts, stop trying for
             // a full 12h. Anything wrong at this point (stale client, banned
             // handshake) won't fix itself in minutes, and continuing to retry
@@ -462,6 +464,7 @@ async function startSocket() {
     } else if (connection === 'open') {
       connectionState = 'connected';
       reconnectAttempts = 0;
+      handshakeFailures = 0;
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,

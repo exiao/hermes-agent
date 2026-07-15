@@ -27,7 +27,7 @@ import {
 // -- reconnect policy ----------------------------------------------------
 {
   const restarted = reconnectPlan({ reason: 515, reconnectAttempts: 10 });
-  assert.deepEqual(restarted, { delay: 1000, reconnectAttempts: 0 },
+  assert.deepEqual(restarted, { delay: 1000, reconnectAttempts: 0, handshakeFailures: 0 },
     'WhatsApp-requested restarts clear prior failure state');
   console.log('  ✓ 515 reconnect clears the consecutive-failure counter');
 }
@@ -35,31 +35,55 @@ import {
 {
   const firstRetry = reconnectPlan({ reason: 405, reconnectAttempts: 0, random: () => 0 });
   assert.equal(firstRetry.reconnectAttempts, 1);
+  assert.equal(firstRetry.handshakeFailures, 1);
   assert.equal(firstRetry.delay, 3000,
     'the first ordinary reconnect stays seconds-scale');
   console.log('  ✓ first reconnect is seconds-scale instead of minutes');
 }
 
 {
-  const cappedRetry = reconnectPlan({ reason: 405, reconnectAttempts: 9, random: () => 0.5 });
+  const cappedRetry = reconnectPlan({
+    reason: 405,
+    reconnectAttempts: 9,
+    handshakeFailures: 9,
+    random: () => 0.5,
+  });
   assert.equal(cappedRetry.reconnectAttempts, 10);
+  assert.equal(cappedRetry.handshakeFailures, 10);
   assert.equal(cappedRetry.delay, 151500,
     'repeated failures use capped exponential jitter');
   console.log('  ✓ repeated reconnects use capped exponential jitter');
 }
 
 {
-  const giveUp = reconnectPlan({ reason: 405, reconnectAttempts: 10 });
-  assert.deepEqual(giveUp, { delay: 12 * 60 * 60 * 1000, reconnectAttempts: 11 },
+  const giveUp = reconnectPlan({ reason: 405, reconnectAttempts: 10, handshakeFailures: 10 });
+  assert.deepEqual(giveUp, {
+    delay: 12 * 60 * 60 * 1000,
+    reconnectAttempts: 11,
+    handshakeFailures: 11,
+  },
     'the eleventh consecutive failure enters the 12-hour backoff');
   console.log('  ✓ persistent failures enter the 12-hour backoff');
 }
 
 {
   const transientRetry = reconnectPlan({ reason: 500, reconnectAttempts: 10, random: () => 0.5 });
-  assert.deepEqual(transientRetry, { delay: 151500, reconnectAttempts: 11 },
+  assert.deepEqual(transientRetry, { delay: 151500, reconnectAttempts: 11, handshakeFailures: 0 },
     'transient failures continue capped reconnects instead of entering the 12-hour backoff');
   console.log('  ✓ transient failures do not enter the 12-hour backoff');
+}
+
+{
+  const firstHandshakeRejection = reconnectPlan({
+    reason: 405,
+    reconnectAttempts: 10,
+    handshakeFailures: 0,
+    random: () => 0,
+  });
+  assert.equal(firstHandshakeRejection.delay, 3000,
+    'a first 405 after transient failures stays on the normal retry schedule');
+  assert.equal(firstHandshakeRejection.handshakeFailures, 1);
+  console.log('  ✓ a first 405 does not inherit transient failure history');
 }
 
 // -- quoted outbound text -------------------------------------------------
