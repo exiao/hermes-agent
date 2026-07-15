@@ -54,6 +54,38 @@ def _run_display(monkeypatch, result):
     return captured
 
 
+def test_global_classic_cli_switch_clears_stale_base_url(monkeypatch):
+    """A persisted native-provider switch must not retain a local OpenAI URL."""
+    import cli as cli_mod
+
+    saved: list[tuple[str, object]] = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda key, value: saved.append((key, value)),
+    )
+    result = ModelSwitchResult(
+        success=True,
+        new_model="claude-sonnet-4-6",
+        target_provider="anthropic",
+        provider_changed=True,
+        api_key="",
+        base_url="",
+        api_mode="anthropic_messages",
+        warning_message="",
+        provider_label="Anthropic",
+        resolved_via_alias=False,
+        capabilities=None,
+        model_info=None,
+        is_global=True,
+    )
+
+    cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, True)
+
+    assert ("model.base_url", None) in saved
+
+
 def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):
     """``_apply_model_switch_result`` must prefer the provider-aware resolver
     (272K on Codex) over the raw models.dev value (1.05M for gpt-5.5).
