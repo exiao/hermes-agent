@@ -677,6 +677,53 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    def test_drop_trigram_fts_drops_triggers_when_tokenizer_missing(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression (reviewer P2): when the SQLite build lacks the trigram
+        tokenizer, the DROP TABLE raises 'no such tokenizer: trigram' and the
+        rollback undoes the (tokenizer-free) trigger drops. Leaving the triggers
+        behind makes every later message INSERT fire messages_fts_trigram_insert
+        against the unusable vtable and crash. The drop must still remove the
+        triggers so writes degrade to the base FTS/LIKE path.
+        """
+        db_path = tmp_path / "state.db"
+        monkeypatch.setattr(SessionDB, "_trigram_fts_enabled", staticmethod(lambda: True))
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="the quick brown fox")
+            assert db._fts_table_exists("messages_fts_trigram") is True
+
+            real_conn = db._conn
+
+            class _NoTokenizerCursor:
+                def execute(self, sql, *args, **kwargs):
+                    normalized = sql.upper()
+                    if "DROP TABLE" in normalized and "MESSAGES_FTS_TRIGRAM" in normalized:
+                        raise sqlite3.OperationalError("no such tokenizer: trigram")
+                    return real_conn.execute(sql, *args, **kwargs)
+
+            # Tokenizer-missing is a known FTS-unavailable error, so the drop
+            # reports False (nothing reclaimable) but must NOT leave stale
+            # triggers pointing at the unusable vtable.
+            assert db._drop_trigram_fts(_NoTokenizerCursor()) is False
+
+            triggers = {
+                row[0]
+                for row in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name LIKE 'messages_fts_trigram_%'"
+                ).fetchall()
+            }
+            assert triggers == set()
+
+            # With the triggers gone, a new message INSERT no longer crashes on
+            # the unusable trigram vtable.
+            db.append_message("s1", role="user", content="second message after drop")
+        finally:
+            db.close()
+
     def test_trigram_disabled_still_repairs_missing_base_triggers(
         self, tmp_path, monkeypatch
     ):

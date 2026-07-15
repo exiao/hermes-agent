@@ -1134,6 +1134,27 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass
             if SessionDB._is_fts5_unavailable_error(exc):
+                # The DROP TABLE needs to load the vtable module/tokenizer, so a
+                # build missing the trigram tokenizer raises here and the rollback
+                # above also undid the (tokenizer-free) trigger drops. Leaving the
+                # triggers in place means every message INSERT fires
+                # messages_fts_trigram_insert against the unusable vtable and
+                # crashes. DROP TRIGGER does not need the tokenizer, so drop them
+                # in a standalone committed step and degrade to the base FTS/LIKE
+                # path. The orphaned trigram table is harmless without triggers.
+                try:
+                    cursor.execute("BEGIN IMMEDIATE")
+                    for trigger in _TRIGRAM_FTS_TRIGGERS:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                    cursor.execute("COMMIT")
+                except sqlite3.OperationalError:
+                    # Locked/unavailable while dropping the triggers alone; leave
+                    # the DB untouched (roll back the partial trigger drop) and
+                    # report no drop so a later uncontended startup retries.
+                    try:
+                        cursor.execute("ROLLBACK")
+                    except sqlite3.OperationalError:
+                        pass
                 return False
             raise
 
