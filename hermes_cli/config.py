@@ -3068,6 +3068,20 @@ DEFAULT_CONFIG = {
         # GBs of disk on heavy users.  Opt in only if you have an external
         # tool that consumes the JSON files directly.
         "write_json_snapshots": False,
+        # WAL watchdog: bound state.db-wal growth. A long-lived reader can pin
+        # the WAL so the periodic checkpoint no-ops and the -wal grows without
+        # bound (seen live at 3.6 GB); a giant WAL + hard shutdown is the
+        # malformed-image corruption scenario. When true the gateway runs a
+        # RESTART checkpoint at startup and hourly if -wal exceeds wal_max_mb.
+        "wal_watchdog": True,
+        # -wal size (MB) above which the watchdog force-checkpoints.
+        "wal_max_mb": 64,
+        # Trigram FTS index for CJK / substring search. The trigram shadow
+        # tables were the single largest consumer on the live DB (~5 GB serving
+        # substring search over ~2 GB of text). When false the trigram table +
+        # triggers are dropped and CJK/substring search falls back to LIKE (no
+        # feature loss, just a slower scan for those queries). Default true.
+        "fts_trigram": True,
     },
 
     # Contextual first-touch onboarding hints (see agent/onboarding.py).

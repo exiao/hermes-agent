@@ -60,6 +60,15 @@ class _NoTrigramCursor(sqlite3.Cursor):
             raise sqlite3.OperationalError("no such tokenizer: trigram")
         return super().executescript(sql_script)
 
+    def execute(self, sql, *args):
+        # The v20 migration recreates FTS tables via execute() (inside its
+        # explicit transaction), not executescript, so simulate the missing
+        # trigram tokenizer here too — matches real SQLite, which raises on
+        # the CREATE VIRTUAL TABLE regardless of the executor used.
+        if isinstance(sql, str) and "tokenize='trigram'" in sql:
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, *args)
+
 
 class _NoTrigramConnection(sqlite3.Connection):
     def cursor(self, factory=None):
@@ -524,6 +533,53 @@ class TestSessionLifecycle:
         finally:
             restored.close()
 
+    def test_base_fts_rebuilds_when_base_trigger_missing_gate_off(
+        self, tmp_path, monkeypatch
+    ):
+        """Gate-off open must rebuild base FTS when a base trigger is missing.
+
+        Regression: the trigram-disabled open path counted the full six-trigger
+        set against a threshold of 3, so three surviving trigram triggers could
+        mask a dropped base trigger (2 base + 3 trigram = 5 >= 3), skipping the
+        rebuild. Messages written while the base trigger was absent then stayed
+        unsearchable forever once the trigram table was dropped. Scope the count
+        to the base triggers so the deficit is seen.
+        """
+        db_path = tmp_path / "state.db"
+
+        # Phase 1: build with trigram ON so the trigram triggers exist on disk.
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: True)
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="s1", source="cli")
+            seeded.append_message("s1", role="user", content="already indexed")
+            assert seeded._trigram_available is True
+            # Simulate trigger-only degradation from a prior no-FTS5 runtime:
+            # drop exactly ONE base trigger, leaving the three trigram triggers
+            # (and the other two base triggers) intact.
+            seeded._conn.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
+            seeded._conn.commit()
+            # A message written during the missing-base-trigger window is not
+            # indexed by base FTS.
+            seeded.append_message(
+                "s1", role="assistant", content="gap window base needle"
+            )
+        finally:
+            seeded.close()
+
+        # Phase 2: reopen with the gate flipped OFF. The base rebuild must fire
+        # despite the surviving trigram triggers, and the trigram table is
+        # dropped — after which only a rebuilt base index can find the gap msg.
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: False)
+        restored = SessionDB(db_path=db_path)
+        try:
+            assert restored._fts_enabled is True
+            assert restored._trigram_available is False
+            assert restored._fts_table_exists("messages_fts_trigram") is False
+            assert len(restored.search_messages("needle")) == 1
+        finally:
+            restored.close()
+
     def test_is_fts5_unavailable_error_catches_trigram_tokenizer(self):
         """Unit test: _is_fts5_unavailable_error matches 'no such tokenizer: trigram'."""
         fts5_err = sqlite3.OperationalError("no such module: fts5")
@@ -643,6 +699,327 @@ class TestSessionLifecycle:
             assert len(results) == 1
             # Note: search_messages strips 'content' from results; use 'snippet'.
             assert "大别山" in results[0]["snippet"]
+        finally:
+            db.close()
+
+
+class TestExternalContentFtsMigration:
+    """v20: view-backed third-party-content FTS + trigram config gate + WAL watchdog."""
+
+    def _seed_inline_v19(self, db_path):
+        """Create a DB, then rewrite FTS to the pre-v20 INLINE schema at v19.
+
+        Mirrors what an on-disk pre-migration DB looks like: messages_fts /
+        messages_fts_trigram declared WITHOUT content= (a full text copy per
+        table) with DELETE-based triggers, and schema_version pinned to 19.
+        """
+        db = SessionDB(db_path=db_path)
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(
+            "s1", role="assistant", content="hello world",
+            tool_name="web_search", tool_calls='{"q":"kittens"}',
+        )
+        db.append_message("s1", role="user", content="plain text only")
+        db.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS messages_fts_insert;
+            DROP TRIGGER IF EXISTS messages_fts_delete;
+            DROP TRIGGER IF EXISTS messages_fts_update;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_insert;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_delete;
+            DROP TRIGGER IF EXISTS messages_fts_trigram_update;
+            DROP TABLE IF EXISTS messages_fts;
+            DROP TABLE IF EXISTS messages_fts_trigram;
+            DROP VIEW IF EXISTS messages_search_v;
+            CREATE VIRTUAL TABLE messages_fts USING fts5(content);
+            CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content, tokenize='trigram');
+            INSERT INTO messages_fts(rowid, content)
+                SELECT id, COALESCE(content,'')||' '||COALESCE(tool_name,'')||' '||COALESCE(tool_calls,'')
+                FROM messages;
+            INSERT INTO messages_fts_trigram(rowid, content)
+                SELECT id, COALESCE(content,'')||' '||COALESCE(tool_name,'')||' '||COALESCE(tool_calls,'')
+                FROM messages;
+            UPDATE schema_version SET version = 19;
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    def test_migration_switches_to_external_content_and_preserves_search(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "state.db"
+        self._seed_inline_v19(db_path)
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            # Version advanced and both FTS tables are now external-content
+            # backed by the messages_search_v view (invariant: content= set).
+            version = migrated._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0]
+            assert version == SCHEMA_VERSION
+            fts_sql = migrated._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'"
+            ).fetchone()[0]
+            assert "content=messages_search_v" in fts_sql.replace("'", "")
+            assert migrated._conn.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type='view' AND name='messages_search_v'"
+            ).fetchone()[0] == 1
+
+            # v11 intent preserved: tool_name + tool_calls stay searchable.
+            assert [m["id"] for m in migrated.search_messages("web_search")]
+            assert [m["id"] for m in migrated.search_messages("kittens")]
+            # snippet() still emits highlight markers.
+            hits = migrated.search_messages("hello")
+            assert hits and ">>>" in hits[0]["snippet"]
+
+            # Incremental maintenance through the new 'delete'-command triggers.
+            migrated.append_message(
+                "s1", role="assistant", content="fresh", tool_name="new_tool",
+            )
+            assert [m["id"] for m in migrated.search_messages("new_tool")]
+        finally:
+            migrated.close()
+
+    def test_migration_is_idempotent(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        self._seed_inline_v19(db_path)
+
+        first = SessionDB(db_path=db_path)
+        first.close()
+        # Second open must be a no-op: version stays put and search still works.
+        second = SessionDB(db_path=db_path)
+        try:
+            assert second._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+            assert len(second.search_messages("web_search")) == 1
+        finally:
+            second.close()
+
+    def test_failed_v20_migration_rolls_back_and_stays_v19(
+        self, tmp_path, monkeypatch
+    ):
+        """A v20 rebuild failure must NOT commit the inline-FTS DROPs.
+
+        Regression: the connection is in autocommit mode, so without an
+        explicit transaction the DROP TABLE statements commit immediately and
+        a rollback is a no-op — leaving the DB at v19 with the FTS tables gone.
+        Force the base FTS recreate to fail and assert the pre-migration
+        schema (inline messages_fts) survives and the version stays at 19.
+        """
+        db_path = tmp_path / "state.db"
+        self._seed_inline_v19(db_path)
+
+        # Make the external-content recreate fail so fts_migrations_complete
+        # goes False after the inline tables/triggers were dropped.
+        real_ensure = SessionDB._ensure_fts_schema
+
+        def _fail_base(self, cursor, table, sql, in_transaction=False):
+            if table == "messages_fts":
+                return False
+            return real_ensure(self, cursor, table, sql, in_transaction)
+
+        monkeypatch.setattr(SessionDB, "_ensure_fts_schema", _fail_base)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            # Version must NOT have advanced.
+            assert db._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == 19
+            # The pre-migration inline FTS table must still exist — the DROPs
+            # were rolled back, not committed.
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type='table' AND name='messages_fts'"
+            ).fetchone()[0] == 1
+        finally:
+            db.close()
+
+    def test_trigram_gate_off_drops_table_and_falls_back_to_like(
+        self, tmp_path, monkeypatch
+    ):
+        # Gate the trigram index off via the config reader (no config file
+        # needed — patch the method the constructor consults).
+        monkeypatch.setattr(
+            SessionDB, "_read_fts_trigram_config", lambda self: False
+        )
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is False
+            # Trigram table must not exist when gated off.
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 0
+
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="大别山项目计划书")
+            # A 3+ CJK query that would normally use trigram must fall back to
+            # LIKE without raising, and still find the row.
+            results = db.search_messages("大别山")
+            assert len(results) == 1
+            assert "大别山" in results[0]["snippet"]
+        finally:
+            db.close()
+
+    def test_trigram_gate_on_keeps_table(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            SessionDB, "_read_fts_trigram_config", lambda self: True
+        )
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is True
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 1
+        finally:
+            db.close()
+
+    def test_trigram_gate_flip_off_vacuums_and_reclaims_disk(
+        self, tmp_path, monkeypatch
+    ):
+        """Flipping fts_trigram false on an already-built DB must VACUUM.
+
+        Regression: the config-gate open path drops the ~5 GB trigram table but
+        only moves its pages to the freelist. Without a VACUUM the on-disk file
+        never shrinks, so the knob's advertised disk recovery wouldn't happen.
+        Assert the reopen returns freed pages to the OS (file shrinks, freelist
+        empty), and that a no-drop reopen reports nothing to reclaim (so the
+        VACUUM is not run on every open).
+        """
+        db_path = tmp_path / "state.db"
+
+        # Phase 1: build a DB with the trigram index populated.
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: True)
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            for i in range(400):
+                db.append_message(
+                    "s1", role="user", content=f"大别山项目计划书 chunk {i} " * 8
+                )
+            assert db._trigram_available is True
+        finally:
+            db.close()
+        size_with_trigram = db_path.stat().st_size
+
+        # Phase 2: reopen with the gate flipped OFF — the drop path must VACUUM
+        # so the freed trigram pages are returned to the OS.
+        monkeypatch.setattr(SessionDB, "_read_fts_trigram_config", lambda self: False)
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is False
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 0
+            # VACUUM rebuilds the file with an empty freelist.
+            assert db._conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+            # CJK search still works via the LIKE fallback.
+            assert len(db.search_messages("大别山")) >= 1
+        finally:
+            db.close()
+        size_after_drop = db_path.stat().st_size
+        assert size_after_drop < size_with_trigram, (
+            f"trigram-disable did not reclaim disk: "
+            f"{size_with_trigram} -> {size_after_drop}"
+        )
+
+        # Phase 3: a subsequent gate-off reopen has no trigram table to drop, so
+        # _drop_trigram_schema must report nothing reclaimable (False) — the
+        # signal that gates the VACUUM off on every steady-state open.
+        drop_results = []
+        real_drop = SessionDB._drop_trigram_schema
+
+        def spy_drop(cursor):
+            res = real_drop(cursor)
+            drop_results.append(res)
+            return res
+
+        monkeypatch.setattr(SessionDB, "_drop_trigram_schema", staticmethod(spy_drop))
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is False
+        finally:
+            db.close()
+        assert drop_results == [False], (
+            f"gate-off reopen should have nothing to reclaim, got {drop_results}"
+        )
+
+    def test_trigram_gate_scoped_to_target_profile(self, tmp_path, monkeypatch):
+        """A cross-profile open reads the TARGET profile's fts_trigram gate.
+
+        Regression: the launch profile's config must not drive destructive
+        trigram DDL on a different profile's DB. Launch profile gates trigram
+        OFF; the opened profile gates it ON — the opened DB must keep trigram.
+        """
+        import yaml
+
+        launch_home = tmp_path / "launch"
+        launch_home.mkdir()
+        (launch_home / "config.yaml").write_text(
+            yaml.safe_dump({"sessions": {"fts_trigram": False}}), encoding="utf-8"
+        )
+        # Active process resolves to the launch profile (trigram OFF).
+        monkeypatch.setattr(hermes_state, "get_hermes_home", lambda: launch_home)
+
+        # Target profile lives elsewhere and gates trigram ON.
+        target_home = tmp_path / "other"
+        target_home.mkdir()
+        (target_home / "config.yaml").write_text(
+            yaml.safe_dump({"sessions": {"fts_trigram": True}}), encoding="utf-8"
+        )
+        db = SessionDB(db_path=target_home / "state.db")
+        try:
+            # Target profile's ON setting wins — trigram table is kept, not
+            # dropped by the launch profile's OFF setting.
+            assert db._fts_trigram_enabled is True
+            assert db._trigram_available is True
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name='messages_fts_trigram'"
+            ).fetchone()[0] == 1
+        finally:
+            db.close()
+
+    def test_wal_watchdog_shrinks_unpinned_wal(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            # Suppress the periodic checkpoint so the WAL is free to grow, then
+            # write enough to push it over a tiny threshold.
+            monkeypatch.setattr(SessionDB, "_CHECKPOINT_EVERY_N_WRITES", 10 ** 9)
+            for i in range(400):
+                db.append_message("s1", role="user", content=("x" * 2000) + str(i))
+
+            before = db._wal_size_bytes()
+            assert before > 0
+            result = db.wal_watchdog(max_mb=0)
+            assert result["checked"] is True
+            assert result["checkpointed"] is True
+            assert result["pinned"] is False
+            # Not pinned -> TRUNCATE follows -> file shrinks to ~0.
+            assert db._wal_size_bytes() < before
+        finally:
+            db.close()
+
+    def test_wal_watchdog_noop_below_threshold(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="tiny")
+            # Huge threshold: watchdog must not touch a small WAL.
+            result = db.wal_watchdog(max_mb=10_000)
+            assert result["checked"] is False
+            assert result["checkpointed"] is False
         finally:
             db.close()
 
