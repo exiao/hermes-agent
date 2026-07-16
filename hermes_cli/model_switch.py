@@ -1275,6 +1275,13 @@ def switch_model(
         _da = DIRECT_ALIASES.get(resolved_alias)
         if _da is not None and _da.base_url:
             base_url = _da.base_url
+            # The alias endpoint is now the source of truth for base_url, NOT
+            # the inherited providers.<provider>.base_url. Reset provenance so
+            # the CLI/TUI persistence paths write model.base_url (the alias URL)
+            # instead of dropping it — otherwise /model <alias> --global saves
+            # the model but loses the endpoint, and after restart the model runs
+            # against providers.<provider>.base_url (e.g. the loopback proxy).
+            base_url_from_provider_config = False
             api_mode = ""  # clear so determine_api_mode re-detects from URL
             if not api_key:
                 api_key = "no-key-required"
