@@ -5513,7 +5513,7 @@ def _reconcile_terminal_completion_with_pr_evidence(
         conn,
         task_id,
         "completion_reconciled_pr_evidence",
-        {"summary": (handoff or "").strip().splitlines()[0][:200] or None},
+        {"summary": next(iter((handoff or "").strip().splitlines()), "")[:200] or None},
         run_id=int(expected_run_id),
     )
     return True
