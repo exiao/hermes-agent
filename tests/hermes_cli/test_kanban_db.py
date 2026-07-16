@@ -1341,10 +1341,44 @@ def test_pr_evidence_reconciles_early_review_completion(kanban_home):
         assert run is not None
         assert run.summary == "Fixed the regression and opened the PR."
         assert run.metadata["commit_sha"] == "abc123"
+        final_task = kb.get_task(conn, task_id)
+        assert final_task is not None
+        assert final_task.result == "Fixed the regression and opened the PR."
         assert any(
             event.kind == "completion_reconciled_pr_evidence"
             for event in kb.list_events(conn, task_id)
         )
+
+
+@pytest.mark.parametrize("handoff", [None, "", " \n\t "])
+def test_pr_evidence_reconciliation_accepts_empty_handoff(kanban_home, handoff):
+    """A PR-evidence recovery must not crash on an absent handoff string."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owner work", assignee="dev")
+        kb.claim_task(conn, task_id, claimer="host:owner", ttl_seconds=300)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="early review completed",
+            expected_run_id=task.current_run_id,
+            expected_claim_lock="host:owner",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary=handoff,
+            metadata={"commit_sha": "abc123", "pr_url": "https://example.test/pr/1"},
+            expected_run_id=task.current_run_id,
+            expected_claim_lock="host:owner",
+        )
+        reconciled = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "completion_reconciled_pr_evidence"
+        ]
+        assert reconciled[-1].payload == {"summary": None}
 
 
 def test_block_then_unblock(kanban_home):

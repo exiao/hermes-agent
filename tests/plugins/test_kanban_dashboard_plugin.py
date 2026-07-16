@@ -1786,15 +1786,10 @@ def test_task_detail_runs_empty_before_claim(client):
 def test_patch_status_done_with_summary_and_metadata(client):
     """PATCH /tasks/:id with status=done + summary + metadata must
     reach complete_task, so the dashboard has CLI parity."""
-    # Create + claim.
+    # A ready task is an unowned manual completion.
     r = client.post("/api/plugins/kanban/tasks", json={"title": "x", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        kb.claim_task(conn, tid)
-    finally:
-        conn.close()
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{tid}",
@@ -1822,11 +1817,6 @@ def test_patch_status_done_without_summary_still_works(client):
     r = client.post("/api/plugins/kanban/tasks", json={"title": "y", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        kb.claim_task(conn, tid)
-    finally:
-        conn.close()
     r = client.patch(
         f"/api/plugins/kanban/tasks/{tid}",
         json={"status": "done", "result": "legacy shape"},
@@ -1839,6 +1829,21 @@ def test_patch_status_done_without_summary_still_works(client):
         assert run.summary == "legacy shape"  # falls back to result
     finally:
         conn.close()
+
+
+def test_patch_status_done_refuses_live_worker_claim(client):
+    """Dashboard completion cannot steal an active dispatcher-owned task."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "owned", "assignee": "worker"})
+    tid = r.json()["task"]["id"]
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, tid, ttl_seconds=300)
+    finally:
+        conn.close()
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "done"})
+    assert r.status_code == 409
 
 
 def test_patch_status_archive_closes_running_run(client):

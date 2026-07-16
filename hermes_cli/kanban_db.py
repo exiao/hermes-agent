@@ -5501,9 +5501,10 @@ def _reconcile_terminal_completion_with_pr_evidence(
     if _has_pushed_pr_evidence(previous_metadata):
         return False
     handoff = summary if summary is not None else result
+    handoff_lines = (handoff or "").strip().splitlines()
     conn.execute(
         "UPDATE tasks SET result = ? WHERE id = ? AND status = 'done'",
-        (result, task_id),
+        (handoff, task_id),
     )
     conn.execute(
         "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
@@ -5513,7 +5514,7 @@ def _reconcile_terminal_completion_with_pr_evidence(
         conn,
         task_id,
         "completion_reconciled_pr_evidence",
-        {"summary": next(iter((handoff or "").strip().splitlines()), "")[:200] or None},
+        {"summary": handoff_lines[0][:_EVENT_PAYLOAD_DETAIL_MAX] if handoff_lines else None},
         run_id=int(expected_run_id),
     )
     return True

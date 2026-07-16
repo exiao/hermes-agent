@@ -548,7 +548,7 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        TERMINAL_KINDS = ("completed", "completion_reconciled_pr_evidence", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -771,7 +771,7 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind in {"completed", "completion_reconciled_pr_evidence"}:
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -793,10 +793,8 @@ class GatewayKanbanWatchersMixin:
                                 first = lines[0] if lines else task.result
                                 detail = _clip_notify_detail(first)
                                 handoff = f"\n{detail}" if detail else ""
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
+                            state = "updated" if kind == "completion_reconciled_pr_evidence" else "done"
+                            msg = f"✔ {board_tag}{tag}Kanban {sub['task_id']} {state} — {title}{handoff}"
                         elif kind == "blocked":
                             reason_detail = ""
                             if ev.payload and ev.payload.get("reason"):
@@ -926,15 +924,16 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
-                        # Unsubscribe only when the task has reached a truly
-                        # final status (done / archived). For blocked /
+                        # A done task can receive a later evidence-reconciliation
+                        # event from its still-running owner, so retain its
+                        # subscription until archival. For blocked /
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
-                        task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        task_terminal = task and task.status == "archived"
+                        _WAKE_KINDS = ("completed", "completion_reconciled_pr_evidence", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         if _wake_kinds:
                             try:
@@ -943,7 +942,7 @@ class GatewayKanbanWatchersMixin:
                                     _title = (task.title if task else sub["task_id"])[:120]
                                     _assignee = task.assignee if task else ""
                                     _parts = []
-                                    if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
+                                    if {"completed", "completion_reconciled_pr_evidence"} & _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
                                     if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                                     if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                                     if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))

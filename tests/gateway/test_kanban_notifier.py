@@ -173,6 +173,52 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
 
 
+def test_notifier_delivers_pr_evidence_reconciliation_after_initial_completion(
+    tmp_path, monkeypatch
+):
+    """A late owner handoff updates a subscriber who already saw the early close."""
+    db_path = tmp_path / "reconciled-handoff.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owner work", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.claim_task(conn, tid, claimer="host:owner", ttl_seconds=300)
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        assert kb.complete_task(
+            conn, tid, summary="review child completed", expected_run_id=run_id,
+            expected_claim_lock="host:owner",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Owner pushed https://example.test/pr/1",
+            metadata={"commit_sha": "abc123", "pr_url": "https://example.test/pr/1"},
+            expected_run_id=run_id,
+            expected_claim_lock="host:owner",
+        )
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 2
+    assert "updated" in adapter.sent[-1]["text"]
+    assert "Owner pushed https://example.test/pr/1" in adapter.sent[-1]["text"]
+
+
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     """A retry cycle (crashed → reclaimed → crashed) notifies the user twice.
 
