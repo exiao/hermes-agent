@@ -562,6 +562,16 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
 
+    # Delegated-child kanban-ownership mask, same policy as the terminal /
+    # execute_code spawn paths (_make_run_env, _sanitize_subprocess_env): a
+    # child spawned under a Kanban worker must not inherit the parent's claim
+    # token. This helper feeds the codex_app_server / ACP-CLI runtimes, which
+    # otherwise copy os.environ verbatim and hand HERMES_KANBAN_* to the Codex
+    # subprocess — letting a delegated reviewer close the parent task via the
+    # Hermes-tools MCP kanban_complete/kanban_block. Strip it here too so the
+    # mask covers every non-terminal spawn surface, not just terminal spawns.
+    _strip_delegated_child_kanban_ownership(env)
+
     return env
 
 
