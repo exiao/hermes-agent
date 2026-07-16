@@ -199,9 +199,15 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.current_run_id is not None
+        assert task.claim_lock is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
     return tid
 
 
@@ -399,22 +405,26 @@ def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
 def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
     monkeypatch, worker_env
 ):
+    from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
     monkeypatch.setenv("HERMES_SESSION_ID", "session-trusted")
+    with kb.connect() as conn:
+        ready_task_id = kb.create_task(conn, title="orchestrator completion", assignee="peer")
 
     out = kt._handle_complete({
-        "task_id": worker_env,
+        "task_id": ready_task_id,
         "summary": "done outside worker scope",
         "metadata": {"files": 2, "worker_session_id": "user-provided"},
     })
     assert json.loads(out)["ok"] is True
 
-    from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        run = kb.latest_run(conn, worker_env)
+        run = kb.latest_run(conn, ready_task_id)
         assert run.metadata == {
             "files": 2,
             "worker_session_id": "user-provided",
@@ -547,6 +557,23 @@ def test_complete_rejects_no_handoff(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({})
     assert json.loads(out).get("error"), "should have errored"
+
+
+def test_complete_without_worker_run_cannot_close_live_claim(worker_env, monkeypatch):
+    """An orchestrator-like tool caller must not complete another live worker's task."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK")
+    out = kt._handle_complete({"task_id": worker_env, "summary": "unowned completion"})
+
+    assert json.loads(out).get("error")
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "running"
 
 
 def test_complete_rejects_non_dict_metadata(worker_env):
@@ -740,6 +767,13 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", fail_if_called)
     monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: False)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, goal_task_id)
+        assert task is not None
+        assert task.current_run_id is not None
+        assert task.claim_lock is not None
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
 
     out = kt._handle_complete({"summary": "done enough"})
     d = json.loads(out)
@@ -1926,10 +1960,6 @@ def test_board_param_routes_complete_to_alt_board(multi_board_env):
     from tools import kanban_tools as kt
 
     alt_seed = multi_board_env["alt_seed"]
-    # Make alt task running so complete is valid.
-    with kb.connect(board="alt") as conn:
-        kb.claim_task(conn, alt_seed)
-
     out = kt._handle_complete({
         "task_id": alt_seed,
         "summary": "alt close",

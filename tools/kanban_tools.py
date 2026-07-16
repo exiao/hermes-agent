@@ -673,6 +673,7 @@ def _handle_complete(args: dict, **kw) -> str:
                         os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
                         if worker_run_id is not None else None
                     ),
+                    enforce_active_claim=worker_run_id is None,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
