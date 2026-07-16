@@ -1537,6 +1537,7 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
         assert run2.id != run1.id
+        run2_lock = kb.get_task(conn, tid).claim_lock
 
         assert not kb.complete_task(
             conn,
@@ -1553,6 +1554,7 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
             tid,
             summary="current completion",
             expected_run_id=run2.id,
+            expected_claim_lock=run2_lock,
         )
         runs = kb.list_runs(conn, tid)
         assert [r.outcome for r in runs] == ["crashed", "completed"]

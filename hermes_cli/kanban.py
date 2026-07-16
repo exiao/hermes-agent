@@ -1905,6 +1905,32 @@ def _worker_claim_lock_for(task_id: str) -> Optional[str]:
     return lock or None
 
 
+def _manual_owner_claim_lock(conn, task: "kb.Task") -> Optional[str]:
+    """Claim lock to forward for a MANUAL CLI complete of an owner-claimed task.
+
+    ``hermes kanban claim`` sets a host-local ``claim_lock`` but (unlike a
+    dispatcher-spawned worker) leaves ``worker_pid`` NULL, and a subsequent
+    ``hermes kanban complete`` runs in a DIFFERENT process with no
+    ``HERMES_KANBAN_*`` env, so it can't prove the token. Without help, the
+    ``enforce_active_claim`` guard treats the operator's OWN manual claim as a
+    live third-party worker and refuses completion, stranding the task until
+    the claim expires. A manual claim is identifiable: it is host-local (the
+    lock's host prefix matches this host) AND has no ``worker_pid`` (no
+    dispatcher-spawned process backs it). In that case the same-host operator
+    IS the legitimate owner, so forward the live lock as proof. A real
+    dispatcher worker (``worker_pid`` set) or a remote/other-host claim returns
+    ``None`` and stays guarded.
+    """
+    if not task.claim_lock or task.status != "running":
+        return None
+    if task.worker_pid:
+        return None  # dispatcher-backed worker owns it — not a manual claim
+    host_prefix = f"{kb._claimer_id().split(':', 1)[0]}:"
+    if not task.claim_lock.startswith(host_prefix):
+        return None  # claimed on another host — genuinely third-party
+    return task.claim_lock
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -1936,13 +1962,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            worker_lock = _worker_claim_lock_for(tid)
+            # A manual `hermes kanban claim` by this same operator has no worker
+            # env; forward its host-local owner lock so enforce_active_claim
+            # doesn't refuse the operator's own completion.
+            claim_lock = worker_lock
+            if claim_lock is None and _worker_run_id_for(tid) is None:
+                _task = kb.get_task(conn, tid)
+                if _task is not None:
+                    claim_lock = _manual_owner_claim_lock(conn, _task)
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
-                expected_claim_lock=_worker_claim_lock_for(tid),
+                expected_claim_lock=claim_lock,
                 enforce_active_claim=True,
             ):
                 failed.append(tid)

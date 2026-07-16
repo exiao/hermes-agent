@@ -5644,7 +5644,16 @@ def complete_task(
                 "AND claim_lock IS NOT NULL",
                 (task_id,),
             ).fetchone()
-            if active and _claim_is_live(active, now):
+            # A caller that PROVES the current claim lock is the legitimate
+            # owner (e.g. a manual `hermes kanban claim` operator completing
+            # their own claim from a later CLI process), so let it through.
+            # Only an unproven third-party completion is blocked while the
+            # claim is live.
+            if (
+                active
+                and _claim_is_live(active, now)
+                and expected_claim_lock != active["claim_lock"]
+            ):
                 return False
         if expected_run_id is None:
             cur = conn.execute(

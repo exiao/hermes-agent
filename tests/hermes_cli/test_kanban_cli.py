@@ -643,3 +643,42 @@ def test_cli_complete_forwards_claim_lock_for_worker_scoped_complete(
     assert "Completed" in out
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "done"
+
+
+def test_manual_cli_claim_then_complete_by_owner_succeeds(kanban_home):
+    """`hermes kanban claim` then `hermes kanban complete` (same operator, a
+    later CLI process, no worker env) must succeed.
+
+    Regression: enforce_active_claim=True on _cmd_complete wrongly treated the
+    operator's OWN manual host-local claim (worker_pid NULL) as a live third-
+    party worker claim and refused, stranding the task until claim expiry.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="manual work", assignee="alice")
+
+    # Manual claim: sets a host-local claim_lock, leaves worker_pid NULL.
+    out = kc.run_slash(f"claim {tid}")
+    assert "Claimed" in out
+    with kb.connect() as conn:
+        t = kb.get_task(conn, tid)
+        assert t.status == "running" and t.claim_lock and t.worker_pid is None
+
+    # Complete from a later CLI invocation (no HERMES_KANBAN_* env) → allowed.
+    out = kc.run_slash(f"complete {tid}")
+    assert "Completed" in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_manual_complete_blocked_for_other_host_claim(kanban_home):
+    """A task claimed on ANOTHER host must NOT be manually completable here —
+    the owner-exemption is strictly host-local."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="remote work", assignee="alice")
+        # Simulate a live claim from a different host (no worker_pid).
+        kb.claim_task(conn, tid, claimer="other-host:999", ttl_seconds=300)
+
+    out = kc.run_slash(f"complete {tid}")
+    assert "cannot complete" in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
