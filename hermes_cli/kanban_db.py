@@ -5664,6 +5664,21 @@ def complete_task(
                 (result, now, task_id),
             )
         else:
+            # Worker-scoped completion (run id pinned at spawn). If the task
+            # currently holds a live claim lock, the caller MUST prove it holds
+            # that lock — otherwise a stale shell or subprocess that retained
+            # (or forged) only the task + run ids could close the task on a bare
+            # current_run_id match, bypassing the ownership guard this path
+            # exists to enforce. A never-claimed ready/blocked task has a NULL
+            # claim_lock and needs no token.
+            if expected_claim_lock is None:
+                live_lock = conn.execute(
+                    "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
+                    "AND claim_lock IS NOT NULL",
+                    (task_id,),
+                ).fetchone()
+                if live_lock:
+                    return False
             lock_clause = " AND claim_lock = ?" if expected_claim_lock is not None else ""
             params: tuple[Any, ...] = (result, now, task_id, int(expected_run_id))
             if expected_claim_lock is not None:

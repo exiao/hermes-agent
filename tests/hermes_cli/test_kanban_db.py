@@ -1541,6 +1541,34 @@ def test_unowned_completion_allowed_when_expired_worker_pid_dead(
         assert kb.get_task(conn, task_id).status == "done"
 
 
+def test_worker_scoped_completion_requires_claim_lock_when_claimed(kanban_home):
+    """A worker-scoped complete (run id pinned) on a task holding a live claim
+    lock must PROVE it holds the lock. A caller that kept/forged only the task
+    + run ids but no claim lock must not close it on a bare current_run_id
+    match (the ownership guard the claim-lock predicate exists to enforce)."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owned", assignee="dev")
+        claimed = kb.claim_task(conn, task_id, claimer="host:owner", ttl_seconds=300)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        real_lock = kb.get_task(conn, task_id).claim_lock
+        assert real_lock
+
+        # Run id correct, but NO claim lock forwarded → rejected, stays running.
+        assert not kb.complete_task(
+            conn, task_id, summary="stale shell tried to close it",
+            expected_run_id=run_id,
+        )
+        assert kb.get_task(conn, task_id).status == "running"
+
+        # Correct lock forwarded → completes.
+        assert kb.complete_task(
+            conn, task_id, summary="owner completes",
+            expected_run_id=run_id, expected_claim_lock=real_lock,
+        )
+        assert kb.get_task(conn, task_id).status == "done"
+
+
 def test_block_then_unblock(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")

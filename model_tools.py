@@ -362,6 +362,7 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            _delegated_child_masks_kanban(),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -394,6 +395,26 @@ def get_tool_definitions(
     return result
 
 
+def _delegated_child_masks_kanban() -> bool:
+    """Whether the current thread is building/running a delegated child agent
+    that must NOT receive kanban lifecycle tools.
+
+    A delegated review child inherits the parent worker's ``HERMES_KANBAN_TASK``
+    but must never mutate the parent's task, so it is the ONE case where a
+    process carrying ``HERMES_KANBAN_TASK`` legitimately has no
+    ``kanban_complete``/``block``/``heartbeat``. It is signalled by the
+    delegate-child ownership mask contextvar (engaged around child construction
+    and run), NOT by a profile's ``disabled_toolsets`` — so a real worker whose
+    profile disabled kanban for cost still gets its lifecycle surface back.
+    """
+    try:
+        from tools.delegate_tool import delegated_child_masks_kanban_ownership
+
+        return delegated_child_masks_kanban_ownership()
+    except Exception:
+        return False
+
+
 def _compute_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -409,14 +430,25 @@ def _compute_tool_definitions(
         if (
             os.environ.get("HERMES_KANBAN_TASK")
             and "kanban" not in effective_enabled_toolsets
-            and "kanban" not in (disabled_toolsets or [])
+            and not _delegated_child_masks_kanban()
         ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
-            # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
+            # (for token/cost reasons) — INCLUDING listing "kanban" in
+            # agent.disabled_toolsets — but that must not strip the kanban
+            # worker's completion/block/heartbeat surface, or the task can
+            # never finish via the lifecycle protocol. The ONE case where a
+            # HERMES_KANBAN_TASK process legitimately has no lifecycle tools is
+            # a delegated review child (it inherits the parent worker's env but
+            # must never mutate the parent's task); that is signalled by the
+            # delegate-child ownership mask, not by the global disabled list.
             effective_enabled_toolsets.append("kanban")
+            # A profile that disabled kanban for cost still gets the worker
+            # lifecycle tools back: drop kanban from the subtraction step below
+            # so the force-append isn't immediately undone.
+            if disabled_toolsets and "kanban" in disabled_toolsets:
+                disabled_toolsets = [d for d in disabled_toolsets if d != "kanban"]
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
