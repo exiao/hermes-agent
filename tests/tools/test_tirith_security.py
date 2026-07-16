@@ -1359,8 +1359,10 @@ class TestAppTldSuppression:
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
-    def test_mixed_findings_preserve_warn(self, mock_cfg, mock_run):
-        """If .app finding is accompanied by another finding, warn is preserved."""
+    def test_mixed_findings_strip_safe_lookalike_preserve_action(self, mock_cfg, mock_run):
+        """A safe .app lookalike accompanying a real finding is STRIPPED, but the
+        real finding preserves the action and becomes findings[0] (so the approval
+        layer keys on the real rule, not the suppressed lookalike)."""
         mock_cfg.return_value = _CFG
         findings = [
             {"rule_id": "lookalike_tld", "value": ".app"},
@@ -1369,7 +1371,8 @@ class TestAppTldSuppression:
         mock_run.return_value = _mock_run(2, _json_stdout(findings, "mixed"))
         result = check_command_security("curl https://bit.ly/test.app")
         assert result["action"] == "warn"
-        assert len(result["findings"]) == 2
+        assert len(result["findings"]) == 1
+        assert result["findings"][0]["rule_id"] == "shortened_url"
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
@@ -1436,13 +1439,27 @@ class TestAppTldSuppression:
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
-    def test_block_verdict_never_suppressed(self, mock_cfg, mock_run):
-        """block exit code is never downgraded, even if finding looks like .app."""
+    def test_block_verdict_with_sole_safe_lookalike_downgraded(self, mock_cfg, mock_run):
+        """A block verdict whose ONLY finding is a safe-domain/gTLD lookalike is
+        downgraded to allow: the block was driven solely by a known false positive.
+        (A real co-firing finding would keep the block — see the mixed test.)"""
         mock_cfg.return_value = _CFG
         findings = [{"rule_id": "lookalike_tld", "value": ".app"}]
         mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
         result = check_command_security("curl https://example.app")
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_block_verdict_unsafe_lookalike_preserved(self, mock_cfg, mock_run):
+        """A block verdict with an unsafe (.zip) lookalike is NOT downgraded."""
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld", "value": ".zip"}]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
+        result = check_command_security("curl https://malware.zip")
         assert result["action"] == "block"
+        assert len(result["findings"]) == 1
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")

@@ -840,19 +840,31 @@ def check_command_security(command: str) -> dict:
         elif action == "warn":
             summary = "security warning detected (details unavailable)"
 
-    # Suppress warn verdicts that consist solely of a lookalike_tld finding for
-    # a known-safe gTLD (.app, .dev).  These are legitimate Google-operated
-    # gTLDs used by many production services (e.g. *.workers.dev, *.web.app),
-    # and the "can be confused with file extensions" heuristic generates false
-    # positives for normal API calls.  Genuinely risky lookalike TLDs that
-    # collide with real filenames (.zip, .mov) are NOT suppressed here, so any
-    # such finding still preserves the warn action.
-    if action == "warn" and findings:
-        non_suppressible = [f for f in findings if not _is_safe_lookalike_tld_finding(f)]
-        if not non_suppressible:
-            action = "allow"
-            findings = []
-            summary = ""
+    # Strip lookalike_tld findings for known-safe gTLDs (.app, .dev) and trusted
+    # registrable domains (modal.run) UNCONDITIONALLY — for both warn AND block
+    # verdicts.  These are legitimate services (e.g. *.workers.dev, *.web.app,
+    # *.modal.run) and the "can be confused with file extensions" heuristic is a
+    # false positive on them.  Two reasons this must happen even when the overall
+    # action is `block`:
+    #   1. A co-firing HIGH finding (e.g. curl_pipe_shell) escalates the verdict to
+    #      `block`, which previously skipped this suppression entirely and left the
+    #      safe-domain false positive in the findings list.
+    #   2. The approval layer keys the prompt on findings[0] only.  A safe-domain
+    #      lookalike sitting at slot 0 hijacks the approval key (tirith:lookalike_tld)
+    #      and masks a real finding the user has already allowlisted
+    #      (e.g. tirith:curl_pipe_shell), forcing a spurious prompt every time.
+    # Genuinely risky lookalike TLDs that collide with real filenames (.zip, .mov)
+    # and untrusted .run domains are NOT _is_safe_lookalike_tld_finding, so their
+    # findings are never stripped and still drive the verdict.
+    if findings:
+        kept = [f for f in findings if not _is_safe_lookalike_tld_finding(f)]
+        if len(kept) != len(findings):
+            findings = kept
+            if not findings:
+                # The only reason for the verdict was the suppressed false
+                # positive; downgrade to allow.
+                action = "allow"
+                summary = ""
 
     return {"action": action, "findings": findings, "summary": summary}
 
