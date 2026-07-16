@@ -1891,6 +1891,20 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_claim_lock_for(task_id: str) -> Optional[str]:
+    """Claim lock pinned in this worker's env for ``task_id`` (else ``None``).
+
+    Mirrors the model-tool ``kanban_complete`` path: a worker-scoped
+    completion must prove it holds the current claim lock, so a stale
+    shell or a sibling subprocess that merely retained the task+run ids
+    cannot close the task out from under the live claim.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    return lock or None
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -1928,6 +1942,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                expected_claim_lock=_worker_claim_lock_for(tid),
                 enforce_active_claim=True,
             ):
                 failed.append(tid)

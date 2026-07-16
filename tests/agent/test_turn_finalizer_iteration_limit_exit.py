@@ -296,3 +296,36 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
+
+
+def test_delegated_child_timeout_does_not_release_parent_kanban_task(monkeypatch):
+    """A delegated child that exhausts its own budget must NOT time out and
+    release the parent worker's Kanban task/run.
+
+    The child runs in-process on a worker thread and inherits the parent's
+    HERMES_KANBAN_TASK in the shared os.environ (env masking only rewrites
+    spawned terminal subprocess env). The delegate-child mask contextvar is
+    thread-visible, so finalize_turn must honor it and skip the parent-task
+    failure record — the parent is merely awaiting delegation.
+    """
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    record = MagicMock(name="record_task_failure")
+    conn = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    # Mark this thread as a delegated child (the mask the terminal env stripper
+    # and now finalize_turn both read).
+    from tools.delegate_tool import delegated_child_kanban_env
+
+    agent = _LimitAgent()
+    with delegated_child_kanban_env():
+        result = _finalize(
+            agent,
+            final_response=None,
+            exit_reason="unknown",
+            pending_verification_response="child composed report",
+        )
+
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    record.assert_not_called()

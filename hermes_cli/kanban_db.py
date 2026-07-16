@@ -5502,6 +5502,26 @@ def _reconcile_terminal_completion_with_pr_evidence(
         previous_metadata = {}
     if _has_pushed_pr_evidence(previous_metadata):
         return False
+    now = int(time.time())
+    # Preserve any scratch-workspace artifacts BEFORE advertising them. The
+    # normal completion path copies scratch artifacts into the durable
+    # attachment dir and rewrites ``metadata["artifacts"]`` to the persisted
+    # paths; this recovery branch returns early, so without doing the same the
+    # reconciled event would advertise the original scratch path while later
+    # workspace cleanup (kept around for active children in the deferred-cleanup
+    # case) removes the only copy, losing the deliverable. Mirror the main path.
+    if isinstance(metadata, dict):
+        _persist_scratch_completion_artifacts(conn, task_id, metadata)
+        for stored_path in metadata.pop("_staged_artifacts", []):
+            path = Path(stored_path)
+            _insert_completion_attachment(
+                conn,
+                task_id,
+                filename=path.name,
+                stored_path=str(path),
+                size=path.stat().st_size,
+                created_at=now,
+            )
     handoff = summary if summary is not None else result
     handoff_lines = (handoff or "").strip().splitlines()
     reconciled_payload: dict = {
@@ -5608,16 +5628,23 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
-        # An external dashboard/CLI caller must not terminal-complete a task
+        # A third-party dashboard/CLI caller must not terminal-complete a task
         # while its dispatcher owner still has a live claim. Worker lifecycle
-        # tools pass both the run id and claim lock pinned at spawn.
+        # tools pass both the run id and claim lock pinned at spawn. A claim
+        # counts as "live" not only while unexpired but also in the post-TTL
+        # window where a host-local worker's PID is still alive — the reclaim
+        # path (``reclaim_stale_claims``) intentionally EXTENDS such a claim
+        # rather than releasing it, so a raw ``claim_expires >= now`` check
+        # would wrongly let a third-party completion close a task out from under
+        # a worker the dispatcher is about to re-extend (#gap: expired-but-live).
         if expected_run_id is None and enforce_active_claim:
             active = conn.execute(
-                "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
-                "AND claim_lock IS NOT NULL AND claim_expires >= ?",
-                (task_id, now),
+                "SELECT claim_lock, claim_expires, worker_pid, last_heartbeat_at "
+                "FROM tasks WHERE id = ? AND status = 'running' "
+                "AND claim_lock IS NOT NULL",
+                (task_id,),
             ).fetchone()
-            if active:
+            if active and _claim_is_live(active, now):
                 return False
         if expected_run_id is None:
             cur = conn.execute(
@@ -7916,6 +7943,38 @@ def reap_worker_zombies() -> "list[int]":
         except Exception:
             pass
     return reaped
+
+
+def _claim_is_live(row: Any, now: int) -> bool:
+    """Whether a running task's claim should still block third-party completion.
+
+    A claim is live when it is either (a) unexpired (``claim_expires >= now``),
+    or (b) expired-but-still-defended: a host-local worker whose PID is alive
+    and whose heartbeat is not stale past the max-stale backstop. Case (b)
+    mirrors ``reclaim_stale_claims``: the dispatcher EXTENDS such a claim rather
+    than releasing it, so a third-party (dashboard/CLI) ``complete`` in that
+    post-TTL window must be rejected too, or it would close the task out from
+    under a worker that is about to be re-extended.
+
+    ``row`` must expose ``claim_lock``, ``claim_expires``, ``worker_pid`` and
+    ``last_heartbeat_at`` (sqlite3.Row or mapping).
+    """
+    expires = row["claim_expires"]
+    if expires is not None and int(expires) >= now:
+        return True
+    lock = row["claim_lock"] or ""
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if not lock.startswith(host_prefix):
+        return False
+    pid = row["worker_pid"]
+    if not pid or not _pid_alive(pid):
+        return False
+    hb = row["last_heartbeat_at"]
+    heartbeat_stale = (
+        hb is not None
+        and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+    )
+    return not heartbeat_stale
 
 
 def _pid_alive(pid: Optional[int]) -> bool:

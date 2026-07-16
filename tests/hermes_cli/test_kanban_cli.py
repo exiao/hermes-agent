@@ -605,3 +605,41 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
     out = kc.run_slash("--board beta boards show")
 
     assert "Current board: alpha" in out
+
+
+def test_cli_complete_forwards_claim_lock_for_worker_scoped_complete(
+    kanban_home, monkeypatch,
+):
+    """A worker-scoped `hermes kanban complete` must prove it holds the current
+    claim lock (mirrors the model-tool kanban_complete path).
+
+    When HERMES_KANBAN_TASK/RUN_ID are set, complete_task takes the worker
+    branch and only closes the task when the forwarded claim lock matches the
+    live one. A stale shell that kept task+run ids but NOT the current lock must
+    not be able to close the task.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="owned work", assignee="alice")
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:worker", ttl_seconds=300)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        real_lock = kb.get_task(conn, tid).claim_lock
+    assert real_lock
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    # Wrong lock in env → worker-scoped complete is rejected, task stays running.
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "some:other:lock")
+    out = kc.run_slash(f"complete {tid}")
+    assert "cannot complete" in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+
+    # Correct lock in env → complete succeeds.
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", real_lock)
+    out = kc.run_slash(f"complete {tid}")
+    assert "Completed" in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"

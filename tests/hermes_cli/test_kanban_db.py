@@ -1415,6 +1415,132 @@ def test_pr_evidence_reconciliation_accepts_empty_handoff(kanban_home, handoff):
         assert reconciled[-1].payload == {"summary": None}
 
 
+def test_pr_evidence_reconciliation_persists_scratch_artifacts(kanban_home):
+    """A recovered owner handoff must durably copy its scratch artifacts.
+
+    Regression for the reconciliation branch returning before the normal
+    ``_persist_scratch_completion_artifacts`` runs: the reconciled event would
+    advertise the volatile scratch path while workspace cleanup later removed
+    the only copy. The recovery path must persist the artifact into the durable
+    attachment dir and advertise THAT path, same as a normal completion.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owner work", assignee="dev")
+        task = kb.get_task(conn, task_id)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, ws)
+        # An active child defers this task's scratch cleanup (#33774): the
+        # workspace (and the deliverable) survives the evidence-free early
+        # close, so the later PR-evidence reconciliation is the realistic
+        # deferred-cleanup case the P2 describes.
+        kb.create_task(conn, title="child", assignee="dev", parents=[task_id])
+        kb.claim_task(conn, task_id, claimer="host:owner", ttl_seconds=300)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+
+        artifact = ws / "deliverable.pdf"
+        artifact.write_bytes(b"owner-report-bytes")
+
+        # First close: evidence-free early review completion.
+        assert kb.complete_task(
+            conn, task_id, summary="early review completed",
+            expected_run_id=run_id, expected_claim_lock="host:owner",
+        )
+        assert ws.exists(), "active child should defer scratch cleanup"
+        assert artifact.exists(), "deliverable still present pre-reconciliation"
+        # Second close: the real owner recovers with a pushed PR + scratch artifact.
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="Owner recovered with the requested deliverable.",
+            metadata={
+                "commit_sha": "abc123",
+                "pr_url": "https://example.test/pr/1",
+                "artifacts": [str(artifact)],
+            },
+            expected_run_id=run_id,
+            expected_claim_lock="host:owner",
+        )
+
+        reconciled = [
+            e for e in kb.list_events(conn, task_id)
+            if e.kind == "completion_reconciled_pr_evidence"
+        ][-1]
+        persisted = Path(reconciled.payload["artifacts"][0])
+        attachments = kb.list_attachments(conn, task_id)
+
+    assert persisted.exists(), "reconciled artifact copy should be durable"
+    assert persisted.parent == kb.task_attachments_dir(task_id)
+    assert persisted.name == "deliverable.pdf"
+    assert persisted.read_bytes() == b"owner-report-bytes"
+    assert str(persisted) != str(artifact), "event must advertise the durable copy"
+    assert [(a.filename, a.stored_path) for a in attachments] == [
+        ("deliverable.pdf", str(persisted.resolve()))
+    ]
+
+
+def test_unowned_completion_rejected_for_expired_but_live_worker(
+    kanban_home, monkeypatch,
+):
+    """A TTL-expired claim whose host-local worker PID is still alive must
+    still block a third-party (dashboard/CLI) completion.
+
+    The reclaim path EXTENDS such a claim rather than releasing it (#23025),
+    so in the post-TTL/pre-extend window a raw ``claim_expires >= now`` guard
+    would wrongly let an unowned complete close the task out from under a live
+    worker the dispatcher is about to re-extend.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owned", assignee="dev")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker", ttl_seconds=300)
+        kb._set_worker_pid(conn, task_id, 12345)
+        # Rewind the claim so it is TTL-expired but recently heartbeated.
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (int(time.time()) - 60, int(time.time()) - 5, task_id),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+
+        assert not kb.complete_task(
+            conn,
+            task_id,
+            summary="dashboard tried to close it",
+            enforce_active_claim=True,
+        )
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_unowned_completion_allowed_when_expired_worker_pid_dead(
+    kanban_home, monkeypatch,
+):
+    """The expired-but-live guard must not over-block: an expired claim whose
+    worker PID is dead is genuinely stale and a third-party complete proceeds."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owned", assignee="dev")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker", ttl_seconds=300)
+        kb._set_worker_pid(conn, task_id, 12345)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 60, task_id),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="stale claim, owner is gone",
+            enforce_active_claim=True,
+        )
+        assert kb.get_task(conn, task_id).status == "done"
+
+
 def test_block_then_unblock(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
