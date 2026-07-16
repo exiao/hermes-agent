@@ -5489,8 +5489,10 @@ def _reconcile_terminal_completion_with_pr_evidence(
     if not row or row["status"] != "done":
         return False
     run = conn.execute(
-        "SELECT outcome, metadata FROM task_runs WHERE id = ? AND task_id = ?",
-        (int(expected_run_id), task_id),
+        """SELECT outcome, metadata FROM task_runs
+           WHERE id = ? AND task_id = ?
+             AND id = (SELECT MAX(id) FROM task_runs WHERE task_id = ?)""",
+        (int(expected_run_id), task_id, task_id),
     ).fetchone()
     if not run or run["outcome"] != "completed":
         return False
