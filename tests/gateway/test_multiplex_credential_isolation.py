@@ -761,6 +761,9 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
             def has_credentials(self):
                 return pool_has_creds
 
+            def has_available(self):
+                return pool_has_creds
+
         monkeypatch.setattr(
             "agent.credential_pool.load_pool", lambda slug: _Pool()
         )
@@ -850,6 +853,9 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
 
         class _Pool:
             def has_credentials(self):
+                return pool_has_creds
+
+            def has_available(self):
                 return pool_has_creds
 
         monkeypatch.setattr("agent.credential_pool.load_pool", lambda slug: _Pool())

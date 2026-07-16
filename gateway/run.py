@@ -14344,7 +14344,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return t("gateway.reasoning.reset_done")
         if effort == "none":
             parsed = {"enabled": False}
-        elif effort in {"minimal", "low", "medium", "high", "xhigh"}:
+        elif effort in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
             parsed = {"enabled": True, "effort": effort}
         else:
             return t(
