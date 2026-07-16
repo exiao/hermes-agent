@@ -663,11 +663,16 @@ def _handle_complete(args: dict, **kw) -> str:
                     )
 
             try:
+                worker_run_id = _worker_run_id(tid)
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=worker_run_id,
+                    expected_claim_lock=(
+                        os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                        if worker_run_id is not None else None
+                    ),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(

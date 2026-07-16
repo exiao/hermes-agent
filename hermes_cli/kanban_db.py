@@ -5456,6 +5456,69 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _has_pushed_pr_evidence(metadata: Optional[dict]) -> bool:
+    """Whether a completion carries the durable evidence for shipped code."""
+    if not isinstance(metadata, dict):
+        return False
+    return bool(str(metadata.get("commit_sha") or "").strip()) and bool(
+        str(metadata.get("pr_url") or "").strip()
+    )
+
+
+def _reconcile_terminal_completion_with_pr_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> bool:
+    """Replace an evidence-free terminal handoff from the same worker run.
+
+    A delegated review child used to inherit its parent's Kanban environment and
+    could close the parent task before the owner had committed.  New child agents
+    no longer receive lifecycle tools, but this narrow recovery keeps the real
+    owner's pushed PR from being orphaned when an older worker raced first.
+    """
+    if not _has_pushed_pr_evidence(metadata):
+        return False
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row or row["status"] != "done":
+        return False
+    run = conn.execute(
+        "SELECT outcome, metadata FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(expected_run_id), task_id),
+    ).fetchone()
+    if not run or run["outcome"] != "completed":
+        return False
+    try:
+        previous_metadata = json.loads(run["metadata"]) if run["metadata"] else {}
+    except (TypeError, json.JSONDecodeError):
+        previous_metadata = {}
+    if _has_pushed_pr_evidence(previous_metadata):
+        return False
+    handoff = summary if summary is not None else result
+    conn.execute(
+        "UPDATE tasks SET result = ? WHERE id = ? AND status = 'done'",
+        (result, task_id),
+    )
+    conn.execute(
+        "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
+        (handoff, json.dumps(metadata, ensure_ascii=False), int(expected_run_id)),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "completion_reconciled_pr_evidence",
+        {"summary": (handoff or "").strip().splitlines()[0][:200] or None},
+        run_id=int(expected_run_id),
+    )
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5465,6 +5528,8 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    enforce_active_claim: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -5527,6 +5592,17 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # An external dashboard/CLI caller must not terminal-complete a task
+        # while its dispatcher owner still has a live claim. Worker lifecycle
+        # tools pass both the run id and claim lock pinned at spawn.
+        if expected_run_id is None and enforce_active_claim:
+            active = conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
+                "AND claim_lock IS NOT NULL AND claim_expires >= ?",
+                (task_id, now),
+            ).fetchone()
+            if active:
+                return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5545,6 +5621,10 @@ def complete_task(
                 (result, now, task_id),
             )
         else:
+            lock_clause = " AND claim_lock = ?" if expected_claim_lock is not None else ""
+            params: tuple[Any, ...] = (result, now, task_id, int(expected_run_id))
+            if expected_claim_lock is not None:
+                params += (expected_claim_lock,)
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5559,10 +5639,19 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
-                """,
-                (result, now, task_id, int(expected_run_id)),
+                """ + lock_clause,
+                params,
             )
         if cur.rowcount != 1:
+            if expected_run_id is not None and _reconcile_terminal_completion_with_pr_evidence(
+                conn,
+                task_id,
+                expected_run_id=int(expected_run_id),
+                result=result,
+                summary=summary,
+                metadata=metadata,
+            ):
+                return True
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)

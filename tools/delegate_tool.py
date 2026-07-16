@@ -1272,6 +1272,16 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
+    # A Kanban worker owns one task/run. Delegate children share the process
+    # environment, including that worker's task/run tokens, so exposing the
+    # lifecycle toolset lets a read-only reviewer terminal-complete its parent.
+    # Reviews belong on separate code-reviewer cards; children may report to the
+    # owner but must never mutate the parent's lifecycle.
+    child_disabled_toolsets: list[str] = []
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        child_toolsets = [toolset for toolset in child_toolsets if toolset != "kanban"]
+        child_disabled_toolsets.append("kanban")
+
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
     # orchestrator capability is granted by role, not inherited — see the
@@ -1467,6 +1477,7 @@ def _build_child_agent(
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
+        disabled_toolsets=child_disabled_toolsets,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",
