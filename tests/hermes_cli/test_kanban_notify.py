@@ -75,7 +75,7 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
         subs = kb.list_notify_subs(conn, tid)
     finally:
         conn.close()
-    assert subs == [], "Subscription should be unsub after completed event"
+    assert len(subs) == 1, "Subscription must survive for a later owner-evidence recovery"
 
 
 @pytest.mark.asyncio
@@ -444,7 +444,7 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
         subs = kb.list_notify_subs(conn, tid)
     finally:
         conn.close()
-    assert subs == []
+    assert len(subs) == 1
 
 
 @pytest.mark.asyncio

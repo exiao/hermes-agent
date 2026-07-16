@@ -1870,7 +1870,6 @@ def test_cli_complete_with_summary_and_metadata(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
-        kb.claim_task(conn, tid)
     finally:
         conn.close()
     # JSON metadata must round-trip through shlex + argparse.
@@ -2093,7 +2092,6 @@ def test_cli_bulk_complete_without_summary_still_works(kanban_home):
     try:
         a = kb.create_task(conn, title="a", assignee="worker")
         b = kb.create_task(conn, title="b", assignee="worker")
-        kb.claim_task(conn, a); kb.claim_task(conn, b)
     finally:
         conn.close()
     out = run_slash(f"complete {a} {b}")
