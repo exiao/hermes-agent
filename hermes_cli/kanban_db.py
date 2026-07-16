@@ -5511,17 +5511,37 @@ def _reconcile_terminal_completion_with_pr_evidence(
     # workspace cleanup (kept around for active children in the deferred-cleanup
     # case) removes the only copy, losing the deliverable. Mirror the main path.
     if isinstance(metadata, dict):
-        _persist_scratch_completion_artifacts(conn, task_id, metadata)
-        for stored_path in metadata.pop("_staged_artifacts", []):
-            path = Path(stored_path)
-            _insert_completion_attachment(
-                conn,
+        # Best-effort in THIS recovery branch: the task is already ``done``, so
+        # the normal completion cleanup has usually already removed the scratch
+        # workspace (the common case when there are no active Kanban children).
+        # If the declared artifacts are gone, preserving them is impossible, but
+        # that must NOT block recording the durable PR evidence — otherwise the
+        # real owner's pushed PR stays orphaned and the task is stuck with the
+        # early review handoff, defeating the whole point of this path. Unlike
+        # the main completion path (where a missing artifact at first close is a
+        # real error worth failing loudly), here we swallow the preservation
+        # failure and still reconcile the PR metadata below.
+        try:
+            _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            for stored_path in metadata.pop("_staged_artifacts", []):
+                path = Path(stored_path)
+                _insert_completion_attachment(
+                    conn,
+                    task_id,
+                    filename=path.name,
+                    stored_path=str(path),
+                    size=path.stat().st_size,
+                    created_at=now,
+                )
+        except ArtifactPreservationError as exc:
+            _log.warning(
+                "PR-evidence recovery for %s: scratch artifacts unavailable "
+                "(workspace likely cleaned up already); reconciling durable PR "
+                "metadata without them: %s",
                 task_id,
-                filename=path.name,
-                stored_path=str(path),
-                size=path.stat().st_size,
-                created_at=now,
+                exc,
             )
+            metadata.pop("_staged_artifacts", None)
     handoff = summary if summary is not None else result
     handoff_lines = (handoff or "").strip().splitlines()
     reconciled_payload: dict = {

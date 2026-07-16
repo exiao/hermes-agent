@@ -1480,6 +1480,67 @@ def test_pr_evidence_reconciliation_persists_scratch_artifacts(kanban_home):
     ]
 
 
+def test_pr_evidence_reconciliation_tolerates_removed_scratch_artifacts(kanban_home):
+    """Recovery must still record PR evidence when scratch artifacts are gone.
+
+    The common case: no active children, so the normal completion cleanup has
+    already removed the scratch workspace by the time the real owner reconciles
+    with a pushed PR. ``_persist_scratch_completion_artifacts`` then raises
+    ``ArtifactPreservationError`` on the missing file. That must NOT abort the
+    reconciliation, or the durable PR evidence is never recorded and the task
+    stays stuck on the early review handoff. Preserve best-effort; reconcile
+    the PR metadata regardless.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owner work", assignee="dev")
+        task = kb.get_task(conn, task_id)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, ws)
+        kb.claim_task(conn, task_id, claimer="host:owner", ttl_seconds=300)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+
+        artifact = ws / "deliverable.pdf"
+        artifact.write_bytes(b"owner-report-bytes")
+
+        # First close: evidence-free early review completion.
+        assert kb.complete_task(
+            conn, task_id, summary="early review completed",
+            expected_run_id=run_id, expected_claim_lock="host:owner",
+        )
+        # Simulate the workspace cleanup that runs after the early close in the
+        # no-active-children case: the scratch deliverable is gone.
+        if artifact.exists():
+            artifact.unlink()
+        assert not artifact.exists()
+
+        # Second close: real owner recovers with a pushed PR whose declared
+        # artifact path no longer resolves to a file. Must NOT raise.
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="Owner recovered with a pushed PR.",
+            metadata={
+                "commit_sha": "abc123",
+                "pr_url": "https://example.test/pr/1",
+                "artifacts": [str(artifact)],
+            },
+            expected_run_id=run_id,
+            expected_claim_lock="host:owner",
+        )
+
+        reconciled = [
+            e for e in kb.list_events(conn, task_id)
+            if e.kind == "completion_reconciled_pr_evidence"
+        ]
+        task_after = kb.get_task(conn, task_id)
+
+    # The durable PR evidence WAS reconciled despite the missing artifact.
+    assert reconciled, "PR-evidence reconciliation event must be recorded"
+    assert task_after is not None and task_after.status == "done"
+
+
 def test_unowned_completion_rejected_for_expired_but_live_worker(
     kanban_home, monkeypatch,
 ):
