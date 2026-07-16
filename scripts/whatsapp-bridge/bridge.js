@@ -43,6 +43,7 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  reconnectPlan,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -378,6 +379,9 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
+let reconnectAttempts = 0;
+let handshakeFailures = 0;
+const RECONNECT_GIVEUP_AFTER = 10;         // after this many straight failures, back off hard
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
@@ -433,19 +437,34 @@ async function startSocket() {
         }
         process.exit(1);
       } else {
-        // 515 = restart requested (common after pairing). Always reconnect.
+        // 515 = restart requested (common after pairing) - legit and fast.
+        // Everything else uses capped exponential backoff + jitter so a persistent
+        // failure (e.g. 405 from a rejected handshake) does not hammer
+        // WhatsApp's servers and risk the account being flagged as abusive.
         emitPairEvent({ event: 'disconnected', reason });
-        if (!PAIR_JSON) {
-          if (reason === 515) {
-            console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
+        const plan = reconnectPlan({ reason, reconnectAttempts, handshakeFailures });
+        reconnectAttempts = plan.reconnectAttempts;
+        handshakeFailures = plan.handshakeFailures;
+        const { delay } = plan;
+        if (reason === 515) {
+          if (!PAIR_JSON) console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
+        } else {
+          if (handshakeFailures > RECONNECT_GIVEUP_AFTER) {
+            // Persistent failure: after 10 straight attempts, stop trying for
+            // a full 12h. Anything wrong at this point (stale client, banned
+            // handshake) won't fix itself in minutes, and continuing to retry
+            // only risks the account. Any successful connect resets the count.
+            if (!PAIR_JSON) console.log(`⛔ ${reconnectAttempts} reconnects failed (reason: ${reason}). Backing off for 12h.`);
           } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+            if (!PAIR_JSON) console.log(`⚠️  Connection closed (reason: ${reason}). Reconnect attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s...`);
           }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        setTimeout(startSocket, delay);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      reconnectAttempts = 0;
+      handshakeFailures = 0;
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
