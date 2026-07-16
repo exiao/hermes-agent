@@ -1350,6 +1350,40 @@ def test_pr_evidence_reconciles_early_review_completion(kanban_home):
         )
 
 
+def test_pr_evidence_reconciliation_event_carries_declared_artifacts(kanban_home):
+    """Recovered owner handoffs retain attachment paths for notifier delivery."""
+    artifacts = ["/tmp/owner-report.pdf"]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owner work", assignee="dev")
+        kb.claim_task(conn, task_id, claimer="host:owner", ttl_seconds=300)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+
+        assert kb.complete_task(
+            conn, task_id, summary="early review completed",
+            expected_run_id=task.current_run_id, expected_claim_lock="host:owner",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="Owner recovered with the requested deliverable.",
+            metadata={
+                "commit_sha": "abc123",
+                "pr_url": "https://example.test/pr/1",
+                "artifacts": artifacts,
+            },
+            expected_run_id=task.current_run_id,
+            expected_claim_lock="host:owner",
+        )
+        reconciled = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "completion_reconciled_pr_evidence"
+        ]
+    payload = reconciled[-1].payload
+    assert payload is not None
+    assert payload["artifacts"] == artifacts
+
+
 @pytest.mark.parametrize("handoff", [None, "", " \n\t "])
 def test_pr_evidence_reconciliation_accepts_empty_handoff(kanban_home, handoff):
     """A PR-evidence recovery must not crash on an absent handoff string."""

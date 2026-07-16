@@ -309,6 +309,26 @@ class TestActiveVenvMarkerStripping:
         assert "CONDA_PREFIX" in _ACTIVE_VENV_MARKER_VARS
 
 
+def test_delegate_child_masks_kanban_ownership_from_terminal_env(monkeypatch):
+    """A delegated child cannot reuse its worker parent's lifecycle token."""
+    from tools.delegate_tool import delegated_child_kanban_env
+    from tools.environments.local import _make_run_env, _sanitize_subprocess_env
+
+    ownership = {
+        "HERMES_KANBAN_TASK": "t_owner",
+        "HERMES_KANBAN_RUN_ID": "42",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-token",
+    }
+    for key, value in ownership.items():
+        monkeypatch.setenv(key, value)
+
+    with delegated_child_kanban_env():
+        assert not (set(_make_run_env({})) & ownership.keys())
+        assert not (set(_sanitize_subprocess_env(dict(ownership))) & ownership.keys())
+
+    assert set(_make_run_env({})) >= ownership.keys()
+
+
 class TestBlocklistCoverage:
     """Sanity checks that the blocklist covers all known providers."""
 

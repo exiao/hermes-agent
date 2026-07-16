@@ -870,9 +870,10 @@ class GatewayKanbanWatchersMixin:
                             # uploads. ``extract_local_files`` finds bare
                             # absolute paths in the summary;
                             # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
+                            # them. Completion recovery emits a distinct event
+                            # after an early evidence-free close, so it must
+                            # deliver the real owner's attachments too.
+                            if kind in {"completed", "completion_reconciled_pr_evidence"}:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,

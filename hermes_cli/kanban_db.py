@@ -5504,6 +5504,19 @@ def _reconcile_terminal_completion_with_pr_evidence(
         return False
     handoff = summary if summary is not None else result
     handoff_lines = (handoff or "").strip().splitlines()
+    reconciled_payload: dict = {
+        "summary": handoff_lines[0][:_EVENT_PAYLOAD_DETAIL_MAX] if handoff_lines else None,
+    }
+    if isinstance(metadata, dict):
+        artifacts = metadata.get("artifacts")
+        if isinstance(artifacts, (list, tuple)):
+            cleaned_artifacts = [
+                str(path).strip()
+                for path in artifacts
+                if isinstance(path, str) and str(path).strip()
+            ]
+            if cleaned_artifacts:
+                reconciled_payload["artifacts"] = cleaned_artifacts
     conn.execute(
         "UPDATE tasks SET result = ? WHERE id = ? AND status = 'done'",
         (handoff, task_id),
@@ -5516,7 +5529,7 @@ def _reconcile_terminal_completion_with_pr_evidence(
         conn,
         task_id,
         "completion_reconciled_pr_evidence",
-        {"summary": handoff_lines[0][:_EVENT_PAYLOAD_DETAIL_MAX] if handoff_lines else None},
+        reconciled_payload,
         run_id=int(expected_run_id),
     )
     return True

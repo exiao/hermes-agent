@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 
 from gateway.config import Platform
@@ -103,6 +104,47 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
 
     assert len(adapter1.sent) == 1
     assert adapter2.sent == []
+
+
+def test_kanban_notifier_delivers_artifacts_for_reconciled_owner_handoff(tmp_path, monkeypatch):
+    """Recovery evidence sends its declared artifact after an early close."""
+    db_path = tmp_path / "reconciled-artifacts.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    artifacts = ["/tmp/owner-report.pdf"]
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="owner work", assignee="worker")
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat-1")
+        kb.claim_task(conn, task_id, claimer="host:owner", ttl_seconds=300)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        assert kb.complete_task(
+            conn, task_id, summary="early review completed",
+            expected_run_id=task.current_run_id, expected_claim_lock="host:owner",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="Owner recovered with deliverable.",
+            metadata={
+                "commit_sha": "abc123",
+                "pr_url": "https://example.test/pr/1",
+                "artifacts": artifacts,
+            },
+            expected_run_id=task.current_run_id,
+            expected_claim_lock="host:owner",
+        )
+    finally:
+        conn.close()
+
+    runner = _make_runner(RecordingAdapter())
+    runner._deliver_kanban_artifacts = AsyncMock()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert runner._deliver_kanban_artifacts.await_count == 2
+    assert runner._deliver_kanban_artifacts.await_args_list[-1].kwargs["event_payload"]["artifacts"] == artifacts
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
