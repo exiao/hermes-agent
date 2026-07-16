@@ -149,9 +149,17 @@ class TestReasoningCommand:
         assert "session only" in result
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("effort", ["max", "ultra"])
-    async def test_handle_reasoning_command_accepts_extended_efforts(
-        self, tmp_path, monkeypatch, effort
+    @pytest.mark.parametrize(
+        ("effort", "expected"),
+        [
+            ("max", {"enabled": True, "effort": "max"}),
+            ("ultra", {"enabled": True, "effort": "ultra"}),
+            ("false", {"enabled": False}),
+            ("disabled", {"enabled": False}),
+        ],
+    )
+    async def test_handle_reasoning_command_accepts_shared_parser_efforts(
+        self, tmp_path, monkeypatch, effort, expected
     ):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -166,10 +174,7 @@ class TestReasoningCommand:
 
         await runner._handle_reasoning_command(event)
 
-        assert runner._session_reasoning_overrides[session_key] == {
-            "enabled": True,
-            "effort": effort,
-        }
+        assert runner._session_reasoning_overrides[session_key] == expected
 
     @pytest.mark.asyncio
     async def test_reasoning_global_clears_existing_session_override(self, tmp_path, monkeypatch):

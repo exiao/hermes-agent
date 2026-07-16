@@ -3601,16 +3601,6 @@ def check_execute_code_guard(code: str, env_type: str,
     # paths don't pay to copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"
 
-    # Redacted copies for user-visible rendering only. An execute_code script
-    # can embed credentials (e.g. api_key = "sk-..."), and the gateway renders
-    # this payload directly to Discord/Slack — those messages are
-    # screenshottable. The raw `command`/`code` are still what get assessed by
-    # smart approval and executed; redaction is display-only. Approval
-    # persistence keys off pattern_key, so the allowlist is unaffected.
-    display_command = _redact_for_approval(command)
-    display_code = _redact_for_approval(code)
-    display_description = _redact_for_approval(description)
-
     # Check session/permanent approval — same gate as check_all_command_guards.
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts the user (#39275).
