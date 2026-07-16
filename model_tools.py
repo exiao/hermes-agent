@@ -425,30 +425,25 @@ def _compute_tool_definitions(
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
+    # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and must
+    # always receive the lifecycle handoff tools. Assignee profiles may
+    # intentionally restrict their normal chat toolsets (for token/cost
+    # reasons) — INCLUDING listing "kanban" in agent.disabled_toolsets — but
+    # that must not strip the worker's completion/block/heartbeat surface, or
+    # the task can never finish via the lifecycle protocol. The ONE case where
+    # a HERMES_KANBAN_TASK process legitimately has no lifecycle tools is a
+    # delegated review child (it inherits the parent worker's env but must
+    # never mutate the parent's task); that is signalled by the delegate-child
+    # ownership mask, not by the global disabled list.
+    worker_needs_kanban = bool(
+        os.environ.get("HERMES_KANBAN_TASK")
+        and not _delegated_child_masks_kanban()
+    )
+
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if (
-            os.environ.get("HERMES_KANBAN_TASK")
-            and "kanban" not in effective_enabled_toolsets
-            and not _delegated_child_masks_kanban()
-        ):
-            # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
-            # must always receive the lifecycle handoff tools. Assignee
-            # profiles may intentionally restrict their normal chat toolsets
-            # (for token/cost reasons) — INCLUDING listing "kanban" in
-            # agent.disabled_toolsets — but that must not strip the kanban
-            # worker's completion/block/heartbeat surface, or the task can
-            # never finish via the lifecycle protocol. The ONE case where a
-            # HERMES_KANBAN_TASK process legitimately has no lifecycle tools is
-            # a delegated review child (it inherits the parent worker's env but
-            # must never mutate the parent's task); that is signalled by the
-            # delegate-child ownership mask, not by the global disabled list.
+        if worker_needs_kanban and "kanban" not in effective_enabled_toolsets:
             effective_enabled_toolsets.append("kanban")
-            # A profile that disabled kanban for cost still gets the worker
-            # lifecycle tools back: drop kanban from the subtraction step below
-            # so the force-append isn't immediately undone.
-            if disabled_toolsets and "kanban" in disabled_toolsets:
-                disabled_toolsets = [d for d in disabled_toolsets if d != "kanban"]
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -472,6 +467,14 @@ def _compute_tool_definitions(
     # This ensures that even if a composite toolset (like hermes-cli)
     # is enabled, any tools belonging to a disabled toolset are strictly
     # stripped out. See issue #17309.
+    if disabled_toolsets and worker_needs_kanban and "kanban" in disabled_toolsets:
+        # A dispatcher worker whose profile disabled kanban for cost still needs
+        # its lifecycle surface back — drop kanban from the subtraction so the
+        # force-include isn't undone. This applies to BOTH the explicit
+        # enabled_toolsets path (force-appended above) and the default-all path
+        # (every toolset included, kanban among them), so a default-all worker
+        # with agent.disabled_toolsets:["kanban"] can still complete its task.
+        disabled_toolsets = [d for d in disabled_toolsets if d != "kanban"]
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):

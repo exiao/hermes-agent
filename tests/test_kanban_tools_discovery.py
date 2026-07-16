@@ -58,6 +58,33 @@ def test_worker_lifecycle_survives_profile_disabled_kanban(monkeypatch):
         assert required in names, f"{required} stripped by profile disabled_toolsets"
 
 
+def test_worker_lifecycle_survives_default_all_with_disabled_kanban(monkeypatch):
+    """The default-all caller path (no explicit enabled_toolsets) must ALSO
+    keep the worker's lifecycle tools when the profile lists ``kanban`` in
+    disabled_toolsets. The force-include exception used to live only inside the
+    ``enabled_toolsets is not None`` branch, so a default-all worker still lost
+    kanban_complete/kanban_block via the disabled-subtraction and could never
+    finish via the lifecycle protocol.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+
+    import model_tools as mt
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    mt._clear_tool_defs_cache()
+    defs = mt.get_tool_definitions(
+        enabled_toolsets=None,  # default-all path
+        disabled_toolsets=["kanban"],
+        quiet_mode=True,
+    )
+    names = {d["function"]["name"] for d in defs}
+    for required in ("kanban_complete", "kanban_block"):
+        assert required in names, (
+            f"{required} stripped on the default-all path by disabled_toolsets"
+        )
+
+
 def test_delegated_child_does_not_get_worker_lifecycle_tools(monkeypatch):
     """A delegated review child inherits the parent worker's HERMES_KANBAN_TASK
     but must NEVER receive lifecycle tools (it must not mutate the parent's
