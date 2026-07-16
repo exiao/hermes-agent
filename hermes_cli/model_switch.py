@@ -1204,6 +1204,11 @@ def switch_model(
                 _kenv = str(_ucfg.get("key_env", "") or "").strip()
                 if _kenv:
                     _ukey = str(_get_secret(_kenv, "") or "").strip()
+            # ``providers.anthropic`` wins provider resolution, so its URL
+            # reaches the runtime as an explicit override. It is still
+            # provider-owned: retaining that provenance prevents global model
+            # switches from freezing a loopback proxy into raw ``model.base_url``.
+            base_url_from_provider_config = target_provider == "anthropic"
             try:
                 runtime = resolve_runtime_provider(
                     requested=target_provider,
