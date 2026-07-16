@@ -382,13 +382,9 @@ def _inject_session_context_env(env: dict) -> None:
 
 def _strip_delegated_child_kanban_ownership(env: dict) -> None:
     """Keep a delegate child from inheriting its worker parent's claim token."""
-    try:
-        from tools.delegate_tool import delegated_child_masks_kanban_ownership
+    from agent.kanban_ownership import delegated_child_masks_kanban_ownership
 
-        masked = delegated_child_masks_kanban_ownership()
-    except Exception:
-        masked = False
-    if masked:
+    if delegated_child_masks_kanban_ownership():
         for key in (
             "HERMES_KANBAN_TASK",
             "HERMES_KANBAN_RUN_ID",

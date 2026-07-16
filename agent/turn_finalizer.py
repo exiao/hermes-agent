@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.kanban_ownership import delegated_child_masks_kanban_ownership
 
 
 def finalize_turn(
@@ -116,13 +117,8 @@ def finalize_turn(
         # The delegate-child mask contextvar is thread-visible, so honor it
         # here the same way the terminal env stripper does.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        try:
-            from tools.delegate_tool import delegated_child_masks_kanban_ownership
-
-            if delegated_child_masks_kanban_ownership():
-                _kanban_task = None
-        except Exception:
-            pass
+        if delegated_child_masks_kanban_ownership():
+            _kanban_task = None
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb

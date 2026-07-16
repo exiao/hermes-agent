@@ -29,6 +29,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.kanban_ownership import delegated_child_masks_kanban_ownership
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
@@ -299,6 +300,7 @@ _LEGACY_TOOLSET_MAP = {
 # inner check_fn TTL cache in registry.py handles environment drift (Docker
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+_tool_defs_cache_lock = threading.Lock()
 
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime
@@ -313,7 +315,8 @@ def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
     execute_code sandbox reconfigured)."""
-    _tool_defs_cache.clear()
+    with _tool_defs_cache_lock:
+        _tool_defs_cache.clear()
 
 
 def get_tool_definitions(
@@ -365,7 +368,8 @@ def get_tool_definitions(
             _delegated_child_masks_kanban(),
             bool(skip_tool_search_assembly),
         )
-        cached = _tool_defs_cache.get(cache_key)
+        with _tool_defs_cache_lock:
+            cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
@@ -388,9 +392,10 @@ def get_tool_definitions(
         # Bound the cache with LRU eviction so a long-lived Gateway process
         # doesn't accumulate entries unboundedly across the many distinct
         # toolset/config fingerprints it sees over its lifetime (#19251).
-        if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
-            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
+        with _tool_defs_cache_lock:
+            if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+                _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
+            _tool_defs_cache[cache_key] = result
         return list(result)
     return result
 
@@ -407,12 +412,7 @@ def _delegated_child_masks_kanban() -> bool:
     and run), NOT by a profile's ``disabled_toolsets`` — so a real worker whose
     profile disabled kanban for cost still gets its lifecycle surface back.
     """
-    try:
-        from tools.delegate_tool import delegated_child_masks_kanban_ownership
-
-        return delegated_child_masks_kanban_ownership()
-    except Exception:
-        return False
+    return delegated_child_masks_kanban_ownership()
 
 
 def _compute_tool_definitions(

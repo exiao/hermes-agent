@@ -28,6 +28,17 @@ def test_enabled_with_kanban_task(clear_kanban_env):
     assert kanban_stop_nudge_enabled() is True
 
 
+def test_delegated_child_does_not_receive_parent_kanban_stop_nudge(clear_kanban_env):
+    """An in-process delegate child must return its summary, not be nudged to
+    call lifecycle tools that belong only to its parent worker."""
+    from agent.kanban_ownership import delegated_child_kanban_env
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent")
+    with delegated_child_kanban_env():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+
+
 def test_env_can_disable(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
     clear_kanban_env.setenv("HERMES_KANBAN_STOP_NUDGE", "0")

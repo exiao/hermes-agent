@@ -19,8 +19,6 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
-from contextlib import contextmanager
-from contextvars import ContextVar
 
 logger = logging.getLogger(__name__)
 import os
@@ -32,6 +30,7 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
+from agent.kanban_ownership import delegated_child_kanban_env
 from toolsets import TOOLSETS, get_toolset_names
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -41,26 +40,6 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
-
-
-_delegate_child_masks_kanban_ownership: ContextVar[bool] = ContextVar(
-    "_delegate_child_masks_kanban_ownership", default=False
-)
-
-
-@contextmanager
-def delegated_child_kanban_env():
-    """Mask a parent's Kanban ownership tokens from child terminal commands."""
-    token = _delegate_child_masks_kanban_ownership.set(True)
-    try:
-        yield
-    finally:
-        _delegate_child_masks_kanban_ownership.reset(token)
-
-
-def delegated_child_masks_kanban_ownership() -> bool:
-    """Whether the current thread is running a delegated child agent."""
-    return _delegate_child_masks_kanban_ownership.get()
 
 
 # Tools that children must never have access to

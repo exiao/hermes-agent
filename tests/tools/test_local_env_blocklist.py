@@ -311,7 +311,7 @@ class TestActiveVenvMarkerStripping:
 
 def test_delegate_child_masks_kanban_ownership_from_terminal_env(monkeypatch):
     """A delegated child cannot reuse its worker parent's lifecycle token."""
-    from tools.delegate_tool import delegated_child_kanban_env
+    from agent.kanban_ownership import delegated_child_kanban_env
     from tools.environments.local import _make_run_env, _sanitize_subprocess_env
 
     ownership = {
@@ -334,7 +334,7 @@ def test_delegate_child_masks_kanban_ownership_from_subprocess_env(monkeypatch):
     drop the worker parent's lifecycle token, or a delegated Codex-runtime
     child could close the parent task via the Hermes-tools MCP kanban_complete.
     """
-    from tools.delegate_tool import delegated_child_kanban_env
+    from agent.kanban_ownership import delegated_child_kanban_env
     from tools.environments.local import hermes_subprocess_env
 
     ownership = {

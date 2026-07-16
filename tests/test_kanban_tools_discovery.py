@@ -94,7 +94,7 @@ def test_delegated_child_does_not_get_worker_lifecycle_tools(monkeypatch):
 
     import model_tools as mt
     from tools.registry import invalidate_check_fn_cache
-    from tools.delegate_tool import delegated_child_kanban_env
+    from agent.kanban_ownership import delegated_child_kanban_env
 
     invalidate_check_fn_cache()
     mt._clear_tool_defs_cache()

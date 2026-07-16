@@ -316,7 +316,7 @@ def test_delegated_child_timeout_does_not_release_parent_kanban_task(monkeypatch
     monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
     # Mark this thread as a delegated child (the mask the terminal env stripper
     # and now finalize_turn both read).
-    from tools.delegate_tool import delegated_child_kanban_env
+    from agent.kanban_ownership import delegated_child_kanban_env
 
     agent = _LimitAgent()
     with delegated_child_kanban_env():
