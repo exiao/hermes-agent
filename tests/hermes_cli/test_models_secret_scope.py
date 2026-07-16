@@ -23,7 +23,7 @@ def test_anthropic_catalog_uses_scoped_key(monkeypatch):
         captured["headers"] = dict(request.headers)
         return _Response()
 
-    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr(
         "agent.anthropic_adapter.resolve_anthropic_token",
         lambda: "sk-ant-oat01-default-profile",
@@ -61,7 +61,7 @@ def test_named_profile_catalog_does_not_borrow_process_credentials(
     named_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(named_home))
 
-    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
     monkeypatch.setattr(
         "agent.anthropic_adapter.resolve_anthropic_token",
@@ -109,7 +109,7 @@ def test_default_profile_catalog_keeps_claude_file_fallback(monkeypatch, tmp_pat
     default_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(default_home))
 
-    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
     monkeypatch.setattr(
         "agent.anthropic_adapter.resolve_anthropic_token",
@@ -162,7 +162,7 @@ def test_explicit_api_key_skips_fallback_resolution(monkeypatch, tmp_path):
     default_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(default_home))
 
-    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
     monkeypatch.setattr("agent.anthropic_adapter.resolve_anthropic_token", _no_resolve)
     ss.set_multiplex_active(True)
@@ -195,7 +195,7 @@ def test_anthropic_catalog_uses_profile_auth_store(monkeypatch):
         captured["headers"] = dict(request.headers)
         return _Response()
 
-    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr(
         "hermes_cli.auth._load_auth_store",
         lambda: {
@@ -232,7 +232,7 @@ def test_anthropic_catalog_skips_unavailable_profile_pool_entries(monkeypatch):
         captured["headers"] = dict(request.headers)
         return _Response()
 
-    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr(
         "hermes_cli.auth._load_auth_store",
         lambda: {
