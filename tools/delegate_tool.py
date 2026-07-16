@@ -19,6 +19,8 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 logger = logging.getLogger(__name__)
 import os
@@ -39,6 +41,26 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+_delegate_child_masks_kanban_ownership: ContextVar[bool] = ContextVar(
+    "_delegate_child_masks_kanban_ownership", default=False
+)
+
+
+@contextmanager
+def delegated_child_kanban_env():
+    """Mask a parent's Kanban ownership tokens from child terminal commands."""
+    token = _delegate_child_masks_kanban_ownership.set(True)
+    try:
+        yield
+    finally:
+        _delegate_child_masks_kanban_ownership.reset(token)
+
+
+def delegated_child_masks_kanban_ownership() -> bool:
+    """Whether the current thread is running a delegated child agent."""
+    return _delegate_child_masks_kanban_ownership.get()
 
 
 # Tools that children must never have access to
@@ -1272,6 +1294,16 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
+    # A Kanban worker owns one task/run. Delegate children share the process
+    # environment, including that worker's task/run tokens, so exposing the
+    # lifecycle toolset lets a read-only reviewer terminal-complete its parent.
+    # Reviews belong on separate code-reviewer cards; children may report to the
+    # owner but must never mutate the parent's lifecycle.
+    child_disabled_toolsets: list[str] = []
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        child_toolsets = [toolset for toolset in child_toolsets if toolset != "kanban"]
+        child_disabled_toolsets.append("kanban")
+
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
     # orchestrator capability is granted by role, not inherited — see the
@@ -1453,46 +1485,62 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
-    child = AIAgent(
-        base_url=effective_base_url,
-        api_key=effective_api_key,
-        model=effective_model,
-        provider=effective_provider,
-        api_mode=effective_api_mode,
-        acp_command=effective_acp_command,
-        acp_args=effective_acp_args,
-        max_iterations=max_iterations,
+    # A delegated child inherits the parent worker's ``HERMES_KANBAN_TASK`` env,
+    # and ``AIAgent(...)`` resolves the child's tool set DURING construction
+    # (here, on the parent thread) — before ``run_conversation`` engages the
+    # ownership mask at call time. Engage it around construction so
+    # ``get_tool_definitions`` can tell this kanban-worker child (which must NOT
+    # receive lifecycle tools) apart from a real worker whose profile merely
+    # disabled kanban for cost. Non-kanban parents build unchanged.
+    from contextlib import nullcontext
 
-        reasoning_config=child_reasoning,
-        prefill_messages=getattr(parent_agent, "prefill_messages", None),
-        fallback_model=parent_fallback,
-        enabled_toolsets=child_toolsets,
-        quiet_mode=True,
-        ephemeral_system_prompt=child_prompt,
-        log_prefix=f"[subagent-{task_index}]",
-        platform="subagent",
-        skip_context_files=True,
-        skip_memory=True,
-        clarify_callback=None,
-        thinking_callback=child_thinking_cb,
-        session_db=getattr(parent_agent, "_session_db", None),
-        parent_session_id=getattr(parent_agent, "session_id", None),
-        providers_allowed=child_providers_allowed,
-        providers_ignored=child_providers_ignored,
-        providers_order=child_providers_order,
-        provider_sort=child_provider_sort,
-        provider_require_parameters=child_provider_require_parameters,
-        provider_data_collection=child_provider_data_collection,
-        request_overrides=(
-            dict(override_request_overrides or {})
-            if override_provider
-            else dict(getattr(parent_agent, "request_overrides", {}) or {})
-        ),
-        openrouter_min_coding_score=child_openrouter_min_coding_score,
-        tool_progress_callback=child_progress_cb,
-        iteration_budget=None,  # fresh budget per subagent
-        **child_optional_kwargs,
+    _child_build_ctx = (
+        delegated_child_kanban_env()
+        if os.environ.get("HERMES_KANBAN_TASK")
+        else nullcontext()
     )
+    with _child_build_ctx:
+        child = AIAgent(
+            base_url=effective_base_url,
+            api_key=effective_api_key,
+            model=effective_model,
+            provider=effective_provider,
+            api_mode=effective_api_mode,
+            acp_command=effective_acp_command,
+            acp_args=effective_acp_args,
+            max_iterations=max_iterations,
+
+            reasoning_config=child_reasoning,
+            prefill_messages=getattr(parent_agent, "prefill_messages", None),
+            fallback_model=parent_fallback,
+            enabled_toolsets=child_toolsets,
+            disabled_toolsets=child_disabled_toolsets,
+            quiet_mode=True,
+            ephemeral_system_prompt=child_prompt,
+            log_prefix=f"[subagent-{task_index}]",
+            platform="subagent",
+            skip_context_files=True,
+            skip_memory=True,
+            clarify_callback=None,
+            thinking_callback=child_thinking_cb,
+            session_db=getattr(parent_agent, "_session_db", None),
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            providers_allowed=child_providers_allowed,
+            providers_ignored=child_providers_ignored,
+            providers_order=child_providers_order,
+            provider_sort=child_provider_sort,
+            provider_require_parameters=child_provider_require_parameters,
+            provider_data_collection=child_provider_data_collection,
+            request_overrides=(
+                dict(override_request_overrides or {})
+                if override_provider
+                else dict(getattr(parent_agent, "request_overrides", {}) or {})
+            ),
+            openrouter_min_coding_score=child_openrouter_min_coding_score,
+            tool_progress_callback=child_progress_cb,
+            iteration_budget=None,  # fresh budget per subagent
+            **child_optional_kwargs,
+        )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -2081,11 +2129,12 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return child.run_conversation(
-                user_message=goal,
-                task_id=child_task_id,
-                stream_callback=_relay_child_text,
-            )
+            with delegated_child_kanban_env():
+                return child.run_conversation(
+                    user_message=goal,
+                    task_id=child_task_id,
+                    stream_callback=_relay_child_text,
+                )
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:

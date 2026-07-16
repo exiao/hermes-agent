@@ -1918,6 +1918,30 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         )
 
     @patch("tools.delegate_tool._load_config", return_value={})
+    def test_kanban_worker_delegate_child_cannot_receive_lifecycle_tools(self, mock_cfg):
+        """A review child cannot terminal-complete its Kanban parent task."""
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "kanban"]
+
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_deadbeef"}), \
+                patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Review only",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        kwargs = MockAgent.call_args[1]
+        assert "kanban" not in kwargs["enabled_toolsets"]
+        assert kwargs["disabled_toolsets"] == ["kanban"]
+
+    @patch("tools.delegate_tool._load_config", return_value={})
     def test_build_child_agent_normalizes_alias_toolset_names(self, mock_cfg):
         # Regression: a wrong name like "ShellExec" must resolve to "terminal"
         # instead of being silently dropped (which left the child shell-less).

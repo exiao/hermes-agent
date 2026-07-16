@@ -380,6 +380,23 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+def _strip_delegated_child_kanban_ownership(env: dict) -> None:
+    """Keep a delegate child from inheriting its worker parent's claim token."""
+    try:
+        from tools.delegate_tool import delegated_child_masks_kanban_ownership
+
+        masked = delegated_child_masks_kanban_ownership()
+    except Exception:
+        masked = False
+    if masked:
+        for key in (
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK",
+        ):
+            env.pop(key, None)
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -416,6 +433,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _strip_delegated_child_kanban_ownership(sanitized)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -543,6 +561,16 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+
+    # Delegated-child kanban-ownership mask, same policy as the terminal /
+    # execute_code spawn paths (_make_run_env, _sanitize_subprocess_env): a
+    # child spawned under a Kanban worker must not inherit the parent's claim
+    # token. This helper feeds the codex_app_server / ACP-CLI runtimes, which
+    # otherwise copy os.environ verbatim and hand HERMES_KANBAN_* to the Codex
+    # subprocess — letting a delegated reviewer close the parent task via the
+    # Hermes-tools MCP kanban_complete/kanban_block. Strip it here too so the
+    # mask covers every non-terminal spawn surface, not just terminal spawns.
+    _strip_delegated_child_kanban_ownership(env)
 
     return env
 
@@ -1001,6 +1029,7 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    _strip_delegated_child_kanban_ownership(run_env)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)

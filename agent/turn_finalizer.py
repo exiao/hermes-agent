@@ -106,7 +106,23 @@ def finalize_turn(
         # We route through ``_record_task_failure(outcome="timed_out")``
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
+        #
+        # A delegated child agent runs IN-PROCESS on a worker thread and
+        # inherits the parent worker's ``HERMES_KANBAN_TASK`` in the shared
+        # ``os.environ`` (env masking only rewrites the env of spawned
+        # terminal subprocesses, not the in-thread child). So a child that
+        # exhausts its own iteration budget must NOT time out and release
+        # the parent's task/run — the parent is merely awaiting delegation.
+        # The delegate-child mask contextvar is thread-visible, so honor it
+        # here the same way the terminal env stripper does.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        try:
+            from tools.delegate_tool import delegated_child_masks_kanban_ownership
+
+            if delegated_child_masks_kanban_ownership():
+                _kanban_task = None
+        except Exception:
+            pass
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
