@@ -118,6 +118,16 @@ code, kbd, pre, samp, .font-mono, .font-mono-ui {
   font-family: var(--theme-font-mono);
 }
 
+/* Headings honor the theme's display font. `--theme-font-display` is set
+   from `typography.fontDisplay` (falling back to `--theme-font-sans` when a
+   theme omits it), so a theme that ships a distinct display face — e.g. a
+   serif for editorial headings over a sans body — actually renders it.
+   Without this rule the variable is computed but never consumed, and every
+   theme's `fontDisplay` is silently inert. */
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--theme-font-display);
+}
+
 /* Density: scale the shadcn spacing utilities via a multiplier. The DS
    components use `p-N` / `gap-N` / `space-*` classes which resolve against
    Tailwind's spacing scale; multiplying `--spacing` at :root scales them
