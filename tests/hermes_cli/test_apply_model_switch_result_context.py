@@ -54,6 +54,72 @@ def _run_display(monkeypatch, result):
     return captured
 
 
+def test_global_classic_cli_switch_clears_stale_base_url(monkeypatch):
+    """A persisted native-provider switch must not retain a local OpenAI URL."""
+    import cli as cli_mod
+
+    saved: list[tuple[str, object]] = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda key, value: saved.append((key, value)),
+    )
+    result = ModelSwitchResult(
+        success=True,
+        new_model="claude-sonnet-4-6",
+        target_provider="anthropic",
+        provider_changed=True,
+        api_key="",
+        base_url="",
+        api_mode="anthropic_messages",
+        warning_message="",
+        provider_label="Anthropic",
+        resolved_via_alias=False,
+        capabilities=None,
+        model_info=None,
+        is_global=True,
+    )
+
+    cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, True)
+
+    assert ("model.base_url", None) in saved
+
+
+def test_global_classic_cli_switch_keeps_provider_scoped_proxy_inherited(monkeypatch):
+    """A provider-derived proxy must not be frozen into ``model.base_url``.
+
+    Once frozen, the runtime no longer knows the loopback URL came from
+    ``providers.anthropic`` and correctly rejects it as a stale local endpoint.
+    Persisting null preserves the provider-scoped provenance on the next run.
+    """
+    import cli as cli_mod
+
+    saved: list[tuple[str, object]] = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda key, value: saved.append((key, value)),
+    )
+    result = ModelSwitchResult(
+        success=True,
+        new_model="claude-sonnet-4-6",
+        target_provider="anthropic",
+        provider_changed=True,
+        base_url="http://127.0.0.1:18801",
+        api_mode="anthropic_messages",
+        provider_label="Anthropic",
+        is_global=True,
+    )
+    result.base_url_from_provider_config = True
+
+    cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, True)
+
+    assert ("model.base_url", None) in saved
+    assert ("model.base_url", "http://127.0.0.1:18801") not in saved
+
+
 def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):
     """``_apply_model_switch_result`` must prefer the provider-aware resolver
     (272K on Codex) over the raw models.dev value (1.05M for gpt-5.5).

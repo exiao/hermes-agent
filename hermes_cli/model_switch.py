@@ -340,6 +340,9 @@ class ModelSwitchResult:
     provider_changed: bool = False
     api_key: str = ""
     base_url: str = ""
+    # Provider-scoped URLs must stay scoped when persisted, or a subsequent
+    # resolution cannot distinguish a local proxy from a stale model override.
+    base_url_from_provider_config: bool = False
     api_mode: str = ""
     error_message: str = ""
     warning_message: str = ""
@@ -1166,6 +1169,7 @@ def switch_model(
     # --- Resolve credentials ---
     api_key = current_api_key
     base_url = current_base_url
+    base_url_from_provider_config = False
     api_mode = ""
 
     if provider_changed or explicit_provider:
@@ -1200,6 +1204,11 @@ def switch_model(
                 _kenv = str(_ucfg.get("key_env", "") or "").strip()
                 if _kenv:
                     _ukey = str(_get_secret(_kenv, "") or "").strip()
+            # ``providers.anthropic`` wins provider resolution, so its URL
+            # reaches the runtime as an explicit override. It is still
+            # provider-owned: retaining that provenance prevents global model
+            # switches from freezing a loopback proxy into raw ``model.base_url``.
+            base_url_from_provider_config = target_provider == "anthropic"
             try:
                 runtime = resolve_runtime_provider(
                     requested=target_provider,
@@ -1226,6 +1235,9 @@ def switch_model(
                 )
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
+                base_url_from_provider_config = bool(
+                    runtime.get("base_url_from_provider_config")
+                )
                 api_mode = runtime.get("api_mode", "")
             except Exception as e:
                 return ModelSwitchResult(
@@ -1250,6 +1262,9 @@ def switch_model(
             # base_url adjustments for OpenCode, etc.).
             api_key = runtime.get("api_key", "")
             base_url = runtime.get("base_url", "")
+            base_url_from_provider_config = bool(
+                runtime.get("base_url_from_provider_config")
+            )
             api_mode = runtime.get("api_mode", "")
         except Exception:
             pass
@@ -1260,6 +1275,13 @@ def switch_model(
         _da = DIRECT_ALIASES.get(resolved_alias)
         if _da is not None and _da.base_url:
             base_url = _da.base_url
+            # The alias endpoint is now the source of truth for base_url, NOT
+            # the inherited providers.<provider>.base_url. Reset provenance so
+            # the CLI/TUI persistence paths write model.base_url (the alias URL)
+            # instead of dropping it — otherwise /model <alias> --global saves
+            # the model but loses the endpoint, and after restart the model runs
+            # against providers.<provider>.base_url (e.g. the loopback proxy).
+            base_url_from_provider_config = False
             api_mode = ""  # clear so determine_api_mode re-detects from URL
             if not api_key:
                 api_key = "no-key-required"
@@ -1381,6 +1403,7 @@ def switch_model(
         provider_changed=provider_changed,
         api_key=api_key,
         base_url=base_url,
+        base_url_from_provider_config=base_url_from_provider_config,
         api_mode=api_mode,
         warning_message=" | ".join(warnings) if warnings else "",
         provider_label=provider_label,

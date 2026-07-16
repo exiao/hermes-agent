@@ -2842,7 +2842,7 @@ def _persist_model_switch(result) -> None:
 
     save_config_value("model.default", result.new_model)
     save_config_value("model.provider", result.target_provider)
-    if result.base_url:
+    if result.base_url and not getattr(result, "base_url_from_provider_config", False):
         save_config_value("model.base_url", result.base_url)
     else:
         # Clear any stale base_url when switching to a provider that doesn't use

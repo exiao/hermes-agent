@@ -864,6 +864,55 @@ def test_switch_model_resolves_user_provider_credentials(monkeypatch, tmp_path):
     assert result.error_message == ""
 
 
+def test_explicit_anthropic_user_provider_preserves_proxy_provenance(monkeypatch):
+    """An explicit Anthropic switch must retain provider-scoped proxy provenance.
+
+    The picker and ``/model --provider anthropic`` resolve the configured
+    ``providers.anthropic`` entry through the user-provider path.  That path
+    passes its URL as an explicit runtime override, but the URL is still owned
+    by provider config and must not be persisted as ``model.base_url``.
+    """
+    proxy_url = "http://127.0.0.1:18801"
+    user_providers = {
+        "anthropic": {
+            "base_url": proxy_url,
+            "transport": "anthropic_messages",
+            "models": {"claude-sonnet-4-6": {}},
+        }
+    }
+    monkeypatch.setattr(
+        rp,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "proxy-token",
+            "base_url": proxy_url,
+            "api_mode": "anthropic_messages",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *args, **kwargs: {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        },
+    )
+
+    result = switch_model(
+        raw_input="claude-sonnet-4-6",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        explicit_provider="anthropic",
+        user_providers=user_providers,
+        custom_providers=[],
+    )
+
+    assert result.success is True, result.error_message
+    assert result.base_url == proxy_url
+    assert result.base_url_from_provider_config is True
+
+
 # =============================================================================
 # Regression: providers: dict ``transport`` field must be honored
 # =============================================================================
