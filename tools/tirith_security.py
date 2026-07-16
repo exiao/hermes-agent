@@ -825,6 +825,7 @@ def check_command_security(command: str) -> dict:
         return {"action": "block", "findings": [], "summary": f"tirith exit code {exit_code} (fail-closed)"}
 
     # Parse JSON for enrichment (never overrides the exit code verdict)
+    raw_findings = []
     findings = []
     summary = ""
     try:
@@ -856,10 +857,10 @@ def check_command_security(command: str) -> dict:
     # Genuinely risky lookalike TLDs that collide with real filenames (.zip, .mov)
     # and untrusted .run domains are NOT _is_safe_lookalike_tld_finding, so their
     # findings are never stripped and still drive the verdict.
-    if findings:
-        kept = [f for f in findings if not _is_safe_lookalike_tld_finding(f)]
-        if len(kept) != len(findings):
-            findings = kept
+    if raw_findings:
+        kept = [f for f in raw_findings if not _is_safe_lookalike_tld_finding(f)]
+        if len(kept) != len(raw_findings):
+            findings = kept[:_MAX_FINDINGS]
             if not findings:
                 # The only reason for the verdict was the suppressed false
                 # positive; downgrade to allow.
