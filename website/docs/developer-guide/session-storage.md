@@ -159,13 +159,12 @@ END;
 ```
 
 The trigram table (`messages_fts_trigram`) mirrors this with `tokenize='trigram'`
-and is gated by `sessions.fts_trigram` (see Configuration below): when disabled
-it is dropped and CJK/substring queries fall back to a `LIKE` scan.
+for CJK and substring search.
 
 
 ## Schema Version and Migrations
 
-Current schema version: **20**
+Current schema version: **21**
 
 The `schema_version` table stores a single integer. Simple column additions are handled declaratively by `_reconcile_columns()` (which diffs live columns against `SCHEMA_SQL` and ADDs any missing ones). The version-gated chain is reserved for data migrations and index/FTS changes that can't be expressed declaratively:
 
@@ -184,7 +183,7 @@ The `schema_version` table stores a single integer. Simple column additions are 
 | 11 | Re-index `messages_fts` and `messages_fts_trigram` to cover `tool_name` + `tool_calls` and switch from external-content to inline mode; drop old triggers and backfill every message row |
 | 16 | Tag delegate subagent rows so pickers stay clean after parent deletes |
 | 18 | Gateway metadata consolidation — backfill `display_name` / `origin_json` / `expiry_finalized` from `sessions.json` |
-| 20 | Switch `messages_fts` + `messages_fts_trigram` back to external-content, backed by the `messages_search_v` VIEW (drops the ~per-table full-text copies inline mode stored); rebuild from the view, VACUUM to reclaim, checkpoint before/after to bound WAL growth. Preserves the v11 intent (tool_name/tool_calls searchable, `snippet()` works). |
+| 21 | Rebuild FTS indexes using the current inline schema. |
 
 Declarative column adds use `ALTER TABLE ADD COLUMN` wrapped in try/except to handle the column-already-exists case (idempotent). The version number is bumped after each successful migration block.
 
@@ -208,34 +207,6 @@ _WRITE_RETRY_MIN_S = 0.020   # 20ms
 _WRITE_RETRY_MAX_S = 0.150   # 150ms
 _CHECKPOINT_EVERY_N_WRITES = 50
 ```
-
-### WAL watchdog
-
-The every-50-writes checkpoint is best-effort: a long-lived reader (dashboard /
-sidebar polling, an unconsumed cursor) pins the WAL so PASSIVE/TRUNCATE
-checkpoints cannot advance past its snapshot, and the `-wal` sidecar grows
-without bound (seen live at 3.6 GB atop a 9.3 GB DB). A giant WAL plus a hard
-shutdown is the malformed-image corruption scenario.
-
-`SessionDB.wal_watchdog(max_mb)` bounds this: when `state.db-wal` exceeds the
-threshold it runs `wal_checkpoint(RESTART)` (flushes every committed frame and
-restarts the WAL at offset 0), then `TRUNCATE` to reclaim the file when no
-reader is pinning it. If the RESTART returns `busy` (a reader IS pinning it) it
-logs a WARNING naming the PIDs holding the DB (via psutil, best-effort). The
-gateway calls it at startup and hourly, gated on `sessions.wal_watchdog`.
-
-### Configuration (`config.yaml`)
-
-Under `sessions:`:
-
-| Key | Default | Effect |
-|-----|---------|--------|
-| `wal_watchdog` | `true` | Gateway runs the WAL watchdog at startup and hourly. |
-| `wal_max_mb` | `64` | `-wal` size (MB) above which the watchdog force-checkpoints. |
-| `fts_trigram` | `true` | Maintain the trigram FTS index (CJK / substring search). Set `false` to drop it — reclaims a large index (~5 GB on the live DB) and falls back to `LIKE` for those queries. |
-
-These are `config.yaml` settings, not environment variables.
-
 
 ## Common Operations
 
