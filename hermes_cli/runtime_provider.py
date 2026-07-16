@@ -583,6 +583,10 @@ def _resolve_runtime_from_pool_entry(
         "provider": provider,
         "api_mode": api_mode,
         "base_url": base_url,
+        "base_url_from_provider_config": (
+            provider == "anthropic"
+            and bool(model_cfg.get("_base_url_from_provider_config"))
+        ),
         "api_key": api_key,
         "source": getattr(entry, "source", "pool"),
         "credential_pool": pool,
@@ -1447,6 +1451,9 @@ def _resolve_explicit_runtime(
             "provider": "anthropic",
             "api_mode": "anthropic_messages",
             "base_url": base_url,
+            "base_url_from_provider_config": bool(
+                model_cfg.get("_base_url_from_provider_config")
+            ) and not explicit_base_url,
             "api_key": api_key,
             "source": "explicit",
             "requested_provider": requested_provider,
@@ -1994,6 +2001,9 @@ def resolve_runtime_provider(
             "provider": "anthropic",
             "api_mode": "anthropic_messages",
             "base_url": base_url,
+            "base_url_from_provider_config": bool(
+                model_cfg.get("_base_url_from_provider_config")
+            ),
             "api_key": token,
             "source": "env",
             "requested_provider": requested_provider,

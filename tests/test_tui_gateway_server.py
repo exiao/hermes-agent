@@ -8850,6 +8850,30 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
     assert not saved["model"].get("base_url"), saved["model"].get("base_url")
 
 
+def test_persist_model_switch_keeps_provider_scoped_proxy_inherited(monkeypatch):
+    """A TUI switch must preserve loopback proxy provenance across restarts."""
+    import types
+    import cli as cli_mod
+
+    saved: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda key, value: saved.append((key, value)),
+    )
+
+    result = types.SimpleNamespace(
+        new_model="claude-sonnet-4-6",
+        target_provider="anthropic",
+        base_url="http://127.0.0.1:18801",
+        base_url_from_provider_config=True,
+    )
+    server._persist_model_switch(result)
+
+    assert ("model.base_url", None) in saved
+    assert ("model.base_url", "http://127.0.0.1:18801") not in saved
+
+
 # ---------------------------------------------------------------------------
 # _resolve_runtime_with_fallback — init-time provider fallback
 # ---------------------------------------------------------------------------

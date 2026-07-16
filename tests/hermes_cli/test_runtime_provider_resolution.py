@@ -177,6 +177,7 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
     assert resolved["api_mode"] == "anthropic_messages"
     assert resolved["api_key"] == "pool-token"
     assert resolved["base_url"] == "https://proxy.example.com/anthropic"
+    assert resolved["base_url_from_provider_config"] is True
 
 
 def test_resolve_runtime_provider_anthropic_falls_back_to_env_base_url(monkeypatch):

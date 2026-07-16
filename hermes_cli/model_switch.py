@@ -340,6 +340,9 @@ class ModelSwitchResult:
     provider_changed: bool = False
     api_key: str = ""
     base_url: str = ""
+    # Provider-scoped URLs must stay scoped when persisted, or a subsequent
+    # resolution cannot distinguish a local proxy from a stale model override.
+    base_url_from_provider_config: bool = False
     api_mode: str = ""
     error_message: str = ""
     warning_message: str = ""
@@ -1166,6 +1169,7 @@ def switch_model(
     # --- Resolve credentials ---
     api_key = current_api_key
     base_url = current_base_url
+    base_url_from_provider_config = False
     api_mode = ""
 
     if provider_changed or explicit_provider:
@@ -1226,6 +1230,9 @@ def switch_model(
                 )
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
+                base_url_from_provider_config = bool(
+                    runtime.get("base_url_from_provider_config")
+                )
                 api_mode = runtime.get("api_mode", "")
             except Exception as e:
                 return ModelSwitchResult(
@@ -1250,6 +1257,9 @@ def switch_model(
             # base_url adjustments for OpenCode, etc.).
             api_key = runtime.get("api_key", "")
             base_url = runtime.get("base_url", "")
+            base_url_from_provider_config = bool(
+                runtime.get("base_url_from_provider_config")
+            )
             api_mode = runtime.get("api_mode", "")
         except Exception:
             pass
@@ -1381,6 +1391,7 @@ def switch_model(
         provider_changed=provider_changed,
         api_key=api_key,
         base_url=base_url,
+        base_url_from_provider_config=base_url_from_provider_config,
         api_mode=api_mode,
         warning_message=" | ".join(warnings) if warnings else "",
         provider_label=provider_label,
