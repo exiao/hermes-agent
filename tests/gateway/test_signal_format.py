@@ -466,7 +466,7 @@ class TestSignalStreamingPatch:
         adapter = SignalAdapter(config)
 
         # Mock the RPC call
-        async def mock_rpc(method, params, rpc_id=None):
+        async def mock_rpc(method, params, rpc_id=None, **kwargs):
             return {"timestamp": 1234567890}
 
         adapter._rpc = mock_rpc
