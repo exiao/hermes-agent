@@ -9021,17 +9021,29 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         for field in (row["title"], row["body"])
     )
     if not anchored_to_pr:
-        # Only the task's OWN lane's comments count: the guard exists to stop
-        # THIS task's next worker from opening a duplicate of a PR a PRIOR
-        # worker of THIS task opened. A PR URL cross-posted by another lane
-        # (context from a sibling card, reviewer notes, an operator pasting a
-        # link) is not evidence this task opened anything — counting it
-        # strands grade-only/QA cards for the full PR window (live incident
-        # 2026-07-17, t_622d5a37).
+        # Only this task's OWN workers' comments count: the guard exists to
+        # stop THIS task's next worker from opening a duplicate of a PR a
+        # PRIOR worker of THIS task opened. A PR URL cross-posted by another
+        # lane (context from a sibling card, reviewer notes, an operator
+        # pasting a link) is not evidence this task opened anything — counting
+        # it strands grade-only/QA cards for the full PR window (live incident
+        # 2026-07-17, t_622d5a37). Include historical run profiles as well as
+        # the current assignee: reassignment is an operator recovery action,
+        # not permission to forget a previous worker's live PR.
         assignee_row = conn.execute(
             "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         task_assignee = assignee_row["assignee"] if assignee_row else None
+        worker_profiles = {
+            run["profile"]
+            for run in conn.execute(
+                "SELECT DISTINCT profile FROM task_runs "
+                "WHERE task_id = ? AND profile IS NOT NULL",
+                (task_id,),
+            ).fetchall()
+        }
+        if task_assignee is not None:
+            worker_profiles.add(task_assignee)
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
         latest_pr_comment_at: Optional[int] = None
         for c in conn.execute(
@@ -9041,7 +9053,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         ).fetchall():
             if not (c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])):
                 continue
-            if task_assignee is not None and c["author"] != task_assignee:
+            if task_assignee is not None and c["author"] not in worker_profiles:
                 continue
             ts = int(c["created_at"] or 0)
             if latest_pr_comment_at is None or ts > latest_pr_comment_at:

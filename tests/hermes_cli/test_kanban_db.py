@@ -2270,6 +2270,27 @@ def test_respawn_guard_cross_author_pr_comment_not_guarded(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_prior_worker_pr_comment_survives_reassignment(kanban_home):
+    """A prior worker's PR survives reassignment to prevent a duplicate."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="implementation", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at) "
+            "VALUES (?, 'alice', 'done', ?)",
+            (t, past),
+        )
+        assert kb.assign_task(conn, t, "bob")
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
 def test_respawn_guard_active_pr_released_by_requeue(kanban_home):
     """An explicit re-queue event STRICTLY after the qualifying PR comment
     bypasses active_pr, mirroring the recent_success exception."""
