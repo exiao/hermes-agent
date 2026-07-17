@@ -9055,7 +9055,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             # worker's PR comment (promotion → spawn → PR in <1s). A tie
             # cannot prove the requeue happened after the PR existed, so
             # ties keep the guard (fail safe toward not duplicating a PR).
-            # OPERATOR-ORIGINATED kinds only ('status', 'unblocked') — unlike
+            # OPERATOR-ORIGINATED kinds only ('status', 'unblocked',
+            # 'promoted_manual' — the `hermes kanban promote` verb) — unlike
             # recent_success, active_pr anchors on a MID-RUN artifact, so
             # automatic events genuinely can postdate it: a worker that
             # crashes after opening its PR gets an automatic 'reclaimed'
@@ -9065,7 +9066,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             requeued_after = conn.execute(
                 "SELECT 1 FROM task_events "
                 "WHERE task_id = ? AND created_at > ? "
-                "AND kind IN ('status', 'unblocked') "
+                "AND kind IN ('status', 'unblocked', 'promoted_manual') "
                 "LIMIT 1",
                 (task_id, latest_pr_comment_at),
             ).fetchone()

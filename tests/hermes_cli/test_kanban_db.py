@@ -2331,6 +2331,23 @@ def test_respawn_guard_active_pr_automatic_events_do_not_bypass(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_released_by_manual_promote(kanban_home):
+    """`hermes kanban promote` emits 'promoted_manual' — an operator verb —
+    which bypasses active_pr like 'status'/'unblocked' do."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        kb._append_event(conn, t, "promoted_manual", {"actor": "eric"})
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
