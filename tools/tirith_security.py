@@ -840,19 +840,30 @@ def check_command_security(command: str) -> dict:
         elif action == "warn":
             summary = "security warning detected (details unavailable)"
 
-    # Suppress warn verdicts that consist solely of a lookalike_tld finding for
-    # a known-safe gTLD (.app, .dev).  These are legitimate Google-operated
-    # gTLDs used by many production services (e.g. *.workers.dev, *.web.app),
-    # and the "can be confused with file extensions" heuristic generates false
-    # positives for normal API calls.  Genuinely risky lookalike TLDs that
-    # collide with real filenames (.zip, .mov) are NOT suppressed here, so any
-    # such finding still preserves the warn action.
-    if action == "warn" and findings:
-        non_suppressible = [f for f in findings if not _is_safe_lookalike_tld_finding(f)]
-        if not non_suppressible:
-            action = "allow"
-            findings = []
-            summary = ""
+    # Suppress lookalike_tld findings for a known-safe gTLD (.app, .dev) or a
+    # trusted registrable domain (e.g. modal.run).  These are legitimate
+    # HTTPS-only services and the "can be confused with file extensions"
+    # heuristic generates false positives for normal API calls.  Genuinely
+    # risky lookalike TLDs that collide with real filenames (.zip, .mov) are
+    # NOT suppressed here.
+    #
+    # When a safe lookalike is bundled ALONGSIDE a real finding (e.g. a
+    # pipe_to_interpreter that pushes the verdict to "block"), strip only the
+    # benign lookalike from the findings list so it no longer rides into the
+    # approval prompt as a separate, un-allowlistable item — while leaving the
+    # real finding and the "block" verdict intact.  When the safe lookalike was
+    # the ONLY thing flagged, a "warn" is downgraded to "allow" (as before); a
+    # genuine "block" (tirith exit code 1) is authoritative and left untouched.
+    if findings:
+        kept = [f for f in findings if not _is_safe_lookalike_tld_finding(f)]
+        if not kept:
+            if action == "warn":
+                action = "allow"
+                findings = []
+                summary = ""
+            # else: authoritative block — leave findings/action unchanged.
+        elif len(kept) != len(findings):
+            findings = kept
 
     return {"action": action, "findings": findings, "summary": summary}
 

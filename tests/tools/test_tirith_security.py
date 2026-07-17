@@ -1360,7 +1360,10 @@ class TestAppTldSuppression:
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
     def test_mixed_findings_preserve_warn(self, mock_cfg, mock_run):
-        """If .app finding is accompanied by another finding, warn is preserved."""
+        """If a benign .app finding accompanies a real finding, the warn action
+        is preserved but the benign .app finding is stripped so it no longer
+        rides into the approval prompt as a separate, un-allowlistable item.
+        The real (shortened_url) finding is what keeps the warn alive."""
         mock_cfg.return_value = _CFG
         findings = [
             {"rule_id": "lookalike_tld", "value": ".app"},
@@ -1369,7 +1372,7 @@ class TestAppTldSuppression:
         mock_run.return_value = _mock_run(2, _json_stdout(findings, "mixed"))
         result = check_command_security("curl https://bit.ly/test.app")
         assert result["action"] == "warn"
-        assert len(result["findings"]) == 2
+        assert [f["rule_id"] for f in result["findings"]] == ["shortened_url"]
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
@@ -1456,6 +1459,55 @@ class TestAppTldSuppression:
         mock_run.return_value = _mock_run(2, _json_stdout(findings))
         result = check_command_security("curl https://a.app https://b.app")
         assert result["action"] == "allow"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_safe_lookalike_stripped_but_real_finding_kept_on_block(
+        self, mock_cfg, mock_run
+    ):
+        """Regression: a benign modal.run lookalike bundled with a real HIGH
+        finding (pipe_to_interpreter) under a block verdict is stripped from
+        the findings list, but the real finding and the block verdict survive.
+
+        This is the recurring-approval bug: the modal.run warning is not
+        allowlistable and re-prompted forever, riding alongside an already
+        allowlisted pipe_to_interpreter. It must be dropped, not bundled.
+        """
+        mock_cfg.return_value = _CFG
+        findings = [
+            {"rule_id": "lookalike_tld",
+             "evidence": [{"raw": "cpe-research--cpe.modal.run"}],
+             "message": "Domain uses '.run' TLD"},
+            {"rule_id": "pipe_to_interpreter",
+             "message": "Pipe to interpreter: rtk | python3"},
+        ]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
+        result = check_command_security(
+            'rtk curl -s "https://cpe-research--cpe.modal.run/memos" '
+            '| python3 -c "import sys,json; print(1)"')
+        assert result["action"] == "block"
+        rule_ids = [f["rule_id"] for f in result["findings"]]
+        assert rule_ids == ["pipe_to_interpreter"]
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_risky_lookalike_bundled_with_real_finding_both_kept(
+        self, mock_cfg, mock_run
+    ):
+        """A risky .zip lookalike bundled with a real finding is NOT stripped;
+        both survive so the .zip warning still reaches the user."""
+        mock_cfg.return_value = _CFG
+        findings = [
+            {"rule_id": "lookalike_tld", "value": "payload.zip"},
+            {"rule_id": "pipe_to_interpreter",
+             "message": "Pipe to interpreter"},
+        ]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
+        result = check_command_security(
+            'curl -s https://payload.zip | python3 -c "import sys; print(1)"')
+        assert result["action"] == "block"
+        rule_ids = {f["rule_id"] for f in result["findings"]}
+        assert rule_ids == {"lookalike_tld", "pipe_to_interpreter"}
 
 
 class TestIsSafeLookalikeTldFinding:
