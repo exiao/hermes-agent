@@ -100,6 +100,12 @@ class TestIsRetryableError:
         duplicate group replies during Signal-side 5xx windows."""
         assert not _StubAdapter._is_retryable_error(_SIGNAL_500_ERROR)
 
+    def test_signal_400_is_not_retryable_despite_network_package(self):
+        """A rejected Signal payload should use plain-text fallback, not retry."""
+        assert not _StubAdapter._is_retryable_error(
+            "org.signal.network.exceptions.NonSuccessfulResponseCodeException: [400] Bad response: 400"
+        )
+
     def test_genuine_signal_push_network_error_still_retryable(self):
         """A real connection-level failure in the same package (no HTTP status)
         is still retryable — the request never reached the server."""
@@ -237,6 +243,23 @@ class TestSendWithRetryNetworkRetry:
         mock_sleep.assert_not_called()
         assert not result.success
         assert len(adapter._send_calls) == 1  # no retry, no fallback → no duplicate
+
+    @pytest.mark.asyncio
+    async def test_signal_400_falls_back_without_retry(self):
+        """A rejected rich payload must skip retries and use plain-text fallback."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                error="org.signal.network.exceptions.NonSuccessfulResponseCodeException: [400] Bad response: 400",
+            ),
+            SendResult(success=True, message_id="fallback_ok"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "**bold**", max_retries=2, base_delay=0)
+        assert result.success
+        mock_sleep.assert_not_called()
+        assert len(adapter._send_calls) == 2
 
     @pytest.mark.asyncio
     async def test_signal_500_retried_when_platform_opts_in(self):

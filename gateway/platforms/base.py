@@ -4276,6 +4276,11 @@ class BasePlatformAdapter(ABC):
         if BasePlatformAdapter._is_ambiguous_delivery_error(error):
             return False
         lowered = error.lower()
+        # A 4xx response is an explicit rejection. Some Signal response-code
+        # exceptions include "network" in their package name, but retrying a
+        # rejected rich payload only delays the plain-text fallback.
+        if re.search(r"\[4\d\d\]|(?:bad response:\s*|http\s+)4\d\d|error\s+'4\d\d", lowered):
+            return False
         return any(pat in lowered for pat in _RETRYABLE_ERROR_PATTERNS)
 
     @staticmethod
