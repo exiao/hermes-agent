@@ -4399,6 +4399,8 @@ class BasePlatformAdapter(ABC):
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
                 if not (result.retryable or self._is_retryable_error(error_str)):
+                    if self._is_timeout_error(error_str) or self._is_ambiguous_delivery_error(error_str):
+                        return result
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
                 # All retries exhausted (loop completed without break) — notify user

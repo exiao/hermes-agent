@@ -243,6 +243,23 @@ class TestSendWithRetryNetworkRetry:
         assert len(adapter._send_calls) == 2
 
     @pytest.mark.asyncio
+    async def test_signal_500_after_transient_retry_has_no_plaintext_fallback(self):
+        """An ambiguous 5xx on a retry may still mean the message was delivered.
+
+        The retry loop must return that failure rather than falling through to
+        the plain-text fallback, which would duplicate the reply.
+        """
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="httpx.ConnectError: connection refused"),
+            SendResult(success=False, error=_SIGNAL_500_ERROR),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
+        assert not result.success
+        assert len(adapter._send_calls) == 2
+
+    @pytest.mark.asyncio
     async def test_connect_timeout_still_retried(self):
         """ConnectTimeout is safe to retry — the connection was never established."""
         adapter = _StubAdapter()
