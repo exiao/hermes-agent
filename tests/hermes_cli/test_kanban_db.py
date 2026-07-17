@@ -2287,6 +2287,24 @@ def test_respawn_guard_active_pr_released_by_requeue(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_active_pr_released_by_manual_promote(kanban_home):
+    """An operator's documented manual promote is an explicit requeue."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (t,))
+        promoted, error = kb.promote_task(conn, t, actor="operator")
+        assert promoted, error
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_respawn_guard_active_pr_same_second_requeue_still_guarded(kanban_home):
     """A requeue event in the SAME one-second bucket as the PR comment cannot
     prove after-ordering (auto-promotion → spawn → PR can land within 1s), so
@@ -2310,12 +2328,13 @@ def test_respawn_guard_active_pr_same_second_requeue_still_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_automatic_events_do_not_bypass(kanban_home):
-    """Automatic 'reclaimed'/'promoted' events after the PR comment do NOT
-    bypass active_pr — only operator-originated kinds do.
+    """Automatic events after the PR comment do NOT bypass active_pr.
 
     A worker that crashes after opening its PR gets an automatic 'reclaimed'
     from release_stale_claims; treating that as a deliberate requeue would
-    respawn the task and open the exact duplicate PR the guard prevents."""
+    respawn the task and open the exact duplicate PR the guard prevents. A
+    parent-reopen demotion is likewise an automatic `status` event, not an
+    operator's request to rerun the child."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         past = int(time.time()) - 120
@@ -2325,8 +2344,12 @@ def test_respawn_guard_active_pr_automatic_events_do_not_bypass(kanban_home):
             "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
             (t, past),
         )
-        for kind in ("reclaimed", "promoted"):
-            kb._append_event(conn, t, kind, {})
+        for kind, payload in (
+            ("reclaimed", {}),
+            ("promoted", {}),
+            ("status", {"status": "todo", "reason": "parent_reopened"}),
+        ):
+            kb._append_event(conn, t, kind, payload)
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
 
