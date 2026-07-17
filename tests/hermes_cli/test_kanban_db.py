@@ -2348,6 +2348,29 @@ def test_respawn_guard_active_pr_released_by_manual_promote(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_active_pr_parent_reopen_status_does_not_bypass(kanban_home):
+    """The automatic child 'status' event emitted by parent-reopen dependency
+    maintenance (payload reason='parent_reopened') does NOT bypass active_pr —
+    same automatic-event class as 'reclaimed'/'promoted'. An operator status
+    event (no parent_reopened reason) still does."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        kb._append_event(
+            conn, t, "status",
+            {"status": "todo", "reason": "parent_reopened", "parent": "t_p"},
+        )
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+        kb._append_event(conn, t, "status", {"status": "ready"})
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
