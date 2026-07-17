@@ -120,6 +120,13 @@ class TestIsAmbiguousDeliveryError:
     def test_5xx_is_ambiguous(self, code):
         assert _StubAdapter._is_ambiguous_delivery_error(f"Bad response: {code}")
 
+    @pytest.mark.parametrize(
+        "error",
+        ["HTTP 500: Graph API unavailable", "graph error 1 (HTTP 503): unavailable"],
+    )
+    def test_http_5xx_is_ambiguous(self, error):
+        assert _StubAdapter._is_ambiguous_delivery_error(error)
+
     def test_signal_500_is_ambiguous(self):
         assert _StubAdapter._is_ambiguous_delivery_error(_SIGNAL_500_ERROR)
 

@@ -4304,7 +4304,7 @@ class BasePlatformAdapter(ABC):
         """
         if not error:
             return False
-        return bool(re.search(r"\[5\d\d\]|bad response:\s*5\d\d", error.lower()))
+        return bool(re.search(r"\[5\d\d\]|(?:bad response:\s*|http\s+)5\d\d", error.lower()))
 
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a handler response into (text, ttl_seconds).
