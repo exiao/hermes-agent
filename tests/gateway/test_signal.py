@@ -41,7 +41,7 @@ def _stub_rpc(return_value):
     """Return an async mock for SignalAdapter._rpc that captures call params."""
     captured = []
 
-    async def mock_rpc(method, params, rpc_id=None):
+    async def mock_rpc(method, params, rpc_id=None, **kwargs):
         captured.append({"method": method, "params": dict(params)})
         return return_value
 
@@ -1119,6 +1119,23 @@ class TestSignalSendReturnsMessageId:
 
 class TestSignalSendResultValidation:
     """Verify that send() validates recipient-level delivery results."""
+
+    @pytest.mark.asyncio
+    async def test_send_preserves_ambiguous_rpc_error(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        response = MagicMock()
+        response.raise_for_status.side_effect = RuntimeError(
+            "org.signal.network.exceptions.NonSuccessfulResponseCodeException: [500] Bad response: 500"
+        )
+        adapter.client = AsyncMock()
+        adapter.client.post = AsyncMock(return_value=response)
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send(chat_id="group:group123", content="hello")
+
+        assert not result.success
+        assert result.error is not None
+        assert "[500] Bad response: 500" in result.error
 
     @pytest.mark.asyncio
     async def test_send_success_when_results_has_success(self, monkeypatch):
