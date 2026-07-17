@@ -2483,6 +2483,77 @@ class TestPreflightUserSystemd:
         assert "Enabled linger" in out
 
 
+class TestLaunchdDaemonResolution:
+    def test_non_root_candidates_exclude_system_daemon(self, monkeypatch, tmp_path):
+        """A normal install must not resolve a root-owned daemon as its target."""
+        user_home = tmp_path / "alice"
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: user_home)
+
+        assert gateway_cli._launchd_plist_candidates() == [
+            user_home / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"
+        ]
+
+    def test_root_candidates_include_system_daemon(self, monkeypatch, tmp_path):
+        user_home = tmp_path / "root"
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: user_home)
+
+        assert gateway_cli._launchd_plist_candidates() == [
+            user_home / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist",
+            Path("/Library/LaunchDaemons/ai.hermes.gateway.plist"),
+        ]
+
+    def test_non_root_domain_does_not_probe_system(self, monkeypatch):
+        gateway_cli._resolved_launchd_domain = None
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[1] == "print":
+                raise subprocess.CalledProcessError(1, cmd)
+            return SimpleNamespace(returncode=0, stdout="Background\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._launchd_domain() == "user/501"
+        assert all("system/" not in " ".join(cmd) for cmd in calls)
+
+    def test_root_uses_system_domain_for_unloaded_daemon(self, monkeypatch):
+        gateway_cli._resolved_launchd_domain = None
+        daemon_plist = Path("/Library/LaunchDaemons/ai.hermes.gateway.plist")
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: daemon_plist)
+        monkeypatch.setattr(gateway_cli, "_launchd_system_plist_path", lambda: daemon_plist)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[1] == "print":
+                raise subprocess.CalledProcessError(1, cmd)
+            return SimpleNamespace(returncode=0, stdout="Background\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._launchd_domain() == "system"
+
+    def test_refresh_does_not_rewrite_system_daemon_plist(self, monkeypatch, tmp_path, capsys):
+        daemon_plist = tmp_path / "LaunchDaemons" / "ai.hermes.gateway.plist"
+        daemon_plist.parent.mkdir()
+        daemon_plist.write_text("daemon-specific definition", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: daemon_plist)
+        monkeypatch.setattr(gateway_cli, "_launchd_system_plist_path", lambda: daemon_plist)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda: (_ for _ in ()).throw(AssertionError("must not generate an agent plist")),
+        )
+
+        assert gateway_cli.refresh_launchd_plist_if_needed() is False
+        assert daemon_plist.read_text(encoding="utf-8") == "daemon-specific definition"
+        assert "system LaunchDaemon" in capsys.readouterr().out
+
+
 class TestProfileArg:
     """Tests for _profile_arg — returns '--profile <name>' for named profiles."""
 

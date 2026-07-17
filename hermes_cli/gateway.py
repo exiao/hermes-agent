@@ -2464,6 +2464,11 @@ def _launchd_plist_basename() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
+def _launchd_system_plist_path() -> Path:
+    """Return the root-owned LaunchDaemon plist path for this profile."""
+    return Path("/Library/LaunchDaemons") / f"{_launchd_plist_basename()}.plist"
+
+
 def _launchd_plist_candidates() -> list[Path]:
     """Candidate plist locations, in write/preference order.
 
@@ -2471,16 +2476,16 @@ def _launchd_plist_candidates() -> list[Path]:
     (``~/Library/LaunchAgents``, the default ``hermes gateway install``
     target, started at login) or as a system LaunchDaemon
     (``/Library/LaunchDaemons``, root-owned, started at boot before login).
-    Resolution must recognise both so that status / restart / probe paths work
-    for daemon deployments, not just the LaunchAgent default. The LaunchAgent
-    path stays first so writes (install) keep landing there unless a daemon
-    plist already exists.
+    Root sessions also recognise a system LaunchDaemon so they can manage that
+    deployment. Non-root sessions deliberately only resolve the LaunchAgent:
+    they cannot manage a system daemon and must keep ``gateway install``
+    targeting their writable user path.
     """
     name = f"{_launchd_plist_basename()}.plist"
-    return [
-        _launchd_user_home() / "Library" / "LaunchAgents" / name,
-        Path("/Library/LaunchDaemons") / name,
-    ]
+    candidates = [_launchd_user_home() / "Library" / "LaunchAgents" / name]
+    if os.getuid() == 0:  # windows-footgun: POSIX launchd helper, never invoked on Windows
+        candidates.append(_launchd_system_plist_path())
+    return candidates
 
 
 def get_launchd_plist_path() -> Path:
@@ -2489,10 +2494,10 @@ def get_launchd_plist_path() -> Path:
     Default ``~/.hermes`` → ``ai.hermes.gateway.plist`` (backward compatible).
     Profile ``~/.hermes/profiles/coder`` → ``ai.hermes.gateway-coder.plist``.
 
-    Prefers an already-installed plist wherever it lives (LaunchAgents *or*
-    LaunchDaemons) so read paths (status/probe/restart) find a system daemon;
-    falls back to the LaunchAgents path when nothing is installed yet, so a
-    fresh install still writes the per-user agent by default.
+    Root sessions prefer an already-installed system daemon when no LaunchAgent
+    exists, so their status/restart paths can manage it. Non-root callers only
+    resolve their writable LaunchAgent path. When nothing is installed, all
+    callers fall back to the LaunchAgent path.
     """
     candidates = _launchd_plist_candidates()
     for path in candidates:
@@ -3557,8 +3562,9 @@ def _launchd_domain() -> str:
     """Return the launchd domain that actually manages the gateway service.
 
     Probes ``gui/<uid>`` first (Aqua sessions), then ``user/<uid>``
-    (Background/SSH sessions).  When neither domain contains a loaded
-    service, falls back to ``launchctl managername`` as a heuristic.
+    (Background/SSH sessions). Root additionally resolves an installed
+    LaunchDaemon to ``system`` even when it is unloaded. When no service
+    domain applies, falls back to ``launchctl managername`` as a heuristic.
 
     The result is cached for the lifetime of the process so that repeated
     calls (``start``, ``stop``, ``restart``) use a consistent domain.
@@ -3601,23 +3607,30 @@ def _launchd_domain() -> str:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # 3. Probe system/ — the gateway may be installed as a root LaunchDaemon
-    #    (``/Library/LaunchDaemons``) that starts at boot before login. Neither
-    #    per-user domain holds it, but it is a live service and status/restart
-    #    must target ``system/<label>``.
-    try:
-        subprocess.run(
-            ["launchctl", "print", f"{system_domain}/{label}"],
-            check=True,
-            timeout=5,
-            capture_output=True,
-        )
+    # 3. A root caller with an installed-but-unloaded daemon must still target
+    #    system/ so bootstrap/kickstart re-register the daemon in its proper
+    #    domain. The system probe cannot establish this because the job is
+    #    deliberately absent.
+    if uid == 0 and get_launchd_plist_path() == _launchd_system_plist_path():
         _resolved_launchd_domain = system_domain
         return system_domain
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-        pass
 
-    # 4. Neither domain has the service loaded — use managername as heuristic.
+    # 4. Probe system/ only as root. Non-root launchctl print system/<label>
+    #    is guaranteed to fail with EPERM and has no useful result.
+    if uid == 0:
+        try:
+            subprocess.run(
+                ["launchctl", "print", f"{system_domain}/{label}"],
+                check=True,
+                timeout=5,
+                capture_output=True,
+            )
+            _resolved_launchd_domain = system_domain
+            return system_domain
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    # 5. Neither domain has the service loaded — use managername as heuristic.
     #    Aqua → gui/<uid>, anything else (Background, loginwindow) → user/<uid>.
     try:
         result = subprocess.run(
@@ -3632,11 +3645,10 @@ def _launchd_domain() -> str:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # 5. Default to user/<uid> (matches the pre-probing behavior for
+    # 6. Default to user/<uid> (matches the pre-probing behavior for
     #    Background/SSH sessions and is the recommended domain on macOS 26+).
     _resolved_launchd_domain = user_domain
     return user_domain
-
 
 # On macOS, exit code 125 ("Domain does not support specified action") and
 # 3/113 ("Could not find service") all mean the job isn't currently loaded in
@@ -4043,6 +4055,10 @@ def refresh_launchd_plist_if_needed() -> bool:
     """
     plist_path = get_launchd_plist_path()
     if not plist_path.exists() or launchd_plist_is_current():
+        return False
+
+    if plist_path == _launchd_system_plist_path():
+        print("⚠ Leaving system LaunchDaemon definition unchanged")
         return False
 
     new_plist = generate_launchd_plist()
