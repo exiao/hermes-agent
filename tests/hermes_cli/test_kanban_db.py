@@ -2309,6 +2309,28 @@ def test_respawn_guard_active_pr_same_second_requeue_still_guarded(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_automatic_events_do_not_bypass(kanban_home):
+    """Automatic 'reclaimed'/'promoted' events after the PR comment do NOT
+    bypass active_pr — only operator-originated kinds do.
+
+    A worker that crashes after opening its PR gets an automatic 'reclaimed'
+    from release_stale_claims; treating that as a deliberate requeue would
+    respawn the task and open the exact duplicate PR the guard prevents."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        for kind in ("reclaimed", "promoted"):
+            kb._append_event(conn, t, kind, {})
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
