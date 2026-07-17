@@ -2392,6 +2392,36 @@ def test_respawn_guard_active_pr_survives_reassignment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_case_insensitive_author_match(kanban_home):
+    """Display-cased assignee ("Alice") vs normalized comment author ("alice")
+    must still match — both sides canonicalize via _canonical_assignee. A raw
+    compare would drop the task's own PR comment and release the guard."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        conn.execute("UPDATE tasks SET assignee = 'Alice' WHERE id = ?", (t,))
+        kb.add_comment(
+            conn, t, "alice",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_blank_author_ignored(kanban_home):
+    """A blank/whitespace comment author neither crashes normalization nor
+    counts as own-lane."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ' ', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, int(time.time())),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:

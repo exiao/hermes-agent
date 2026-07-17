@@ -9038,13 +9038,22 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # author; forgetting it would let the new assignee open a duplicate
         # PR. A sibling lane's cross-post still never matches — that profile
         # has no run row on this task.
-        own_lane = {task_assignee} if task_assignee else set()
-        for r in conn.execute(
-            "SELECT DISTINCT profile FROM task_runs "
-            "WHERE task_id = ? AND profile IS NOT NULL",
-            (task_id,),
-        ).fetchall():
-            own_lane.add(r["profile"])
+        # Canonicalize with _canonical_assignee: rows may carry display-cased
+        # names ("Alice") while comment authors carry the normalized worker
+        # profile id ("alice") — a raw string compare would drop the task's
+        # own PR comment and release the guard.
+        own_lane: set[str] = set()
+        for candidate in [task_assignee] + [
+            r["profile"]
+            for r in conn.execute(
+                "SELECT DISTINCT profile FROM task_runs "
+                "WHERE task_id = ? AND profile IS NOT NULL",
+                (task_id,),
+            ).fetchall()
+        ]:
+            if not candidate or not str(candidate).strip():
+                continue
+            own_lane.add(_canonical_assignee(candidate))
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
         latest_pr_comment_at: Optional[int] = None
         for c in conn.execute(
@@ -9054,7 +9063,13 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         ).fetchall():
             if not (c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])):
                 continue
-            if own_lane and c["author"] not in own_lane:
+            author = c["author"]
+            author_canon = (
+                _canonical_assignee(author)
+                if author and str(author).strip()
+                else None
+            )
+            if own_lane and author_canon not in own_lane:
                 continue
             ts = int(c["created_at"] or 0)
             if latest_pr_comment_at is None or ts > latest_pr_comment_at:
