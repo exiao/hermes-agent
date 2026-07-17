@@ -4266,6 +4266,15 @@ class BasePlatformAdapter(ABC):
         """Return True if the error string looks like a transient network failure."""
         if not error:
             return False
+        # An ambiguous server response (HTTP 5xx) means the request reached the
+        # server and may have been applied before it errored — retrying risks
+        # duplicate delivery, so it is NOT retryable even though the substring
+        # patterns below (notably "network") would otherwise match. This guard
+        # must run first: Signal surfaces 5xx as
+        # ``org.signal.network.exceptions.NonSuccessfulResponseCodeException``,
+        # whose package name literally contains "network".
+        if BasePlatformAdapter._is_ambiguous_delivery_error(error):
+            return False
         lowered = error.lower()
         return any(pat in lowered for pat in _RETRYABLE_ERROR_PATTERNS)
 
@@ -4280,6 +4289,22 @@ class BasePlatformAdapter(ABC):
             return False
         lowered = error.lower()
         return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
+
+    @staticmethod
+    def _is_ambiguous_delivery_error(error: Optional[str]) -> bool:
+        """Return True for an HTTP 5xx server error on a send.
+
+        A 5xx means the request reached the server, which may have accepted and
+        delivered the message before returning the error (Signal in particular
+        frequently delivers a message and then answers 500). Like a timeout on a
+        non-idempotent call, such an error is ambiguous: it must NOT be retried
+        and must NOT trigger a plain-text fallback, or the recipient gets
+        duplicate copies. 4xx is excluded — those are outright rejections
+        (nothing delivered) and remain eligible for the plain-text fallback.
+        """
+        if not error:
+            return False
+        return bool(re.search(r"\[5\d\d\]|bad response:\s*5\d\d", error.lower()))
 
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a handler response into (text, ttl_seconds).
@@ -4334,9 +4359,15 @@ class BasePlatformAdapter(ABC):
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
-        # Timeout errors are not safe to retry (message may have been
-        # delivered) and not formatting errors — return the failure as-is.
-        if not is_network and self._is_timeout_error(error_str):
+        # Ambiguous failures (read/write timeout, or an HTTP 5xx server error)
+        # are not safe to retry — the message may have already been delivered —
+        # and are not formatting errors, so the plain-text fallback would only
+        # duplicate them. Return the failure as-is. ``result.retryable`` still
+        # wins: a platform that knows its 5xx is safe to retry can opt in.
+        if not is_network and (
+            self._is_timeout_error(error_str)
+            or self._is_ambiguous_delivery_error(error_str)
+        ):
             return result
 
         if is_network:
