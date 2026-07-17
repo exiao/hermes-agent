@@ -2371,6 +2371,27 @@ def test_respawn_guard_active_pr_parent_reopen_status_does_not_bypass(kanban_hom
         assert kb.check_respawn_guard(conn, t) is None
 
 
+def test_respawn_guard_active_pr_survives_reassignment(kanban_home):
+    """A prior worker's PR comment still guards after the task is reassigned:
+    own-lane matching includes any profile in task_runs for this task, not
+    just the current assignee. (A sibling lane's cross-post still never
+    matches — that profile has no run row here.)"""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at) "
+            "VALUES (?, 'alice', 'crashed', ?)",
+            (t, int(time.time()) - 300),
+        )
+        kb.add_comment(
+            conn, t, "alice",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        conn.execute("UPDATE tasks SET assignee = 'bob' WHERE id = ?", (t,))
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:

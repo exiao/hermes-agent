@@ -9032,6 +9032,19 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         task_assignee = assignee_row["assignee"] if assignee_row else None
+        # "Own lane" = the current assignee OR any profile that has actually
+        # run THIS task (task_runs.profile). Reassignment rewrites
+        # tasks.assignee but the prior worker's PR comment keeps its old
+        # author; forgetting it would let the new assignee open a duplicate
+        # PR. A sibling lane's cross-post still never matches — that profile
+        # has no run row on this task.
+        own_lane = {task_assignee} if task_assignee else set()
+        for r in conn.execute(
+            "SELECT DISTINCT profile FROM task_runs "
+            "WHERE task_id = ? AND profile IS NOT NULL",
+            (task_id,),
+        ).fetchall():
+            own_lane.add(r["profile"])
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
         latest_pr_comment_at: Optional[int] = None
         for c in conn.execute(
@@ -9041,7 +9054,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         ).fetchall():
             if not (c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])):
                 continue
-            if task_assignee is not None and c["author"] != task_assignee:
+            if own_lane and c["author"] not in own_lane:
                 continue
             ts = int(c["created_at"] or 0)
             if latest_pr_comment_at is None or ts > latest_pr_comment_at:
