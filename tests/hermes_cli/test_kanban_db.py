@@ -2392,6 +2392,19 @@ def test_respawn_guard_active_pr_survives_reassignment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_normalizes_own_lane_profiles(kanban_home):
+    """A mixed-case persisted assignee still recognizes its worker comment."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        conn.execute("UPDATE tasks SET assignee = 'Alice' WHERE id = ?", (t,))
+        kb.add_comment(
+            conn, t, "alice",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
