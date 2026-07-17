@@ -29,6 +29,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.kanban_ownership import delegated_child_masks_kanban_ownership
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
@@ -299,6 +300,7 @@ _LEGACY_TOOLSET_MAP = {
 # inner check_fn TTL cache in registry.py handles environment drift (Docker
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+_tool_defs_cache_lock = threading.Lock()
 
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime
@@ -313,7 +315,8 @@ def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
     execute_code sandbox reconfigured)."""
-    _tool_defs_cache.clear()
+    with _tool_defs_cache_lock:
+        _tool_defs_cache.clear()
 
 
 def get_tool_definitions(
@@ -362,9 +365,11 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            _delegated_child_masks_kanban(),
             bool(skip_tool_search_assembly),
         )
-        cached = _tool_defs_cache.get(cache_key)
+        with _tool_defs_cache_lock:
+            cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
@@ -387,11 +392,27 @@ def get_tool_definitions(
         # Bound the cache with LRU eviction so a long-lived Gateway process
         # doesn't accumulate entries unboundedly across the many distinct
         # toolset/config fingerprints it sees over its lifetime (#19251).
-        if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
-            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
+        with _tool_defs_cache_lock:
+            if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+                _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
+            _tool_defs_cache[cache_key] = result
         return list(result)
     return result
+
+
+def _delegated_child_masks_kanban() -> bool:
+    """Whether the current thread is building/running a delegated child agent
+    that must NOT receive kanban lifecycle tools.
+
+    A delegated review child inherits the parent worker's ``HERMES_KANBAN_TASK``
+    but must never mutate the parent's task, so it is the ONE case where a
+    process carrying ``HERMES_KANBAN_TASK`` legitimately has no
+    ``kanban_complete``/``block``/``heartbeat``. It is signalled by the
+    delegate-child ownership mask contextvar (engaged around child construction
+    and run), NOT by a profile's ``disabled_toolsets`` — so a real worker whose
+    profile disabled kanban for cost still gets its lifecycle surface back.
+    """
+    return delegated_child_masks_kanban_ownership()
 
 
 def _compute_tool_definitions(
@@ -404,14 +425,24 @@ def _compute_tool_definitions(
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
+    # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and must
+    # always receive the lifecycle handoff tools. Assignee profiles may
+    # intentionally restrict their normal chat toolsets (for token/cost
+    # reasons) — INCLUDING listing "kanban" in agent.disabled_toolsets — but
+    # that must not strip the worker's completion/block/heartbeat surface, or
+    # the task can never finish via the lifecycle protocol. The ONE case where
+    # a HERMES_KANBAN_TASK process legitimately has no lifecycle tools is a
+    # delegated review child (it inherits the parent worker's env but must
+    # never mutate the parent's task); that is signalled by the delegate-child
+    # ownership mask, not by the global disabled list.
+    worker_needs_kanban = bool(
+        os.environ.get("HERMES_KANBAN_TASK")
+        and not _delegated_child_masks_kanban()
+    )
+
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
-            # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
-            # must always receive the lifecycle handoff tools. Assignee
-            # profiles may intentionally restrict their normal chat toolsets
-            # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
+        if worker_needs_kanban and "kanban" not in effective_enabled_toolsets:
             effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
@@ -436,6 +467,14 @@ def _compute_tool_definitions(
     # This ensures that even if a composite toolset (like hermes-cli)
     # is enabled, any tools belonging to a disabled toolset are strictly
     # stripped out. See issue #17309.
+    if disabled_toolsets and worker_needs_kanban and "kanban" in disabled_toolsets:
+        # A dispatcher worker whose profile disabled kanban for cost still needs
+        # its lifecycle surface back — drop kanban from the subtraction so the
+        # force-include isn't undone. This applies to BOTH the explicit
+        # enabled_toolsets path (force-appended above) and the default-all path
+        # (every toolset included, kanban among them), so a default-all worker
+        # with agent.disabled_toolsets:["kanban"] can still complete its task.
+        disabled_toolsets = [d for d in disabled_toolsets if d != "kanban"]
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):

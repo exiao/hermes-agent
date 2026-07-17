@@ -16,6 +16,8 @@ These tests pin:
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 import model_tools
@@ -107,6 +109,22 @@ class TestQuietModeCacheIsolation:
         assert len(model_tools._tool_defs_cache) == cap, (
             "Eviction should keep the cache at the cap, not clear it or grow"
         )
+
+    def test_concurrent_cache_access_keeps_results_and_bound(self, monkeypatch):
+        """Concurrent delegated children may resolve schemas simultaneously;
+        cache reads, eviction, and writes must not raise or exceed the cap."""
+        monkeypatch.setattr(model_tools, "_TOOL_DEFS_CACHE_MAX", 2)
+
+        def resolve(index):
+            return model_tools.get_tool_definitions(
+                enabled_toolsets=[f"fake_toolset_{index}"], quiet_mode=True,
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(resolve, range(32)))
+
+        assert all(isinstance(result, list) for result in results)
+        assert len(model_tools._tool_defs_cache) <= 2
 
     def test_non_quiet_mode_does_not_use_cache(self):
         """Sanity: quiet_mode=False (TUI path) skips the cache entirely \u2014

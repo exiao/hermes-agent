@@ -309,6 +309,56 @@ class TestActiveVenvMarkerStripping:
         assert "CONDA_PREFIX" in _ACTIVE_VENV_MARKER_VARS
 
 
+def test_delegate_child_masks_kanban_ownership_from_terminal_env(monkeypatch):
+    """A delegated child cannot reuse its worker parent's lifecycle token."""
+    from agent.kanban_ownership import delegated_child_kanban_env
+    from tools.environments.local import _make_run_env, _sanitize_subprocess_env
+
+    ownership = {
+        "HERMES_KANBAN_TASK": "t_owner",
+        "HERMES_KANBAN_RUN_ID": "42",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-token",
+    }
+    for key, value in ownership.items():
+        monkeypatch.setenv(key, value)
+
+    with delegated_child_kanban_env():
+        assert not (set(_make_run_env({})) & ownership.keys())
+        assert not (set(_sanitize_subprocess_env(dict(ownership))) & ownership.keys())
+
+    assert set(_make_run_env({})) >= ownership.keys()
+
+
+def test_delegate_child_masks_kanban_ownership_from_subprocess_env(monkeypatch):
+    """The non-terminal spawn surface (codex_app_server / ACP CLI) must also
+    drop the worker parent's lifecycle token, or a delegated Codex-runtime
+    child could close the parent task via the Hermes-tools MCP kanban_complete.
+    """
+    from agent.kanban_ownership import delegated_child_kanban_env
+    from tools.environments.local import hermes_subprocess_env
+
+    ownership = {
+        "HERMES_KANBAN_TASK": "t_owner",
+        "HERMES_KANBAN_RUN_ID": "42",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-token",
+    }
+    for key, value in ownership.items():
+        monkeypatch.setenv(key, value)
+
+    # Outside a delegated child: tokens pass through (a real worker needs them).
+    assert set(hermes_subprocess_env()) >= ownership.keys()
+
+    # Inside a delegated child: the mask strips every ownership token, even
+    # when the caller inherits provider credentials.
+    with delegated_child_kanban_env():
+        assert not (set(hermes_subprocess_env()) & ownership.keys())
+        assert not (
+            set(hermes_subprocess_env(inherit_credentials=True)) & ownership.keys()
+        )
+
+    assert set(hermes_subprocess_env()) >= ownership.keys()
+
+
 class TestBlocklistCoverage:
     """Sanity checks that the blocklist covers all known providers."""
 

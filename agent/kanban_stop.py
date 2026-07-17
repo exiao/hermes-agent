@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable, Optional
 
+from agent.kanban_ownership import delegated_child_masks_kanban_ownership
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
@@ -30,6 +31,8 @@ def kanban_stop_nudge_enabled() -> bool:
     """
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    if delegated_child_masks_kanban_ownership():
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     return bool(task)
