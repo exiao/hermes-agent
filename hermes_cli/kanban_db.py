@@ -9050,9 +9050,14 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             # Mirror the recent_success exception: an explicit re-queue AFTER
             # the qualifying PR comment (operator drag, dependency promotion,
             # unblock, reclaim) is a deliberate "run it again" — honor it.
+            # STRICTLY after: created_at is integer seconds, and an auto
+            # 'promoted' event can share the same one-second bucket as the
+            # worker's PR comment (promotion → spawn → PR in <1s). A tie
+            # cannot prove the requeue happened after the PR existed, so
+            # ties keep the guard (fail safe toward not duplicating a PR).
             requeued_after = conn.execute(
                 "SELECT 1 FROM task_events "
-                "WHERE task_id = ? AND created_at >= ? "
+                "WHERE task_id = ? AND created_at > ? "
                 "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
                 "LIMIT 1",
                 (task_id, latest_pr_comment_at),

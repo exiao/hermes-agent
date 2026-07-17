@@ -2271,17 +2271,42 @@ def test_respawn_guard_cross_author_pr_comment_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_released_by_requeue(kanban_home):
-    """An explicit re-queue event AFTER the qualifying PR comment bypasses
-    active_pr, mirroring the recent_success exception."""
+    """An explicit re-queue event STRICTLY after the qualifying PR comment
+    bypasses active_pr, mirroring the recent_success exception."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
-        kb.add_comment(
-            conn, t, "alice",
-            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
         )
         kb._append_event(conn, t, "unblocked", {})
         reason = kb.check_respawn_guard(conn, t)
     assert reason is None
+
+
+def test_respawn_guard_active_pr_same_second_requeue_still_guarded(kanban_home):
+    """A requeue event in the SAME one-second bucket as the PR comment cannot
+    prove after-ordering (auto-promotion → spawn → PR can land within 1s), so
+    the tie keeps the guard — fail safe toward not duplicating a PR."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        now_ts = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, now_ts),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'promoted', '{}', ?)",
+            (t, now_ts),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
