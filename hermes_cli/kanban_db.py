@@ -9021,12 +9021,43 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         for field in (row["title"], row["body"])
     )
     if not anchored_to_pr:
+        # Only the task's OWN lane's comments count: the guard exists to stop
+        # THIS task's next worker from opening a duplicate of a PR a PRIOR
+        # worker of THIS task opened. A PR URL cross-posted by another lane
+        # (context from a sibling card, reviewer notes, an operator pasting a
+        # link) is not evidence this task opened anything — counting it
+        # strands grade-only/QA cards for the full PR window (live incident
+        # 2026-07-17, t_622d5a37).
+        assignee_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        task_assignee = assignee_row["assignee"] if assignee_row else None
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        latest_pr_comment_at: Optional[int] = None
         for c in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            "SELECT author, body, created_at FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ?",
             (task_id, pr_cutoff),
         ).fetchall():
-            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            if not (c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])):
+                continue
+            if task_assignee is not None and c["author"] != task_assignee:
+                continue
+            ts = int(c["created_at"] or 0)
+            if latest_pr_comment_at is None or ts > latest_pr_comment_at:
+                latest_pr_comment_at = ts
+        if latest_pr_comment_at is not None:
+            # Mirror the recent_success exception: an explicit re-queue AFTER
+            # the qualifying PR comment (operator drag, dependency promotion,
+            # unblock, reclaim) is a deliberate "run it again" — honor it.
+            requeued_after = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND created_at >= ? "
+                "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+                "LIMIT 1",
+                (task_id, latest_pr_comment_at),
+            ).fetchone()
+            if not requeued_after:
                 return "active_pr"
 
     return None

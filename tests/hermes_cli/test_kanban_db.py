@@ -2241,15 +2241,47 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+    """A GitHub PR URL in a recent comment BY THE TASK'S OWN LANE triggers
+    active_pr."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
+
+
+def test_respawn_guard_cross_author_pr_comment_not_guarded(kanban_home):
+    """A PR URL cross-posted by a DIFFERENT lane (context from a sibling card,
+    reviewer notes, an operator pasting a link) does not strand the task.
+
+    Regression: a grade-only memo-evaluator card was respawn_guarded for the
+    full 24h PR window because a dev lane cross-posted its (already-merged)
+    PR URL as context (live incident 2026-07-17, t_622d5a37)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="grade-only", assignee="memo-evaluator")
+        kb.add_comment(
+            conn, t, "dev",
+            "Context: fix merged in https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_released_by_requeue(kanban_home):
+    """An explicit re-queue event AFTER the qualifying PR comment bypasses
+    active_pr, mirroring the recent_success exception."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "alice",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        kb._append_event(conn, t, "unblocked", {})
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
@@ -2317,7 +2349,7 @@ def test_respawn_guard_impl_task_still_guarded_by_pr_comment(kanban_home):
             conn, title="Implement rate limiter", assignee="alice",
         )
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
@@ -2407,7 +2439,7 @@ def test_dispatch_respawn_guard_skips_active_pr(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
