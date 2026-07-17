@@ -9094,15 +9094,23 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             # automatic case too: parent-reopen dependency maintenance
             # demotes children with a status event whose payload reason is
             # 'parent_reopened' — exclude it (same automatic-event class).
-            requeued_after = conn.execute(
-                "SELECT 1 FROM task_events "
+            requeued_after = False
+            for event in conn.execute(
+                "SELECT kind, payload FROM task_events "
                 "WHERE task_id = ? AND created_at > ? "
-                "AND kind IN ('status', 'unblocked', 'promoted_manual') "
-                "AND COALESCE(json_extract(payload, '$.reason'), '') "
-                "    != 'parent_reopened' "
-                "LIMIT 1",
+                "AND kind IN ('status', 'unblocked', 'promoted_manual')",
                 (task_id, latest_pr_comment_at),
-            ).fetchone()
+            ).fetchall():
+                if event["kind"] in {"unblocked", "promoted_manual"}:
+                    requeued_after = True
+                    break
+                try:
+                    payload = json.loads(event["payload"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if payload.get("reason") != "parent_reopened":
+                    requeued_after = True
+                    break
             if not requeued_after:
                 return "active_pr"
 
