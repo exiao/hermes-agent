@@ -2458,15 +2458,47 @@ def _launchd_user_home() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
 
 
+def _launchd_plist_basename() -> str:
+    """Return the plist file basename (label), scoped per profile."""
+    suffix = _profile_suffix()
+    return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+
+
+def _launchd_plist_candidates() -> list[Path]:
+    """Candidate plist locations, in write/preference order.
+
+    A gateway can be installed either as a per-user LaunchAgent
+    (``~/Library/LaunchAgents``, the default ``hermes gateway install``
+    target, started at login) or as a system LaunchDaemon
+    (``/Library/LaunchDaemons``, root-owned, started at boot before login).
+    Resolution must recognise both so that status / restart / probe paths work
+    for daemon deployments, not just the LaunchAgent default. The LaunchAgent
+    path stays first so writes (install) keep landing there unless a daemon
+    plist already exists.
+    """
+    name = f"{_launchd_plist_basename()}.plist"
+    return [
+        _launchd_user_home() / "Library" / "LaunchAgents" / name,
+        Path("/Library/LaunchDaemons") / name,
+    ]
+
+
 def get_launchd_plist_path() -> Path:
     """Return the launchd plist path, scoped per profile.
 
     Default ``~/.hermes`` → ``ai.hermes.gateway.plist`` (backward compatible).
     Profile ``~/.hermes/profiles/coder`` → ``ai.hermes.gateway-coder.plist``.
+
+    Prefers an already-installed plist wherever it lives (LaunchAgents *or*
+    LaunchDaemons) so read paths (status/probe/restart) find a system daemon;
+    falls back to the LaunchAgents path when nothing is installed yet, so a
+    fresh install still writes the per-user agent by default.
     """
-    suffix = _profile_suffix()
-    name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
-    return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
+    candidates = _launchd_plist_candidates()
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
 
 
 def _detect_venv_dir() -> Path | None:
@@ -3541,6 +3573,7 @@ def _launchd_domain() -> str:
     label = get_launchd_label()
     gui_domain = f"gui/{uid}"
     user_domain = f"user/{uid}"
+    system_domain = "system"
 
     # 1. Probe gui/<uid> first — in Aqua sessions the service is loaded here.
     try:
@@ -3568,7 +3601,23 @@ def _launchd_domain() -> str:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # 3. Neither domain has the service loaded — use managername as heuristic.
+    # 3. Probe system/ — the gateway may be installed as a root LaunchDaemon
+    #    (``/Library/LaunchDaemons``) that starts at boot before login. Neither
+    #    per-user domain holds it, but it is a live service and status/restart
+    #    must target ``system/<label>``.
+    try:
+        subprocess.run(
+            ["launchctl", "print", f"{system_domain}/{label}"],
+            check=True,
+            timeout=5,
+            capture_output=True,
+        )
+        _resolved_launchd_domain = system_domain
+        return system_domain
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # 4. Neither domain has the service loaded — use managername as heuristic.
     #    Aqua → gui/<uid>, anything else (Background, loginwindow) → user/<uid>.
     try:
         result = subprocess.run(
@@ -3583,7 +3632,7 @@ def _launchd_domain() -> str:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # 4. Default to user/<uid> (matches the pre-probing behavior for
+    # 5. Default to user/<uid> (matches the pre-probing behavior for
     #    Background/SSH sessions and is the recommended domain on macOS 26+).
     _resolved_launchd_domain = user_domain
     return user_domain
