@@ -15,6 +15,17 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult, _RETRYABLE_E
 from gateway.platforms.base import Platform, PlatformConfig
 
 
+# Real Signal send failure observed for group-send HTTP 5xx: the JSON-RPC error
+# message wraps the Java exception whose package name contains "network".
+_SIGNAL_500_ERROR = (
+    "Failed to send message: "
+    "org.signal.network.exceptions.NonSuccessfulResponseCodeException: "
+    "[500] Bad response: 500 : {\"code\":500,\"message\":\"There was an error "
+    "processing your request. It has been logged (ID 05db3b542d515cd7).\"} "
+    "(IOException) (UnexpectedErrorException)"
+)
+
+
 # ---------------------------------------------------------------------------
 # Minimal concrete adapter for testing (no real network)
 # ---------------------------------------------------------------------------
@@ -80,6 +91,62 @@ class TestIsRetryableError:
 
     def test_connect_timeout_is_retryable(self):
         assert _StubAdapter._is_retryable_error("ConnectTimeout: connection timed out")
+
+    def test_signal_500_not_retryable_despite_network_in_package(self):
+        """A Signal HTTP 500 surfaces as
+        ``org.signal.network.exceptions.NonSuccessfulResponseCodeException`` —
+        the package name contains "network" but the send is ambiguous (may have
+        been delivered), so it must NOT be classified retryable. Regression for
+        duplicate group replies during Signal-side 5xx windows."""
+        assert not _StubAdapter._is_retryable_error(_SIGNAL_500_ERROR)
+
+    def test_signal_400_is_not_retryable_despite_network_package(self):
+        """A rejected Signal payload should use plain-text fallback, not retry."""
+        assert not _StubAdapter._is_retryable_error(
+            "org.signal.network.exceptions.NonSuccessfulResponseCodeException: [400] Bad response: 400"
+        )
+
+    def test_genuine_signal_push_network_error_still_retryable(self):
+        """A real connection-level failure in the same package (no HTTP status)
+        is still retryable — the request never reached the server."""
+        assert _StubAdapter._is_retryable_error(
+            "org.signal.network.exceptions.PushNetworkException: broken pipe"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _is_ambiguous_delivery_error
+# ---------------------------------------------------------------------------
+
+class TestIsAmbiguousDeliveryError:
+    def test_none_is_not_ambiguous(self):
+        assert not _StubAdapter._is_ambiguous_delivery_error(None)
+
+    @pytest.mark.parametrize("code", ["500", "502", "503", "504"])
+    def test_5xx_is_ambiguous(self, code):
+        assert _StubAdapter._is_ambiguous_delivery_error(f"Bad response: {code}")
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "HTTP 500: Graph API unavailable",
+            "graph error 1 (HTTP 503): unavailable",
+            "Server error '500 Internal Server Error' for url 'https://signal.example/send'",
+        ],
+    )
+    def test_http_5xx_is_ambiguous(self, error):
+        assert _StubAdapter._is_ambiguous_delivery_error(error)
+
+    def test_signal_500_is_ambiguous(self):
+        assert _StubAdapter._is_ambiguous_delivery_error(_SIGNAL_500_ERROR)
+
+    def test_4xx_is_not_ambiguous(self):
+        """4xx is an outright rejection (nothing delivered) — still eligible for
+        the plain-text fallback."""
+        assert not _StubAdapter._is_ambiguous_delivery_error("[400] Bad response: 400")
+
+    def test_no_status_is_not_ambiguous(self):
+        assert not _StubAdapter._is_ambiguous_delivery_error("ConnectError: refused")
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +230,68 @@ class TestSendWithRetryNetworkRetry:
         mock_sleep.assert_not_called()
         assert not result.success
         assert len(adapter._send_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_signal_500_not_retried_and_no_fallback(self):
+        """A Signal group-send HTTP 500 is ambiguous (may have been delivered).
+        It must not be retried and must not trigger the plain-text fallback,
+        otherwise the recipient gets duplicate copies. Only one send happens."""
+        adapter = _StubAdapter()
+        adapter._send_results = [SendResult(success=False, error=_SIGNAL_500_ERROR)]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=3, base_delay=0)
+        mock_sleep.assert_not_called()
+        assert not result.success
+        assert len(adapter._send_calls) == 1  # no retry, no fallback → no duplicate
+
+    @pytest.mark.asyncio
+    async def test_signal_400_falls_back_without_retry(self):
+        """A rejected rich payload must skip retries and use plain-text fallback."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                error="org.signal.network.exceptions.NonSuccessfulResponseCodeException: [400] Bad response: 400",
+            ),
+            SendResult(success=True, message_id="fallback_ok"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "**bold**", max_retries=2, base_delay=0)
+        assert result.success
+        mock_sleep.assert_not_called()
+        assert len(adapter._send_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_signal_500_retried_when_platform_opts_in(self):
+        """A platform that sets retryable=True on its 5xx still gets a retry —
+        the ambiguous-delivery guard only overrides the error-string heuristic,
+        not an explicit opt-in."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error=_SIGNAL_500_ERROR, retryable=True),
+            SendResult(success=True, message_id="ok"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
+        assert result.success
+        assert len(adapter._send_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_signal_500_after_transient_retry_has_no_plaintext_fallback(self):
+        """An ambiguous 5xx on a retry may still mean the message was delivered.
+
+        The retry loop must return that failure rather than falling through to
+        the plain-text fallback, which would duplicate the reply.
+        """
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="httpx.ConnectError: connection refused"),
+            SendResult(success=False, error=_SIGNAL_500_ERROR),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
+        assert not result.success
+        assert len(adapter._send_calls) == 2
 
     @pytest.mark.asyncio
     async def test_connect_timeout_still_retried(self):

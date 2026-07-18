@@ -70,6 +70,10 @@ HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
 
 
+class SignalRPCError(RuntimeError):
+    """A JSON-RPC send failure whose text must reach retry classification."""
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -986,6 +990,7 @@ class SignalAdapter(BasePlatformAdapter):
         *,
         log_failures: bool = True,
         raise_on_rate_limit: bool = False,
+        raise_on_error: bool = False,
         timeout: float = 30.0,
     ) -> Any:
         """Send a JSON-RPC 2.0 request to signal-cli daemon.
@@ -1000,6 +1005,9 @@ class SignalAdapter(BasePlatformAdapter):
         ``RateLimitException`` response raises ``SignalRateLimitError``
         instead of being swallowed — lets callers (multi-attachment send)
         opt into backoff-retry without changing default behaviour.
+
+        When ``raise_on_error=True``, preserve JSON-RPC and HTTP failure text
+        for the caller instead of collapsing it to ``None``.
         """
         if not self.client:
             logger.warning("Signal: RPC called but client not connected")
@@ -1035,6 +1043,8 @@ class SignalAdapter(BasePlatformAdapter):
                     logger.warning("Signal RPC error (%s): %s", method, err)
                 else:
                     logger.debug("Signal RPC error (%s): %s", method, err)
+                if raise_on_error:
+                    raise SignalRPCError(str(err))
                 return None
 
             result = data.get("result")
@@ -1050,11 +1060,15 @@ class SignalAdapter(BasePlatformAdapter):
 
         except SignalRateLimitError:
             raise
+        except SignalRPCError:
+            raise
         except Exception as e:
             if log_failures:
                 logger.warning("Signal RPC %s failed: %s", method, e)
             else:
                 logger.debug("Signal RPC %s failed: %s", method, e)
+            if raise_on_error:
+                raise SignalRPCError(str(e)) from e
             return None
 
     # ------------------------------------------------------------------
@@ -1131,7 +1145,10 @@ class SignalAdapter(BasePlatformAdapter):
             params["recipient"] = [await self._resolve_recipient(chat_id)]
 
         logger.info("[Signal] Sending response (%d chars) to %s", len(plain_text), chat_id)
-        result = await self._rpc("send", params)
+        try:
+            result = await self._rpc("send", params, raise_on_error=True)
+        except SignalRPCError as exc:
+            return SendResult(success=False, error=str(exc))
 
         if result is not None:
             success, err_msg = self._validate_send_result(result)
