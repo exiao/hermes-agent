@@ -9069,7 +9069,15 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
                 if author and str(author).strip()
                 else None
             )
-            if own_lane and author_canon not in own_lane:
+            # ``kanban_comment`` deliberately falls back to the literal
+            # ``worker`` author when HERMES_PROFILE is unavailable. That is
+            # the task's own dispatcher handoff (including legacy rows), not
+            # a cross-lane attribution; retain it even when the task has an
+            # assigned/profile-derived own lane. Other authors must belong to
+            # that lane, and an empty lane cannot claim arbitrary comments.
+            if author_canon != "worker" and (
+                not own_lane or author_canon not in own_lane
+            ):
                 continue
             ts = int(c["created_at"] or 0)
             if latest_pr_comment_at is None or ts > latest_pr_comment_at:

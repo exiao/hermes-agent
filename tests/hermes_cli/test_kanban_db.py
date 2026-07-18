@@ -2253,6 +2253,20 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_fallback_worker_comment(kanban_home):
+    """A dispatcher worker without ``HERMES_PROFILE`` records its task-owned
+    PR handoff as ``worker``; that legacy fallback must still guard an
+    assigned task from opening a duplicate PR."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
 def test_respawn_guard_cross_author_pr_comment_not_guarded(kanban_home):
     """A PR URL cross-posted by a DIFFERENT lane (context from a sibling card,
     reviewer notes, an operator pasting a link) does not strand the task.
