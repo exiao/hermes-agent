@@ -9084,7 +9084,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             # cannot prove the requeue happened after the PR existed, so
             # ties keep the guard (fail safe toward not duplicating a PR).
             # OPERATOR-ORIGINATED kinds only ('status', 'unblocked',
-            # 'promoted_manual' — the `hermes kanban promote` verb) — unlike
+            # 'promoted_manual', and manual 'reclaimed') — unlike
             # recent_success, active_pr anchors on a MID-RUN artifact, so
             # automatic events genuinely can postdate it: a worker that
             # crashes after opening its PR gets an automatic 'reclaimed'
@@ -9098,7 +9098,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             for event in conn.execute(
                 "SELECT kind, payload FROM task_events "
                 "WHERE task_id = ? AND created_at > ? "
-                "AND kind IN ('status', 'unblocked', 'promoted_manual')",
+                "AND kind IN ('status', 'unblocked', 'promoted_manual', 'reclaimed')",
                 (task_id, latest_pr_comment_at),
             ).fetchall():
                 if event["kind"] in {"unblocked", "promoted_manual"}:
@@ -9108,7 +9108,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
                     payload = json.loads(event["payload"] or "{}")
                 except (TypeError, ValueError):
                     continue
-                if payload.get("reason") != "parent_reopened":
+                if event["kind"] == "reclaimed":
+                    if payload.get("manual") is True:
+                        requeued_after = True
+                        break
+                elif payload.get("reason") != "parent_reopened":
                     requeued_after = True
                     break
             if not requeued_after:
