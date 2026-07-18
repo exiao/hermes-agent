@@ -2302,7 +2302,7 @@ def test_respawn_guard_active_pr_same_second_requeue_still_guarded(kanban_home):
         )
         conn.execute(
             "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'promoted', '{}', ?)",
+            "VALUES (?, 'unblocked', '{}', ?)",
             (t, now_ts),
         )
         reason = kb.check_respawn_guard(conn, t)
