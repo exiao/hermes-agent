@@ -2782,6 +2782,28 @@ import weakref as _weakref
 _gateway_runner_ref: _weakref.ref = lambda: None
 
 
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def _install_runner_ref(runner):
+    """Temporarily point the module-level runner weakref at ``runner``.
+
+    Test helper: lets tests exercise module-level functions that deref
+    ``_gateway_runner_ref`` (e.g. ``_heartbeat_active_agents``) against a
+    GatewayRunner double, then restores the prior ref on exit. Production code
+    installs the ref via ``GatewayRunner.__init__``; this is only for exercising
+    the heartbeat without booting a full gateway.
+    """
+    global _gateway_runner_ref
+    _prev = _gateway_runner_ref
+    _gateway_runner_ref = _weakref.ref(runner)
+    try:
+        yield runner
+    finally:
+        _gateway_runner_ref = _prev
+
+
 def _normalize_empty_agent_response(
     agent_result: dict,
     response: str,
@@ -22034,6 +22056,36 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
+def _heartbeat_active_agents() -> None:
+    """Re-persist the live active_agents count from the housekeeping thread.
+
+    gateway_state.json:active_agents is only rewritten at CHAT turn boundaries
+    (the runner's _persist_active_agents in _run_agent's finally). Cron jobs and
+    api-server runs are folded into _active_work_count() but have NO persist hook
+    of their own, so after cron activity the on-disk count freezes at a stale
+    non-zero value AND its mtime stops advancing between chat turns.
+
+    The signal watchdog reads that file as its manual-mode liveness signal and
+    force-kills a healthy-but-idle gateway that matches "active_agents>0 + mtime
+    stale > GATEWAY_BUSY_STALE_SECONDS" (four false SIGKILLs on 2026-07-18).
+
+    Calling this once per housekeeping tick fixes both failure modes at once:
+    the count is recomputed from live _active_work_count() so a completed cron
+    job's decrement lands within a tick, and the write advances the file mtime
+    so it becomes a true process-liveness heartbeat rather than a chat-turn
+    artifact. Once mtime advances every ~60s the watchdog's stale-file branch
+    can only trip when the process is genuinely wedged (housekeeping dead too).
+
+    Best-effort: a failed status write must never disrupt the housekeeping loop.
+    """
+    try:
+        _runner = _gateway_runner_ref()
+        if _runner is not None:
+            _runner._persist_active_agents()
+    except Exception as e:
+        logger.debug("active_agents heartbeat error: %s", e)
+
+
 def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
     """Background thread for gateway-only periodic chores (NOT cron).
 
@@ -22060,6 +22112,9 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        # active_agents heartbeat (every tick). See _heartbeat_active_agents.
+        _heartbeat_active_agents()
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
