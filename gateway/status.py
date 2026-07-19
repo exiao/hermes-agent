@@ -45,6 +45,10 @@ _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
 _gateway_running_pid_cache_lock = threading.Lock()
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple[Any, ...], Optional[int]]] = {}
+# Runtime-status updates are read-modify-write operations.  The gateway event
+# loop and its housekeeping thread share this lock so a heartbeat cannot write
+# a stale lifecycle snapshot over a concurrent stop/drain transition.
+_runtime_status_write_lock = threading.RLock()
 
 
 def _get_process_hermes_home() -> Path:
@@ -794,7 +798,7 @@ def write_pid_file() -> None:
         raise
 
 
-def write_runtime_status(
+def _write_runtime_status_unlocked(
     *,
     gateway_state: Any = _UNSET,
     exit_reason: Any = _UNSET,
@@ -843,6 +847,33 @@ def write_runtime_status(
         payload["platforms"][platform] = platform_payload
 
     _write_json_file(path, payload)
+
+
+def write_runtime_status(
+    *,
+    gateway_state: Any = _UNSET,
+    exit_reason: Any = _UNSET,
+    restart_requested: Any = _UNSET,
+    active_agents: Any = _UNSET,
+    platform: Any = _UNSET,
+    platform_state: Any = _UNSET,
+    error_code: Any = _UNSET,
+    error_message: Any = _UNSET,
+    served_profiles: Any = _UNSET,
+) -> None:
+    """Persist runtime status without interleaving in-process updates."""
+    with _runtime_status_write_lock:
+        _write_runtime_status_unlocked(
+            gateway_state=gateway_state,
+            exit_reason=exit_reason,
+            restart_requested=restart_requested,
+            active_agents=active_agents,
+            platform=platform,
+            platform_state=platform_state,
+            error_code=error_code,
+            error_message=error_message,
+            served_profiles=served_profiles,
+        )
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:

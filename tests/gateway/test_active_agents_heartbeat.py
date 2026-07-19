@@ -15,6 +15,7 @@ real GatewayRunner double writing to a temp HERMES_HOME gateway_state.json.
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -123,6 +124,57 @@ class TestHeartbeatPersistsLiveCount:
             run._heartbeat_active_agents()
 
         assert _read_active_agents(temp_hermes_home) == 2
+
+    def test_heartbeat_does_not_restore_stale_lifecycle_state(
+        self, temp_hermes_home, monkeypatch
+    ):
+        """A concurrent stop must win over a heartbeat that read ``running``.
+
+        The housekeeping thread and the gateway loop both update the same
+        read-modify-write status record.  If the heartbeat reads first and the
+        stop transition writes while it is paused, the heartbeat must not later
+        put its stale ``gateway_state=running`` snapshot back on disk.
+        """
+        import gateway.run as run
+        import gateway.status as status
+        from gateway.status import read_runtime_status, write_runtime_status
+
+        runner, _adapter = make_restart_runner()
+        write_runtime_status(gateway_state="running", active_agents=1)
+
+        heartbeat_read = threading.Event()
+        allow_heartbeat_write = threading.Event()
+        original_read = status._read_json_file
+
+        def pause_heartbeat_after_read(path):
+            record = original_read(path)
+            if threading.current_thread().name == "heartbeat":
+                heartbeat_read.set()
+                assert allow_heartbeat_write.wait(timeout=1)
+            return record
+
+        monkeypatch.setattr(status, "_read_json_file", pause_heartbeat_after_read)
+
+        with run._install_runner_ref(runner):
+            heartbeat = threading.Thread(target=run._heartbeat_active_agents, name="heartbeat")
+            lifecycle = threading.Thread(
+                target=lambda: write_runtime_status(gateway_state="stopped"),
+                name="lifecycle",
+            )
+            heartbeat.start()
+            assert heartbeat_read.wait(timeout=1)
+            lifecycle.start()
+            # An unlocked implementation lets the stop complete while the
+            # heartbeat is paused after its stale read.  A serialized writer
+            # keeps it blocked until the heartbeat finishes.
+            time.sleep(0.05)
+            allow_heartbeat_write.set()
+            heartbeat.join(timeout=1)
+            lifecycle.join(timeout=1)
+
+        assert not heartbeat.is_alive()
+        assert not lifecycle.is_alive()
+        assert read_runtime_status()["gateway_state"] == "stopped"
 
 
 class TestHeartbeatFailOpen:
