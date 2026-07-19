@@ -875,7 +875,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 async with self._http_session.post(
                     f"http://127.0.0.1:{self._bridge_port}/send",
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    # Group sends are deliberately serialized and paced by the
+                    # bridge to avoid WhatsApp rate-overlimit bans. Leave room
+                    # for an admitted request to wait behind that safe queue.
+                    timeout=aiohttp.ClientTimeout(
+                        total=120 if chat_id.endswith("@g.us") else 30
+                    )
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()

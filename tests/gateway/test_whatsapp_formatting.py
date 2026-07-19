@@ -204,6 +204,19 @@ class TestSendChunking:
         assert adapter._http_session.post.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_group_send_allows_queue_pacing(self):
+        adapter = _make_adapter()
+        resp = MagicMock(status=200)
+        resp.json = AsyncMock(return_value={"messageId": "msg1"})
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.send("group@g.us", "short message")
+
+        assert result.success
+        timeout = adapter._http_session.post.call_args.kwargs["timeout"]
+        assert timeout.total == 120
+
+    @pytest.mark.asyncio
     async def test_long_message_chunked(self):
         adapter = _make_adapter()
         resp = MagicMock(status=200)

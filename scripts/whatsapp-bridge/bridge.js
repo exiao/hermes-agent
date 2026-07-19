@@ -174,6 +174,7 @@ function isGroupJid(chatId) {
 //     (#33360) — the WhatsApp protocol-level routing can misdeliver when
 //     two sendMessage() Promises race on the same socket. ---
 let _sendQueue = Promise.resolve();
+let _nextGroupSendAt = 0;
 
 function enqueueSend(fn) {
   const task = _sendQueue.then(() => fn(), () => fn());
@@ -188,6 +189,10 @@ function sleep(ms) {
 function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
   const group = isGroupJid(chatId);
   return enqueueSend(async () => {
+    if (group) {
+      const delay = _nextGroupSendAt - Date.now();
+      if (delay > 0) await sleep(delay);
+    }
     // Warm the group-metadata cache BEFORE the send so Baileys' internal
     // `cachedGroupMetadata` hook gets a hit and skips its own network fetch.
     // resolveGroupMetadata does at most one query per TTL window per group and
@@ -207,11 +212,10 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
       return await Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise]);
     } finally {
       clearTimeout(timer);
-      // Pace group sends harder than DMs to stay under WhatsApp's burst
-      // threshold. Held inside the serialized queue so the delay actually
-      // spaces consecutive group sends rather than overlapping them.
+      // Keep the cooldown for the next group send, not the whole queue: a
+      // direct message behind this task must not inherit group-only pacing.
       if (group && GROUP_SEND_DELAY_MS > 0) {
-        await sleep(GROUP_SEND_DELAY_MS);
+        _nextGroupSendAt = Date.now() + GROUP_SEND_DELAY_MS;
       }
     }
   });
