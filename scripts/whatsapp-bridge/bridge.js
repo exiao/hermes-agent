@@ -186,13 +186,6 @@ function sleep(ms) {
 }
 
 function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
-      timeoutMs,
-    );
-  });
   const group = isGroupJid(chatId);
   return enqueueSend(async () => {
     // Warm the group-metadata cache BEFORE the send so Baileys' internal
@@ -203,6 +196,13 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
     if (group) {
       try { await resolveGroupMetadata(chatId); } catch { /* non-fatal */ }
     }
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
+        timeoutMs,
+      );
+    });
     try {
       return await Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise]);
     } finally {
@@ -463,6 +463,10 @@ async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
+  // Socket event subscriptions do not observe membership changes during a
+  // disconnect, so snapshots tied to the previous socket must not survive a
+  // reconnect.
+  _groupMetaCache.clear();
   sock = makeWASocket({
     version,
     auth: state,

@@ -33,6 +33,18 @@ function createSendQueue() {
   return { enqueueSend };
 }
 
+function createSendWithTimeout(enqueueSend, send, timeoutMs) {
+  return () => {
+    return enqueueSend(() => {
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+      });
+      return Promise.race([send(), timeout]).finally(() => clearTimeout(timer));
+    });
+  };
+}
+
 // -- serial ordering -------------------------------------------------
 {
   const { enqueueSend } = createSendQueue();
@@ -88,6 +100,18 @@ function createSendQueue() {
   });
   await assert.rejects(() => timedOut, /timeout/, 'inner timeout propagates');
   console.log('  ✓ timeout propagation');
+}
+
+// -- queued time does not consume the send timeout --------------------
+{
+  const { enqueueSend } = createSendQueue();
+  const releaseFirst = enqueueSend(() => new Promise(resolve => setTimeout(resolve, 30)));
+  const send = createSendWithTimeout(enqueueSend, async () => 'sent', 10);
+
+  const result = await send();
+  await releaseFirst;
+  assert.equal(result, 'sent', 'timeout starts only after the queued send begins');
+  console.log('  ✓ queue delay does not consume send timeout');
 }
 
 // -- concurrent enqueues maintain single-consumer semantics ----------
