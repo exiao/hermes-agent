@@ -106,7 +106,7 @@ class TestMaxTokensRetryHardening:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
+                  side_effect=lambda resp, _task, **_kw: resp),
         ):
             with pytest.raises(RuntimeError):
                 call_llm(
@@ -133,7 +133,7 @@ class TestMaxTokensRetryHardening:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
+                  side_effect=lambda resp, _task, **_kw: resp),
         ):
             with pytest.raises(RuntimeError):
                 await async_call_llm(
