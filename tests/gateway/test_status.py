@@ -1,6 +1,7 @@
 """Tests for gateway runtime status tracking."""
 
 import json
+import multiprocessing
 import os
 import sys
 import time
@@ -8,6 +9,32 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gateway import status
+
+
+def _paused_active_agents_write(home: str, read_complete, allow_write) -> None:
+    """Child-process half of the runtime-status lost-update regression."""
+    os.environ["HERMES_HOME"] = home
+    from gateway import status as child_status
+
+    original_read = child_status._read_json_file
+
+    def pause_after_read(path):
+        record = original_read(path)
+        read_complete.set()
+        assert allow_write.wait(timeout=5)
+        return record
+
+    child_status._read_json_file = pause_after_read
+    child_status.write_runtime_status(active_agents=0)
+
+
+def _write_s6_desired_state(home: str, complete) -> None:
+    """Child-process stand-in for ``hermes gateway stop`` under s6."""
+    os.environ["HERMES_HOME"] = home
+    from hermes_cli.service_manager import _write_gateway_desired_state
+
+    _write_gateway_desired_state("gateway-default", "stopped")
+    complete.set()
 
 
 class TestGatewayPidState:
@@ -1614,6 +1641,53 @@ class TestActiveAgentsTurnBoundaryWrite:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         status.write_runtime_status(gateway_state="running", active_agents=-5)
         assert status.read_runtime_status()["active_agents"] == 0
+
+    def test_s6_stop_preserves_desired_state_across_a_heartbeat_process(self, tmp_path, monkeypatch):
+        """A paused heartbeat must not overwrite an s6 stop intent.
+
+        ``hermes gateway stop`` runs in a separate CLI process from the gateway
+        heartbeat. The status update is a cross-process read-modify-write, so
+        serializing only gateway threads loses ``desired_state=stopped`` here.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        status.write_runtime_status(gateway_state="running", active_agents=1)
+
+        ctx = multiprocessing.get_context("spawn")
+        heartbeat_read = ctx.Event()
+        allow_heartbeat_write = ctx.Event()
+        stop_complete = ctx.Event()
+        heartbeat = ctx.Process(
+            target=_paused_active_agents_write,
+            args=(str(tmp_path), heartbeat_read, allow_heartbeat_write),
+        )
+        stop = ctx.Process(
+            target=_write_s6_desired_state,
+            args=(str(tmp_path), stop_complete),
+        )
+        heartbeat.start()
+        try:
+            assert heartbeat_read.wait(timeout=5)
+            stop.start()
+            # Before the fix the independent service-manager writer completes
+            # while the heartbeat holds its stale snapshot. After the fix it
+            # waits on the shared interprocess lock until we release below.
+            stop_complete.wait(timeout=0.5)
+            allow_heartbeat_write.set()
+            heartbeat.join(timeout=5)
+            stop.join(timeout=5)
+            assert heartbeat.exitcode == 0
+            assert stop.exitcode == 0
+        finally:
+            allow_heartbeat_write.set()
+            for process in (heartbeat, stop):
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        record = status.read_runtime_status() or {}
+        assert record["desired_state"] == "stopped"
+
+
 class TestGatewayBusyDerivation:
     """Pure contract for derive_gateway_busy / derive_gateway_drainable — the
     single shared definition both /api/status and /health/detailed consume."""

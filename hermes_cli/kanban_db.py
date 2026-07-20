@@ -9132,12 +9132,109 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         for field in (row["title"], row["body"])
     )
     if not anchored_to_pr:
+        # Only the task's OWN lane's comments count: the guard exists to stop
+        # THIS task's next worker from opening a duplicate of a PR a PRIOR
+        # worker of THIS task opened. A PR URL cross-posted by another lane
+        # (context from a sibling card, reviewer notes, an operator pasting a
+        # link) is not evidence this task opened anything — counting it
+        # strands grade-only/QA cards for the full PR window (live incident
+        # 2026-07-17, t_622d5a37).
+        assignee_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        task_assignee = assignee_row["assignee"] if assignee_row else None
+        # "Own lane" = the current assignee OR any profile that has actually
+        # run THIS task (task_runs.profile). Reassignment rewrites
+        # tasks.assignee but the prior worker's PR comment keeps its old
+        # author; forgetting it would let the new assignee open a duplicate
+        # PR. A sibling lane's cross-post still never matches — that profile
+        # has no run row on this task.
+        # Canonicalize with _canonical_assignee: rows may carry display-cased
+        # names ("Alice") while comment authors carry the normalized worker
+        # profile id ("alice") — a raw string compare would drop the task's
+        # own PR comment and release the guard.
+        own_lane: set[str] = set()
+        for candidate in [task_assignee] + [
+            r["profile"]
+            for r in conn.execute(
+                "SELECT DISTINCT profile FROM task_runs "
+                "WHERE task_id = ? AND profile IS NOT NULL",
+                (task_id,),
+            ).fetchall()
+        ]:
+            if not candidate or not str(candidate).strip():
+                continue
+            own_lane.add(_canonical_assignee(candidate))
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        latest_pr_comment_at: Optional[int] = None
         for c in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            "SELECT author, body, created_at FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ?",
             (task_id, pr_cutoff),
         ).fetchall():
-            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            if not (c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])):
+                continue
+            author = c["author"]
+            author_canon = (
+                _canonical_assignee(author)
+                if author and str(author).strip()
+                else None
+            )
+            # ``kanban_comment`` deliberately falls back to the literal
+            # ``worker`` author when HERMES_PROFILE is unavailable. That is
+            # the task's own dispatcher handoff (including legacy rows), not
+            # a cross-lane attribution; retain it even when the task has an
+            # assigned/profile-derived own lane. Other authors must belong to
+            # that lane, and an empty lane cannot claim arbitrary comments.
+            if author_canon != "worker" and (
+                not own_lane or author_canon not in own_lane
+            ):
+                continue
+            ts = int(c["created_at"] or 0)
+            if latest_pr_comment_at is None or ts > latest_pr_comment_at:
+                latest_pr_comment_at = ts
+        if latest_pr_comment_at is not None:
+            # Mirror the recent_success exception: an explicit re-queue AFTER
+            # the qualifying PR comment (operator drag, dependency promotion,
+            # unblock, reclaim) is a deliberate "run it again" — honor it.
+            # STRICTLY after: created_at is integer seconds, and an auto
+            # 'promoted' event can share the same one-second bucket as the
+            # worker's PR comment (promotion → spawn → PR in <1s). A tie
+            # cannot prove the requeue happened after the PR existed, so
+            # ties keep the guard (fail safe toward not duplicating a PR).
+            # OPERATOR-ORIGINATED kinds only ('status', 'unblocked',
+            # 'promoted_manual', and manual 'reclaimed') — unlike
+            # recent_success, active_pr anchors on a MID-RUN artifact, so
+            # automatic events genuinely can postdate it: a worker that
+            # crashes after opening its PR gets an automatic 'reclaimed'
+            # from release_stale_claims (and dependency engines emit
+            # 'promoted'), which would bypass the guard and open the very
+            # duplicate PR it exists to prevent. 'status' events carry one
+            # automatic case too: parent-reopen dependency maintenance
+            # demotes children with a status event whose payload reason is
+            # 'parent_reopened' — exclude it (same automatic-event class).
+            requeued_after = False
+            for event in conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id = ? AND created_at > ? "
+                "AND kind IN ('status', 'unblocked', 'promoted_manual', 'reclaimed')",
+                (task_id, latest_pr_comment_at),
+            ).fetchall():
+                if event["kind"] in {"unblocked", "promoted_manual"}:
+                    requeued_after = True
+                    break
+                try:
+                    payload = json.loads(event["payload"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if event["kind"] == "reclaimed":
+                    if payload.get("manual") is True:
+                        requeued_after = True
+                        break
+                elif payload.get("reason") != "parent_reopened":
+                    requeued_after = True
+                    break
+            if not requeued_after:
                 return "active_pr"
 
     return None

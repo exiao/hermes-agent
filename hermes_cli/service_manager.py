@@ -367,25 +367,14 @@ def _write_gateway_desired_state(name: str, desired_state: str) -> None:
     best-effort: a failed persistence attempt must not prevent immediate s6
     lifecycle control.
     """
-    import json
-    import time
-
     profile_dir = _profile_dir_for_gateway_service(name)
     state_file = profile_dir / "gateway_state.json"
     try:
         if not profile_dir.exists():
             return
-        try:
-            data = json.loads(state_file.read_text()) if state_file.exists() else {}
-            if not isinstance(data, dict):
-                data = {}
-        except (OSError, json.JSONDecodeError):
-            data = {}
-        data["desired_state"] = desired_state
-        data["updated_at"] = int(time.time())
-        tmp = state_file.with_suffix(state_file.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, separators=(",", ":")) + "\n")
-        tmp.replace(state_file)
+        from gateway.status import write_runtime_status_desired_state
+
+        write_runtime_status_desired_state(state_file, desired_state)
     except OSError:
         return
 

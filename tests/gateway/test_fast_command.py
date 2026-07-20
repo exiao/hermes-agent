@@ -161,6 +161,57 @@ async def test_handle_fast_command_session_scoped_by_default(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_handle_fast_command_gates_on_session_model_override(monkeypatch, tmp_path):
+    """/fast must validate the model that the session will actually run."""
+    runner = _make_runner()
+    event = _make_event("/fast fast")
+    session_key = runner._session_key_for_source(event.source)
+    runner._session_model_overrides = {
+        session_key: {
+            "model": "gpt-5.4",
+            "provider": "openrouter",
+            "api_key": "test-key",
+        }
+    }
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "unsupported-model")
+    import hermes_cli.models as models_mod
+
+    monkeypatch.setattr(models_mod, "model_supports_fast_mode", lambda model: model == "gpt-5.4")
+
+    response = await runner._handle_fast_command(event)
+
+    assert "FAST" in response
+    assert runner._service_tier == "priority"
+
+
+@pytest.mark.asyncio
+async def test_handle_fast_command_gates_on_channel_model_override(monkeypatch, tmp_path):
+    """/fast must validate a channel model that overrides the global default."""
+    runner = _make_runner()
+    event = _make_event("/fast fast")
+    runner.config = SimpleNamespace(streaming=None)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "unsupported-model")
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {})
+    monkeypatch.setattr(
+        gateway_run,
+        "_get_channel_override",
+        lambda *_args, **_kwargs: SimpleNamespace(model="gpt-5.4", provider=None),
+    )
+    import hermes_cli.models as models_mod
+
+    monkeypatch.setattr(models_mod, "model_supports_fast_mode", lambda model: model == "gpt-5.4")
+
+    response = await runner._handle_fast_command(event)
+
+    assert "FAST" in response
+    assert runner._service_tier == "priority"
+
+
+@pytest.mark.asyncio
 async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
 
