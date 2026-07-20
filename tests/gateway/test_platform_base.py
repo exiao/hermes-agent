@@ -615,6 +615,29 @@ class TestExtractMedia:
         media, _ = BasePlatformAdapter.extract_media(content)
         assert [p for p, _ in media] == [str(f)]
 
+    @pytest.mark.parametrize("name", ["artifact.py", "worker.log"])
+    @pytest.mark.parametrize("wrapper", [
+        "`MEDIA:{path}`",
+        "```text\nMEDIA:{path}\n```",
+        "> MEDIA:{path}",
+    ])
+    def test_real_validated_extension_media_in_wrapper_is_delivered(
+        self, tmp_path, monkeypatch, name, wrapper,
+    ):
+        """Validated code/log artifacts retain the wrapped MEDIA-tag behavior."""
+        root = tmp_path / "cache"
+        f = root / name
+        f.parent.mkdir(parents=True)
+        f.write_text("content", encoding="utf-8")
+        self._patch_safe_root(monkeypatch, root)
+
+        media, cleaned = BasePlatformAdapter.extract_media(
+            wrapper.format(path=f)
+        )
+
+        assert [path for path, _ in media] == [str(f)]
+        assert "MEDIA:" not in cleaned
+
     def test_multiple_real_media_in_one_fence_all_delivered(
         self, tmp_path, monkeypatch
     ):

@@ -3722,20 +3722,26 @@ class BasePlatformAdapter(ABC):
         if not lines:
             return False
         # Every remaining line must be a real, deliverable MEDIA tag. One prose
-        # line (or one example/denylisted tag) masks the whole span. The line
-        # must match the SAME extractor grammar (MEDIA_TAG_CLEANUP_RE, which is
-        # ext-restricted) that actually delivers tags — otherwise an existing
-        # but undeliverable file (e.g. MEDIA:/tmp/x.env) would wrongly count as
-        # "real" and get its wrapper deleted without anything being sent.
+        # line (or one example/denylisted tag) masks the whole span. Match the
+        # same two extractor paths: delivery extensions go through the direct
+        # pattern; every other extension must pass path validation. Otherwise a
+        # valid wrapped code/log artifact stays masked, while an undeliverable
+        # path (e.g. MEDIA:/tmp/x.env) could wrongly lose its wrapper.
         for line in lines:
             stripped = line.strip("`").strip()
             tm = MEDIA_TAG_CLEANUP_RE.fullmatch(stripped)
             if not tm:
-                return False
-            path = tm.group("path").strip()
-            if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
-                path = path[1:-1].strip()
-            path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+                tm = MEDIA_EXTENSIONLESS_TAG_RE.fullmatch(stripped)
+                if not tm:
+                    return False
+                path = _normalize_media_tag_path(tm.group("path"))
+                if (
+                    not _path_lacks_deliverable_extension(path)
+                    or Path(path).suffix.lower() not in MEDIA_TAG_EXTRA_EXTS
+                ):
+                    return False
+            else:
+                path = _normalize_media_tag_path(tm.group("path"))
             try:
                 if validate_media_delivery_path(os.path.expanduser(path)) is None:
                     return False
