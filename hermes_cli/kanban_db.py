@@ -9152,7 +9152,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             # happen after a worker crashes and must not permit a duplicate PR.
             requeued_after_pr = conn.execute(
                 "SELECT 1 FROM task_events "
-                "WHERE task_id = ? AND created_at >= ? "
+                "WHERE task_id = ? AND created_at > ? "
                 "AND (kind IN ('status', 'promoted', 'promoted_manual', 'unblocked') "
                 "OR (kind = 'reclaimed' "
                 "AND json_extract(payload, '$.manual') = 1)) "

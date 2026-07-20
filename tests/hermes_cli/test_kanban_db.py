@@ -2312,6 +2312,26 @@ def test_respawn_guard_active_pr_requeue_before_pr_still_guarded(kanban_home):
         assert kb.check_respawn_guard(conn, t) == "active_pr"
 
 
+def test_respawn_guard_same_second_requeue_before_pr_still_guarded(kanban_home):
+    """Second-resolution timestamps must fail closed on ambiguous ordering."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale-requeue", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/307', ?)",
+            (t, now),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
 def test_respawn_guard_active_pr_not_bypassed_by_stale_lock_reclaim(kanban_home):
     """Automatic stale-lock recovery must not look like an operator re-queue.
 
@@ -2324,6 +2344,10 @@ def test_respawn_guard_active_pr_not_bypassed_by_stale_lock_reclaim(kanban_home)
         kb.add_comment(
             conn, t, "worker",
             "PR: https://github.com/totemx-AI/subsidysmart/pull/304",
+        )
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - 1 WHERE task_id = ?",
+            (t,),
         )
         kb.claim_task(conn, t)
         conn.execute(
@@ -2343,6 +2367,10 @@ def test_respawn_guard_active_pr_bypassed_by_manual_reclaim(kanban_home):
             conn, t, "worker",
             "PR: https://github.com/totemx-AI/subsidysmart/pull/305",
         )
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - 1 WHERE task_id = ?",
+            (t,),
+        )
         kb.claim_task(conn, t)
 
         assert kb.reclaim_task(conn, t, reason="retry requested") is True
@@ -2356,6 +2384,10 @@ def test_respawn_guard_active_pr_bypassed_by_manual_promotion(kanban_home):
         kb.add_comment(
             conn, t, "worker",
             "PR: https://github.com/totemx-AI/subsidysmart/pull/306",
+        )
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - 1 WHERE task_id = ?",
+            (t,),
         )
         conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (t,))
 
