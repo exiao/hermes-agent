@@ -148,20 +148,50 @@ function invalidateGroupMetadata(jid) {
 // Fetch group metadata through the cache: return a fresh snapshot when hot,
 // otherwise query the socket once and memoize it. Passed to makeWASocket as
 // `cachedGroupMetadata` so Baileys' own send path reuses it too.
+//
+// The uncached fetch is bounded by GROUP_META_TIMEOUT_MS: sock.groupMetadata()
+// is a network round-trip that can stall precisely under the rate-limit /
+// degraded-connection conditions this cache exists to relieve. Because the
+// send path awaits this while holding the serialized send queue, an unbounded
+// stall here would wedge the queue and block ALL later sends, including DMs.
+// On timeout we return undefined (cache miss) so the caller proceeds — Baileys'
+// own send will resolve metadata if it truly needs it, and the next call
+// re-attempts the warm fetch.
+const GROUP_META_TIMEOUT_MS = parseInt(process.env.WHATSAPP_GROUP_META_TIMEOUT_MS || '10000', 10);
+
 async function resolveGroupMetadata(jid) {
   const cached = getCachedGroupMetadata(jid);
   if (cached) return cached;
   if (!sock) return undefined;
-  const metadata = await sock.groupMetadata(jid);
-  setCachedGroupMetadata(jid, metadata);
-  return metadata;
+  let timer;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), GROUP_META_TIMEOUT_MS);
+  });
+  try {
+    const metadata = await Promise.race([sock.groupMetadata(jid), timeoutPromise]);
+    if (metadata) setCachedGroupMetadata(jid, metadata);
+    return metadata;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Extra spacing applied AFTER a send whose target is a group JID. Group sends
 // are the WhatsApp-ban-sensitive path (see cache note above); pacing them more
 // conservatively than 1:1 DMs keeps burst rate under WhatsApp's threshold.
 // Default 1s; tune via WHATSAPP_GROUP_SEND_DELAY_MS. DMs are unaffected.
-const GROUP_SEND_DELAY_MS = parseInt(process.env.WHATSAPP_GROUP_SEND_DELAY_MS || '1000', 10);
+//
+// Clamped to GROUP_SEND_DELAY_MAX_MS (25s). The pacing delay is served while a
+// later send waits in the serialized queue, and the Python adapter's poll and
+// location callers abandon their HTTP request after 30s. Left unbounded, a
+// misconfigured delay >30s would make a group poll/location queued behind
+// another group send deterministically time out at the adapter. Cap below that
+// budget so pacing can never starve a legitimate send.
+const GROUP_SEND_DELAY_MAX_MS = 25000;
+const GROUP_SEND_DELAY_MS = Math.min(
+  Math.max(parseInt(process.env.WHATSAPP_GROUP_SEND_DELAY_MS || '1000', 10) || 0, 0),
+  GROUP_SEND_DELAY_MAX_MS,
+);
 
 function isGroupJid(chatId) {
   return typeof chatId === 'string' && chatId.endsWith('@g.us');
