@@ -3246,7 +3246,22 @@ class GatewaySlashCommandsMixin:
         )
 
         user_config = _load_gateway_config()
-        model = _resolve_gateway_model(user_config)
+        try:
+            model, _runtime_kwargs = self._resolve_session_agent_runtime(
+                source=event.source,
+                session_key=session_key,
+                user_config=user_config,
+            )
+        except RuntimeError:
+            # A slash command should retain its availability check when a test
+            # harness or incomplete setup has no resolvable provider. Real
+            # turns use the complete resolver above, including channel and
+            # runtime-provider model overrides.
+            self._rehydrate_session_model_override(session_key)
+            override = getattr(self, "_session_model_overrides", {}).get(session_key)
+            model = str((override or {}).get("model") or "")
+            if not model:
+                model = _resolve_gateway_model(user_config)
         if not model_supports_fast_mode(model):
             return t("gateway.fast.not_supported")
 
