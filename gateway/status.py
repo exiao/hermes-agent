@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
@@ -33,6 +34,7 @@ else:
 
 _GATEWAY_KIND = "hermes-gateway"
 _RUNTIME_STATUS_FILE = "gateway_state.json"
+_RUNTIME_STATUS_LOCK_FILE = "gateway_state.lock"
 _LOCKS_DIRNAME = "gateway-locks"
 _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
@@ -49,6 +51,7 @@ _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple[Any,
 # loop and its housekeeping thread share this lock so a heartbeat cannot write
 # a stale lifecycle snapshot over a concurrent stop/drain transition.
 _runtime_status_write_lock = threading.RLock()
+_runtime_status_lock_state = threading.local()
 
 
 def _get_process_hermes_home() -> Path:
@@ -84,6 +87,11 @@ def _get_gateway_lock_path(pid_path: Optional[Path] = None) -> Path:
 def _get_runtime_status_path() -> Path:
     """Return the persisted runtime health/status file path."""
     return _get_pid_path().with_name(_RUNTIME_STATUS_FILE)
+
+
+def _get_runtime_status_lock_path(path: Path) -> Path:
+    """Return the advisory lock shared by every writer of ``path``."""
+    return path.with_name(_RUNTIME_STATUS_LOCK_FILE)
 
 
 def _get_lock_dir() -> Path:
@@ -798,8 +806,51 @@ def write_pid_file() -> None:
         raise
 
 
+@contextmanager
+def _runtime_status_write_transaction(path: Path):
+    """Serialize a runtime-status read-modify-write across processes.
+
+    Gateway heartbeats and s6 lifecycle commands run in different processes but
+    update fields in the same JSON record.  The short advisory lock prevents an
+    old heartbeat snapshot from deleting the durable ``desired_state`` written
+    by ``hermes gateway stop``. Nested calls in one thread retain the lock.
+    """
+    depth = getattr(_runtime_status_lock_state, "depth", 0)
+    if depth:
+        _runtime_status_lock_state.depth = depth + 1
+        try:
+            yield
+        finally:
+            _runtime_status_lock_state.depth -= 1
+        return
+
+    with _runtime_status_write_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(_get_runtime_status_lock_path(path), "a+", encoding="utf-8")
+        try:
+            if _IS_WINDOWS:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write("\n")
+                    handle.flush()
+                handle.seek(_WINDOWS_LOCK_OFFSET)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _runtime_status_lock_state.depth = 1
+            try:
+                yield
+            finally:
+                _runtime_status_lock_state.depth = 0
+                _release_file_lock(handle)
+        finally:
+            handle.close()
+
+
 def _write_runtime_status_unlocked(
     *,
+    path: Optional[Path] = None,
+    refresh_pid_metadata: bool = True,
     gateway_state: Any = _UNSET,
     exit_reason: Any = _UNSET,
     restart_requested: Any = _UNSET,
@@ -809,16 +860,22 @@ def _write_runtime_status_unlocked(
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
     served_profiles: Any = _UNSET,
+    desired_state: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
-    path = _get_runtime_status_path()
-    payload = _read_json_file(path) or _build_runtime_status_record()
-    current_record = _build_pid_record()
+    path = path or _get_runtime_status_path()
+    payload = _read_json_file(path)
+    if not isinstance(payload, dict):
+        # A lifecycle command may establish durable desired-state before the
+        # gateway has ever run. Do not stamp that record with the CLI PID.
+        payload = _build_runtime_status_record() if refresh_pid_metadata else {}
     payload.setdefault("platforms", {})
-    payload["kind"] = current_record["kind"]
-    payload["pid"] = current_record["pid"]
-    payload["argv"] = current_record["argv"]
-    payload["start_time"] = current_record["start_time"]
+    if refresh_pid_metadata:
+        current_record = _build_pid_record()
+        payload["kind"] = current_record["kind"]
+        payload["pid"] = current_record["pid"]
+        payload["argv"] = current_record["argv"]
+        payload["start_time"] = current_record["start_time"]
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not _UNSET:
@@ -834,6 +891,8 @@ def _write_runtime_status_unlocked(
         # for a single-profile gateway. Lets `hermes status` show per-profile
         # coverage without a second probe.
         payload["served_profiles"] = list(served_profiles or [])
+    if desired_state is not _UNSET:
+        payload["desired_state"] = desired_state
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})
@@ -861,9 +920,11 @@ def write_runtime_status(
     error_message: Any = _UNSET,
     served_profiles: Any = _UNSET,
 ) -> None:
-    """Persist runtime status without interleaving in-process updates."""
-    with _runtime_status_write_lock:
+    """Persist runtime status without interleaving concurrent updates."""
+    path = _get_runtime_status_path()
+    with _runtime_status_write_transaction(path):
         _write_runtime_status_unlocked(
+            path=path,
             gateway_state=gateway_state,
             exit_reason=exit_reason,
             restart_requested=restart_requested,
@@ -873,6 +934,16 @@ def write_runtime_status(
             error_code=error_code,
             error_message=error_message,
             served_profiles=served_profiles,
+        )
+
+
+def write_runtime_status_desired_state(path: Path, desired_state: str) -> None:
+    """Persist s6 operator intent without changing gateway-owned metadata."""
+    with _runtime_status_write_transaction(path):
+        _write_runtime_status_unlocked(
+            path=path,
+            refresh_pid_metadata=False,
+            desired_state=desired_state,
         )
 
 
