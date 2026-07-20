@@ -39,6 +39,8 @@ import {
   buildTextSendPayload,
   createBoundedMessageStore,
   createExpiringCache,
+  createGenerationTracker,
+  createInFlightLookup,
   extractBridgeEvent,
   inferMediaType,
   mediaPayloadForFile,
@@ -131,6 +133,8 @@ const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000'
 // still picked up. TTL default 5min; tune via WHATSAPP_GROUP_META_TTL_MS.
 const GROUP_META_TTL_MS = parseInt(process.env.WHATSAPP_GROUP_META_TTL_MS || '300000', 10);
 const _groupMetaCache = createExpiringCache(); // jid -> metadata
+const _groupMetaGenerations = createGenerationTracker();
+const _groupMetaInFlight = createInFlightLookup();
 
 function getCachedGroupMetadata(jid) {
   return _groupMetaCache.get(jid);
@@ -142,7 +146,10 @@ function setCachedGroupMetadata(jid, metadata) {
 }
 
 function invalidateGroupMetadata(jid) {
-  if (jid) _groupMetaCache.delete(jid);
+  if (!jid) return;
+  _groupMetaGenerations.invalidate(jid);
+  _groupMetaCache.delete(jid);
+  _groupMetaInFlight.clear(jid);
 }
 
 // Fetch group metadata through the cache: return a fresh snapshot when hot,
@@ -163,14 +170,21 @@ async function resolveGroupMetadata(jid) {
   const cached = getCachedGroupMetadata(jid);
   if (cached) return cached;
   if (!sock) return undefined;
+  const socket = sock;
+  const token = _groupMetaGenerations.token(jid);
+  const metadataPromise = _groupMetaInFlight.getOrCreate(jid, async () => {
+    const metadata = await socket.groupMetadata(jid);
+    if (metadata && _groupMetaGenerations.isCurrent(jid, token)) {
+      setCachedGroupMetadata(jid, metadata);
+    }
+    return metadata;
+  });
   let timer;
   const timeoutPromise = new Promise((resolve) => {
     timer = setTimeout(() => resolve(undefined), GROUP_META_TIMEOUT_MS);
   });
   try {
-    const metadata = await Promise.race([sock.groupMetadata(jid), timeoutPromise]);
-    if (metadata) setCachedGroupMetadata(jid, metadata);
-    return metadata;
+    return await Promise.race([metadataPromise, timeoutPromise]);
   } finally {
     clearTimeout(timer);
   }
@@ -499,7 +513,9 @@ async function startSocket() {
   // Socket event subscriptions do not observe membership changes during a
   // disconnect, so snapshots tied to the previous socket must not survive a
   // reconnect.
+  _groupMetaGenerations.clear();
   _groupMetaCache.clear();
+  _groupMetaInFlight.clear();
   sock = makeWASocket({
     version,
     auth: state,
@@ -511,7 +527,7 @@ async function startSocket() {
     // Reuse a cached group participant snapshot instead of re-querying
     // sock.groupMetadata on every group send. Prevents groupMetadata bursts
     // from tripping WhatsApp's rate-overlimit (ban vector). See cache note above.
-    cachedGroupMetadata: async (jid) => getCachedGroupMetadata(jid),
+    cachedGroupMetadata: async (jid) => getCachedGroupMetadata(jid) || _groupMetaInFlight.get(jid),
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
     getMessage: async (key) => {

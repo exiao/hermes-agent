@@ -11,10 +11,51 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { createGenerationTracker, createInFlightLookup } from './bridge_helpers.js';
 
 // ------------------------------------------------------------------
 // 1.  Unit test for the queue primitives
 // ------------------------------------------------------------------
+
+// -- group metadata invalidation / coalescing -----------------------------
+{
+  const generations = createGenerationTracker();
+  const beforeInvalidation = generations.token('group@g.us');
+  generations.invalidate('group@g.us');
+  assert.equal(
+    generations.isCurrent('group@g.us', beforeInvalidation),
+    false,
+    'an in-flight snapshot cannot be stored after its group is invalidated',
+  );
+
+  const beforeReconnect = generations.token('group@g.us');
+  generations.clear();
+  assert.equal(
+    generations.isCurrent('group@g.us', beforeReconnect),
+    false,
+    'an old-socket snapshot cannot be stored after reconnect clears the cache',
+  );
+  console.log('  ✓ metadata generations reject invalidated snapshots');
+}
+
+{
+  const inFlight = createInFlightLookup();
+  let resolveMetadata;
+  let requests = 0;
+  const create = () => {
+    requests += 1;
+    return new Promise(resolve => { resolveMetadata = resolve; });
+  };
+  const first = inFlight.getOrCreate('group@g.us', create);
+  const second = inFlight.getOrCreate('group@g.us', create);
+  assert.strictEqual(first, second, 'concurrent callers share one metadata request');
+  assert.equal(requests, 1, 'only one metadata request is started');
+  resolveMetadata({ id: 'group@g.us' });
+  await first;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(inFlight.get('group@g.us'), undefined, 'settled metadata requests are released');
+  console.log('  ✓ metadata lookup coalesces in-flight requests');
+}
 
 /**
  * Replicate the queue logic from bridge.js so we can test it in
