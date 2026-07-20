@@ -2241,7 +2241,22 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+    """A GitHub PR URL in a recent comment BY THE TASK'S OWN LANE triggers
+    active_pr."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "alice",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_fallback_worker_comment(kanban_home):
+    """A dispatcher worker without ``HERMES_PROFILE`` records its task-owned
+    PR handoff as ``worker``; that legacy fallback must still guard an
+    assigned task from opening a duplicate PR."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
@@ -2250,6 +2265,192 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
+
+
+def test_respawn_guard_cross_author_pr_comment_not_guarded(kanban_home):
+    """A PR URL cross-posted by a DIFFERENT lane (context from a sibling card,
+    reviewer notes, an operator pasting a link) does not strand the task.
+
+    Regression: a grade-only memo-evaluator card was respawn_guarded for the
+    full 24h PR window because a dev lane cross-posted its (already-merged)
+    PR URL as context (live incident 2026-07-17, t_622d5a37)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="grade-only", assignee="memo-evaluator")
+        kb.add_comment(
+            conn, t, "dev",
+            "Context: fix merged in https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_released_by_requeue(kanban_home):
+    """An explicit re-queue event STRICTLY after the qualifying PR comment
+    bypasses active_pr, mirroring the recent_success exception."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        kb._append_event(conn, t, "unblocked", {})
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_same_second_requeue_still_guarded(kanban_home):
+    """A requeue event in the SAME one-second bucket as the PR comment cannot
+    prove after-ordering (auto-promotion → spawn → PR can land within 1s), so
+    the tie keeps the guard — fail safe toward not duplicating a PR."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        now_ts = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, now_ts),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', '{}', ?)",
+            (t, now_ts),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_automatic_events_do_not_bypass(kanban_home):
+    """Automatic 'reclaimed'/'promoted' events after the PR comment do NOT
+    bypass active_pr — only operator-originated kinds do.
+
+    A worker that crashes after opening its PR gets an automatic 'reclaimed'
+    from release_stale_claims; treating that as a deliberate requeue would
+    respawn the task and open the exact duplicate PR the guard prevents."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        for kind in ("reclaimed", "promoted"):
+            kb._append_event(conn, t, kind, {})
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_manual_reclaim_bypasses(kanban_home):
+    """Operator reclaim records ``reclaimed`` with ``manual: true`` and is a
+    deliberate recovery action, so it releases an existing PR guard."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        kb._append_event(conn, t, "reclaimed", {"manual": True})
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_released_by_manual_promote(kanban_home):
+    """`hermes kanban promote` emits 'promoted_manual' — an operator verb —
+    which bypasses active_pr like 'status'/'unblocked' do."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        kb._append_event(conn, t, "promoted_manual", {"actor": "eric"})
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_parent_reopen_status_does_not_bypass(kanban_home):
+    """The automatic child 'status' event emitted by parent-reopen dependency
+    maintenance (payload reason='parent_reopened') does NOT bypass active_pr —
+    same automatic-event class as 'reclaimed'/'promoted'. An operator status
+    event (no parent_reopened reason) still does."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        past = int(time.time()) - 120
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'alice', "
+            "'PR created: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, past),
+        )
+        kb._append_event(
+            conn, t, "status",
+            {"status": "todo", "reason": "parent_reopened", "parent": "t_p"},
+        )
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+        kb._append_event(conn, t, "status", {"status": "ready"})
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_survives_reassignment(kanban_home):
+    """A prior worker's PR comment still guards after the task is reassigned:
+    own-lane matching includes any profile in task_runs for this task, not
+    just the current assignee. (A sibling lane's cross-post still never
+    matches — that profile has no run row here.)"""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at) "
+            "VALUES (?, 'alice', 'crashed', ?)",
+            (t, int(time.time()) - 300),
+        )
+        kb.add_comment(
+            conn, t, "alice",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        conn.execute("UPDATE tasks SET assignee = 'bob' WHERE id = ?", (t,))
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_case_insensitive_author_match(kanban_home):
+    """Display-cased assignee ("Alice") vs normalized comment author ("alice")
+    must still match — both sides canonicalize via _canonical_assignee. A raw
+    compare would drop the task's own PR comment and release the guard."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        conn.execute("UPDATE tasks SET assignee = 'Alice' WHERE id = ?", (t,))
+        kb.add_comment(
+            conn, t, "alice",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_blank_author_ignored(kanban_home):
+    """A blank/whitespace comment author neither crashes normalization nor
+    counts as own-lane."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ' ', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, int(time.time())),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
@@ -2317,7 +2518,7 @@ def test_respawn_guard_impl_task_still_guarded_by_pr_comment(kanban_home):
             conn, title="Implement rate limiter", assignee="alice",
         )
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
@@ -2407,7 +2608,7 @@ def test_dispatch_respawn_guard_skips_active_pr(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
