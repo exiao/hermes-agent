@@ -180,6 +180,25 @@ async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+async def test_handle_fast_command_global_save_failure_keeps_session_override(monkeypatch, tmp_path):
+    """A failed --global write must still make the requested tier effective."""
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(runner, "_save_gateway_config_key", lambda key, value: False)
+
+    event = _make_event("/fast fast --global")
+    session_key = runner._session_key_for_source(event.source)
+    response = await runner._handle_fast_command(event)
+
+    assert "FAST" in response
+    assert runner._resolve_session_service_tier(session_key=session_key) == "priority"
+    assert not (tmp_path / "config.yaml").exists()
+
+
+@pytest.mark.asyncio
 async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path):
     """A session /fast normal wins over agent.service_tier: fast in config."""
     runner = _make_runner()
@@ -204,6 +223,38 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key=session_key) is None
     # A different session still gets the config default.
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
+
+
+@pytest.mark.asyncio
+async def test_btw_uses_the_calling_sessions_fast_override():
+    """/btw must resolve the same session-scoped tier as a regular turn."""
+    runner = _make_runner()
+    source = _make_source()
+    runner._resolve_session_service_tier = MagicMock(return_value="priority")
+    runner._load_service_tier = MagicMock(return_value=None)
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=("gpt-5.4", {"api_key": "***"})
+    )
+    runner._load_reasoning_config = MagicMock(return_value=None)
+    runner._resolve_turn_agent_config = MagicMock(
+        return_value={"model": "gpt-5.4", "runtime": {"api_key": "***"}}
+    )
+    runner._running_agents["session-key"] = SimpleNamespace(_session_messages=[])
+    runner._run_in_executor_with_context = AsyncMock(
+        return_value={"final_response": "ok"}
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    adapter.extract_media.return_value = ([], "ok")
+    adapter.extract_images.return_value = ([], "ok")
+    runner.adapters[Platform.TELEGRAM] = adapter
+
+    await runner._run_btw_task("what changed?", source, "session-key", "btw-test")
+
+    runner._resolve_session_service_tier.assert_called_once_with(
+        source=source, session_key="session-key"
+    )
+    runner._load_service_tier.assert_not_called()
 
 
 @pytest.mark.asyncio
