@@ -2349,6 +2349,20 @@ def test_respawn_guard_active_pr_bypassed_by_manual_reclaim(kanban_home):
         assert kb.check_respawn_guard(conn, t) is None
 
 
+def test_respawn_guard_active_pr_bypassed_by_manual_promotion(kanban_home):
+    """Manual promotion after a PR comment is an explicit re-run request."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="implementation", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR: https://github.com/totemx-AI/subsidysmart/pull/306",
+        )
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (t,))
+
+        assert kb.promote_task(conn, t, actor="operator") == (True, None)
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
