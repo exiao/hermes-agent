@@ -1746,6 +1746,12 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
         os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
+    for config_key, env_name in (
+        ("group_meta_ttl_ms", "WHATSAPP_GROUP_META_TTL_MS"),
+        ("group_send_delay_ms", "WHATSAPP_GROUP_SEND_DELAY_MS"),
+    ):
+        if config_key in whatsapp_cfg and not os.getenv(env_name):
+            os.environ[env_name] = str(whatsapp_cfg[config_key])
     return None
 
 

@@ -7,6 +7,7 @@ Covers:
 """
 
 import asyncio
+import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -62,6 +63,22 @@ def _make_adapter():
     adapter._group_policy = "open"
     adapter._group_allow_from = set()
     return adapter
+
+
+def test_yaml_config_bridges_group_pacing_settings_to_bridge_env(monkeypatch):
+    """Non-secret bridge behavior is configurable through config.yaml."""
+    from plugins.platforms.whatsapp.adapter import _apply_yaml_config
+
+    monkeypatch.delenv("WHATSAPP_GROUP_META_TTL_MS", raising=False)
+    monkeypatch.delenv("WHATSAPP_GROUP_SEND_DELAY_MS", raising=False)
+
+    _apply_yaml_config({}, {
+        "group_meta_ttl_ms": 12_000,
+        "group_send_delay_ms": 250,
+    })
+
+    assert os.environ["WHATSAPP_GROUP_META_TTL_MS"] == "12000"
+    assert os.environ["WHATSAPP_GROUP_SEND_DELAY_MS"] == "250"
 
 
 class _AsyncCM:

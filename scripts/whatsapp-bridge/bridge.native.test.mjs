@@ -16,6 +16,7 @@ import {
   buildPollPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  createExpiringCache,
   appendMediaFailureNote,
   reconnectPlan,
   extractBridgeEvent,
@@ -23,6 +24,18 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- expiring cache --------------------------------------------------------
+{
+  let now = 1000;
+  const cache = createExpiringCache({ now: () => now });
+  cache.set('group@g.us', { participants: [] }, 500);
+  assert.deepEqual(cache.get('group@g.us'), { participants: [] }, 'hot values are returned');
+  now += 500;
+  assert.equal(cache.get('group@g.us'), undefined, 'expired values are not returned');
+  assert.equal(cache.size(), 0, 'expired values are evicted instead of retained');
+  console.log('  ✓ expiring cache evicts stale values');
+}
 
 // -- reconnect policy ----------------------------------------------------
 {

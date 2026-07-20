@@ -101,6 +101,44 @@ export function createBoundedMessageStore(limit = 512) {
   return { remember, get };
 }
 
+/**
+ * Store values with per-entry expiry and remove stale entries on access.
+ *
+ * The bridge uses this for group metadata: returning `undefined` alone is not
+ * enough because a long-lived bridge would retain every group it has seen.
+ */
+export function createExpiringCache({ now = Date.now } = {}) {
+  const entries = new Map();
+
+  function get(key) {
+    const entry = entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= now()) {
+      entries.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  }
+
+  function set(key, value, ttlMs) {
+    entries.set(key, { value, expiresAt: now() + ttlMs });
+  }
+
+  function deleteEntry(key) {
+    entries.delete(key);
+  }
+
+  function clear() {
+    entries.clear();
+  }
+
+  function size() {
+    return entries.size;
+  }
+
+  return { get, set, delete: deleteEntry, clear, size };
+}
+
 export function pollCreationMessageSecret(pollCreation) {
   return pollCreation?.message?.messageContextInfo?.messageSecret
     || pollCreation?.messageContextInfo?.messageSecret

@@ -38,6 +38,7 @@ import {
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  createExpiringCache,
   extractBridgeEvent,
   inferMediaType,
   mediaPayloadForFile,
@@ -129,17 +130,15 @@ const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000'
 // invalidate on group-participants/update events so membership changes are
 // still picked up. TTL default 5min; tune via WHATSAPP_GROUP_META_TTL_MS.
 const GROUP_META_TTL_MS = parseInt(process.env.WHATSAPP_GROUP_META_TTL_MS || '300000', 10);
-const _groupMetaCache = new Map(); // jid -> { metadata, expiresAt }
+const _groupMetaCache = createExpiringCache(); // jid -> metadata
 
 function getCachedGroupMetadata(jid) {
-  const hit = _groupMetaCache.get(jid);
-  if (hit && hit.expiresAt > Date.now()) return hit.metadata;
-  return undefined;
+  return _groupMetaCache.get(jid);
 }
 
 function setCachedGroupMetadata(jid, metadata) {
   if (!jid || !metadata) return;
-  _groupMetaCache.set(jid, { metadata, expiresAt: Date.now() + GROUP_META_TTL_MS });
+  _groupMetaCache.set(jid, metadata, GROUP_META_TTL_MS);
 }
 
 function invalidateGroupMetadata(jid) {
