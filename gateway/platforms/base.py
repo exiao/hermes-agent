@@ -3722,20 +3722,25 @@ class BasePlatformAdapter(ABC):
         if not lines:
             return False
         # Every remaining line must be a real, deliverable MEDIA tag. One prose
-        # line (or one example/denylisted tag) masks the whole span. The line
-        # must match the SAME extractor grammar (MEDIA_TAG_CLEANUP_RE, which is
-        # ext-restricted) that actually delivers tags — otherwise an existing
-        # but undeliverable file (e.g. MEDIA:/tmp/x.env) would wrongly count as
-        # "real" and get its wrapper deleted without anything being sent.
+        # line (or one example/denylisted tag) masks the whole span. Use the
+        # broad tag grammar here for the explicit validated-extra set (.py,
+        # .log, etc.). Other unknown suffixes stay masked in protected spans:
+        # although bare tags may be validated later, unmasking arbitrary paths
+        # would turn documentation examples into attachments.
         for line in lines:
             stripped = line.strip("`").strip()
-            tm = MEDIA_TAG_CLEANUP_RE.fullmatch(stripped)
+            tm = MEDIA_EXTENSIONLESS_TAG_RE.fullmatch(stripped)
             if not tm:
                 return False
             path = tm.group("path").strip()
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
             path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+            if (
+                _path_lacks_deliverable_extension(path)
+                and Path(path).suffix.lower() not in MEDIA_TAG_EXTRA_EXTS
+            ):
+                return False
             try:
                 if validate_media_delivery_path(os.path.expanduser(path)) is None:
                     return False

@@ -995,6 +995,23 @@ class TestUniversalMediaEgress:
         assert "MEDIA:" not in cleaned
         assert "Done." in cleaned
 
+    @pytest.mark.parametrize("wrapper", ["`{tag}`", "> {tag}", "```\n{tag}\n```"])
+    def test_validated_unknown_extension_delivered_from_protected_span(
+        self, tmp_path, monkeypatch, wrapper,
+    ):
+        root = tmp_path / "output"
+        root.mkdir()
+        f = root / "script.py"
+        f.write_text("content", encoding="utf-8")
+        self._patch_allow_root(monkeypatch, root)
+
+        media, cleaned = BasePlatformAdapter.extract_media(
+            wrapper.format(tag=f"MEDIA:{f}")
+        )
+
+        assert media == [(str(f.resolve()), False)]
+        assert "MEDIA:" not in cleaned
+
     def test_unknown_extension_left_visible_when_not_on_disk(
         self, tmp_path, monkeypatch,
     ):
