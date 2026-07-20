@@ -342,8 +342,8 @@ def test_string_api_keys_are_not_retained_in_cache_key_repr():
     assert second_secret not in rendered
 
 
-def test_fifo_eviction_does_not_close_client_that_may_have_an_inflight_call():
-    """A bounded-cache eviction must not invalidate another caller's client."""
+def test_fifo_eviction_releases_dead_loop_client():
+    """A bounded-cache eviction releases clients with no live owning loop."""
     clients = []
 
     def fake_resolve(_provider, model, _async_mode, **_kwargs):
@@ -356,10 +356,10 @@ def test_fifo_eviction_does_not_close_client_that_may_have_an_inflight_call():
             aux._get_cached_client("custom", model=f"model-{index}")
 
     assert len(aux._client_cache) == 64
-    for client in clients:
+    clients[0].close.assert_called_once_with()
+    for client in clients[1:]:
         client.close.assert_not_called()
 
     aux.shutdown_cached_clients()
-    clients[0].close.assert_not_called()
     for client in clients[1:]:
         client.close.assert_called_once_with()

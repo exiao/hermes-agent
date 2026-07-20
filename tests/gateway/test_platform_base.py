@@ -680,11 +680,8 @@ class TestExtractMedia:
         media, _ = BasePlatformAdapter.extract_media(content)
         assert media == []
 
-    def test_unsupported_ext_wrapper_not_deleted(self, tmp_path, monkeypatch):
-        """A fenced tag whose path exists but has an undeliverable extension
-        (MEDIA:/tmp/x.env) is never extracted by MEDIA_TAG_CLEANUP_RE, so its
-        wrapper must NOT be deleted from cleaned text — otherwise an example
-        block vanishes with no attachment sent. Regression for codex P2."""
+    def test_validated_unknown_ext_wrapper_is_delivered(self, tmp_path, monkeypatch):
+        """A validated tag outside the delivery extension list still delivers."""
         root = tmp_path / "cache"
         root.mkdir(parents=True)
         bad = root / "config.env"
@@ -695,9 +692,21 @@ class TestExtractMedia:
 
         content = f"```\nMEDIA:{bad}\n```\nMEDIA:{good}"
         media, cleaned = BasePlatformAdapter.extract_media(content)
-        assert [p for p, _ in media] == [str(good)]
-        assert f"MEDIA:{bad}" in cleaned  # example fence preserved
-        assert "```" in cleaned
+        assert {path for path, _voice in media} == {str(bad), str(good)}
+        assert "MEDIA:" not in cleaned
+
+    def test_validated_code_tag_in_fence_is_delivered(self, tmp_path, monkeypatch):
+        """Validated code-file tags must not remain masked by their fence."""
+        root = tmp_path / "cache"
+        root.mkdir(parents=True)
+        script = root / "result.py"
+        script.write_text("print('ok')")
+        self._patch_safe_root(monkeypatch, root)
+
+        media, cleaned = BasePlatformAdapter.extract_media(f"```\nMEDIA:{script}\n```")
+
+        assert [path for path, _voice in media] == [str(script)]
+        assert "MEDIA:" not in cleaned
 
     def test_nested_inline_in_masked_fence_not_deleted(self, tmp_path, monkeypatch):
         """An inline `MEDIA:...` example INSIDE a masked fenced block must not

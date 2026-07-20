@@ -3733,7 +3733,10 @@ class BasePlatformAdapter(ABC):
         # "real" and get its wrapper deleted without anything being sent.
         for line in lines:
             stripped = line.strip("`").strip()
-            tm = MEDIA_TAG_CLEANUP_RE.fullmatch(stripped)
+            tm = (
+                MEDIA_TAG_CLEANUP_RE.fullmatch(stripped)
+                or MEDIA_EXTENSIONLESS_TAG_RE.fullmatch(stripped)
+            )
             if not tm:
                 return False
             path = tm.group("path").strip()

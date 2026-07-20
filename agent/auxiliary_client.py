@@ -6422,12 +6422,12 @@ def _get_cached_client(
             if cache_key not in _client_cache:
                 # Safety belt: if the cache has grown beyond the max, evict
                 # the oldest entries (FIFO — dict preserves insertion order).
-                # Do not close an evicted client: another caller may still be
-                # using it for an in-flight request. The process shutdown path
-                # closes clients that remain cached; an evicted client is left
-                # to its caller's lifetime.
+                # _release_cached_client_fds only closes transports when the
+                # entry's bound loop is dead, so it frees evicted clients
+                # without interrupting an in-flight async request.
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
-                    evict_key = next(iter(_client_cache))
+                    evict_key, evict_entry = next(iter(_client_cache.items()))
+                    _release_cached_client_fds(evict_entry[0], evict_entry[2])
                     del _client_cache[evict_key]
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:
