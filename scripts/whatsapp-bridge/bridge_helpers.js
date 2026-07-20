@@ -101,6 +101,118 @@ export function createBoundedMessageStore(limit = 512) {
   return { remember, get };
 }
 
+/**
+ * Store values with per-entry expiry and remove stale entries on access.
+ *
+ * The bridge uses this for group metadata: returning `undefined` alone is not
+ * enough because a long-lived bridge would retain every group it has seen.
+ */
+export function createExpiringCache({ now = Date.now } = {}) {
+  const entries = new Map();
+
+  function get(key) {
+    const entry = entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= now()) {
+      entries.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  }
+
+  function set(key, value, ttlMs) {
+    entries.set(key, { value, expiresAt: now() + ttlMs });
+  }
+
+  function deleteEntry(key) {
+    entries.delete(key);
+  }
+
+  function clear() {
+    entries.clear();
+  }
+
+  function size() {
+    return entries.size;
+  }
+
+  return { get, set, delete: deleteEntry, clear, size };
+}
+
+/** Track cache generations so an invalidated async result cannot repopulate it. */
+export function createGenerationTracker() {
+  let generation = 0;
+  const revisions = new Map();
+
+  function token(key) {
+    return { generation, revision: revisions.get(key) || 0 };
+  }
+
+  function isCurrent(key, candidate) {
+    return candidate?.generation === generation
+      && candidate.revision === (revisions.get(key) || 0);
+  }
+
+  function invalidate(key) {
+    revisions.set(key, (revisions.get(key) || 0) + 1);
+  }
+
+  function clear() {
+    generation += 1;
+    revisions.clear();
+  }
+
+  return { token, isCurrent, invalidate, clear };
+}
+
+/** Coalesce an async lookup until it settles without retaining its result. */
+export function createInFlightLookup() {
+  const entries = new Map();
+
+  function get(key) {
+    return entries.get(key);
+  }
+
+  function getOrCreate(key, create) {
+    const existing = entries.get(key);
+    if (existing) return existing;
+    let promise;
+    try {
+      promise = Promise.resolve(create());
+    } catch (error) {
+      promise = Promise.reject(error);
+    }
+    entries.set(key, promise);
+    promise.finally(() => {
+      if (entries.get(key) === promise) entries.delete(key);
+    }).catch(() => {});
+    return promise;
+  }
+
+  function clear(key) {
+    if (key) entries.delete(key);
+    else entries.clear();
+  }
+
+  return { get, getOrCreate, clear };
+}
+
+/**
+ * Resolve an asynchronous best-effort lookup within a bounded wait.  A timeout
+ * returns a cache miss and gives the caller one synchronous cleanup hook for
+ * invalidating state that belongs to the now-stale lookup.
+ */
+export function raceWithTimeout(promise, timeoutMs, onTimeout = () => {}) {
+  let timer;
+  const timeout = new Promise(resolve => {
+    timer = setTimeout(() => {
+      onTimeout();
+      resolve(undefined);
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 export function pollCreationMessageSecret(pollCreation) {
   return pollCreation?.message?.messageContextInfo?.messageSecret
     || pollCreation?.messageContextInfo?.messageSecret

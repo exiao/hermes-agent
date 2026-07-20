@@ -829,7 +829,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_process = None
         self._close_bridge_log()
         print(f"[{self.name}] Disconnected")
-    
+
+    @staticmethod
+    def _bridge_send_timeout(chat_id: str) -> int:
+        """Leave paced group requests enough time to reach the bridge."""
+        return 120 if chat_id.endswith("@g.us") else 30
+
     async def send(
         self,
         chat_id: str,
@@ -875,7 +880,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 async with self._http_session.post(
                     f"http://127.0.0.1:{self._bridge_port}/send",
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    # Group sends are deliberately serialized and paced by the
+                    # bridge to avoid WhatsApp rate-overlimit bans. Leave room
+                    # for an admitted request to wait behind that safe queue.
+                    timeout=aiohttp.ClientTimeout(total=self._bridge_send_timeout(chat_id))
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -922,7 +930,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "messageId": message_id,
                     "message": content,
                 },
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(
+                    total=self._bridge_send_timeout(to_whatsapp_jid(chat_id))
+                )
             ) as resp:
                 if resp.status == 200:
                     return SendResult(success=True, message_id=message_id)
@@ -1012,7 +1022,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/send-poll",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=self._bridge_send_timeout(payload["chatId"])),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -1099,7 +1109,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/send-location",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=self._bridge_send_timeout(payload["chatId"])),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -1741,6 +1751,13 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
         os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
+    for config_key, env_name in (
+        ("group_meta_ttl_ms", "WHATSAPP_GROUP_META_TTL_MS"),
+        ("group_meta_timeout_ms", "WHATSAPP_GROUP_META_TIMEOUT_MS"),
+        ("group_send_delay_ms", "WHATSAPP_GROUP_SEND_DELAY_MS"),
+    ):
+        if config_key in whatsapp_cfg and not os.getenv(env_name):
+            os.environ[env_name] = str(whatsapp_cfg[config_key])
     return None
 
 

@@ -38,11 +38,15 @@ import {
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  createExpiringCache,
+  createGenerationTracker,
+  createInFlightLookup,
   extractBridgeEvent,
   inferMediaType,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  raceWithTimeout,
   reconnectPlan,
 } from './bridge_helpers.js';
 
@@ -117,12 +121,100 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
 
+// --- Group metadata cache -------------------------------------------------
+// Baileys resolves a group's participant list (sock.groupMetadata) on EVERY
+// send to a @g.us JID unless a cache is supplied. Each of those is a network
+// round-trip to WhatsApp; a burst of group sends (broadcast fan-out, or the
+// bot replying across several groups) fires many groupMetadata queries in a
+// short window and trips WhatsApp's `rate-overlimit`, which is a fast path to
+// getting an unofficial linked-device session flagged/banned. Supplying a
+// `cachedGroupMetadata` function to makeWASocket lets Baileys reuse a recent
+// snapshot instead of re-querying per send. We cache per JID with a TTL and
+// invalidate on group-participants/update events so membership changes are
+// still picked up. TTL default 5min; tune via WHATSAPP_GROUP_META_TTL_MS.
+const GROUP_META_TTL_MS = parseInt(process.env.WHATSAPP_GROUP_META_TTL_MS || '300000', 10);
+const _groupMetaCache = createExpiringCache(); // jid -> metadata
+const _groupMetaGenerations = createGenerationTracker();
+const _groupMetaInFlight = createInFlightLookup();
+
+function getCachedGroupMetadata(jid) {
+  return _groupMetaCache.get(jid);
+}
+
+function setCachedGroupMetadata(jid, metadata) {
+  if (!jid || !metadata) return;
+  _groupMetaCache.set(jid, metadata, GROUP_META_TTL_MS);
+}
+
+function invalidateGroupMetadata(jid) {
+  if (!jid) return;
+  _groupMetaGenerations.invalidate(jid);
+  _groupMetaCache.delete(jid);
+  _groupMetaInFlight.clear(jid);
+}
+
+// Fetch group metadata through the cache: return a fresh snapshot when hot,
+// otherwise query the socket once and memoize it. Passed to makeWASocket as
+// `cachedGroupMetadata` so Baileys' own send path reuses it too.
+//
+// The uncached fetch is bounded by GROUP_META_TIMEOUT_MS: sock.groupMetadata()
+// is a network round-trip that can stall precisely under the rate-limit /
+// degraded-connection conditions this cache exists to relieve. Because the
+// send path awaits this while holding the serialized send queue, an unbounded
+// stall here would wedge the queue and block ALL later sends, including DMs.
+// On timeout we return undefined (cache miss), invalidate the stale lookup, and
+// let the next call start a fresh warm fetch.  The old request cannot be
+// cancelled, so its generation must also be retired before it can settle.
+const GROUP_META_TIMEOUT_MS = parseInt(process.env.WHATSAPP_GROUP_META_TIMEOUT_MS || '10000', 10);
+
+async function resolveGroupMetadata(jid) {
+  const cached = getCachedGroupMetadata(jid);
+  if (cached) return cached;
+  if (!sock) return undefined;
+  const socket = sock;
+  const token = _groupMetaGenerations.token(jid);
+  const metadataPromise = _groupMetaInFlight.getOrCreate(jid, async () => {
+    const metadata = await socket.groupMetadata(jid);
+    if (metadata && _groupMetaGenerations.isCurrent(jid, token)) {
+      setCachedGroupMetadata(jid, metadata);
+    }
+    return metadata;
+  });
+  return raceWithTimeout(metadataPromise, GROUP_META_TIMEOUT_MS, () => {
+    _groupMetaGenerations.invalidate(jid);
+    _groupMetaCache.delete(jid);
+    _groupMetaInFlight.clear(jid);
+  });
+}
+
+// Extra spacing applied AFTER a send whose target is a group JID. Group sends
+// are the WhatsApp-ban-sensitive path (see cache note above); pacing them more
+// conservatively than 1:1 DMs keeps burst rate under WhatsApp's threshold.
+// Default 1s; tune via WHATSAPP_GROUP_SEND_DELAY_MS. DMs are unaffected.
+//
+// Clamped to GROUP_SEND_DELAY_MAX_MS (25s). The pacing delay is served while a
+// later send waits in the serialized queue, and the Python adapter's poll and
+// location callers abandon their HTTP request after 30s. Left unbounded, a
+// misconfigured delay >30s would make a group poll/location queued behind
+// another group send deterministically time out at the adapter. Cap below that
+// budget so pacing can never starve a legitimate send.
+const GROUP_SEND_DELAY_MAX_MS = 25000;
+const GROUP_SEND_DELAY_MS = Math.min(
+  Math.max(parseInt(process.env.WHATSAPP_GROUP_SEND_DELAY_MS || '1000', 10) || 0, 0),
+  GROUP_SEND_DELAY_MAX_MS,
+);
+
+function isGroupJid(chatId) {
+  return typeof chatId === 'string' && chatId.endsWith('@g.us');
+}
+
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
 //     Overlapping sends are the root cause of cross-chat contamination
 //     (#33360) — the WhatsApp protocol-level routing can misdeliver when
 //     two sendMessage() Promises race on the same socket. ---
 let _sendQueue = Promise.resolve();
+let _nextGroupSendAt = 0;
 
 function enqueueSend(fn) {
   const task = _sendQueue.then(() => fn(), () => fn());
@@ -135,17 +227,38 @@ function sleep(ms) {
 }
 
 function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
-      timeoutMs,
-    );
+  const group = isGroupJid(chatId);
+  return enqueueSend(async () => {
+    if (group) {
+      const delay = _nextGroupSendAt - Date.now();
+      if (delay > 0) await sleep(delay);
+    }
+    // Warm the group-metadata cache BEFORE the send so Baileys' internal
+    // `cachedGroupMetadata` hook gets a hit and skips its own network fetch.
+    // resolveGroupMetadata does at most one query per TTL window per group and
+    // is best-effort: a failure here must not block the actual send (the send
+    // path will surface the real error).
+    if (group) {
+      try { await resolveGroupMetadata(chatId); } catch { /* non-fatal */ }
+    }
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
+        timeoutMs,
+      );
+    });
+    try {
+      return await Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise]);
+    } finally {
+      clearTimeout(timer);
+      // Keep the cooldown for the next group send, not the whole queue: a
+      // direct message behind this task must not inherit group-only pacing.
+      if (group && GROUP_SEND_DELAY_MS > 0) {
+        _nextGroupSendAt = Date.now() + GROUP_SEND_DELAY_MS;
+      }
+    }
   });
-  return enqueueSend(() =>
-    Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
-      .finally(() => clearTimeout(timer))
-  );
 }
 
 function formatOutgoingMessage(message) {
@@ -394,6 +507,12 @@ async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
+  // Socket event subscriptions do not observe membership changes during a
+  // disconnect, so snapshots tied to the previous socket must not survive a
+  // reconnect.
+  _groupMetaGenerations.clear();
+  _groupMetaCache.clear();
+  _groupMetaInFlight.clear();
   sock = makeWASocket({
     version,
     auth: state,
@@ -402,6 +521,10 @@ async function startSocket() {
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
+    // Reuse a cached group participant snapshot instead of re-querying
+    // sock.groupMetadata on every group send. Prevents groupMetadata bursts
+    // from tripping WhatsApp's rate-overlimit (ban vector). See cache note above.
+    cachedGroupMetadata: async (jid) => getCachedGroupMetadata(jid) || _groupMetaInFlight.get(jid),
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
     getMessage: async (key) => {
@@ -412,6 +535,20 @@ async function startSocket() {
   });
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+
+  // Keep the group-metadata cache correct across membership changes. A stale
+  // participant snapshot could misroute a group send, so drop the cached entry
+  // whenever WhatsApp reports the group changed; the next send re-warms it with
+  // a single fresh query. `groups.update` carries partial group objects with an
+  // `id`; `group-participants.update` carries the affected group `id`.
+  sock.ev.on('groups.update', (updates) => {
+    for (const g of updates || []) {
+      if (g && g.id) invalidateGroupMetadata(g.id);
+    }
+  });
+  sock.ev.on('group-participants.update', (update) => {
+    if (update && update.id) invalidateGroupMetadata(update.id);
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -1068,12 +1205,16 @@ app.get('/chat/:id', async (req, res) => {
 
   if (isGroup && sock) {
     try {
-      const metadata = await sock.groupMetadata(chatId);
-      return res.json({
-        name: metadata.subject,
-        isGroup: true,
-        participants: metadata.participants.map(p => p.id),
-      });
+      // Route through the cache so /chat lookups don't add to groupMetadata
+      // network pressure (shares the same TTL'd snapshot as the send path).
+      const metadata = await resolveGroupMetadata(chatId);
+      if (metadata) {
+        return res.json({
+          name: metadata.subject,
+          isGroup: true,
+          participants: metadata.participants.map(p => p.id),
+        });
+      }
     } catch {
       // Fall through to default
     }

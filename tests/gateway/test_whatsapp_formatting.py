@@ -7,6 +7,7 @@ Covers:
 """
 
 import asyncio
+import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -62,6 +63,25 @@ def _make_adapter():
     adapter._group_policy = "open"
     adapter._group_allow_from = set()
     return adapter
+
+
+def test_yaml_config_bridges_group_pacing_settings_to_bridge_env(monkeypatch):
+    """Non-secret bridge behavior is configurable through config.yaml."""
+    from plugins.platforms.whatsapp.adapter import _apply_yaml_config
+
+    monkeypatch.delenv("WHATSAPP_GROUP_META_TTL_MS", raising=False)
+    monkeypatch.delenv("WHATSAPP_GROUP_META_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("WHATSAPP_GROUP_SEND_DELAY_MS", raising=False)
+
+    _apply_yaml_config({}, {
+        "group_meta_ttl_ms": 12_000,
+        "group_meta_timeout_ms": 7_500,
+        "group_send_delay_ms": 250,
+    })
+
+    assert os.environ["WHATSAPP_GROUP_META_TTL_MS"] == "12000"
+    assert os.environ["WHATSAPP_GROUP_META_TIMEOUT_MS"] == "7500"
+    assert os.environ["WHATSAPP_GROUP_SEND_DELAY_MS"] == "250"
 
 
 class _AsyncCM:
@@ -202,6 +222,57 @@ class TestSendChunking:
         assert result.success
         # Only one call to bridge /send
         assert adapter._http_session.post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_group_send_allows_queue_pacing(self):
+        adapter = _make_adapter()
+        resp = MagicMock(status=200)
+        resp.json = AsyncMock(return_value={"messageId": "msg1"})
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.send("group@g.us", "short message")
+
+        assert result.success
+        timeout = adapter._http_session.post.call_args.kwargs["timeout"]
+        assert timeout.total == 120
+
+    @pytest.mark.asyncio
+    async def test_group_poll_allows_queue_pacing(self):
+        adapter = _make_adapter()
+        resp = MagicMock(status=200)
+        resp.json = AsyncMock(return_value={"messageId": "poll1"})
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.send_poll("group@g.us", "Proceed?", ["Yes", "No"])
+
+        assert result.success
+        timeout = adapter._http_session.post.call_args.kwargs["timeout"]
+        assert timeout.total == 120
+
+    @pytest.mark.asyncio
+    async def test_group_location_allows_queue_pacing(self):
+        adapter = _make_adapter()
+        resp = MagicMock(status=200)
+        resp.json = AsyncMock(return_value={"messageId": "location1"})
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.send_location("group@g.us", 1.0, 2.0)
+
+        assert result.success
+        timeout = adapter._http_session.post.call_args.kwargs["timeout"]
+        assert timeout.total == 120
+
+    @pytest.mark.asyncio
+    async def test_group_edit_allows_queue_pacing(self):
+        adapter = _make_adapter()
+        resp = MagicMock(status=200)
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.edit_message("group@g.us", "message1", "updated")
+
+        assert result.success
+        timeout = adapter._http_session.post.call_args.kwargs["timeout"]
+        assert timeout.total == 120
 
     @pytest.mark.asyncio
     async def test_long_message_chunked(self):

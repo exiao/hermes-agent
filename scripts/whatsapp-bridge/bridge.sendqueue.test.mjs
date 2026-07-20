@@ -11,10 +11,84 @@
  */
 
 import { strict as assert } from 'node:assert';
+import {
+  createGenerationTracker,
+  createInFlightLookup,
+  raceWithTimeout,
+} from './bridge_helpers.js';
 
 // ------------------------------------------------------------------
 // 1.  Unit test for the queue primitives
 // ------------------------------------------------------------------
+
+// -- group metadata invalidation / coalescing -----------------------------
+{
+  const generations = createGenerationTracker();
+  const beforeInvalidation = generations.token('group@g.us');
+  generations.invalidate('group@g.us');
+  assert.equal(
+    generations.isCurrent('group@g.us', beforeInvalidation),
+    false,
+    'an in-flight snapshot cannot be stored after its group is invalidated',
+  );
+
+  const beforeReconnect = generations.token('group@g.us');
+  generations.clear();
+  assert.equal(
+    generations.isCurrent('group@g.us', beforeReconnect),
+    false,
+    'an old-socket snapshot cannot be stored after reconnect clears the cache',
+  );
+  console.log('  ✓ metadata generations reject invalidated snapshots');
+}
+
+{
+  const inFlight = createInFlightLookup();
+  let resolveMetadata;
+  let requests = 0;
+  const create = () => {
+    requests += 1;
+    return new Promise(resolve => { resolveMetadata = resolve; });
+  };
+  const first = inFlight.getOrCreate('group@g.us', create);
+  const second = inFlight.getOrCreate('group@g.us', create);
+  assert.strictEqual(first, second, 'concurrent callers share one metadata request');
+  assert.equal(requests, 1, 'only one metadata request is started');
+  resolveMetadata({ id: 'group@g.us' });
+  await first;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(inFlight.get('group@g.us'), undefined, 'settled metadata requests are released');
+  console.log('  ✓ metadata lookup coalesces in-flight requests');
+}
+
+{
+  const generations = createGenerationTracker();
+  const inFlight = createInFlightLookup();
+  let releaseStalledLookup;
+  const staleToken = generations.token('group@g.us');
+  const stalledLookup = inFlight.getOrCreate(
+    'group@g.us',
+    () => new Promise(resolve => { releaseStalledLookup = resolve; }),
+  );
+
+  const result = await raceWithTimeout(stalledLookup, 5, () => {
+    generations.invalidate('group@g.us');
+    inFlight.clear('group@g.us');
+  });
+  assert.equal(result, undefined, 'timed-out metadata returns a cache miss');
+  assert.equal(inFlight.get('group@g.us'), undefined, 'timed-out lookup is released for retry');
+  assert.equal(
+    generations.isCurrent('group@g.us', staleToken),
+    false,
+    'a late timed-out lookup can no longer populate the cache',
+  );
+
+  const replacement = inFlight.getOrCreate('group@g.us', async () => ({ id: 'fresh@g.us' }));
+  assert.notStrictEqual(replacement, stalledLookup, 'the next warm fetch starts a replacement lookup');
+  releaseStalledLookup({ id: 'stale@g.us' });
+  await Promise.all([stalledLookup, replacement]);
+  console.log('  ✓ timed-out metadata lookup is invalidated and retried');
+}
 
 /**
  * Replicate the queue logic from bridge.js so we can test it in
@@ -31,6 +105,18 @@ function createSendQueue() {
   }
 
   return { enqueueSend };
+}
+
+function createSendWithTimeout(enqueueSend, send, timeoutMs) {
+  return () => {
+    return enqueueSend(() => {
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+      });
+      return Promise.race([send(), timeout]).finally(() => clearTimeout(timer));
+    });
+  };
 }
 
 // -- serial ordering -------------------------------------------------
@@ -88,6 +174,18 @@ function createSendQueue() {
   });
   await assert.rejects(() => timedOut, /timeout/, 'inner timeout propagates');
   console.log('  ✓ timeout propagation');
+}
+
+// -- queued time does not consume the send timeout --------------------
+{
+  const { enqueueSend } = createSendQueue();
+  const releaseFirst = enqueueSend(() => new Promise(resolve => setTimeout(resolve, 30)));
+  const send = createSendWithTimeout(enqueueSend, async () => 'sent', 10);
+
+  const result = await send();
+  await releaseFirst;
+  assert.equal(result, 'sent', 'timeout starts only after the queued send begins');
+  console.log('  ✓ queue delay does not consume send timeout');
 }
 
 // -- concurrent enqueues maintain single-consumer semantics ----------
