@@ -15522,13 +15522,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return t("gateway.reasoning.set_session", effort=effort)
 
     async def _handle_fast_command(self, event: MessageEvent) -> str:
-        """Handle /fast — mirror the CLI Priority Processing toggle in gateway chats."""
+        """Handle /fast — mirror the CLI Priority Processing toggle in gateway chats.
+
+        Session-scoped by default (like /reasoning): a bare ``/fast fast`` or
+        ``/fast normal`` records a per-session override and leaves config.yaml
+        untouched. ``--global`` (any position) persists the change to
+        config.yaml and clears the session override so the global default wins.
+        """
         import yaml
         from hermes_cli.models import model_supports_fast_mode
 
-        args = event.get_command_args().strip().lower()
+        raw_args = event.get_command_args().strip().replace("—", "--")
+        # Split off --global (any position); the remainder is the mode token.
+        try:
+            import shlex
+
+            tokens = shlex.split(raw_args)
+        except ValueError:
+            tokens = raw_args.split()
+        persist_global = False
+        value_tokens = []
+        for token in tokens:
+            if token == "--global":
+                persist_global = True
+            else:
+                value_tokens.append(token)
+        args = " ".join(value_tokens).strip().lower()
+
         config_path = _hermes_home / "config.yaml"
-        self._service_tier = self._load_service_tier()
+        session_key = self._session_key_for_source(event.source)
+        self._service_tier = self._resolve_session_service_tier(session_key=session_key)
 
         user_config = _load_gateway_config()
         model = _resolve_gateway_model(user_config)
@@ -15560,18 +15583,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return t("gateway.fast.status", mode=status)
 
         if args in {"fast", "on"}:
-            self._service_tier = "priority"
+            service_tier = "priority"
             saved_value = "fast"
             label = t("gateway.fast.label_fast")
         elif args in {"normal", "off"}:
-            self._service_tier = None
+            service_tier = None
             saved_value = "normal"
             label = t("gateway.fast.label_normal")
         else:
             return t("gateway.fast.unknown_arg", arg=args)
 
-        if _save_config_key("agent.service_tier", saved_value):
-            return t("gateway.fast.saved", label=label)
+        self._service_tier = service_tier
+
+        if persist_global:
+            # Global write supersedes any session override for this session.
+            self._set_session_service_tier_override(session_key, None, clear=True)
+            if _save_config_key("agent.service_tier", saved_value):
+                return t("gateway.fast.saved", label=label)
+            return t("gateway.fast.session_only", label=label)
+
+        # Session-scoped default: record the override, leave config.yaml alone.
+        self._set_session_service_tier_override(session_key, service_tier)
         return t("gateway.fast.session_only", label=label)
 
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
