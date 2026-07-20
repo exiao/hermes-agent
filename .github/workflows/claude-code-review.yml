@@ -81,8 +81,13 @@ jobs:
         uses: anthropics/claude-code-action@700e7f8316990de46bed556429765647af760efc # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          use_sticky_comment: true
-          track_progress: true
+          # Do NOT set track_progress / use_sticky_comment on a pull_request event:
+          # they force the action into "tag" mode, which discards --allowed-tools and
+          # keeps only a fixed whitelist + mcp__github_* tools, stripping
+          # Bash(gh pr review *) / Bash(gh pr comment *). The model then reviews but
+          # has no permitted way to post, so runs go green on a placeholder and real
+          # findings are lost. With a prompt present and no track_progress the detector
+          # picks "agent" mode, which honors --allowed-tools and submits a formal review.
           allowed_bots: 'claude,claude[bot]'
           additional_permissions: |
             actions: read
