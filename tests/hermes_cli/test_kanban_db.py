@@ -2252,6 +2252,66 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_bypassed_by_requeue(kanban_home):
+    """An explicit re-queue AFTER a PR-URL comment (operator unblock/status
+    drag, dependency re-promotion, reclaim) is a deliberate "run it again"
+    and must bypass the active_pr guard.
+
+    Regression: a diagnostic / rerun task that legitimately opened a PR posts
+    that PR's URL in its own comments. The active_pr guard would then strand
+    it in ready for the full 24h PR window even after the operator explicitly
+    unblocks it — the card silently re-emits respawn_guarded every tick and
+    never spawns. Mirrors the recent_success requeue bypass.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rerun-after-pr", assignee="alice")
+        now = int(time.time())
+        # Prior worker opened a PR and recorded it in a comment.
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'Implementation shipped to PR "
+            "https://github.com/totemx-AI/subsidysmart/pull/302', ?)",
+            (t, now - 120),
+        )
+        # Baseline: the PR comment defers the respawn.
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+        # Operator explicitly unblocks AFTER the PR comment: a deliberate
+        # re-run request that must override the duplicate-PR guard.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now - 10),
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_active_pr_requeue_before_pr_still_guarded(kanban_home):
+    """A re-queue event that PRE-dates the PR comment does NOT bypass the
+    guard — only a re-queue that arrives after the PR was opened counts as a
+    deliberate re-run. Guards against a stale earlier unblock spuriously
+    freeing a task the moment a worker opens a fresh PR.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale-requeue", assignee="alice")
+        now = int(time.time())
+        # An unblock happened earlier...
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now - 300),
+        )
+        # ...then the worker opened a PR AFTER that unblock.
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/303', ?)",
+            (t, now - 60),
+        )
+        # The stale earlier unblock must not free the task.
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:

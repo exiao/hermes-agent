@@ -9133,11 +9133,33 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     )
     if not anchored_to_pr:
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        latest_pr_comment_at = 0
         for c in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            "SELECT body, created_at FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ?",
             (task_id, pr_cutoff),
         ).fetchall():
             if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                latest_pr_comment_at = max(
+                    latest_pr_comment_at, int(c["created_at"] or 0)
+                )
+        if latest_pr_comment_at:
+            # A prior worker opened a PR — but an explicit re-queue AFTER that
+            # PR comment (operator dragging a card back to ready, a dependency
+            # re-promotion, an unblock, a reclaim) is a deliberate "run it
+            # again" and must override the duplicate-PR guard. Without this a
+            # diagnostic / rerun task that legitimately opened a PR gets
+            # stranded in ready for the full 24h PR window even after the
+            # operator explicitly unblocks it. Mirrors the recent_success
+            # bypass above.
+            requeued_after_pr = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND created_at >= ? "
+                "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+                "LIMIT 1",
+                (task_id, latest_pr_comment_at),
+            ).fetchone()
+            if not requeued_after_pr:
                 return "active_pr"
 
     return None
