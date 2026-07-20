@@ -120,8 +120,14 @@ class TestExtractMediaExpandedExtensions:
         "mp4", "mov", "avi", "mkv", "webm",
         "ogg", "opus", "mp3", "wav", "m4a",
     ])
-    def test_extract_media_matches_extension(self, ext):
-        content = f"Here is the file\nMEDIA:/tmp/test_file.{ext}"
+    def test_extract_media_matches_extension(self, ext, tmp_path):
+        # MEDIA tags outside MEDIA_DELIVERY_EXTS (for example .py/.log) are
+        # accepted only after path validation, so use a real safe file for
+        # every declared extension rather than asserting that nonexistent
+        # arbitrary paths are deliverable.
+        file_path = tmp_path / f"test_file.{ext}"
+        file_path.write_text("fixture", encoding="utf-8")
+        content = f"Here is the file\nMEDIA:{file_path}"
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert len(media) >= 1, f"extract_media() did not match .{ext}"
         path = media[0][0]
