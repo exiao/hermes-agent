@@ -363,3 +363,33 @@ def test_fifo_eviction_does_not_close_client_that_may_have_an_inflight_call():
     clients[0].close.assert_not_called()
     for client in clients[1:]:
         client.close.assert_called_once_with()
+
+
+def test_fifo_eviction_retires_async_client_until_its_loop_can_be_reaped():
+    """Evicted async clients remain owned until their live loop has closed."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    clients = []
+
+    def fake_resolve(_provider, model, _async_mode, **_kwargs):
+        client = MagicMock(name=f"client-{model}")
+        clients.append(client)
+        return client, model
+
+    try:
+        with patch.object(aux, "_CLIENT_CACHE_MAX_SIZE", 1), patch.object(
+            aux, "resolve_provider_client", side_effect=fake_resolve
+        ):
+            aux._get_cached_client("custom", model="first", async_mode=True)
+            aux._get_cached_client("custom", model="second", async_mode=True)
+
+        assert len(aux._client_cache) == 1
+        clients[0].close.assert_not_called()
+
+        loop.close()
+        aux.cleanup_stale_async_clients()
+
+        clients[0].close.assert_called_once_with()
+    finally:
+        if not loop.is_closed():
+            loop.close()
