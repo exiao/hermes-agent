@@ -930,7 +930,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "messageId": message_id,
                     "message": content,
                 },
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(
+                    total=self._bridge_send_timeout(to_whatsapp_jid(chat_id))
+                )
             ) as resp:
                 if resp.status == 200:
                     return SendResult(success=True, message_id=message_id)

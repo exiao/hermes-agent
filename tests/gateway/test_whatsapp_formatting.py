@@ -263,6 +263,18 @@ class TestSendChunking:
         assert timeout.total == 120
 
     @pytest.mark.asyncio
+    async def test_group_edit_allows_queue_pacing(self):
+        adapter = _make_adapter()
+        resp = MagicMock(status=200)
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.edit_message("group@g.us", "message1", "updated")
+
+        assert result.success
+        timeout = adapter._http_session.post.call_args.kwargs["timeout"]
+        assert timeout.total == 120
+
+    @pytest.mark.asyncio
     async def test_long_message_chunked(self):
         adapter = _make_adapter()
         resp = MagicMock(status=200)
