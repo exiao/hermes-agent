@@ -46,6 +46,7 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  raceWithTimeout,
   reconnectPlan,
 } from './bridge_helpers.js';
 
@@ -161,9 +162,9 @@ function invalidateGroupMetadata(jid) {
 // degraded-connection conditions this cache exists to relieve. Because the
 // send path awaits this while holding the serialized send queue, an unbounded
 // stall here would wedge the queue and block ALL later sends, including DMs.
-// On timeout we return undefined (cache miss) so the caller proceeds — Baileys'
-// own send will resolve metadata if it truly needs it, and the next call
-// re-attempts the warm fetch.
+// On timeout we return undefined (cache miss), invalidate the stale lookup, and
+// let the next call start a fresh warm fetch.  The old request cannot be
+// cancelled, so its generation must also be retired before it can settle.
 const GROUP_META_TIMEOUT_MS = parseInt(process.env.WHATSAPP_GROUP_META_TIMEOUT_MS || '10000', 10);
 
 async function resolveGroupMetadata(jid) {
@@ -179,15 +180,11 @@ async function resolveGroupMetadata(jid) {
     }
     return metadata;
   });
-  let timer;
-  const timeoutPromise = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(undefined), GROUP_META_TIMEOUT_MS);
+  return raceWithTimeout(metadataPromise, GROUP_META_TIMEOUT_MS, () => {
+    _groupMetaGenerations.invalidate(jid);
+    _groupMetaCache.delete(jid);
+    _groupMetaInFlight.clear(jid);
   });
-  try {
-    return await Promise.race([metadataPromise, timeoutPromise]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 // Extra spacing applied AFTER a send whose target is a group JID. Group sends

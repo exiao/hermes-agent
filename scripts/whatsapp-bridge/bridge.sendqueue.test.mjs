@@ -11,7 +11,11 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { createGenerationTracker, createInFlightLookup } from './bridge_helpers.js';
+import {
+  createGenerationTracker,
+  createInFlightLookup,
+  raceWithTimeout,
+} from './bridge_helpers.js';
 
 // ------------------------------------------------------------------
 // 1.  Unit test for the queue primitives
@@ -55,6 +59,35 @@ import { createGenerationTracker, createInFlightLookup } from './bridge_helpers.
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(inFlight.get('group@g.us'), undefined, 'settled metadata requests are released');
   console.log('  ✓ metadata lookup coalesces in-flight requests');
+}
+
+{
+  const generations = createGenerationTracker();
+  const inFlight = createInFlightLookup();
+  let releaseStalledLookup;
+  const staleToken = generations.token('group@g.us');
+  const stalledLookup = inFlight.getOrCreate(
+    'group@g.us',
+    () => new Promise(resolve => { releaseStalledLookup = resolve; }),
+  );
+
+  const result = await raceWithTimeout(stalledLookup, 5, () => {
+    generations.invalidate('group@g.us');
+    inFlight.clear('group@g.us');
+  });
+  assert.equal(result, undefined, 'timed-out metadata returns a cache miss');
+  assert.equal(inFlight.get('group@g.us'), undefined, 'timed-out lookup is released for retry');
+  assert.equal(
+    generations.isCurrent('group@g.us', staleToken),
+    false,
+    'a late timed-out lookup can no longer populate the cache',
+  );
+
+  const replacement = inFlight.getOrCreate('group@g.us', async () => ({ id: 'fresh@g.us' }));
+  assert.notStrictEqual(replacement, stalledLookup, 'the next warm fetch starts a replacement lookup');
+  releaseStalledLookup({ id: 'stale@g.us' });
+  await Promise.all([stalledLookup, replacement]);
+  console.log('  ✓ timed-out metadata lookup is invalidated and retried');
 }
 
 /**

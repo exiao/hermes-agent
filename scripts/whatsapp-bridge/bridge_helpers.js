@@ -197,6 +197,22 @@ export function createInFlightLookup() {
   return { get, getOrCreate, clear };
 }
 
+/**
+ * Resolve an asynchronous best-effort lookup within a bounded wait.  A timeout
+ * returns a cache miss and gives the caller one synchronous cleanup hook for
+ * invalidating state that belongs to the now-stale lookup.
+ */
+export function raceWithTimeout(promise, timeoutMs, onTimeout = () => {}) {
+  let timer;
+  const timeout = new Promise(resolve => {
+    timer = setTimeout(() => {
+      onTimeout();
+      resolve(undefined);
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 export function pollCreationMessageSecret(pollCreation) {
   return pollCreation?.message?.messageContextInfo?.messageSecret
     || pollCreation?.messageContextInfo?.messageSecret
