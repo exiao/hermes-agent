@@ -5920,11 +5920,6 @@ def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> di
 _client_cache: Dict[tuple, tuple] = {}
 _client_cache_lock = threading.Lock()
 _CLIENT_CACHE_MAX_SIZE = 64  # safety belt — evict oldest when exceeded
-# FIFO eviction cannot close an async client while its owning loop may still
-# have an in-flight request. Keep that cache-owned reference until the regular
-# per-turn cleanup observes its loop has closed, rather than leaking its
-# transport when the cache drops the entry.
-_retired_async_clients: List[tuple[Any, Any]] = []
 
 
 class _CallableCacheDiscriminator:
@@ -6276,9 +6271,6 @@ def shutdown_cached_clients() -> None:
                 continue
             _close_cached_client(client)
         _client_cache.clear()
-        for client, loop in _retired_async_clients:
-            _release_cached_client_fds(client, loop)
-        _retired_async_clients.clear()
 
 
 def cleanup_stale_async_clients() -> None:
@@ -6298,14 +6290,6 @@ def cleanup_stale_async_clients() -> None:
                 stale_keys.append(key)
         for key in stale_keys:
             del _client_cache[key]
-        retired_stale = [
-            (client, loop)
-            for client, loop in _retired_async_clients
-            if getattr(loop, "is_closed", lambda: False)()
-        ]
-        for client, loop in retired_stale:
-            _release_cached_client_fds(client, loop)
-            _retired_async_clients.remove((client, loop))
 
 
 def _is_openrouter_client(client: Any) -> bool:
@@ -6438,15 +6422,11 @@ def _get_cached_client(
             if cache_key not in _client_cache:
                 # Safety belt: if the cache has grown beyond the max, evict
                 # the oldest entries (FIFO — dict preserves insertion order).
-                # An evicted async client may still serve an in-flight caller.
-                # Preserve cache cleanup ownership until its loop has closed;
-                # no caller owns a shared cached client's lifecycle.
+                # An evicted client may still serve an in-flight caller, so
+                # only remove our cache reference and let its owner close it.
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
-                    evict_key, evicted_entry = next(iter(_client_cache.items()))
+                    evict_key, _ = next(iter(_client_cache.items()))
                     del _client_cache[evict_key]
-                    evicted_client, _evicted_model, evicted_loop = evicted_entry
-                    if evicted_loop is not None:
-                        _retired_async_clients.append((evicted_client, evicted_loop))
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:
                 built_client = client
