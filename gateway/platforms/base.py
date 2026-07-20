@@ -1487,13 +1487,14 @@ _MEDIA_EXT_ALTERNATION = "|".join(
     sorted((e.lstrip(".") for e in MEDIA_DELIVERY_EXTS), key=len, reverse=True)
 )
 
-# Extensions accepted ONLY for explicit ``MEDIA:<path>`` tags (e.g. emitted by
-# the ``send_file`` tool). These are a deliberate superset of
-# MEDIA_DELIVERY_EXTS: when an agent explicitly tags a file it intends to send,
-# we honor code/config/log files too. They are intentionally NOT added to
-# MEDIA_DELIVERY_EXTS because the bare-path detector (extract_local_files)
-# scans untagged prose, where auto-shipping a ``.py``/``.log`` the model merely
-# mentioned would be a surprise (see test_extract_local_files.py rationale).
+# Extensions historically accepted for explicit ``MEDIA:<path>`` tags. Retained
+# for the producer-tool detector in gateway/run.py (``_TOOL_MEDIA_RE``), which
+# scans tool output for known-producer paths. They are deliberately NOT folded
+# into ``_MEDIA_TAG_EXT_ALTERNATION`` below: per the egress design (#36060), an
+# explicit ``MEDIA:`` tag with a code/config/log extension must pass
+# ``validate_media_delivery_path`` (exists on disk, safe root, not denylisted)
+# via the validated pass rather than extract unconditionally — otherwise a
+# prompt-injection ``MEDIA:/etc/anything.py`` would silently exfiltrate.
 MEDIA_TAG_EXTRA_EXTS: Tuple[str, ...] = (
     # Config / data
     ".toml", ".ini", ".cfg", ".conf",
@@ -1505,13 +1506,13 @@ MEDIA_TAG_EXTRA_EXTS: Tuple[str, ...] = (
     # Logs
     ".log",
 )
-_MEDIA_TAG_EXT_ALTERNATION = "|".join(
-    sorted(
-        (e.lstrip(".") for e in (*MEDIA_DELIVERY_EXTS, *MEDIA_TAG_EXTRA_EXTS)),
-        key=len,
-        reverse=True,
-    )
-)
+# The unconditional ``MEDIA:`` cleanup/extract grammar covers ONLY the known
+# deliverable media extensions (MEDIA_DELIVERY_EXTS). Unknown extensions —
+# extension-less files AND the code/config/log set in MEDIA_TAG_EXTRA_EXTS —
+# route through the validated pass (MEDIA_EXTENSIONLESS_TAG_RE + validate_
+# media_delivery_path), so they deliver when the file validates and stay
+# visible in the text when it does not (#36060 universal egress).
+_MEDIA_TAG_EXT_ALTERNATION = _MEDIA_EXT_ALTERNATION
 
 # Anchored ``MEDIA:<path>`` cleanup pattern. Unlike the old loose
 # ``MEDIA:\\s*\\S+``, this only strips a tag whose path ends in a known

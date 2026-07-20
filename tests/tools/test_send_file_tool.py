@@ -120,8 +120,24 @@ class TestExtractMediaExpandedExtensions:
         "mp4", "mov", "avi", "mkv", "webm",
         "ogg", "opus", "mp3", "wav", "m4a",
     ])
-    def test_extract_media_matches_extension(self, ext):
-        content = f"Here is the file\nMEDIA:/tmp/test_file.{ext}"
+    def test_extract_media_matches_extension(self, ext, tmp_path, monkeypatch):
+        # Create the file in a safe delivery root: known media extensions
+        # extract unconditionally, but code/config/log extensions (.py, .log,
+        # .toml, …) only extract via the validated pass (file must exist under
+        # an allowed root), per the #36060 universal-egress design. A bare
+        # nonexistent path would correctly stay visible, so the fixture must be
+        # a real, deliverable file to exercise the match.
+        root = tmp_path / "output"
+        root.mkdir()
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (str(root),),
+        )
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        f = root / f"test_file.{ext}"
+        f.write_text("content", encoding="utf-8")
+
+        content = f"Here is the file\nMEDIA:{f}"
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert len(media) >= 1, f"extract_media() did not match .{ext}"
         path = media[0][0]
