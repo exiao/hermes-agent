@@ -2312,6 +2312,43 @@ def test_respawn_guard_active_pr_requeue_before_pr_still_guarded(kanban_home):
         assert kb.check_respawn_guard(conn, t) == "active_pr"
 
 
+def test_respawn_guard_active_pr_not_bypassed_by_stale_lock_reclaim(kanban_home):
+    """Automatic stale-lock recovery must not look like an operator re-queue.
+
+    A dead worker can leave its task comment with an implementation PR behind.
+    Releasing that stale claim makes the card ready again, but dispatching it
+    would open a duplicate PR, which is exactly what ``active_pr`` prevents.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="implementation", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR: https://github.com/totemx-AI/subsidysmart/pull/304",
+        )
+        kb.claim_task(conn, t)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, t),
+        )
+
+        assert kb.release_stale_claims(conn) == 1
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
+def test_respawn_guard_active_pr_bypassed_by_manual_reclaim(kanban_home):
+    """An operator reclaim after a PR comment is an explicit re-run request."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="implementation", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR: https://github.com/totemx-AI/subsidysmart/pull/305",
+        )
+        kb.claim_task(conn, t)
+
+        assert kb.reclaim_task(conn, t, reason="retry requested") is True
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
