@@ -6422,14 +6422,12 @@ def _get_cached_client(
             if cache_key not in _client_cache:
                 # Safety belt: if the cache has grown beyond the max, evict
                 # the oldest entries (FIFO — dict preserves insertion order).
-                # _release_cached_client_fds is loop-dead-gated: it only frees
-                # the raw sockets when the evicted client's bound loop is dead
-                # (no live loop can hold an in-flight request on them), so this
-                # is safe here AND reclaims fds that would otherwise leak in
-                # long-lived processes (gateway, kanban workers).
+                # Do not close an evicted client: another caller may still be
+                # using it for an in-flight request. The process shutdown path
+                # closes clients that remain cached; an evicted client is left
+                # to its caller's lifetime.
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
-                    evict_key, evict_entry = next(iter(_client_cache.items()))
-                    _release_cached_client_fds(evict_entry[0], evict_entry[2])
+                    evict_key = next(iter(_client_cache))
                     del _client_cache[evict_key]
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:
