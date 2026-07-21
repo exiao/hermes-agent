@@ -129,7 +129,13 @@ def _rebalance_inline_markdown_chunks(chunks: List[str]) -> List[str]:
 
         offset = 0
         while offset < len(body):
-            if body.startswith("**", offset):
+            if body.startswith("```", offset):
+                closing = body.find("```", offset + 3)
+                offset = closing + 3 if closing >= 0 else len(body)
+            elif body[offset] == "`":
+                closing = body.find("`", offset + 1)
+                offset = closing + 1 if closing >= 0 else len(body)
+            elif body.startswith("**", offset):
                 toggle("**")
                 offset += 2
             elif body.startswith("__", offset):
@@ -141,7 +147,10 @@ def _rebalance_inline_markdown_chunks(chunks: List[str]) -> List[str]:
             elif body[offset] == "*":
                 previous = body[offset - 1] if offset else ""
                 following = body[offset + 1] if offset + 1 < len(body) else ""
-                if previous != "*" and following not in {"*", " "}:
+                if "*" in active:
+                    if previous != "*":
+                        toggle("*")
+                elif following not in {"*", " "}:
                     toggle("*")
                 offset += 1
             elif body[offset] == "_":
@@ -1224,6 +1233,7 @@ class SignalAdapter(BasePlatformAdapter):
         chunks = _rebalance_inline_markdown_chunks(
             self.truncate_message(content, MAX_MESSAGE_LENGTH)
         )
+        sent_chunks = 0
         for chunk in chunks:
             plain_text, text_styles = self._markdown_to_signal(chunk)
             params = {**params_base, "message": plain_text}
@@ -1237,18 +1247,44 @@ class SignalAdapter(BasePlatformAdapter):
             try:
                 result = await self._rpc("send", params, raise_on_error=True)
             except SignalRPCError as exc:
-                return SendResult(success=False, error=str(exc))
+                return self._partial_send_failure(sent_chunks, len(chunks), str(exc))
 
             if result is None:
-                return SendResult(success=False, error="RPC send failed")
+                return self._partial_send_failure(sent_chunks, len(chunks), "RPC send failed")
             success, err_msg = self._validate_send_result(result)
             if not success:
-                return SendResult(success=False, error=err_msg, raw_response=result)
+                return self._partial_send_failure(
+                    sent_chunks, len(chunks), err_msg or "Signal rejected send", result
+                )
             self._track_sent_timestamp(result)
+            sent_chunks += 1
         # Signal has no editable message identifier. Returning None keeps the
         # stream consumer on the non-edit fallback path instead of pretending
         # future edits can remove an in-progress cursor from the chat thread.
         return SendResult(success=True, message_id=None)
+
+    @staticmethod
+    def _partial_send_failure(
+        sent_chunks: int,
+        total_chunks: int,
+        error: str,
+        raw_response=None,
+    ) -> SendResult:
+        """Return a failure that prevents retries after partial delivery."""
+        if not sent_chunks:
+            return SendResult(success=False, error=error, raw_response=raw_response)
+        logger.error(
+            "[Signal] Partial send: delivered %d/%d chunks before failure: %s",
+            sent_chunks,
+            total_chunks,
+            error,
+        )
+        return SendResult(
+            success=False,
+            error=f"Partial send after {sent_chunks}/{total_chunks} chunks: {error}",
+            raw_response=raw_response,
+            partial_delivery=True,
+        )
 
     def _track_sent_timestamp(self, rpc_result) -> None:
         """Record outbound message timestamp for echo-back filtering."""
