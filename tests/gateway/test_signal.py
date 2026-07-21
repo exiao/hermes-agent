@@ -1115,6 +1115,37 @@ class TestSignalSendReturnsMessageId:
         assert result.message_id is None
 
     @pytest.mark.asyncio
+    async def test_send_chunks_long_markdown_with_independent_formatting(self, monkeypatch):
+        """Long markdown is sent in ordered, separately formatted Signal messages."""
+        from gateway.platforms.signal import MAX_MESSAGE_LENGTH
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        sent = []
+
+        async def mock_rpc(method, params, rpc_id=None, **kwargs):
+            sent.append({"method": method, "params": dict(params)})
+            return {"timestamp": len(sent)}
+
+        adapter._rpc = mock_rpc
+        content = "**Opening paragraph**\n\n" + ("word " * 1600) + "**Closing paragraph**"
+
+        result = await adapter.send(chat_id="+155****4567", content=content)
+
+        assert adapter.splits_long_messages is True
+        assert result.success is True
+        assert result.message_id is None
+        assert [call["method"] for call in sent] == ["send", "send"]
+        assert all(len(call["params"]["message"]) <= MAX_MESSAGE_LENGTH for call in sent)
+        assert sent[0]["params"]["message"].startswith("Opening paragraph")
+        assert "Closing paragraph" in sent[1]["params"]["message"]
+        assert all("**" not in call["params"]["message"] for call in sent)
+        for call in sent:
+            styles = [call["params"].get("textStyle", ""), *call["params"].get("textStyles", [])]
+            assert any(style.endswith(":BOLD") for style in styles)
+        assert {1, 2} <= set(adapter._recent_sent_timestamps)
+
+    @pytest.mark.asyncio
     async def test_send_returns_none_message_id_when_no_timestamp(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
         mock_rpc, _ = _stub_rpc({})  # No timestamp key

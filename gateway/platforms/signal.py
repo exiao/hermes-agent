@@ -278,6 +278,7 @@ class SignalAdapter(BasePlatformAdapter):
     """Signal messenger adapter using signal-cli HTTP daemon."""
 
     platform = Platform.SIGNAL
+    splits_long_messages = True  # send() chunks raw markdown before formatting.
     # Signal has no real edit API for already-sent messages. Mark it explicitly
     # so streaming suppresses the visible cursor instead of leaving a stale tofu
     # square behind in chat clients when edit attempts fail.
@@ -1134,40 +1135,40 @@ class SignalAdapter(BasePlatformAdapter):
         """Send a text message with native Signal formatting."""
         await self._stop_typing_indicator(chat_id)
 
-        plain_text, text_styles = self._markdown_to_signal(content)
-
-        params: Dict[str, Any] = {
+        params_base: Dict[str, Any] = {
             "account": self.account,
-            "message": plain_text,
         }
 
-        if text_styles:
-            if len(text_styles) == 1:
-                params["textStyle"] = text_styles[0]
-            else:
-                params["textStyles"] = text_styles
-
         if chat_id.startswith("group:"):
-            params["groupId"] = chat_id[6:]
+            params_base["groupId"] = chat_id[6:]
         else:
-            params["recipient"] = [await self._resolve_recipient(chat_id)]
+            params_base["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        logger.info("[Signal] Sending response (%d chars) to %s", len(plain_text), chat_id)
-        try:
-            result = await self._rpc("send", params, raise_on_error=True)
-        except SignalRPCError as exc:
-            return SendResult(success=False, error=str(exc))
+        for chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
+            plain_text, text_styles = self._markdown_to_signal(chunk)
+            params = {**params_base, "message": plain_text}
+            if text_styles:
+                if len(text_styles) == 1:
+                    params["textStyle"] = text_styles[0]
+                else:
+                    params["textStyles"] = text_styles
 
-        if result is not None:
+            logger.info("[Signal] Sending response (%d chars) to %s", len(plain_text), chat_id)
+            try:
+                result = await self._rpc("send", params, raise_on_error=True)
+            except SignalRPCError as exc:
+                return SendResult(success=False, error=str(exc))
+
+            if result is None:
+                return SendResult(success=False, error="RPC send failed")
             success, err_msg = self._validate_send_result(result)
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
-            # Signal has no editable message identifier. Returning None keeps the
-            # stream consumer on the non-edit fallback path instead of pretending
-            # future edits can remove an in-progress cursor from the chat thread.
-            return SendResult(success=True, message_id=None)
-        return SendResult(success=False, error="RPC send failed")
+        # Signal has no editable message identifier. Returning None keeps the
+        # stream consumer on the non-edit fallback path instead of pretending
+        # future edits can remove an in-progress cursor from the chat thread.
+        return SendResult(success=True, message_id=None)
 
     def _track_sent_timestamp(self, rpc_result) -> None:
         """Record outbound message timestamp for echo-back filtering."""
