@@ -152,6 +152,47 @@ def test_base_ref_falls_back_to_head_without_remote(tmp_path: Path) -> None:
     assert _worktree_base_ref(repo) == "HEAD"
 
 
+def test_base_ref_uses_cached_default_when_offline(origin_and_clone) -> None:
+    """Origin unreachable: resolve from the cached origin/<default>, don't stall.
+
+    The clone already has ``origin/main`` cached and ``origin/HEAD`` set. After
+    the bare origin disappears (network outage / removed remote), every network
+    call fails fast, and the function must fall back to the locally cached
+    default rather than retrying a fetch per candidate or returning ``HEAD``.
+    """
+    origin, clone = origin_and_clone
+    # Sanity: cached ref exists before we sever the remote.
+    assert _git(clone, "rev-parse", "--verify", "--quiet", "origin/main^{commit}")
+    # Sever origin: subsequent ls-remote/fetch fail fast (no such path).
+    import shutil
+    shutil.rmtree(origin)
+    assert _worktree_base_ref(clone) == "origin/main"
+
+
+def test_base_ref_head_when_offline_without_cached_default(tmp_path: Path) -> None:
+    """Origin unreachable AND no cached main/master/origin-HEAD: return HEAD."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "trunk", str(origin)],
+                   capture_output=True, check=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(origin), str(seed)], capture_output=True, check=True)
+    _git(seed, "config", "user.email", "t@t")
+    _git(seed, "config", "user.name", "t")
+    (seed / "base.txt").write_text("base\n")
+    _git(seed, "add", "base.txt")
+    _git(seed, "commit", "-m", "base commit")
+    _git(seed, "push", "origin", "trunk")
+    clone = tmp_path / "anchor"
+    subprocess.run(["git", "clone", str(origin), str(clone)], capture_output=True, check=True)
+    # Drop the local origin/HEAD symref so no cached default remains, then sever
+    # the remote. Only origin/trunk is cached (a non-main/master name we must
+    # NOT guess); with no reachable remote, the safe answer is HEAD.
+    _git(clone, "remote", "set-head", "origin", "-d")
+    import shutil
+    shutil.rmtree(origin)
+    assert _worktree_base_ref(clone) == "HEAD"
+
+
 def test_worktree_ignores_parked_anchor_branch(origin_and_clone, tmp_path: Path) -> None:
     """Anchor parked on a stacked feature branch must NOT leak into the worktree."""
     _, clone = origin_and_clone
