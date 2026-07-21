@@ -7469,7 +7469,7 @@ def _worktree_base_ref(repo_root: Path) -> str:
         try:
             subprocess.run(
                 ["git", "-C", str(repo_root), "fetch", "origin", "--quiet",
-                 f"refs/heads/{branch}:refs/remotes/{candidate}"],
+                 f"+refs/heads/{branch}:refs/remotes/{candidate}"],
                 capture_output=True,
                 text=True,
                 timeout=60,

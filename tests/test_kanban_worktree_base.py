@@ -118,6 +118,29 @@ def test_base_ref_refreshes_a_stale_origin_head_default(origin_and_clone, tmp_pa
     assert _worktree_base_ref(clone) == "origin/trunk"
 
 
+def test_base_ref_force_updates_a_rewritten_default(origin_and_clone, tmp_path: Path) -> None:
+    """A force-pushed remote default must replace its cached tracking ref."""
+    origin, clone = origin_and_clone
+    base_sha = _git(clone, "rev-parse", "origin/main")
+    writer = tmp_path / "writer"
+    subprocess.run(["git", "clone", str(origin), str(writer)], capture_output=True, check=True)
+    _git(writer, "config", "user.email", "t@t")
+    _git(writer, "config", "user.name", "t")
+    (writer / "base.txt").write_text("discarded\n")
+    _git(writer, "commit", "-am", "discarded default commit")
+    _git(writer, "push", "origin", "main")
+    assert _worktree_base_ref(clone) == "origin/main"
+
+    _git(writer, "reset", "--hard", base_sha)
+    (writer / "replacement.txt").write_text("replacement\n")
+    _git(writer, "add", "replacement.txt")
+    _git(writer, "commit", "-m", "replacement default commit")
+    _git(writer, "push", "--force", "origin", "main")
+
+    assert _worktree_base_ref(clone) == "origin/main"
+    assert _git(clone, "rev-parse", "origin/main") == _git(writer, "rev-parse", "main")
+
+
 def test_base_ref_falls_back_to_head_without_remote(tmp_path: Path) -> None:
     repo = tmp_path / "local-only"
     subprocess.run(["git", "init", "-b", "main", str(repo)], capture_output=True, check=True)
