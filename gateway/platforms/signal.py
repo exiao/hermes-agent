@@ -84,6 +84,83 @@ def _parse_comma_list(value: str) -> List[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _rebalance_inline_markdown_chunks(chunks: List[str]) -> List[str]:
+    """Make each chunk independently valid for Signal's inline formatter.
+
+    ``truncate_message()`` already carries fenced code blocks, but its chunks can
+    bisect bold, italic, and strikethrough spans. Signal formats every chunk
+    independently, so close an active span before its indicator and reopen it at
+    the beginning of the next body.  The virtual delimiters are removed by
+    ``markdown_to_signal()``, leaving the indicator unstyled and the text range
+    continuous across sends.
+    """
+    if len(chunks) < 2:
+        return chunks
+
+    active: List[str] = []
+
+    def toggle(marker: str) -> None:
+        if marker in active:
+            active.remove(marker)
+        else:
+            active.append(marker)
+
+    total = len(chunks)
+    bodies = []
+    for index, chunk in enumerate(chunks, start=1):
+        indicator = f" ({index}/{total})"
+        bodies.append(chunk[:-len(indicator)] if chunk.endswith(indicator) else chunk)
+
+    # Keep a two-character delimiter together when the raw split bisects it.
+    # The moved delimiter disappears during formatting, so this cannot enlarge
+    # the outgoing Signal message.
+    for index in range(total - 1):
+        if not bodies[index] or not bodies[index + 1]:
+            continue
+        delimiter = bodies[index][-1] + bodies[index + 1][0]
+        if delimiter in {"**", "__", "~~"}:
+            bodies[index] += bodies[index + 1][0]
+            bodies[index + 1] = bodies[index + 1][1:]
+
+    balanced: List[str] = []
+    for index, body in enumerate(bodies, start=1):
+        indicator = f" ({index}/{total})"
+        prefix = "".join(active)
+
+        offset = 0
+        while offset < len(body):
+            if body.startswith("**", offset):
+                toggle("**")
+                offset += 2
+            elif body.startswith("__", offset):
+                toggle("__")
+                offset += 2
+            elif body.startswith("~~", offset):
+                toggle("~~")
+                offset += 2
+            elif body[offset] == "*":
+                previous = body[offset - 1] if offset else ""
+                following = body[offset + 1] if offset + 1 < len(body) else ""
+                if previous != "*" and following not in {"*", " "}:
+                    toggle("*")
+                offset += 1
+            elif body[offset] == "_":
+                previous = body[offset - 1] if offset else ""
+                following = body[offset + 1] if offset + 1 < len(body) else ""
+                if "_" in active:
+                    if previous != "_" and not following.isalnum():
+                        toggle("_")
+                elif not previous.isalnum() and following != "_":
+                    toggle("_")
+                offset += 1
+            else:
+                offset += 1
+
+        balanced.append(prefix + body + "".join(reversed(active)) + indicator)
+
+    return balanced
+
+
 def _guess_extension(data: bytes) -> str:
     """Guess file extension from magic bytes.
 
@@ -1144,7 +1221,10 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             params_base["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        for chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
+        chunks = _rebalance_inline_markdown_chunks(
+            self.truncate_message(content, MAX_MESSAGE_LENGTH)
+        )
+        for chunk in chunks:
             plain_text, text_styles = self._markdown_to_signal(chunk)
             params = {**params_base, "message": plain_text}
             if text_styles:
