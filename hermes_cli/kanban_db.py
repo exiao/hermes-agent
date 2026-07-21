@@ -7432,6 +7432,16 @@ def _worktree_base_ref(repo_root: Path) -> str:
     spawned task's diff, and even on the default branch it may be stale. Fall
     back to ``HEAD`` only when there is no usable remote (local-only repos,
     tests).
+
+    Offline fallback contract: when ``origin`` is unreachable AND the local
+    ``origin/HEAD`` symref is absent AND neither ``origin/main`` nor
+    ``origin/master`` resolves, this returns ``HEAD`` (the pre-fix behavior).
+    We deliberately do NOT guess the remote default among other cached
+    ``origin/*`` refs — an arbitrary cached ref could be a parked feature or
+    review branch, reintroducing exactly the foreign-commit contamination this
+    function exists to prevent, and provenance is unrecoverable while offline.
+    A non-``main``/``master`` remote default is only honored when discoverable
+    online (``ls-remote --symref``) or already recorded in ``origin/HEAD``.
     """
     try:
         head_ref = subprocess.run(
