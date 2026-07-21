@@ -10164,6 +10164,36 @@ def _default_spawn(
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
 
+    # Scrub inherited TERMINAL_* backend/image vars so the worker's own profile
+    # config wins. The dispatcher process runs the lazy terminal-config bridge
+    # once (tools.terminal_tool._maybe_bridge_terminal_config ->
+    # apply_terminal_config_to_env) which exports TERMINAL_ENV / TERMINAL_MODAL_IMAGE
+    # / TERMINAL_CONTAINER_PERSISTENT etc. into the dispatcher's os.environ from the
+    # ROOT config. Those then leak into `dict(os.environ)` here. Because the child's
+    # bridge early-returns when TERMINAL_ENV is already set, an inherited
+    # TERMINAL_ENV=local (or a root TERMINAL_MODAL_IMAGE=<base image>) silently
+    # overrides the assignee profile's terminal.backend / terminal.modal_image —
+    # e.g. a profile pinned to backend: modal with a baked CLI image would run the
+    # root's local/base image instead. We set HERMES_HOME to the profile below, so
+    # the child can re-derive every TERMINAL_* value from the profile's own
+    # config.yaml — but only if these aren't already present. Drop the config-derived
+    # ones (never TERMINAL_CWD, which the dispatcher sets deliberately below).
+    _TERMINAL_CONFIG_LEAK_KEYS = (
+        "TERMINAL_ENV",
+        "TERMINAL_MODAL_MODE",
+        "TERMINAL_DOCKER_IMAGE",
+        "TERMINAL_MODAL_IMAGE",
+        "TERMINAL_SINGULARITY_IMAGE",
+        "TERMINAL_DAYTONA_IMAGE",
+        "TERMINAL_CONTAINER_PERSISTENT",
+        "TERMINAL_CONTAINER_CPU",
+        "TERMINAL_CONTAINER_MEMORY",
+        "TERMINAL_CONTAINER_DISK",
+        "TERMINAL_LIFETIME_SECONDS",
+    )
+    for _leak_key in _TERMINAL_CONFIG_LEAK_KEYS:
+        env.pop(_leak_key, None)
+
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
     # config.  Without this, `env = dict(os.environ)` copies only the parent's

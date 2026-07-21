@@ -99,3 +99,53 @@ def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path
 
     # Inherited value is preserved (not overwritten with a bogus path).
     assert captured["env"]["TERMINAL_CWD"] == "/pre/existing/anchor"
+
+
+def test_inherited_terminal_backend_vars_scrubbed(monkeypatch, tmp_path):
+    """Leaked dispatcher TERMINAL_* backend/image vars must NOT reach the worker.
+
+    Regression: the dispatcher's lazy terminal-config bridge exports the ROOT
+    config's TERMINAL_ENV / TERMINAL_MODAL_IMAGE / TERMINAL_CONTAINER_PERSISTENT
+    into os.environ. _default_spawn does ``env = dict(os.environ)``, so those
+    leak into the child. Because the child's own bridge early-returns when
+    TERMINAL_ENV is already present, the inherited root values silently override
+    the assignee profile's terminal.backend / terminal.modal_image. The spawn
+    must scrub the config-derived TERMINAL_* vars so the child re-derives them
+    from its own profile config. TERMINAL_CWD is set deliberately and must NOT
+    be scrubbed (covered by the tests above).
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    # Simulate the dispatcher's leaked backend/image env.
+    leaked = {
+        "TERMINAL_ENV": "local",
+        "TERMINAL_MODAL_MODE": "auto",
+        "TERMINAL_DOCKER_IMAGE": "nikolaik/python-nodejs:python3.11-nodejs20",
+        "TERMINAL_MODAL_IMAGE": "nikolaik/python-nodejs:python3.11-nodejs20",
+        "TERMINAL_SINGULARITY_IMAGE": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
+        "TERMINAL_DAYTONA_IMAGE": "nikolaik/python-nodejs:python3.11-nodejs20",
+        "TERMINAL_CONTAINER_PERSISTENT": "True",
+        "TERMINAL_CONTAINER_CPU": "1",
+        "TERMINAL_CONTAINER_MEMORY": "5120",
+        "TERMINAL_CONTAINER_DISK": "51200",
+        "TERMINAL_LIFETIME_SECONDS": "300",
+    }
+    for k, v in leaked.items():
+        monkeypatch.setenv(k, v)
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    # None of the leaked backend/image vars survive into the child env.
+    for key in leaked:
+        assert key not in captured["env"], f"{key} leaked into the worker env"
+    # TERMINAL_CWD is a deliberate set, not a leak — it must still be present.
+    assert captured["env"]["TERMINAL_CWD"] == str(workspace)
