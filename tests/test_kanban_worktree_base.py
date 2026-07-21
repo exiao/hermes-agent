@@ -79,6 +79,27 @@ def test_base_ref_refreshes_only_default_branch(origin_and_clone, tmp_path: Path
     assert _git(clone, "rev-parse", "origin/unrelated") == unrelated_before
 
 
+def test_base_ref_discovers_non_main_remote_default_without_origin_head(tmp_path: Path) -> None:
+    """A deleted local origin/HEAD must not lose a remote trunk default."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "trunk", str(origin)],
+                   capture_output=True, check=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(origin), str(seed)], capture_output=True, check=True)
+    _git(seed, "config", "user.email", "t@t")
+    _git(seed, "config", "user.name", "t")
+    (seed / "base.txt").write_text("base\n")
+    _git(seed, "add", "base.txt")
+    _git(seed, "commit", "-m", "base commit")
+    _git(seed, "push", "origin", "trunk")
+
+    clone = tmp_path / "anchor"
+    subprocess.run(["git", "clone", str(origin), str(clone)], capture_output=True, check=True)
+    _git(clone, "remote", "set-head", "origin", "-d")
+
+    assert _worktree_base_ref(clone) == "origin/trunk"
+
+
 def test_base_ref_falls_back_to_head_without_remote(tmp_path: Path) -> None:
     repo = tmp_path / "local-only"
     subprocess.run(["git", "init", "-b", "main", str(repo)], capture_output=True, check=True)
