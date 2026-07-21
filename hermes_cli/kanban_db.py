@@ -7445,25 +7445,24 @@ def _worktree_base_ref(repo_root: Path) -> str:
         head_ref = None
 
     candidates = []
+    try:
+        remote_head = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-remote", "--symref", "origin", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        for line in remote_head.stdout.splitlines():
+            if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                remote_branch = line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
+                candidates.append(f"origin/{remote_branch}")
+                break
+    except Exception:
+        pass
     if head_ref is not None and head_ref.returncode == 0 and head_ref.stdout.strip():
         # refs/remotes/origin/<default> -> origin/<default>
         candidates.append(head_ref.stdout.strip().removeprefix("refs/remotes/"))
-    if not candidates:
-        try:
-            remote_head = subprocess.run(
-                ["git", "-C", str(repo_root), "ls-remote", "--symref", "origin", "HEAD"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
-            for line in remote_head.stdout.splitlines():
-                if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
-                    remote_branch = line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
-                    candidates.append(f"origin/{remote_branch}")
-                    break
-        except Exception:
-            pass
     candidates.extend(("origin/main", "origin/master"))
     for candidate in dict.fromkeys(candidates):
         branch = candidate.removeprefix("origin/")

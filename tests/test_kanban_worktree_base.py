@@ -100,6 +100,24 @@ def test_base_ref_discovers_non_main_remote_default_without_origin_head(tmp_path
     assert _worktree_base_ref(clone) == "origin/trunk"
 
 
+def test_base_ref_refreshes_a_stale_origin_head_default(origin_and_clone, tmp_path: Path) -> None:
+    """The remote's current default wins when local origin/HEAD is stale."""
+    origin, clone = origin_and_clone
+    writer = tmp_path / "writer"
+    subprocess.run(["git", "clone", str(origin), str(writer)], capture_output=True, check=True)
+    _git(writer, "config", "user.email", "t@t")
+    _git(writer, "config", "user.name", "t")
+    _git(writer, "checkout", "-b", "trunk")
+    (writer / "trunk.txt").write_text("trunk\n")
+    _git(writer, "add", "trunk.txt")
+    _git(writer, "commit", "-m", "trunk default commit")
+    _git(writer, "push", "origin", "trunk")
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/trunk")
+
+    assert _git(clone, "symbolic-ref", "refs/remotes/origin/HEAD") == "refs/remotes/origin/main"
+    assert _worktree_base_ref(clone) == "origin/trunk"
+
+
 def test_base_ref_falls_back_to_head_without_remote(tmp_path: Path) -> None:
     repo = tmp_path / "local-only"
     subprocess.run(["git", "init", "-b", "main", str(repo)], capture_output=True, check=True)
