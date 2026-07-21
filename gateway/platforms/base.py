@@ -1936,6 +1936,9 @@ class SendResult:
     # stream consumer can send the missing tail instead of marking a clipped
     # response complete.
     retryable: bool = False  # True for transient connection errors — base will retry automatically
+    # True when a multi-message adapter delivered a non-empty prefix before a
+    # later chunk failed. Retrying the full payload would duplicate that prefix.
+    partial_delivery: bool = False
     # Server-requested retry delay in seconds (e.g. Telegram FloodWait retry_after).
     # When present, _send_with_retry() honors this instead of its default backoff.
     retry_after: Optional[float] = None
@@ -4474,6 +4477,9 @@ class BasePlatformAdapter(ABC):
         )
 
         if result.success:
+            return result
+
+        if result.partial_delivery:
             return result
 
         error_str = result.error or ""

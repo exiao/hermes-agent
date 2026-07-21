@@ -84,6 +84,92 @@ def _parse_comma_list(value: str) -> List[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _rebalance_inline_markdown_chunks(chunks: List[str]) -> List[str]:
+    """Make each chunk independently valid for Signal's inline formatter.
+
+    ``truncate_message()`` already carries fenced code blocks, but its chunks can
+    bisect bold, italic, and strikethrough spans. Signal formats every chunk
+    independently, so close an active span before its indicator and reopen it at
+    the beginning of the next body.  The virtual delimiters are removed by
+    ``markdown_to_signal()``, leaving the indicator unstyled and the text range
+    continuous across sends.
+    """
+    if len(chunks) < 2:
+        return chunks
+
+    active: List[str] = []
+
+    def toggle(marker: str) -> None:
+        if marker in active:
+            active.remove(marker)
+        else:
+            active.append(marker)
+
+    total = len(chunks)
+    bodies = []
+    for index, chunk in enumerate(chunks, start=1):
+        indicator = f" ({index}/{total})"
+        bodies.append(chunk[:-len(indicator)] if chunk.endswith(indicator) else chunk)
+
+    # Keep a two-character delimiter together when the raw split bisects it.
+    # The moved delimiter disappears during formatting, so this cannot enlarge
+    # the outgoing Signal message.
+    for index in range(total - 1):
+        if not bodies[index] or not bodies[index + 1]:
+            continue
+        delimiter = bodies[index][-1] + bodies[index + 1][0]
+        if delimiter in {"**", "__", "~~"}:
+            bodies[index] += bodies[index + 1][0]
+            bodies[index + 1] = bodies[index + 1][1:]
+
+    balanced: List[str] = []
+    for index, body in enumerate(bodies, start=1):
+        indicator = f" ({index}/{total})"
+        prefix = "".join(active)
+
+        offset = 0
+        while offset < len(body):
+            if body.startswith("```", offset):
+                closing = body.find("```", offset + 3)
+                offset = closing + 3 if closing >= 0 else len(body)
+            elif body[offset] == "`":
+                closing = body.find("`", offset + 1)
+                offset = closing + 1 if closing >= 0 else len(body)
+            elif body.startswith("**", offset):
+                toggle("**")
+                offset += 2
+            elif body.startswith("__", offset):
+                toggle("__")
+                offset += 2
+            elif body.startswith("~~", offset):
+                toggle("~~")
+                offset += 2
+            elif body[offset] == "*":
+                previous = body[offset - 1] if offset else ""
+                following = body[offset + 1] if offset + 1 < len(body) else ""
+                if "*" in active:
+                    if previous != "*":
+                        toggle("*")
+                elif following not in {"*", " "}:
+                    toggle("*")
+                offset += 1
+            elif body[offset] == "_":
+                previous = body[offset - 1] if offset else ""
+                following = body[offset + 1] if offset + 1 < len(body) else ""
+                if "_" in active:
+                    if previous != "_" and not following.isalnum():
+                        toggle("_")
+                elif not previous.isalnum() and following != "_":
+                    toggle("_")
+                offset += 1
+            else:
+                offset += 1
+
+        balanced.append(prefix + body + "".join(reversed(active)) + indicator)
+
+    return balanced
+
+
 def _guess_extension(data: bytes) -> str:
     """Guess file extension from magic bytes.
 
@@ -278,6 +364,7 @@ class SignalAdapter(BasePlatformAdapter):
     """Signal messenger adapter using signal-cli HTTP daemon."""
 
     platform = Platform.SIGNAL
+    splits_long_messages = True  # send() chunks raw markdown before formatting.
     # Signal has no real edit API for already-sent messages. Mark it explicitly
     # so streaming suppresses the visible cursor instead of leaving a stale tofu
     # square behind in chat clients when edit attempts fail.
@@ -1134,40 +1221,70 @@ class SignalAdapter(BasePlatformAdapter):
         """Send a text message with native Signal formatting."""
         await self._stop_typing_indicator(chat_id)
 
-        plain_text, text_styles = self._markdown_to_signal(content)
-
-        params: Dict[str, Any] = {
+        params_base: Dict[str, Any] = {
             "account": self.account,
-            "message": plain_text,
         }
 
-        if text_styles:
-            if len(text_styles) == 1:
-                params["textStyle"] = text_styles[0]
-            else:
-                params["textStyles"] = text_styles
-
         if chat_id.startswith("group:"):
-            params["groupId"] = chat_id[6:]
+            params_base["groupId"] = chat_id[6:]
         else:
-            params["recipient"] = [await self._resolve_recipient(chat_id)]
+            params_base["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        logger.info("[Signal] Sending response (%d chars) to %s", len(plain_text), chat_id)
-        try:
-            result = await self._rpc("send", params, raise_on_error=True)
-        except SignalRPCError as exc:
-            return SendResult(success=False, error=str(exc))
+        chunks = _rebalance_inline_markdown_chunks(
+            self.truncate_message(content, MAX_MESSAGE_LENGTH)
+        )
+        sent_chunks = 0
+        for chunk in chunks:
+            plain_text, text_styles = self._markdown_to_signal(chunk)
+            params = {**params_base, "message": plain_text}
+            if text_styles:
+                if len(text_styles) == 1:
+                    params["textStyle"] = text_styles[0]
+                else:
+                    params["textStyles"] = text_styles
 
-        if result is not None:
+            logger.info("[Signal] Sending response (%d chars) to %s", len(plain_text), chat_id)
+            try:
+                result = await self._rpc("send", params, raise_on_error=True)
+            except SignalRPCError as exc:
+                return self._partial_send_failure(sent_chunks, len(chunks), str(exc))
+
+            if result is None:
+                return self._partial_send_failure(sent_chunks, len(chunks), "RPC send failed")
             success, err_msg = self._validate_send_result(result)
             if not success:
-                return SendResult(success=False, error=err_msg, raw_response=result)
+                return self._partial_send_failure(
+                    sent_chunks, len(chunks), err_msg or "Signal rejected send", result
+                )
             self._track_sent_timestamp(result)
-            # Signal has no editable message identifier. Returning None keeps the
-            # stream consumer on the non-edit fallback path instead of pretending
-            # future edits can remove an in-progress cursor from the chat thread.
-            return SendResult(success=True, message_id=None)
-        return SendResult(success=False, error="RPC send failed")
+            sent_chunks += 1
+        # Signal has no editable message identifier. Returning None keeps the
+        # stream consumer on the non-edit fallback path instead of pretending
+        # future edits can remove an in-progress cursor from the chat thread.
+        return SendResult(success=True, message_id=None)
+
+    @staticmethod
+    def _partial_send_failure(
+        sent_chunks: int,
+        total_chunks: int,
+        error: str,
+        raw_response=None,
+    ) -> SendResult:
+        """Return a failure that prevents retries after partial delivery."""
+        if not sent_chunks:
+            return SendResult(success=False, error=error, raw_response=raw_response)
+        logger.error(
+            "[Signal] Partial send: delivered %d/%d chunks before failure: %s",
+            sent_chunks,
+            total_chunks,
+            error,
+        )
+        return SendResult(
+            success=False,
+            error=f"Partial send after {sent_chunks}/{total_chunks} chunks: {error}",
+            raw_response=raw_response,
+            partial_delivery=True,
+        )
 
     def _track_sent_timestamp(self, rpc_result) -> None:
         """Record outbound message timestamp for echo-back filtering."""

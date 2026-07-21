@@ -1115,6 +1115,174 @@ class TestSignalSendReturnsMessageId:
         assert result.message_id is None
 
     @pytest.mark.asyncio
+    async def test_send_chunks_long_markdown_with_independent_formatting(self, monkeypatch):
+        """Long markdown is sent in ordered, separately formatted Signal messages."""
+        from gateway.platforms.signal import MAX_MESSAGE_LENGTH
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        sent = []
+
+        async def mock_rpc(method, params, rpc_id=None, **kwargs):
+            sent.append({"method": method, "params": dict(params)})
+            return {"timestamp": len(sent)}
+
+        adapter._rpc = mock_rpc
+        content = "**Opening paragraph**\n\n" + ("word " * 1600) + "**Closing paragraph**"
+
+        result = await adapter.send(chat_id="+155****4567", content=content)
+
+        assert adapter.splits_long_messages is True
+        assert result.success is True
+        assert result.message_id is None
+        assert [call["method"] for call in sent] == ["send", "send"]
+        assert all(len(call["params"]["message"]) <= MAX_MESSAGE_LENGTH for call in sent)
+        assert sent[0]["params"]["message"].startswith("Opening paragraph")
+        assert "Closing paragraph" in sent[1]["params"]["message"]
+        assert all("**" not in call["params"]["message"] for call in sent)
+        for call in sent:
+            styles = [call["params"].get("textStyle", ""), *call["params"].get("textStyles", [])]
+            assert any(style.endswith(":BOLD") for style in styles)
+        assert {1, 2} <= set(adapter._recent_sent_timestamps)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("marker", "style"),
+        [
+            ("**", "BOLD"),
+            ("__", "BOLD"),
+            ("*", "ITALIC"),
+            ("_", "ITALIC"),
+            ("~~", "STRIKETHROUGH"),
+        ],
+    )
+    async def test_send_preserves_inline_style_across_chunk_boundary(self, monkeypatch, marker, style):
+        """An inline style span remains native-formatted when it needs two sends."""
+        from gateway.platforms.signal import MAX_MESSAGE_LENGTH
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        sent = []
+
+        async def mock_rpc(method, params, rpc_id=None, **kwargs):
+            sent.append(dict(params))
+            return {"timestamp": len(sent)}
+
+        adapter._rpc = mock_rpc
+
+        result = await adapter.send(
+            chat_id="+155****4567",
+            content=marker + ("x" * (MAX_MESSAGE_LENGTH + 100)) + marker,
+        )
+
+        assert result.success is True
+        assert len(sent) == 2
+        assert all(marker not in params["message"] for params in sent)
+        for params in sent:
+            styles = [params.get("textStyle", ""), *params.get("textStyles", [])]
+            assert any(text_style.endswith(f":{style}") for text_style in styles)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("marker", "style"),
+        [("**", "BOLD"), ("__", "BOLD"), ("~~", "STRIKETHROUGH")],
+    )
+    async def test_send_preserves_style_when_closing_delimiter_straddles_chunk_boundary(
+        self, monkeypatch, marker, style
+    ):
+        """A two-character closing delimiter can itself straddle the raw split."""
+        from gateway.platforms.signal import MAX_MESSAGE_LENGTH
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        sent = []
+
+        async def mock_rpc(method, params, rpc_id=None, **kwargs):
+            sent.append(dict(params))
+            return {"timestamp": len(sent)}
+
+        adapter._rpc = mock_rpc
+        result = await adapter.send(
+            chat_id="+155****4567",
+            content=marker + ("x" * 7983) + marker + ("z" * 100),
+        )
+
+        assert result.success is True
+        assert len(sent) == 2
+        assert all(marker not in params["message"] for params in sent)
+        first_styles = [sent[0].get("textStyle", ""), *sent[0].get("textStyles", [])]
+        assert any(text_style.endswith(f":{style}") for text_style in first_styles)
+
+    @pytest.mark.asyncio
+    async def test_send_does_not_carry_italic_after_closing_marker_before_space(self, monkeypatch):
+        from gateway.platforms.signal import MAX_MESSAGE_LENGTH
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        sent = []
+
+        async def mock_rpc(method, params, rpc_id=None, **kwargs):
+            sent.append(dict(params))
+            return {"timestamp": len(sent)}
+
+        adapter._rpc = mock_rpc
+        result = await adapter.send(
+            chat_id="+155****4567",
+            content="Prefix *important* " + ("x" * (MAX_MESSAGE_LENGTH + 100)),
+        )
+
+        assert result.success is True
+        assert "*" not in sent[0]["message"]
+        assert not any(
+            style.endswith(":ITALIC")
+            for style in [sent[1].get("textStyle", ""), *sent[1].get("textStyles", [])]
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_ignores_markers_inside_code_spans(self, monkeypatch):
+        from gateway.platforms.signal import MAX_MESSAGE_LENGTH
+
+        for content in (
+            "```\n" + ("x" * 100) + "**" + ("x" * MAX_MESSAGE_LENGTH) + "\n```",
+            "`**` " + ("x" * (MAX_MESSAGE_LENGTH + 100)),
+        ):
+            adapter = _make_signal_adapter(monkeypatch)
+            adapter._stop_typing_indicator = AsyncMock()
+            sent = []
+
+            async def mock_rpc(method, params, rpc_id=None, **kwargs):
+                sent.append(dict(params))
+                return {"timestamp": len(sent)}
+
+            adapter._rpc = mock_rpc
+            result = await adapter.send(chat_id="+155****4567", content=content)
+
+            assert result.success is True
+            assert "".join(params["message"] for params in sent).count("**") == 1
+
+    @pytest.mark.asyncio
+    async def test_send_marks_partial_delivery_on_later_chunk_failure(self, monkeypatch):
+        from gateway.platforms.signal import MAX_MESSAGE_LENGTH
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        calls = 0
+
+        async def mock_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            return {"timestamp": 1} if calls == 1 else None
+
+        adapter._rpc = mock_rpc
+        result = await adapter.send(
+            chat_id="+155****4567", content="x" * (MAX_MESSAGE_LENGTH + 100)
+        )
+
+        assert result.success is False
+        assert result.partial_delivery is True
+        assert result.error == "Partial send after 1/2 chunks: RPC send failed"
+
+    @pytest.mark.asyncio
     async def test_send_returns_none_message_id_when_no_timestamp(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
         mock_rpc, _ = _stub_rpc({})  # No timestamp key
