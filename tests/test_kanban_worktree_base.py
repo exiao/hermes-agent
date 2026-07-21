@@ -49,6 +49,36 @@ def test_base_ref_prefers_origin_default(origin_and_clone) -> None:
     assert _worktree_base_ref(clone) == "origin/main"
 
 
+def test_base_ref_refreshes_only_default_branch(origin_and_clone, tmp_path: Path) -> None:
+    """Refreshing the base must not update every tracked remote branch."""
+    origin, clone = origin_and_clone
+    writer = tmp_path / "writer"
+    subprocess.run(["git", "clone", str(origin), str(writer)], capture_output=True, check=True)
+    _git(writer, "config", "user.email", "t@t")
+    _git(writer, "config", "user.name", "t")
+
+    _git(writer, "checkout", "-b", "unrelated")
+    (writer / "unrelated.txt").write_text("first\n")
+    _git(writer, "add", "unrelated.txt")
+    _git(writer, "commit", "-m", "first unrelated commit")
+    _git(writer, "push", "origin", "unrelated")
+    _git(clone, "fetch", "origin", "unrelated:refs/remotes/origin/unrelated")
+    unrelated_before = _git(clone, "rev-parse", "origin/unrelated")
+
+    _git(writer, "checkout", "main")
+    (writer / "base.txt").write_text("fresh default\n")
+    _git(writer, "commit", "-am", "fresh default commit")
+    _git(writer, "push", "origin", "main")
+    _git(writer, "checkout", "unrelated")
+    (writer / "unrelated.txt").write_text("second\n")
+    _git(writer, "commit", "-am", "second unrelated commit")
+    _git(writer, "push", "origin", "unrelated")
+
+    assert _worktree_base_ref(clone) == "origin/main"
+    assert _git(clone, "rev-parse", "origin/main") == _git(writer, "rev-parse", "origin/main")
+    assert _git(clone, "rev-parse", "origin/unrelated") == unrelated_before
+
+
 def test_base_ref_falls_back_to_head_without_remote(tmp_path: Path) -> None:
     repo = tmp_path / "local-only"
     subprocess.run(["git", "init", "-b", "main", str(repo)], capture_output=True, check=True)
