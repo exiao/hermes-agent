@@ -101,26 +101,34 @@ def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path
     assert captured["env"]["TERMINAL_CWD"] == "/pre/existing/anchor"
 
 
-def test_inherited_terminal_backend_vars_scrubbed(monkeypatch, tmp_path):
-    """Leaked dispatcher TERMINAL_* backend/image vars must NOT reach the worker.
+def test_inherited_terminal_config_vars_scrubbed(monkeypatch, tmp_path):
+    """Leaked dispatcher TERMINAL_* config vars must NOT reach the worker.
 
-    Regression: the dispatcher's lazy terminal-config bridge exports the ROOT
-    config's TERMINAL_ENV / TERMINAL_MODAL_IMAGE / TERMINAL_CONTAINER_PERSISTENT
-    into os.environ. _default_spawn does ``env = dict(os.environ)``, so those
-    leak into the child. Because the child's own bridge early-returns when
-    TERMINAL_ENV is already present, the inherited root values silently override
-    the assignee profile's terminal.backend / terminal.modal_image. The spawn
-    must scrub the config-derived TERMINAL_* vars so the child re-derives them
-    from its own profile config. TERMINAL_CWD is set deliberately and must NOT
-    be scrubbed (covered by the tests above).
+    Regression: the dispatcher's lazy terminal-config bridge overwrites os.environ
+    with the ROOT config's TERMINAL_* values (backend, images, container limits,
+    docker mounts/env/network) whenever the root config has a ``terminal:``
+    section. _default_spawn does ``env = dict(os.environ)``, so those leak into
+    the child. Because the child's own bridge early-returns when TERMINAL_ENV is
+    already present and otherwise backfills with override=False, the inherited
+    root values silently override the assignee profile's terminal.* config. The
+    spawn must scrub the config-derived TERMINAL_* vars so the child re-derives
+    them from its own profile config. TERMINAL_CWD / TERMINAL_TIMEOUT are pinned
+    deliberately and must survive.
     """
     root = tmp_path / ".hermes"
     (root / "profiles" / "w").mkdir(parents=True)
     (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    # Root has a `terminal:` section — this is what makes the dispatcher bridge
+    # run with override=True and clobber os.environ, so scrubbing is warranted.
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\nterminal:\n  backend: local\n", encoding="utf-8"
+    )
     monkeypatch.setenv("HERMES_HOME", str(root))
 
-    # Simulate the dispatcher's leaked backend/image env.
+    # Simulate the dispatcher's leaked env: backend, images, container limits, AND
+    # the docker mount/env/network settings the reviewer flagged (P1). Every one
+    # of these must be scrubbed so a docker/modal worker can't inherit the root
+    # profile's backend, bind mounts, injected env, or egress policy.
     leaked = {
         "TERMINAL_ENV": "local",
         "TERMINAL_MODAL_MODE": "auto",
@@ -133,6 +141,12 @@ def test_inherited_terminal_backend_vars_scrubbed(monkeypatch, tmp_path):
         "TERMINAL_CONTAINER_MEMORY": "5120",
         "TERMINAL_CONTAINER_DISK": "51200",
         "TERMINAL_LIFETIME_SECONDS": "300",
+        "TERMINAL_DOCKER_VOLUMES": "/host:/container",
+        "TERMINAL_DOCKER_ENV": "SECRET=root",
+        "TERMINAL_DOCKER_NETWORK": "host",
+        "TERMINAL_DOCKER_EXTRA_ARGS": "--privileged",
+        "TERMINAL_DOCKER_FORWARD_ENV": "PATH",
+        "TERMINAL_SANDBOX_DIR": "/root/sandbox",
     }
     for k, v in leaked.items():
         monkeypatch.setenv(k, v)
@@ -144,8 +158,40 @@ def test_inherited_terminal_backend_vars_scrubbed(monkeypatch, tmp_path):
 
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
-    # None of the leaked backend/image vars survive into the child env.
+    # None of the leaked config-derived vars survive into the child env.
     for key in leaked:
         assert key not in captured["env"], f"{key} leaked into the worker env"
     # TERMINAL_CWD is a deliberate set, not a leak — it must still be present.
     assert captured["env"]["TERMINAL_CWD"] == str(workspace)
+
+
+def test_explicit_terminal_env_preserved_when_root_has_no_terminal_section(monkeypatch, tmp_path):
+    """An operator's explicit TERMINAL_* must survive when root has no terminal cfg.
+
+    When the ROOT config.yaml has NO ``terminal:`` section, the dispatcher's
+    bridge ran with override=False and left any operator-exported TERMINAL_*
+    (e.g. a gateway launched with ``TERMINAL_ENV=modal``) untouched — that IS an
+    explicit selection. Scrubbing it would wrongly fall the worker back to its
+    default backend, so the spawn must NOT scrub in this case.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    # No `terminal:` section in the root config.
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    # Operator explicitly exported a backend + image on the gateway.
+    monkeypatch.setenv("TERMINAL_ENV", "modal")
+    monkeypatch.setenv("TERMINAL_MODAL_IMAGE", "im-operatorExplicit123")
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    # The explicit operator selection is preserved, not scrubbed.
+    assert captured["env"]["TERMINAL_ENV"] == "modal"
+    assert captured["env"]["TERMINAL_MODAL_IMAGE"] == "im-operatorExplicit123"
