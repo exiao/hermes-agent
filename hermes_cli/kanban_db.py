@@ -7422,6 +7422,55 @@ def _worktree_path_resolvable(workspace_path: str) -> bool:
     return _repo_root_for_worktree_target(requested.parent) is not None
 
 
+def _worktree_base_ref(repo_root: Path) -> str:
+    """Return the ref new task worktrees branch from.
+
+    Prefer ``origin/<default>`` (after a best-effort fetch) so a task's base is
+    the repo's true upstream tip. Basing off ``HEAD`` is wrong twice over: the
+    main checkout may be parked on an arbitrary branch (a local PR review, a
+    stacked feature), silently baking foreign commits into every spawned task's
+    diff, and even on the default branch it may be stale. Fall back to ``HEAD``
+    only when there is no usable remote (local-only repos, tests).
+    """
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo_root), "fetch", "origin", "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception:
+        pass  # offline is fine; the ref check below decides
+    try:
+        head_ref = subprocess.run(
+            ["git", "-C", str(repo_root), "symbolic-ref", "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        candidates = []
+        if head_ref.returncode == 0 and head_ref.stdout.strip():
+            # refs/remotes/origin/<default> -> origin/<default>
+            candidates.append(head_ref.stdout.strip().removeprefix("refs/remotes/"))
+        candidates.extend(("origin/main", "origin/master"))
+        for candidate in candidates:
+            verify = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
+                 f"{candidate}^{{commit}}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if verify.returncode == 0:
+                return candidate
+    except Exception:
+        pass
+    return "HEAD"
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -7436,7 +7485,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), _worktree_base_ref(repo_root),
         ]
     result = subprocess.run(
         cmd,
