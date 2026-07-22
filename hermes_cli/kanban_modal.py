@@ -21,6 +21,14 @@ _MODAL_LANE = "memo-evaluator"
 _MAX_MODAL_BRIEF_CHARS = 64_000
 _log = logging.getLogger(__name__)
 
+# Metadata keys the local Kanban lifecycle treats as trusted, host-side
+# directives (they make ``complete_task`` copy/attach/unlink host files at the
+# named paths). A remote Modal result is untrusted input — a prompt-injected or
+# malformed worker response must never be able to smuggle these in and turn an
+# arbitrary readable host file into a Kanban attachment (or get it unlinked).
+# Strip them before applying the remote result.
+_RESERVED_METADATA_KEYS = frozenset({"_staged_artifacts", "artifacts"})
+
 
 class ModalUnsupportedTask(Exception):
     """A memo task cannot be evaluated remotely and must run on a mounted backend.
@@ -79,6 +87,17 @@ def apply_modal_result(
             raise ValueError("Modal completion is missing summary")
         remote_metadata = result.get("metadata")
         metadata = dict(remote_metadata) if isinstance(remote_metadata, dict) else {}
+        # The remote worker is untrusted: drop reserved host-side directive keys
+        # so a malicious/hallucinated result cannot attach or unlink host files.
+        stripped = _RESERVED_METADATA_KEYS.intersection(metadata)
+        if stripped:
+            _log.warning(
+                "modal result for %s carried reserved metadata keys %s; stripped",
+                task_id,
+                sorted(stripped),
+            )
+            for key in stripped:
+                metadata.pop(key, None)
         metadata.update(audit)
         kb.add_comment(
             conn,
@@ -198,16 +217,18 @@ def _run_modal(request: dict[str, Any], *, timeout: int | None = None) -> dict[s
     os.close(fd)
     result_path = Path(result_name)
     try:
-        completed = subprocess.run(  # noqa: S603 -- fixed CLI plus serialized request
+        completed = subprocess.run(  # noqa: S603 -- fixed CLI, request piped via stdin
             [
                 modal_bin,
                 "run",
                 "--write-result",
                 str(result_path),
                 _modal_runner_path(),
-                "--request-json",
-                json.dumps(request, separators=(",", ":")),
             ],
+            # Pass the (potentially ~64KB) request over stdin, not as an argv
+            # element: Windows caps the ENTIRE command line at 32,767 chars, so a
+            # large brief in ``--request-json`` would overflow the spawn there.
+            input=json.dumps(request, separators=(",", ":")),
             check=False,
             capture_output=True,
             text=True,

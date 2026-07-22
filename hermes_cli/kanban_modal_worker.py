@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -183,8 +184,13 @@ Task brief follows:
 
 
 @app.local_entrypoint()
-def main(request_json: str) -> str:
-    """Return the remote result plus the FunctionCall audit handle to the shim."""
+def main() -> str:
+    """Return the remote result plus the FunctionCall audit handle to the shim.
+
+    The serialized request arrives on stdin (not an argv element) so a large
+    brief cannot overflow the Windows 32,767-char command-line limit.
+    """
+    request_json = sys.stdin.read()
     call = evaluate_memo.spawn(request_json)
     result = json.loads(call.get())
     result["modal_call_id"] = call.object_id
