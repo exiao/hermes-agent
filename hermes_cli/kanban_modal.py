@@ -22,6 +22,18 @@ _MAX_MODAL_BRIEF_CHARS = 64_000
 _log = logging.getLogger(__name__)
 
 
+class ModalUnsupportedTask(Exception):
+    """A memo task cannot be evaluated remotely and must run on a mounted backend.
+
+    The Modal worker has no Kanban attachments mount, so a task whose memo is
+    supplied as an attachment (PDF / source document) would be evaluated with
+    only its file *path* in the brief — the remote container cannot read the
+    bytes and could return a hallucinated ``complete``. Surface this as a
+    capability block so a human reroutes the task instead of trusting a verdict
+    made against files the worker never saw.
+    """
+
+
 def resolve_worker_backend(assignee: str | None, kanban_config: dict[str, Any]) -> str:
     """Return the configured backend, restricting Modal to memo-evaluator.
 
@@ -156,6 +168,14 @@ def _build_modal_request(task_id: str, workspace: str) -> tuple[dict[str, Any], 
             raise ValueError(f"Kanban task {task_id} is not running")
         if (task.assignee or "").strip().lower() != _MODAL_LANE:
             raise ValueError(f"Kanban task {task_id} is not assigned to {_MODAL_LANE}")
+        attachments = kb.list_attachments(conn, task.id)
+        if attachments:
+            names = ", ".join(sorted(a.filename for a in attachments))
+            raise ModalUnsupportedTask(
+                f"Kanban task {task_id} has attachments ({names}) that the "
+                "mount-less Modal worker cannot read; run it on a backend with "
+                "the attachments directory mounted."
+            )
         brief = kb.build_worker_context(conn, task.id)
         if len(brief) > _MAX_MODAL_BRIEF_CHARS:
             raise ValueError(
@@ -222,6 +242,20 @@ def run_modal_shim(task_id: str, workspace: str) -> bool:
         with kb.connect_closing() as conn:
             return apply_modal_result(
                 conn, task_id, result, expected_run_id=expected_run_id
+            )
+    except ModalUnsupportedTask as exc:
+        _log.warning("modal Kanban shim cannot run %s remotely: %s", task_id, exc)
+        with kb.connect_closing() as conn:
+            if expected_run_id is None:
+                task = kb.get_task(conn, task_id)
+                expected_run_id = task.current_run_id if task else None
+            kb.add_comment(conn, task_id, "modal-shim", str(exc))
+            return kb.block_task(
+                conn,
+                task_id,
+                reason=str(exc),
+                kind="capability",
+                expected_run_id=expected_run_id,
             )
     except Exception as exc:
         _log.error("modal Kanban shim failed for %s: %s", task_id, exc)

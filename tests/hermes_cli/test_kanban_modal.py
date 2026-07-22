@@ -95,6 +95,73 @@ def test_modal_request_serializes_worker_brief_and_comments_without_board_env():
     assert "HERMES_KANBAN_DB" not in request
 
 
+def test_modal_request_refuses_a_task_with_unreadable_attachments(tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="grade memo",
+            body="Evaluate the attached investment memo.",
+            assignee="memo-evaluator",
+        )
+        assert kb.claim_task(conn, task_id) is not None
+        blob = tmp_path / "memo.pdf"
+        blob.write_bytes(b"%PDF-1.4 fake")
+        kb.add_attachment(
+            conn,
+            task_id,
+            filename="memo.pdf",
+            stored_path=str(blob),
+            content_type="application/pdf",
+            size=blob.stat().st_size,
+        )
+
+    # The mount-less Modal worker cannot read attachment bytes, so the shim must
+    # refuse rather than ship a path-only brief that invites a hallucinated verdict.
+    with pytest.raises(kanban_modal.ModalUnsupportedTask, match="memo.pdf"):
+        kanban_modal._build_modal_request(task_id, "/tmp/workspace")
+
+
+def test_modal_shim_blocks_an_attachment_task_as_a_capability_gap(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="grade memo",
+            body="Evaluate the attached investment memo.",
+            assignee="memo-evaluator",
+        )
+        assert kb.claim_task(conn, task_id) is not None
+        blob = tmp_path / "memo.pdf"
+        blob.write_bytes(b"%PDF-1.4 fake")
+        kb.add_attachment(
+            conn,
+            task_id,
+            filename="memo.pdf",
+            stored_path=str(blob),
+            content_type="application/pdf",
+            size=blob.stat().st_size,
+        )
+
+    def _fail_run(*_args, **_kwargs):
+        raise AssertionError("Modal must not be invoked for an unreadable-attachment task")
+
+    monkeypatch.setattr(kanban_modal, "_run_modal", _fail_run)
+
+    assert kanban_modal.run_modal_shim(task_id, "/tmp/workspace") is True
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "blocked"
+
+
 def test_modal_request_rejects_an_oversized_worker_brief(monkeypatch):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_modal
