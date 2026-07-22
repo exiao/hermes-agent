@@ -17,12 +17,13 @@
  *   - DEFAULT ON. createAntiban() is enabled unless WHATSAPP_ANTIBAN is
  *     explicitly 0/false.
  *   - TWO pacing profiles:
- *       reply (broadcast:false) — LIGHT + UNCAPPED. A short "typing…" indicator
- *         + small gaussian jitter (default 0.6-3s). No rate cap. Designed to run
- *         OUTSIDE the serialised send queue so several concurrent conversations
- *         pace in parallel and stay real-time. An LLM reply already arrives
- *         after variable generation latency, which is itself human-shaped; this
- *         just adds a typing indicator and stops robotic zero-latency sends.
+ *       reply (broadcast:false) — MINIMAL + UNCAPPED. A brief "typing…"
+ *         indicator + tiny gaussian jitter (default 0.1-0.5s). No rate cap.
+ *         Designed to run OUTSIDE the serialised send queue so several
+ *         concurrent conversations pace in parallel and stay real-time. An LLM
+ *         reply already arrives after variable generation latency (itself
+ *         human-shaped); this just flashes a typing state and avoids a
+ *         byte-perfect zero-latency send. Set the floor to 0 for near-instant.
  *       broadcast (broadcast:true) — HEAVY. Big gaussian jitter (default 3-15s),
  *         typing dwell, and per-recipient + global sliding-window rate caps.
  *         The ban-prone fan-out path. Runs INSIDE the send queue.
@@ -30,8 +31,8 @@
  * KNOBS (env, all optional):
  *   WHATSAPP_ANTIBAN                      master switch (default ON; 0 disables)
  *   -- reply path --
- *   WHATSAPP_ANTIBAN_REPLY_JITTER_MIN_MS  reply typing/delay floor   (default 600)
- *   WHATSAPP_ANTIBAN_REPLY_JITTER_MAX_MS  reply typing/delay ceiling (default 3000)
+ *   WHATSAPP_ANTIBAN_REPLY_JITTER_MIN_MS  reply typing/delay floor   (default 100)
+ *   WHATSAPP_ANTIBAN_REPLY_JITTER_MAX_MS  reply typing/delay ceiling (default 500)
  *   -- broadcast path --
  *   WHATSAPP_ANTIBAN_JITTER_MIN_MS        broadcast pre-send delay floor   (default 3000)
  *   WHATSAPP_ANTIBAN_JITTER_MAX_MS        broadcast pre-send delay ceiling (default 15000)
@@ -209,12 +210,14 @@ function createAntiban({ env = process.env } = {}) {
 
   const jitterMin = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_JITTER_MIN_MS', 3000));
   const jitterMax = Math.max(jitterMin, envInt(env, 'WHATSAPP_ANTIBAN_JITTER_MAX_MS', 15000));
-  // Reply pacing is deliberately light: an LLM reply already arrives after
+  // Reply pacing is deliberately MINIMAL: an LLM reply already arrives after
   // variable generation time (2-8s), which is itself a human-shaped signal, so
-  // replies only need a "typing…" indicator plus a small floor of jitter so
-  // fast/cached replies aren't robotically instant. NO rate cap on replies.
-  const replyJitterMin = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_REPLY_JITTER_MIN_MS', 600));
-  const replyJitterMax = Math.max(replyJitterMin, envInt(env, 'WHATSAPP_ANTIBAN_REPLY_JITTER_MAX_MS', 3000));
+  // the reply path only needs to (a) flash a brief "typing…" indicator and
+  // (b) avoid a byte-perfect zero-latency send. A ~0.1-0.5s dwell does both
+  // without being perceptibly slow. NO rate cap on replies. Set floor to 0 for
+  // an essentially instant reply that still shows a momentary typing state.
+  const replyJitterMin = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_REPLY_JITTER_MIN_MS', 100));
+  const replyJitterMax = Math.max(replyJitterMin, envInt(env, 'WHATSAPP_ANTIBAN_REPLY_JITTER_MAX_MS', 500));
   const typingOn = envFlag(env, 'WHATSAPP_ANTIBAN_TYPING', true);
   const typingPerChar = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_TYPING_MS_PER_CHAR', 35));
   const typingMax = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_TYPING_MAX_MS', 6000));

@@ -135,8 +135,8 @@ import {
   });
   assert.deepStrictEqual(presence, ['composing', 'paused'], 'reply shows typing');
   assert.strictEqual(slept.length, 1, 'reply has exactly one (typing) delay');
-  assert.ok(slept[0] >= 600 && slept[0] <= 3000, `reply jitter ${slept[0]} in reply band 600-3000`);
-  console.log('  ✓ default on, replies get light typing + small jitter');
+  assert.ok(slept[0] >= 100 && slept[0] <= 500, `reply jitter ${slept[0]} in reply band 100-500`);
+  console.log('  ✓ default on, replies get brief typing + tiny jitter');
 }
 
 // -- explicit hard-disable via env ----------------------------------
