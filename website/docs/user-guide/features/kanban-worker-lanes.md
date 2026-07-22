@@ -84,6 +84,20 @@ The shape every kanban worker takes today: the assignee is a profile name, the d
 
 When you create profiles for your fleet, choose names that match the *role* you want the orchestrator to route to. The orchestrator (when there is one) discovers your profile names via `hermes profile list` — there's no fixed roster the system assumes (the orchestrator side of the contract is part of the injected `KANBAN_GUIDANCE`).
 
+### Modal memo-evaluator lane (opt-in)
+
+`memo-evaluator` is the only profile lane with a supported remote backend. It remains local by default. To send that lane through Modal, change one config value:
+
+```yaml
+kanban:
+  worker_backends:
+    memo-evaluator: modal
+```
+
+The dispatcher still starts a local shim. The shim serializes the bounded worker brief (including comments), runs `modal run` synchronously, and applies the returned completion or block through the local Kanban database. The remote container never receives Kanban database paths or lifecycle credentials. A successful completion records the Modal function-call id and dashboard log URL in both run metadata and a `modal-shim` comment.
+
+The Modal image bakes only the `memo-evaluator` profile's `SOUL.md` and `skills/`; it reads `OPENAI_API_KEY` from the named `bloom-llm-proxy` Modal secret and routes LLM calls through `https://proxy.getbloom.app`. Before enabling the backend, ensure that profile assets exist locally and that the Modal secret has been provisioned. Values other than `memo-evaluator` remain local, even if a config entry asks for Modal.
+
 ### Orchestrator profile lane
 
 A specialisation of the profile lane: an orchestrator is a Hermes profile whose toolset includes `kanban` but excludes `terminal` / `file` / `code` / `web` for implementation. Its job is decomposing a high-level goal into child tasks via `kanban_create` + `kanban_link` and stepping back. The orchestrator skill encodes the anti-temptation rules.

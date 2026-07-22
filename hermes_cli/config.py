@@ -1543,6 +1543,10 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Worker execution backend per lane. Only ``memo-evaluator`` supports
+        # ``modal`` in this phase; every other lane remains local even if a
+        # stray config value names Modal.
+        "worker_backends": {"memo-evaluator": "local"},
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

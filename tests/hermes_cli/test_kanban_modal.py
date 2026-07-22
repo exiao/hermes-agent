@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import os
+from types import SimpleNamespace
+
+import pytest
+
+
+def test_memo_evaluator_is_the_only_lane_that_can_use_modal():
+    from hermes_cli import kanban_modal
+
+    assert kanban_modal.resolve_worker_backend("memo-evaluator", {}) == "local"
+    assert kanban_modal.resolve_worker_backend(
+        "memo-evaluator", {"worker_backends": {"memo-evaluator": "modal"}}
+    ) == "modal"
+    assert kanban_modal.resolve_worker_backend(
+        "dev", {"worker_backends": {"dev": "modal"}}
+    ) == "local"
+
+
+def test_modal_completion_is_written_locally_with_audit_metadata():
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="grade memo", assignee="memo-evaluator")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+
+        assert kanban_modal.apply_modal_result(
+            conn,
+            task_id,
+            {
+                "outcome": "complete",
+                "summary": "Memo passed the rubric.",
+                "metadata": {"score": 8},
+                "modal_call_id": "fc-123",
+                "modal_log_url": "https://modal.com/apps/example/logs/fc-123",
+            },
+            expected_run_id=task.current_run_id,
+        )
+
+        completed = kb.get_task(conn, task_id)
+        assert completed is not None and completed.status == "done"
+        run = kb.list_runs(conn, task_id)[-1]
+        assert run.metadata == {
+            "score": 8,
+            "modal_call_id": "fc-123",
+            "modal_log_url": "https://modal.com/apps/example/logs/fc-123",
+        }
+        assert "fc-123" in kb.list_comments(conn, task_id)[-1].body
+
+
+def test_configured_spawn_routes_only_memo_evaluator_to_modal(monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    calls = []
+    monkeypatch.setattr(
+        kanban_modal,
+        "spawn_modal_worker",
+        lambda task, workspace, *, board=None: calls.append((task.assignee, workspace, board)) or 71,
+    )
+    monkeypatch.setattr(kb, "_load_kanban_cfg", lambda: {"worker_backends": {"memo-evaluator": "modal"}})
+    monkeypatch.setattr(kb, "_default_spawn", lambda *_args, **_kwargs: 72)
+
+    memo_task = SimpleNamespace(assignee="memo-evaluator")
+    dev_task = SimpleNamespace(assignee="dev")
+    assert kb._configured_worker_spawn(memo_task, "/tmp/memo", board="test-board") == 71
+    assert kb._configured_worker_spawn(dev_task, "/tmp/dev", board="test-board") == 72
+    assert calls == [("memo-evaluator", "/tmp/memo", "test-board")]
+
+
+def test_modal_request_serializes_worker_brief_and_comments_without_board_env():
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="grade memo",
+            body="Evaluate the attached investment memo.",
+            assignee="memo-evaluator",
+        )
+        kb.add_comment(conn, task_id, "reviewer", "Use the current evidence rubric.")
+        assert kb.claim_task(conn, task_id) is not None
+
+    request, _run_id = kanban_modal._build_modal_request(task_id, "/tmp/workspace")
+
+    assert request["workspace"] == "/tmp/workspace"
+    assert "Evaluate the attached investment memo." in request["brief"]
+    assert "Use the current evidence rubric." in request["brief"]
+    assert "HERMES_KANBAN_DB" not in request
+
+
+def test_modal_request_rejects_an_oversized_worker_brief(monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="grade memo", assignee="memo-evaluator")
+        assert kb.claim_task(conn, task_id) is not None
+
+    monkeypatch.setattr(
+        kb,
+        "build_worker_context",
+        lambda *_args: "x" * (kanban_modal._MAX_MODAL_BRIEF_CHARS + 1),
+    )
+    with pytest.raises(ValueError, match="too large"):
+        kanban_modal._build_modal_request(task_id, "/tmp/workspace")
+
+
+def test_modal_cli_result_is_consumed_from_the_write_result_file(monkeypatch, tmp_path):
+    from hermes_cli import kanban_modal
+
+    fake_modal = tmp_path / "modal"
+    fake_modal.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        "out = pathlib.Path(sys.argv[sys.argv.index('--write-result') + 1])\n"
+        "out.write_text(json.dumps({'outcome': 'complete', 'summary': 'done', "
+        "'modal_call_id': 'fc-test', 'modal_log_url': 'https://modal.test/log'}))\n",
+        encoding="utf-8",
+    )
+    fake_modal.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    result = kanban_modal._run_modal({"task_id": "t_test", "brief": "grade this"})
+
+    assert result["modal_call_id"] == "fc-test"
+    assert result["modal_log_url"] == "https://modal.test/log"
