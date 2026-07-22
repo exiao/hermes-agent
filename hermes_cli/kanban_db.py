@@ -5205,7 +5205,7 @@ def release_stale_claims(
 
     Backstop (#29747 gap 3): if the worker's PID is still alive but its
     ``last_heartbeat_at`` is stale by more than
-    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (1h), the worker has
+    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (40min), the worker has
     been making no observable progress and we reclaim anyway — even if
     ``_pid_alive`` is still true. This catches the wedged-in-a-logic-loop
     case where the process is technically running but accomplishing
