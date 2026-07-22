@@ -9039,7 +9039,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error, title, body FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, title, body, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -9124,6 +9124,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    a babysit task references the PR up front in its title/body. So if a
     #    PR reference appears in title/body, this task is about an existing PR,
     #    not at risk of duplicating one — skip the comment-based guard.
+    #
+    #    SECOND exemption (cross-lane handoff): the duplicate-PR risk only
+    #    exists when THIS task's OWN worker (running under the task's assignee
+    #    profile) opened the PR. A QA-verify card is handed its target PR by a
+    #    DIFFERENT lane — the dev card posts "PR ready for the linked QA run:
+    #    <url>" as a comment authored by `dev`, not `qa`. That comment is a
+    #    handoff pointer, not this worker's own output, so re-spawning the QA
+    #    worker cannot duplicate it. Only a PR-URL comment authored by the
+    #    task's OWN assignee signals a real duplicate risk. Without this, every
+    #    dev→qa verify card is stranded for the full 24h PR window.
     anchored_to_pr = any(
         field and (
             _RESPAWN_GUARD_PR_URL_RE.search(field)
@@ -9133,11 +9143,18 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     )
     if not anchored_to_pr:
         pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        task_assignee = row["assignee"]
         for c in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            "SELECT author, body FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ?",
             (task_id, pr_cutoff),
         ).fetchall():
             if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                # Only a PR opened by THIS task's own worker (comment author
+                # == task assignee) risks a duplicate. A cross-lane handoff
+                # comment (e.g. dev handing a PR to qa) does not.
+                if task_assignee and c["author"] != task_assignee:
+                    continue
                 return "active_pr"
 
     return None
