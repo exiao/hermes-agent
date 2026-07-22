@@ -252,7 +252,10 @@ DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 # bridges chunk-level liveness into ``last_heartbeat_at`` via #31752,
 # so any genuinely active worker keeps its heartbeat fresh as a side
 # effect of normal API traffic.
-DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
+# Lowered 1h → 40min (2026-07-22) so wedged workers reclaim faster; kept
+# consistent with _STALE_HEARTBEAT_GAP_SECONDS. Still well above normal
+# streaming heartbeat cadence, so healthy quiet-on-CI workers aren't false-reaped.
+DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 2400
 
 # Grace added to a claim when a reclaim is deferred because the previous
 # host-local worker is still alive after a termination attempt. Releasing the
@@ -8363,9 +8366,11 @@ def enforce_max_runtime(
 
 # Heartbeat staleness heartbeat gap — if a running task hasn't sent a
 # heartbeat in this many seconds it's considered inactive regardless of
-# the ``dispatch_stale_timeout_seconds`` threshold.  Hardcoded at 1 hour
-# to match the original spec (">4h started + no commits in 1h").
-_STALE_HEARTBEAT_GAP_SECONDS = 3600
+# the ``dispatch_stale_timeout_seconds`` threshold.  Lowered 1h → 40min
+# (2026-07-22) so wedged workers reclaim faster; kept consistent with
+# DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS. Still well above normal
+# streaming heartbeat cadence, so healthy quiet-on-CI workers aren't false-reaped.
+_STALE_HEARTBEAT_GAP_SECONDS = 2400
 
 
 def detect_stale_running(
