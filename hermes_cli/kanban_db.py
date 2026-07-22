@@ -7422,6 +7422,95 @@ def _worktree_path_resolvable(workspace_path: str) -> bool:
     return _repo_root_for_worktree_target(requested.parent) is not None
 
 
+def _worktree_base_ref(repo_root: Path) -> str:
+    """Return the ref new task worktrees branch from.
+
+    Prefer ``origin/<default>`` (after a best-effort targeted fetch) so a task's
+    base is the repo's true upstream tip. Basing off ``HEAD`` is wrong twice
+    over: the main checkout may be parked on an arbitrary branch (a local PR
+    review, a stacked feature), silently baking foreign commits into every
+    spawned task's diff, and even on the default branch it may be stale. Fall
+    back to ``HEAD`` only when there is no usable remote (local-only repos,
+    tests).
+
+    Offline fallback contract: when ``origin`` is unreachable, the ``ls-remote``
+    probe is the single network attempt — we do NOT retry a fetch per candidate
+    (that would stall the dispatcher for minutes before the ``HEAD`` fallback).
+    Offline, candidates are verified against already-cached refs only. If the
+    local ``origin/HEAD`` symref is absent AND neither cached ``origin/main`` nor
+    ``origin/master`` resolves, this returns ``HEAD`` (the pre-fix behavior). We
+    deliberately do NOT guess the remote default among other cached ``origin/*``
+    refs — an arbitrary cached ref could be a parked feature or review branch,
+    reintroducing exactly the foreign-commit contamination this function exists
+    to prevent, and provenance is unrecoverable while offline. A
+    non-``main``/``master`` remote default is only honored when discoverable
+    online (``ls-remote --symref``) or already recorded in ``origin/HEAD``.
+    """
+    try:
+        head_ref = subprocess.run(
+            ["git", "-C", str(repo_root), "symbolic-ref", "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        head_ref = None
+
+    candidates = []
+    remote_reachable = False
+    try:
+        remote_head = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-remote", "--symref", "origin", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        remote_reachable = remote_head.returncode == 0
+        for line in remote_head.stdout.splitlines():
+            if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                remote_branch = line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
+                candidates.append(f"origin/{remote_branch}")
+                break
+    except Exception:
+        pass
+    if head_ref is not None and head_ref.returncode == 0 and head_ref.stdout.strip():
+        # refs/remotes/origin/<default> -> origin/<default>
+        candidates.append(head_ref.stdout.strip().removeprefix("refs/remotes/"))
+    candidates.extend(("origin/main", "origin/master"))
+    for candidate in dict.fromkeys(candidates):
+        branch = candidate.removeprefix("origin/")
+        try:
+            # Only spend a network fetch when the remote answered the probe
+            # above. When origin is unreachable, ``ls-remote`` already burned
+            # its timeout; retrying a fetch per candidate would stall the
+            # dispatcher for minutes before the HEAD fallback. Offline, we only
+            # verify already-cached refs locally.
+            if remote_reachable:
+                subprocess.run(
+                    ["git", "-C", str(repo_root), "fetch", "origin", "--quiet",
+                     f"+refs/heads/{branch}:refs/remotes/{candidate}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+            verify = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
+                 f"{candidate}^{{commit}}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if verify.returncode == 0:
+                return candidate
+        except Exception:
+            pass  # offline is fine; the ref check below decides
+    return "HEAD"
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -7436,7 +7525,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), _worktree_base_ref(repo_root),
         ]
     result = subprocess.run(
         cmd,
