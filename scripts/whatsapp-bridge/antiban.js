@@ -244,13 +244,19 @@ function createAntiban({ env = process.env } = {}) {
   // failures never block the send.
   async function showTyping(sock, chatId, dwellMs, sleepFn) {
     if (typingOn && sock && chatId) {
+      let dwelled = false;
       try {
         await sock.sendPresenceUpdate('composing', chatId);
         await sleepFn(dwellMs);
+        dwelled = true;
         await sock.sendPresenceUpdate('paused', chatId);
         return;
       } catch {
-        // fall through to a plain sleep so the delay still applies
+        // Presence update failed. If the dwell already completed (only the
+        // trailing 'paused' update threw), don't sleep it a second time —
+        // that would double the delay (up to +typingMax per send). Only fall
+        // through to a plain sleep when the dwell never ran.
+        if (dwelled) return;
       }
     }
     await sleepFn(dwellMs);

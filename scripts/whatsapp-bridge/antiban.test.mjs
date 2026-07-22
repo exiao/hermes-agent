@@ -306,4 +306,36 @@ import {
   console.log('  ✓ over-cap broadcast records at the effective post-wait send time');
 }
 
+// ------------------------------------------------------------------
+// Regression: when the typing dwell already ran and only the trailing
+// 'paused' presence update fails, showTyping must NOT sleep the dwell a
+// second time (that would double the delay, up to +typingMax per send).
+// ------------------------------------------------------------------
+{
+  const ab = createAntiban({
+    env: {
+      WHATSAPP_ANTIBAN: '1',
+      WHATSAPP_ANTIBAN_TYPING: '1',
+      WHATSAPP_ANTIBAN_TYPING_MS_PER_CHAR: '100',
+      WHATSAPP_ANTIBAN_TYPING_MAX_MS: '6000',
+      WHATSAPP_ANTIBAN_JITTER_MIN_MS: '0',
+      WHATSAPP_ANTIBAN_JITTER_MAX_MS: '0',
+      WHATSAPP_ANTIBAN_MAX_PER_RECIPIENT_HR: '0',
+      WHATSAPP_ANTIBAN_MAX_PER_HOUR: '0',
+    },
+  });
+  const slept = [];
+  const sleepFn = async (ms) => { slept.push(ms); };
+  const sock = {
+    sendPresenceUpdate: async (state) => {
+      if (state === 'paused') throw new Error('presence paused failed');
+    },
+  };
+  // textLength 20 → dwell = 20 * 100 = 2000ms, once.
+  await ab.beforeSend({ chatId: 'x@s.whatsapp.net', broadcast: true, textLength: 20, sock, sleepFn });
+  const dwellCount = slept.filter(ms => ms === 2000).length;
+  assert.strictEqual(dwellCount, 1, `dwell must run exactly once even when 'paused' fails (got ${dwellCount} x 2000ms in ${JSON.stringify(slept)})`);
+  console.log("  ✓ typing dwell runs once when only 'paused' presence update fails");
+}
+
 console.log('\n✅ All antiban tests passed.');
