@@ -96,7 +96,7 @@ kanban:
 
 The dispatcher still starts a local shim. The shim serializes the bounded worker brief (including comments), runs `modal run` synchronously, and applies the returned completion or block through the local Kanban database. The remote container never receives Kanban database paths or lifecycle credentials. A successful completion records the Modal function-call id and dashboard log URL in both run metadata and a `modal-shim` comment.
 
-The Modal image bakes only the `memo-evaluator` profile's `SOUL.md` and `skills/`; it reads `OPENAI_API_KEY` from the named `bloom-llm-proxy` Modal secret and routes LLM calls through `https://proxy.getbloom.app`. Before enabling the backend, ensure that profile assets exist locally and that the Modal secret has been provisioned. Values other than `memo-evaluator` remain local, even if a config entry asks for Modal.
+The Modal image bakes only the `memo-evaluator` profile's `SOUL.md` and `skills/`; it reads `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` from the named `research-proxy` Modal secret and routes LLM calls (model `claude-fable-5`) through that Anthropic-Messages proxy. Before enabling the backend, ensure that profile assets exist locally and that the Modal secret has been provisioned. Values other than `memo-evaluator` remain local, even if a config entry asks for Modal.
 
 ### Orchestrator profile lane
 
