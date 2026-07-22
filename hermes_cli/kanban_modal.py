@@ -138,9 +138,11 @@ def spawn_modal_worker(task: Any, workspace: str, *, board: str | None = None) -
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
-    except Exception:
+    finally:
+        # The child inherits its own dup of the fd; the parent's handle is
+        # only needed for the spawn and must be released so open descriptors
+        # don't accumulate as more Modal workers are launched.
         log_f.close()
-        raise
     return proc.pid
 
 
