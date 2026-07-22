@@ -15,23 +15,32 @@
  *   - Pure, dependency-free, unit-testable in isolation (mirrors the
  *     outbound_ids.js / bridge_helpers.js pattern).
  *   - DEFAULT ON. createAntiban() is enabled unless WHATSAPP_ANTIBAN is
- *     explicitly 0/false. This is safe by default because only sends marked
- *     `broadcast: true` are ever paced (see below) — everything else is a
- *     pure passthrough.
- *   - Interactive replies stay snappy; only sends explicitly marked
- *     `broadcast: true` (the alerts wrapper's fan-out path) pay ANY cost
- *     (typing, jitter, rate cap). A non-broadcast send returns immediately.
- *     A high reply ratio *lowers* ban risk, so we never slow the reply path.
+ *     explicitly 0/false.
+ *   - TWO pacing profiles:
+ *       reply (broadcast:false) — LIGHT + UNCAPPED. A short "typing…" indicator
+ *         + small gaussian jitter (default 0.6-3s). No rate cap. Designed to run
+ *         OUTSIDE the serialised send queue so several concurrent conversations
+ *         pace in parallel and stay real-time. An LLM reply already arrives
+ *         after variable generation latency, which is itself human-shaped; this
+ *         just adds a typing indicator and stops robotic zero-latency sends.
+ *       broadcast (broadcast:true) — HEAVY. Big gaussian jitter (default 3-15s),
+ *         typing dwell, and per-recipient + global sliding-window rate caps.
+ *         The ban-prone fan-out path. Runs INSIDE the send queue.
  *
  * KNOBS (env, all optional):
  *   WHATSAPP_ANTIBAN                      master switch (default ON; 0 disables)
+ *   -- reply path --
+ *   WHATSAPP_ANTIBAN_REPLY_JITTER_MIN_MS  reply typing/delay floor   (default 600)
+ *   WHATSAPP_ANTIBAN_REPLY_JITTER_MAX_MS  reply typing/delay ceiling (default 3000)
+ *   -- broadcast path --
  *   WHATSAPP_ANTIBAN_JITTER_MIN_MS        broadcast pre-send delay floor   (default 3000)
  *   WHATSAPP_ANTIBAN_JITTER_MAX_MS        broadcast pre-send delay ceiling (default 15000)
+ *   -- shared --
  *   WHATSAPP_ANTIBAN_TYPING               send composing presence before a send (default on)
- *   WHATSAPP_ANTIBAN_TYPING_MS_PER_CHAR   typing dwell per char            (default 35)
- *   WHATSAPP_ANTIBAN_TYPING_MAX_MS        typing dwell cap                 (default 6000)
- *   WHATSAPP_ANTIBAN_MAX_PER_RECIPIENT_HR per-chat broadcast cap/hour, 0=off (default 6)
- *   WHATSAPP_ANTIBAN_MAX_PER_HOUR         global broadcast cap/hour, 0=off (default 60)
+ *   WHATSAPP_ANTIBAN_TYPING_MS_PER_CHAR   broadcast typing dwell per char  (default 35)
+ *   WHATSAPP_ANTIBAN_TYPING_MAX_MS        broadcast typing dwell cap       (default 6000)
+ *   WHATSAPP_ANTIBAN_MAX_PER_RECIPIENT_HR per-chat BROADCAST cap/hour, 0=off (default 240)
+ *   WHATSAPP_ANTIBAN_MAX_PER_HOUR         global BROADCAST cap/hour, 0=off (default 60)
  *   WHATSAPP_ANTIBAN_VARY_BODY            append invisible variation so no
  *                                         two broadcast bodies are byte-identical
  *                                         (default OFF — weak measure; real copy
@@ -200,10 +209,18 @@ function createAntiban({ env = process.env } = {}) {
 
   const jitterMin = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_JITTER_MIN_MS', 3000));
   const jitterMax = Math.max(jitterMin, envInt(env, 'WHATSAPP_ANTIBAN_JITTER_MAX_MS', 15000));
+  // Reply pacing is deliberately light: an LLM reply already arrives after
+  // variable generation time (2-8s), which is itself a human-shaped signal, so
+  // replies only need a "typing…" indicator plus a small floor of jitter so
+  // fast/cached replies aren't robotically instant. NO rate cap on replies.
+  const replyJitterMin = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_REPLY_JITTER_MIN_MS', 600));
+  const replyJitterMax = Math.max(replyJitterMin, envInt(env, 'WHATSAPP_ANTIBAN_REPLY_JITTER_MAX_MS', 3000));
   const typingOn = envFlag(env, 'WHATSAPP_ANTIBAN_TYPING', true);
   const typingPerChar = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_TYPING_MS_PER_CHAR', 35));
   const typingMax = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_TYPING_MAX_MS', 6000));
-  const perRecipientHour = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_MAX_PER_RECIPIENT_HR', 6));
+  // Per-recipient cap only ever applies to broadcasts; replies are uncapped so a
+  // real-time back-and-forth is never throttled. Default set high for headroom.
+  const perRecipientHour = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_MAX_PER_RECIPIENT_HR', 240));
   const perHour = Math.max(0, envInt(env, 'WHATSAPP_ANTIBAN_MAX_PER_HOUR', 60));
   const varyOn = envFlag(env, 'WHATSAPP_ANTIBAN_VARY_BODY', false);
 
@@ -219,6 +236,23 @@ function createAntiban({ env = process.env } = {}) {
     return Math.min(typingMax, len * typingPerChar);
   }
 
+  // Show a real "typing…" indicator for `dwellMs`, then let the caller send
+  // (the actual message clears the composing state). Best-effort: presence
+  // failures never block the send.
+  async function showTyping(sock, chatId, dwellMs, sleepFn) {
+    if (typingOn && sock && chatId) {
+      try {
+        await sock.sendPresenceUpdate('composing', chatId);
+        await sleepFn(dwellMs);
+        await sock.sendPresenceUpdate('paused', chatId);
+        return;
+      } catch {
+        // fall through to a plain sleep so the delay still applies
+      }
+    }
+    await sleepFn(dwellMs);
+  }
+
   async function beforeSend(opts = {}) {
     const {
       chatId,
@@ -230,35 +264,28 @@ function createAntiban({ env = process.env } = {}) {
       now = Date.now(),
     } = opts;
 
-    // Interactive (non-broadcast) sends are never paced — no rate wait, no
-    // typing dwell, no jitter — so default-on adds zero latency to normal
-    // conversation. Only the alert fan-out (broadcast:true) is shaped.
-    if (!broadcast) return;
-
-    // Rate cap: wait out the window rather than dropping — the alerts wrapper
-    // sends sequentially so a short wait paces the batch.
-    if (perRecipientHour > 0 || perHour > 0) {
-      const { retryAfterMs } = limiter.check(chatId, now);
-      if (retryAfterMs > 0) {
-        await sleepFn(retryAfterMs);
+    if (broadcast) {
+      // Broadcast fan-out: the ban-prone path. Heavy pacing + rate caps.
+      // Runs sequentially (the alerts wrapper sends one at a time), so the
+      // rate window stays accurate.
+      if (perRecipientHour > 0 || perHour > 0) {
+        const { retryAfterMs } = limiter.check(chatId, now);
+        if (retryAfterMs > 0) await sleepFn(retryAfterMs);
       }
+      await showTyping(sock, chatId, typingDwell(textLength), sleepFn);
+      // Gaussian jitter (uniform/fixed delays are the scripted-send tell).
+      await sleepFn(gaussianDelay(jitterMin, jitterMax, rng));
+      limiter.record(chatId, now);
+      return;
     }
 
-    // Typing/composing presence before the send — human-like, and cheap.
-    if (typingOn && sock && chatId) {
-      try {
-        await sock.sendPresenceUpdate('composing', chatId);
-        await sleepFn(typingDwell(textLength));
-        await sock.sendPresenceUpdate('paused', chatId);
-      } catch {
-        // Presence is best-effort; never block the send on it.
-      }
-    }
-
-    // Gaussian jitter (uniform/fixed delays are the scripted-send tell).
-    await sleepFn(gaussianDelay(jitterMin, jitterMax, rng));
-
-    limiter.record(chatId, now);
+    // Reply path: light + uncapped so a real-time convo (incl. several people
+    // at once) stays snappy. The jitter doubles as the "typing" duration, so
+    // fast replies still show a brief composing indicator and never land with
+    // robotic zero latency. Meant to run OUTSIDE the serialised send queue so
+    // concurrent chats pace in parallel.
+    const dwell = gaussianDelay(replyJitterMin, replyJitterMax, rng);
+    await showTyping(sock, chatId, dwell, sleepFn);
   }
 
   return {
@@ -266,7 +293,10 @@ function createAntiban({ env = process.env } = {}) {
     varyBody,
     beforeSend,
     // Exposed for tests / diagnostics.
-    _config: { jitterMin, jitterMax, typingOn, typingPerChar, typingMax, perRecipientHour, perHour, varyOn },
+    _config: {
+      jitterMin, jitterMax, replyJitterMin, replyJitterMax,
+      typingOn, typingPerChar, typingMax, perRecipientHour, perHour, varyOn,
+    },
   };
 }
 

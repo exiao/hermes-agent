@@ -116,24 +116,27 @@ import {
 }
 
 // ------------------------------------------------------------------
-// createAntiban: DEFAULT ON, but a pure passthrough for interactive replies
+// createAntiban: DEFAULT ON. Replies get LIGHT pacing (typing + small jitter,
+// no rate cap); broadcasts get heavy pacing.
 // ------------------------------------------------------------------
 {
   // Env unset -> enabled by default.
   const ab = createAntiban({ env: {} });
   assert.strictEqual(ab.enabled, true, 'enabled by default when env unset');
 
-  // Interactive (non-broadcast) send: nothing happens — no presence, no sleep.
-  let sockCalled = false;
-  const sock = { sendPresenceUpdate: async () => { sockCalled = true; } };
+  // Reply: shows typing + one small jitter sleep in the REPLY band (0.6-3s),
+  // and never touches the rate limiter.
+  const presence = [];
+  const sock = { sendPresenceUpdate: async (s) => { presence.push(s); } };
   const slept = [];
   await ab.beforeSend({
     chatId: 'x@s.whatsapp.net', broadcast: false, sock,
-    sleepFn: async (ms) => { slept.push(ms); },
+    sleepFn: async (ms) => { slept.push(ms); }, rng: () => 0.5,
   });
-  assert.strictEqual(sockCalled, false, 'no presence on interactive reply');
-  assert.strictEqual(slept.length, 0, 'no delay added to interactive reply');
-  console.log('  ✓ default on, interactive replies untouched');
+  assert.deepStrictEqual(presence, ['composing', 'paused'], 'reply shows typing');
+  assert.strictEqual(slept.length, 1, 'reply has exactly one (typing) delay');
+  assert.ok(slept[0] >= 600 && slept[0] <= 3000, `reply jitter ${slept[0]} in reply band 600-3000`);
+  console.log('  ✓ default on, replies get light typing + small jitter');
 }
 
 // -- explicit hard-disable via env ----------------------------------
@@ -143,22 +146,27 @@ import {
   assert.strictEqual(ab.varyBody('hello'), 'hello', 'varyBody identity when disabled');
   let sockCalled = false;
   const sock = { sendPresenceUpdate: async () => { sockCalled = true; } };
-  await ab.beforeSend({ chatId: 'x@s.whatsapp.net', broadcast: true, sock });
-  assert.strictEqual(sockCalled, false, 'no presence when hard-disabled even for broadcast');
-  console.log('  ✓ WHATSAPP_ANTIBAN=0 hard-disables');
+  const slept = [];
+  await ab.beforeSend({ chatId: 'x@s.whatsapp.net', broadcast: false, sock, sleepFn: async (ms) => { slept.push(ms); } });
+  await ab.beforeSend({ chatId: 'x@s.whatsapp.net', broadcast: true, sock, sleepFn: async (ms) => { slept.push(ms); } });
+  assert.strictEqual(sockCalled, false, 'no presence when hard-disabled (reply or broadcast)');
+  assert.strictEqual(slept.length, 0, 'no delay at all when hard-disabled');
+  console.log('  ✓ WHATSAPP_ANTIBAN=0 hard-disables both paths');
 }
 
 // ------------------------------------------------------------------
-// createAntiban ENABLED: reply path stays instant, broadcast gets paced
+// createAntiban ENABLED: reply pacing is lighter than broadcast pacing
 // ------------------------------------------------------------------
 {
   const ab = createAntiban({
     env: {
       WHATSAPP_ANTIBAN: '1',
+      WHATSAPP_ANTIBAN_REPLY_JITTER_MIN_MS: '600',
+      WHATSAPP_ANTIBAN_REPLY_JITTER_MAX_MS: '3000',
       WHATSAPP_ANTIBAN_JITTER_MIN_MS: '3000',
       WHATSAPP_ANTIBAN_JITTER_MAX_MS: '15000',
       WHATSAPP_ANTIBAN_TYPING: 'on',
-      WHATSAPP_ANTIBAN_MAX_PER_RECIPIENT_HR: '6',
+      WHATSAPP_ANTIBAN_MAX_PER_RECIPIENT_HR: '240',
       WHATSAPP_ANTIBAN_MAX_PER_HOUR: '60',
     },
   });
@@ -169,13 +177,14 @@ import {
   const presence = [];
   const sock = { sendPresenceUpdate: async (state) => { presence.push(state); } };
 
-  // Interactive reply: NOTHING — no presence, no sleep at all.
+  // Reply: typing + ONE small jitter in the reply band. No rate-cap sleep.
   slept.length = 0; presence.length = 0;
-  await ab.beforeSend({ chatId: 'r@s.whatsapp.net', broadcast: false, textLength: 40, sock, sleepFn });
-  assert.deepStrictEqual(presence, [], 'reply shows no typing (broadcast-only)');
-  assert.strictEqual(slept.length, 0, 'reply adds no delay');
+  await ab.beforeSend({ chatId: 'r@s.whatsapp.net', broadcast: false, textLength: 40, sock, sleepFn, rng: () => 0.5 });
+  assert.deepStrictEqual(presence, ['composing', 'paused'], 'reply shows typing');
+  assert.strictEqual(slept.length, 1, 'reply: one delay (typing jitter only, no cap)');
+  assert.ok(slept[0] >= 600 && slept[0] <= 3000, `reply jitter ${slept[0]} in reply band`);
 
-  // Broadcast: typing dwell + gaussian jitter (2 sleeps), jitter in range.
+  // Broadcast: typing dwell + gaussian jitter (2 sleeps), jitter in broadcast band.
   slept.length = 0; presence.length = 0;
   await ab.beforeSend({
     chatId: 'r@s.whatsapp.net', broadcast: true, textLength: 40, sock, sleepFn,
@@ -185,7 +194,7 @@ import {
   assert.strictEqual(slept.length, 2, 'broadcast sleeps twice (typing + jitter)');
   const jitter = slept[1];
   assert.ok(jitter >= 3000 && jitter <= 15000, `jitter ${jitter} within configured band`);
-  console.log('  ✓ enabled: reply instant, broadcast paced with jitter');
+  console.log('  ✓ enabled: reply light-paced, broadcast heavy-paced');
 }
 
 // -- enabled broadcast honours the rate cap (waits, does not drop) ---

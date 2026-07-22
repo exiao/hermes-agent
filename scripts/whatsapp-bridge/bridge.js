@@ -227,10 +227,13 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Anti-ban middleware (gaussian jitter, typing presence, sliding-window rate
-// caps, optional body variation). DEFAULT ON, but only sends flagged
-// `broadcast: true` are ever paced — interactive replies get zero added
-// latency, so default-on is safe. Set WHATSAPP_ANTIBAN=0 to hard-disable.
+// Anti-ban middleware. DEFAULT ON (WHATSAPP_ANTIBAN=0 disables). Two profiles:
+//   - reply (broadcast:false): light typing + small jitter, NO rate cap. Runs
+//     OUTSIDE this queue (in the /send handler) so concurrent conversations
+//     pace in parallel and stay real-time.
+//   - broadcast (broadcast:true): heavy jitter + typing + rate caps. Runs
+//     INSIDE the queue below so typing never overlaps and the rate window
+//     stays accurate.
 const antiban = createAntiban();
 
 function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS, antibanOpts = {}) {
@@ -248,10 +251,11 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
     if (group) {
       try { await resolveGroupMetadata(chatId); } catch { /* non-fatal */ }
     }
-    // Anti-ban pacing runs INSIDE the serialised queue so typing presence
-    // never overlaps across chats and the global rate window stays accurate.
-    // No-op when disabled or when the send isn't a broadcast.
-    if (antiban.enabled) {
+    // BROADCAST pacing runs inside the serialised queue so typing never
+    // overlaps across chats and the global rate window stays accurate. Reply
+    // pacing is NOT done here — it runs outside the queue in the /send handler
+    // so real-time conversations don't block each other.
+    if (antiban.enabled && antibanOpts.broadcast) {
       try { await antiban.beforeSend({ chatId, sock, ...antibanOpts }); } catch { /* non-fatal */ }
     }
     let timer;
@@ -988,9 +992,16 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    // Broadcast sends (the alerts fan-out) opt into anti-ban pacing and, if
-    // WHATSAPP_ANTIBAN_VARY_BODY is on, invisible body variation. Interactive
-    // replies (no broadcast flag) are untouched and stay instant.
+    // Anti-ban pacing.
+    //   - Reply (no broadcast flag): light typing + small jitter, run HERE,
+    //     outside the serialised send queue, so several concurrent chats pace
+    //     in parallel and stay real-time. Only paced once, on the first chunk.
+    //   - Broadcast (alerts fan-out): heavy pacing + rate caps run inside the
+    //     queue (in sendWithTimeout); here we only apply optional body variation.
+    if (antiban.enabled && !broadcast) {
+      try { await antiban.beforeSend({ chatId, sock, broadcast: false, textLength: String(message).length }); }
+      catch { /* non-fatal */ }
+    }
     const varied = broadcast ? antiban.varyBody(message) : message;
     const chunks = splitLongMessage(formatOutgoingMessage(varied));
     const messageIds = [];
