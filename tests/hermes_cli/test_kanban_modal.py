@@ -204,15 +204,17 @@ def test_modal_cli_result_is_consumed_from_the_write_result_file(monkeypatch, tm
 def _load_worker_module(monkeypatch, tmp_path):
     """Import the Modal worker module with its import-time guards satisfied.
 
-    The module imports ``modal`` and validates that a memo-evaluator profile
-    (SOUL.md + skills/) exists at import time, so point it at a throwaway
-    profile fixture. Skips cleanly when ``modal`` is not installed.
+    The module imports ``modal`` and validates that the ``memo-evaluator``
+    profile (SOUL.md + skills/) exists at import time, resolving its path via
+    ``get_profile_dir`` under the per-test HERMES_HOME. Create that profile so
+    the import-time guard passes. Skips cleanly when ``modal`` is not installed.
     """
     modal = pytest.importorskip("modal")  # noqa: F841 -- import guard only
-    profile = tmp_path / "profile"
-    (profile / "skills").mkdir(parents=True)
+    from hermes_cli.profiles import get_profile_dir
+
+    profile = get_profile_dir("memo-evaluator")
+    (profile / "skills").mkdir(parents=True, exist_ok=True)
     (profile / "SOUL.md").write_text("test soul", encoding="utf-8")
-    monkeypatch.setenv("HERMES_MODAL_MEMO_EVALUATOR_PROFILE", str(profile))
     import importlib
 
     return importlib.import_module("hermes_cli.kanban_modal_worker")

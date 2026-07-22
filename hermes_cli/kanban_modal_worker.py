@@ -7,7 +7,6 @@ structured result only.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -15,14 +14,28 @@ from typing import Any
 import modal
 
 APP_NAME = "hermes-kanban-memo-evaluator"
-PROFILE_SOURCE = Path(
-    os.environ.get(
-        "HERMES_MODAL_MEMO_EVALUATOR_PROFILE",
-        "~/.hermes/profiles/memo-evaluator",
-    )
-).expanduser()
-SOUL_SOURCE = PROFILE_SOURCE / "SOUL.md"
-SKILLS_SOURCE = PROFILE_SOURCE / "skills"
+
+
+def _default_profile_source() -> Path:
+    """Resolve the memo-evaluator profile dir, honoring HERMES_HOME.
+
+    Anchored to the profiles root via ``get_profile_dir`` so custom / Docker /
+    profile-isolated ``HERMES_HOME`` layouts (e.g. ``/opt/data``) resolve
+    correctly instead of a hardcoded ``~/.hermes`` that would not exist there.
+    Only ever called under ``modal.is_local()`` (the local launcher), so the
+    ``hermes_cli`` import is always available.
+    """
+    from hermes_cli.profiles import get_profile_dir
+
+    return get_profile_dir("memo-evaluator")
+
+
+# Model the memo-evaluator profile is pinned to (see its config.yaml). Passed
+# explicitly because the image bakes only SOUL.md + skills/, not a config.yaml,
+# so there is no on-disk model default inside the container.
+MEMO_EVALUATOR_MODEL = "claude-fable-5"
+MEMO_EVALUATOR_PROVIDER = "anthropic"
+
 # The memo-evaluator runs a Claude model through the shared billing proxy, which
 # only speaks the Anthropic Messages API. The proxy hostname and its inbound gate
 # key both live in the existing ``research-proxy`` Modal secret (ANTHROPIC_BASE_URL
@@ -32,22 +45,21 @@ PROXY_SECRET = modal.Secret.from_name(
     "research-proxy",
     required_keys=["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"],
 )
-# Model the memo-evaluator profile is pinned to (see its config.yaml). Passed
-# explicitly because the image bakes only SOUL.md + skills/, not a config.yaml,
-# so there is no on-disk model default inside the container.
-MEMO_EVALUATOR_MODEL = "claude-fable-5"
-MEMO_EVALUATOR_PROVIDER = "anthropic"
 
 # The profile source (SOUL.md + skills/) is only present on the machine that
 # builds/launches the app; inside the Modal container the module is re-imported
 # with only the baked ``/opt/memo-evaluator`` payload, so these local paths do
-# not exist. Guard the source check and the ``add_local_*`` mounts on
-# ``modal.is_local()`` — validating the source at container-import time crashes
-# every remote run.
+# not exist. Guard the source resolution, check, and the ``add_local_*`` mounts
+# on ``modal.is_local()`` — resolving/validating the source at container-import
+# time crashes every remote run.
 if modal.is_local():
-    if not SOUL_SOURCE.is_file() or not SKILLS_SOURCE.is_dir():
+    _profile_source = _default_profile_source()
+    _soul_source = _profile_source / "SOUL.md"
+    _skills_source = _profile_source / "skills"
+    if not _soul_source.is_file() or not _skills_source.is_dir():
         raise RuntimeError(
-            "Set HERMES_MODAL_MEMO_EVALUATOR_PROFILE to a profile containing SOUL.md and skills/."
+            f"memo-evaluator profile at {_profile_source} is missing SOUL.md "
+            "and skills/; create it with `hermes profile create memo-evaluator`."
         )
 
 _base_image = modal.Image.debian_slim(python_version="3.13").pip_install(
@@ -55,8 +67,8 @@ _base_image = modal.Image.debian_slim(python_version="3.13").pip_install(
 )
 if modal.is_local():
     image = _base_image.add_local_file(
-        SOUL_SOURCE, "/opt/memo-evaluator/SOUL.md"
-    ).add_local_dir(SKILLS_SOURCE, "/opt/memo-evaluator/skills")
+        _soul_source, "/opt/memo-evaluator/SOUL.md"
+    ).add_local_dir(_skills_source, "/opt/memo-evaluator/skills")
 else:
     image = _base_image
 app = modal.App(APP_NAME)
