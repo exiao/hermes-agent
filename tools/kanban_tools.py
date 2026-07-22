@@ -640,13 +640,14 @@ def _handle_complete(args: dict, **kw) -> str:
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
+                transport_failed = False
                 try:
                     # judge_goal returns (verdict, reason, parse_failed,
                     # wait_directive, transport_failed) — see
                     # hermes_cli/goals.py. Unpacking fewer raises ValueError,
                     # which the defensive handler below swallows, leaving
                     # verdict="done" and silently disabling the gate.
-                    verdict, reason, _, _, _ = judge_goal(
+                    verdict, reason, _, _, transport_failed = judge_goal(
                         goal=f"{task.title}\n\n{task.body or ''}".strip(),
                         last_response=(summary or result or "").strip(),
                     )
@@ -658,7 +659,21 @@ def _handle_complete(args: dict, **kw) -> str:
                         judge_exc,
                         exc_info=True,
                     )
-                if verdict != "done":
+                if transport_failed:
+                    # The judge couldn't be REACHED (auth 401, timeout, DNS,
+                    # connection error) — this is not a "not done" judgment.
+                    # judge_goal returns verdict="continue" in this case, but
+                    # treating that as a rejection would wedge a genuinely
+                    # complete card whenever the proxy/aux endpoint has a
+                    # transient blip (observed live: a proxy account-pool 401
+                    # window blocked 3 merge-ready PR-babysitter cards as
+                    # needs_input). Fail open, mirroring _goal_judge_available's
+                    # rationale — an unreachable judge must not block completion.
+                    logger.warning(
+                        "goal judge unreachable (%s); allowing completion of %s",
+                        reason, tid,
+                    )
+                elif verdict != "done":
                     return tool_error(
                         f"Goal completion rejected by judge: {reason}. "
                         f"To proceed, either: (1) provide explicit acceptance "

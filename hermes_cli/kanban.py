@@ -2042,13 +2042,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     from hermes_cli.goals import judge_goal
                     verdict = "done"
                     reason = ""
+                    transport_failed = False
                     try:
                         # judge_goal returns (verdict, reason, parse_failed,
                         # wait_directive, transport_failed) — see
                         # hermes_cli/goals.py. Unpacking fewer raises
                         # ValueError into the fail-open handler below,
                         # silently disabling the gate.
-                        verdict, reason, _, _, _ = judge_goal(
+                        verdict, reason, _, _, transport_failed = judge_goal(
                             goal=f"{task.title}\n\n{task.body or ''}".strip(),
                             last_response=(summary or args.result or "").strip(),
                         )
@@ -2059,7 +2060,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                             judge_exc,
                             exc_info=True,
                         )
-                    if verdict != "done":
+                    if transport_failed:
+                        # The judge couldn't be REACHED (auth 401, timeout,
+                        # DNS, connection error), not a "not done" judgment.
+                        # judge_goal returns verdict="continue" here; treating
+                        # that as a rejection wedges a genuinely complete card
+                        # on a transient proxy/aux blip. Fail open, mirroring
+                        # the tool-call gate in tools/kanban_tools.py.
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(
+                            "goal judge unreachable (%s); allowing completion of %s",
+                            reason, tid,
+                        )
+                    elif verdict != "done":
                         print(
                             f"kanban: goal completion of {tid} rejected by judge: {reason}. "
                             f"Provide evidence matching the task's acceptance criteria.",
