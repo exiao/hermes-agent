@@ -228,10 +228,9 @@ function sleep(ms) {
 }
 
 // Anti-ban middleware (gaussian jitter, typing presence, sliding-window rate
-// caps, optional body variation). DEFAULT OFF: with WHATSAPP_ANTIBAN unset it
-// is a no-op passthrough, so non-broadcast deployments are unaffected. Only
-// sends flagged `broadcast: true` pay the jitter + rate-cap cost; interactive
-// replies stay snappy (a high reply ratio itself lowers ban risk).
+// caps, optional body variation). DEFAULT ON, but only sends flagged
+// `broadcast: true` are ever paced — interactive replies get zero added
+// latency, so default-on is safe. Set WHATSAPP_ANTIBAN=0 to hard-disable.
 const antiban = createAntiban();
 
 function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS, antibanOpts = {}) {

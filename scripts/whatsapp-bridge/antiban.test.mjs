@@ -116,18 +116,36 @@ import {
 }
 
 // ------------------------------------------------------------------
-// createAntiban: DISABLED by default = pure passthrough
+// createAntiban: DEFAULT ON, but a pure passthrough for interactive replies
 // ------------------------------------------------------------------
 {
+  // Env unset -> enabled by default.
   const ab = createAntiban({ env: {} });
-  assert.strictEqual(ab.enabled, false, 'disabled when env unset');
+  assert.strictEqual(ab.enabled, true, 'enabled by default when env unset');
+
+  // Interactive (non-broadcast) send: nothing happens — no presence, no sleep.
+  let sockCalled = false;
+  const sock = { sendPresenceUpdate: async () => { sockCalled = true; } };
+  const slept = [];
+  await ab.beforeSend({
+    chatId: 'x@s.whatsapp.net', broadcast: false, sock,
+    sleepFn: async (ms) => { slept.push(ms); },
+  });
+  assert.strictEqual(sockCalled, false, 'no presence on interactive reply');
+  assert.strictEqual(slept.length, 0, 'no delay added to interactive reply');
+  console.log('  ✓ default on, interactive replies untouched');
+}
+
+// -- explicit hard-disable via env ----------------------------------
+{
+  const ab = createAntiban({ env: { WHATSAPP_ANTIBAN: '0' } });
+  assert.strictEqual(ab.enabled, false, 'WHATSAPP_ANTIBAN=0 disables');
   assert.strictEqual(ab.varyBody('hello'), 'hello', 'varyBody identity when disabled');
-  // beforeSend must resolve immediately and do nothing.
   let sockCalled = false;
   const sock = { sendPresenceUpdate: async () => { sockCalled = true; } };
   await ab.beforeSend({ chatId: 'x@s.whatsapp.net', broadcast: true, sock });
-  assert.strictEqual(sockCalled, false, 'no presence when disabled');
-  console.log('  ✓ disabled = no-op passthrough');
+  assert.strictEqual(sockCalled, false, 'no presence when hard-disabled even for broadcast');
+  console.log('  ✓ WHATSAPP_ANTIBAN=0 hard-disables');
 }
 
 // ------------------------------------------------------------------
@@ -151,12 +169,11 @@ import {
   const presence = [];
   const sock = { sendPresenceUpdate: async (state) => { presence.push(state); } };
 
-  // Interactive reply: typing presence allowed, but NO jitter.
+  // Interactive reply: NOTHING — no presence, no sleep at all.
   slept.length = 0; presence.length = 0;
   await ab.beforeSend({ chatId: 'r@s.whatsapp.net', broadcast: false, textLength: 40, sock, sleepFn });
-  assert.deepStrictEqual(presence, ['composing', 'paused'], 'reply shows typing');
-  // Only the typing dwell sleep, no jitter sleep.
-  assert.strictEqual(slept.length, 1, 'reply sleeps once (typing dwell only)');
+  assert.deepStrictEqual(presence, [], 'reply shows no typing (broadcast-only)');
+  assert.strictEqual(slept.length, 0, 'reply adds no delay');
 
   // Broadcast: typing dwell + gaussian jitter (2 sleeps), jitter in range.
   slept.length = 0; presence.length = 0;
@@ -164,6 +181,7 @@ import {
     chatId: 'r@s.whatsapp.net', broadcast: true, textLength: 40, sock, sleepFn,
     rng: () => 0.5,
   });
+  assert.deepStrictEqual(presence, ['composing', 'paused'], 'broadcast shows typing');
   assert.strictEqual(slept.length, 2, 'broadcast sleeps twice (typing + jitter)');
   const jitter = slept[1];
   assert.ok(jitter >= 3000 && jitter <= 15000, `jitter ${jitter} within configured band`);

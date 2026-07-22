@@ -14,15 +14,17 @@
  * DESIGN
  *   - Pure, dependency-free, unit-testable in isolation (mirrors the
  *     outbound_ids.js / bridge_helpers.js pattern).
- *   - DEFAULT OFF. With WHATSAPP_ANTIBAN unset/false, createAntiban()
- *     returns a no-op passthrough so existing deployments are unaffected.
+ *   - DEFAULT ON. createAntiban() is enabled unless WHATSAPP_ANTIBAN is
+ *     explicitly 0/false. This is safe by default because only sends marked
+ *     `broadcast: true` are ever paced (see below) — everything else is a
+ *     pure passthrough.
  *   - Interactive replies stay snappy; only sends explicitly marked
- *     `broadcast: true` (the alerts wrapper's fan-out path) pay the full
- *     jitter + rate-cap cost. A high reply ratio *lowers* ban risk, so we
- *     never slow the reply path down.
+ *     `broadcast: true` (the alerts wrapper's fan-out path) pay ANY cost
+ *     (typing, jitter, rate cap). A non-broadcast send returns immediately.
+ *     A high reply ratio *lowers* ban risk, so we never slow the reply path.
  *
- * KNOBS (env, all optional; only read when WHATSAPP_ANTIBAN is truthy):
- *   WHATSAPP_ANTIBAN                      master switch (default off)
+ * KNOBS (env, all optional):
+ *   WHATSAPP_ANTIBAN                      master switch (default ON; 0 disables)
  *   WHATSAPP_ANTIBAN_JITTER_MIN_MS        broadcast pre-send delay floor   (default 3000)
  *   WHATSAPP_ANTIBAN_JITTER_MAX_MS        broadcast pre-send delay ceiling (default 15000)
  *   WHATSAPP_ANTIBAN_TYPING               send composing presence before a send (default on)
@@ -181,7 +183,12 @@ function sleep(ms) {
  *   sleepFn/rng  injectable for tests
  */
 function createAntiban({ env = process.env } = {}) {
-  const enabled = envFlag(env, 'WHATSAPP_ANTIBAN', false);
+  // Default ON. The middleware only ever paces sends explicitly flagged
+  // `broadcast: true`; interactive replies are never touched (see beforeSend),
+  // so enabling by default adds zero latency to normal conversation and is
+  // safe for any WhatsApp deployment — it stays inert until something sends a
+  // broadcast. Set WHATSAPP_ANTIBAN=0/false to hard-disable.
+  const enabled = envFlag(env, 'WHATSAPP_ANTIBAN', true);
 
   if (!enabled) {
     return {
@@ -223,16 +230,21 @@ function createAntiban({ env = process.env } = {}) {
       now = Date.now(),
     } = opts;
 
-    // Rate cap: broadcasts only. Wait out the window rather than dropping —
-    // the alerts wrapper sends sequentially so a short wait paces the batch.
-    if (broadcast && (perRecipientHour > 0 || perHour > 0)) {
+    // Interactive (non-broadcast) sends are never paced — no rate wait, no
+    // typing dwell, no jitter — so default-on adds zero latency to normal
+    // conversation. Only the alert fan-out (broadcast:true) is shaped.
+    if (!broadcast) return;
+
+    // Rate cap: wait out the window rather than dropping — the alerts wrapper
+    // sends sequentially so a short wait paces the batch.
+    if (perRecipientHour > 0 || perHour > 0) {
       const { retryAfterMs } = limiter.check(chatId, now);
       if (retryAfterMs > 0) {
         await sleepFn(retryAfterMs);
       }
     }
 
-    // Typing presence: cheap and human-like. Applied to any send when on.
+    // Typing/composing presence before the send — human-like, and cheap.
     if (typingOn && sock && chatId) {
       try {
         await sock.sendPresenceUpdate('composing', chatId);
@@ -243,14 +255,10 @@ function createAntiban({ env = process.env } = {}) {
       }
     }
 
-    // Gaussian jitter: broadcasts only, so interactive replies stay instant.
-    if (broadcast) {
-      await sleepFn(gaussianDelay(jitterMin, jitterMax, rng));
-    }
+    // Gaussian jitter (uniform/fixed delays are the scripted-send tell).
+    await sleepFn(gaussianDelay(jitterMin, jitterMax, rng));
 
-    if (broadcast) {
-      limiter.record(chatId, now);
-    }
+    limiter.record(chatId, now);
   }
 
   return {
