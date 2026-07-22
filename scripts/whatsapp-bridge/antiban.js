@@ -271,14 +271,30 @@ function createAntiban({ env = process.env } = {}) {
       // Broadcast fan-out: the ban-prone path. Heavy pacing + rate caps.
       // Runs sequentially (the alerts wrapper sends one at a time), so the
       // rate window stays accurate.
+      //
+      // Track the EFFECTIVE send time. The message is not actually put on the
+      // wire until every pacing delay below (rate-cap wait, typing dwell,
+      // gaussian jitter) has elapsed, so recording at the original `now` would
+      // stamp the send in the past. On an over-cap broadcast that waits out the
+      // window (e.g. 30s) that error makes the sliding window expire the entry
+      // ~30s early, so the limiter drifts more permissive than configured.
+      // Advance `sendAt` by each delay we impose and record at that time.
+      let sendAt = now;
       if (perRecipientHour > 0 || perHour > 0) {
         const { retryAfterMs } = limiter.check(chatId, now);
-        if (retryAfterMs > 0) await sleepFn(retryAfterMs);
+        if (retryAfterMs > 0) {
+          await sleepFn(retryAfterMs);
+          sendAt += retryAfterMs;
+        }
       }
-      await showTyping(sock, chatId, typingDwell(textLength), sleepFn);
+      const dwellMs = typingDwell(textLength);
+      await showTyping(sock, chatId, dwellMs, sleepFn);
+      sendAt += dwellMs;
       // Gaussian jitter (uniform/fixed delays are the scripted-send tell).
-      await sleepFn(gaussianDelay(jitterMin, jitterMax, rng));
-      limiter.record(chatId, now);
+      const jitterMs = gaussianDelay(jitterMin, jitterMax, rng);
+      await sleepFn(jitterMs);
+      sendAt += jitterMs;
+      limiter.record(chatId, sendAt);
       return;
     }
 

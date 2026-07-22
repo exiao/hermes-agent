@@ -257,4 +257,53 @@ import {
   console.log('  ✓ reply sequence: read receipt → typing → send');
 }
 
+// ------------------------------------------------------------------
+// Regression: an over-cap broadcast that WAITS out the window records the
+// send at the EFFECTIVE (post-wait) time, not the stale `now` captured at the
+// start of beforeSend(). If it recorded at the old `now`, the sliding window
+// would expire the entry early and the very next broadcast (attempted at the
+// real moment the prior send left the wire) would be under-throttled.
+// ------------------------------------------------------------------
+{
+  const ab = createAntiban({
+    env: {
+      WHATSAPP_ANTIBAN: '1',
+      WHATSAPP_ANTIBAN_TYPING: 'off',
+      WHATSAPP_ANTIBAN_JITTER_MIN_MS: '0',
+      WHATSAPP_ANTIBAN_JITTER_MAX_MS: '0',
+      WHATSAPP_ANTIBAN_MAX_PER_RECIPIENT_HR: '1',
+      WHATSAPP_ANTIBAN_MAX_PER_HOUR: '0',
+    },
+  });
+  const HOUR = 60 * 60 * 1000;
+  const chat = 'c@s.whatsapp.net';
+  const base = 5_000_000;
+  const slept = [];
+  const sleepFn = async (ms) => { slept.push(ms); };
+
+  // Send 1 at t=base: allowed, no wait, records at base.
+  await ab.beforeSend({ chatId: chat, broadcast: true, sleepFn, now: base });
+
+  // Send 2 at t=base+1000: over cap, must wait out the window (~HOUR-1000).
+  slept.length = 0;
+  await ab.beforeSend({ chatId: chat, broadcast: true, sleepFn, now: base + 1000 });
+  const wait2 = slept.reduce((a, b) => a + b, 0);
+  assert.ok(wait2 > 0, 'send 2 waits out the window');
+
+  // The effective moment send 2 left the wire = base+1000 + wait2. Send 3 is
+  // attempted at that instant. Because send 2 was recorded at its effective
+  // time (~base+HOUR), the window has NOT freed up, so send 3 must wait a full
+  // window again. Under the bug (record at stale now=base+1000) send 2's entry
+  // ages out almost immediately and send 3 would wait only ~1000ms.
+  const send2Effective = base + 1000 + wait2;
+  slept.length = 0;
+  await ab.beforeSend({ chatId: chat, broadcast: true, sleepFn, now: send2Effective });
+  const wait3 = slept.reduce((a, b) => a + b, 0);
+  assert.ok(
+    wait3 > HOUR / 2,
+    `send 3 must wait a fresh window (got ${wait3}ms; the bug yields ~1000ms)`,
+  );
+  console.log('  ✓ over-cap broadcast records at the effective post-wait send time');
+}
+
 console.log('\n✅ All antiban tests passed.');
