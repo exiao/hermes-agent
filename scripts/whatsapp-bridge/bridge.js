@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createAntiban } from './antiban.js';
 import {
   buildPollPayload,
   buildLocationPayload,
@@ -226,7 +227,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
+// Anti-ban middleware. DEFAULT ON (WHATSAPP_ANTIBAN=0 disables). Two profiles:
+//   - reply (broadcast:false): light typing + small jitter, NO rate cap. Runs
+//     OUTSIDE this queue (in the /send handler) so concurrent conversations
+//     pace in parallel and stay real-time.
+//   - broadcast (broadcast:true): heavy jitter + typing + rate caps. Runs
+//     INSIDE the queue below so typing never overlaps and the rate window
+//     stays accurate.
+const antiban = createAntiban();
+
+function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS, antibanOpts = {}) {
   const group = isGroupJid(chatId);
   return enqueueSend(async () => {
     if (group) {
@@ -240,6 +250,13 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
     // path will surface the real error).
     if (group) {
       try { await resolveGroupMetadata(chatId); } catch { /* non-fatal */ }
+    }
+    // BROADCAST pacing runs inside the serialised queue so typing never
+    // overlaps across chats and the global rate window stays accurate. Reply
+    // pacing is NOT done here — it runs outside the queue in the /send handler
+    // so real-time conversations don't block each other.
+    if (antiban.enabled && antibanOpts.broadcast) {
+      try { await antiban.beforeSend({ chatId, sock, ...antibanOpts }); } catch { /* non-fatal */ }
     }
     let timer;
     const timeoutPromise = new Promise((_, reject) => {
@@ -969,13 +986,31 @@ app.post('/send', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, message, replyTo } = req.body;
+  const { chatId, message, replyTo, broadcast } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
   try {
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    // Anti-ban pacing for REPLIES (not broadcasts). Human sequence is
+    // read → typing → reply, run HERE outside the serialised send queue so
+    // several concurrent chats pace in parallel and stay real-time.
+    if (antiban.enabled && !broadcast) {
+      // 1. Read receipt: a real person opens the chat before replying, so the
+      //    sender sees the message marked read. Only the message we're actually
+      //    replying to (replyTo), best-effort. Skipped when there's no key.
+      if (replyTo) {
+        const quoted = messageStore.get(replyTo);
+        if (quoted?.key) {
+          try { await sock.readMessages([quoted.key]); } catch { /* non-fatal */ }
+        }
+      }
+      // 2. Typing indicator + tiny jitter.
+      try { await antiban.beforeSend({ chatId, sock, broadcast: false, textLength: String(message).length }); }
+      catch { /* non-fatal */ }
+    }
+    const varied = broadcast ? antiban.varyBody(message) : message;
+    const chunks = splitLongMessage(formatOutgoingMessage(varied));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
       const { content: payload, options } = buildTextSendPayload(chunks[i], {
@@ -983,7 +1018,10 @@ app.post('/send', async (req, res) => {
         replyTo: i === 0 ? replyTo : undefined,
         messageStore,
       });
-      const sent = await sendWithTimeout(chatId, payload, options);
+      const sent = await sendWithTimeout(chatId, payload, options, SEND_TIMEOUT_MS, {
+        broadcast: !!broadcast,
+        textLength: chunks[i].length,
+      });
       trackSentMessageId(sent);
       messageStore.remember(sent);
       if (sent?.key?.id) messageIds.push(sent.key.id);
@@ -1042,7 +1080,7 @@ app.post('/send-media', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, filePath, mediaType, caption, fileName } = req.body;
+  const { chatId, filePath, mediaType, caption, fileName, broadcast } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
   }
@@ -1126,7 +1164,10 @@ app.post('/send-media', async (req, res) => {
         break;
     }
 
-    const sent = await sendWithTimeout(chatId, msgPayload);
+    const sent = await sendWithTimeout(chatId, msgPayload, {}, SEND_TIMEOUT_MS, {
+      broadcast: !!broadcast,
+      textLength: (caption || '').length,
+    });
     trackSentMessageId(sent);
     messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
@@ -1234,6 +1275,7 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    antiban: antiban.enabled,
   });
 });
 
