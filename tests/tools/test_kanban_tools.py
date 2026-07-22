@@ -734,6 +734,61 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
         conn2.close()
 
 
+def test_complete_goal_mode_allows_when_judge_transport_fails(monkeypatch, tmp_path):
+    """Fail-open on a transient transport failure mid-call.
+
+    The availability probe (_goal_judge_available) can pass, but the judge
+    call itself then hits an auth 401 / timeout / connection error. judge_goal
+    returns verdict="continue" with transport_failed=True in that case. The
+    gate must treat transport_failed as "couldn't reach the judge" and fail
+    open, NOT as a rejection — otherwise a transient proxy/aux blip wedges a
+    genuinely merge-ready card as needs_input (observed live: a proxy
+    account-pool 401 window blocked 3 merge-ready PR-babysitter cards)."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        goal_task_id = kb.create_task(
+            conn, title="goal-mode-test", assignee="test-worker",
+            body="Must achieve X with verified evidence.", goal_mode=True
+        )
+        kb.claim_task(conn, goal_task_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+
+    # Judge is "available" at probe time, but the call transport-fails: the
+    # real judge_goal returns ("continue", "judge error: AuthenticationError",
+    # False, None, True). verdict != "done" here, so only the transport_failed
+    # flag distinguishes this from a real rejection.
+    def mock_transport_fail(goal, last_response, *, timeout=30.0, subgoals=None):
+        return "continue", "judge error: AuthenticationError", False, None, True
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_transport_fail)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    out = kt._handle_complete({"summary": "PR is OPEN, CLEAN, merge-ready"})
+    d = json.loads(out)
+    assert d.get("ok") is True, f"expected fail-open completion, got {d}"
+
+    conn2 = kb.connect()
+    try:
+        assert kb.get_task(conn2, goal_task_id).status == "done"
+    finally:
+        conn2.close()
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})
