@@ -223,4 +223,38 @@ import {
   console.log('  ✓ enabled: rate cap paces (waits, no drop)');
 }
 
+// ------------------------------------------------------------------
+// Reply sequence: read receipt → typing → send (mirrors bridge.js /send).
+// The read receipt itself lives in bridge.js (needs the Baileys message key),
+// so this asserts the ORDER of the human sequence against a mock socket the
+// same way the handler drives it.
+// ------------------------------------------------------------------
+{
+  const ab = createAntiban({
+    env: {
+      WHATSAPP_ANTIBAN: '1',
+      WHATSAPP_ANTIBAN_REPLY_JITTER_MIN_MS: '100',
+      WHATSAPP_ANTIBAN_REPLY_JITTER_MAX_MS: '100',
+    },
+  });
+  const events = [];
+  const quotedKey = { id: 'INBOUND1', remoteJid: 'u@s.whatsapp.net', fromMe: false };
+  const sock = {
+    readMessages: async (keys) => { events.push(`read:${keys[0].id}`); },
+    sendPresenceUpdate: async (state) => { events.push(`presence:${state}`); },
+  };
+
+  // Replicate the /send reply path: read the quoted msg, then beforeSend, then send.
+  await sock.readMessages([quotedKey]);
+  await ab.beforeSend({ chatId: 'u@s.whatsapp.net', broadcast: false, textLength: 20, sock });
+  events.push('send');
+
+  assert.deepStrictEqual(
+    events,
+    ['read:INBOUND1', 'presence:composing', 'presence:paused', 'send'],
+    'human sequence: read → typing → send, in order',
+  );
+  console.log('  ✓ reply sequence: read receipt → typing → send');
+}
+
 console.log('\n✅ All antiban tests passed.');

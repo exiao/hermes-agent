@@ -992,13 +992,20 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    // Anti-ban pacing.
-    //   - Reply (no broadcast flag): light typing + small jitter, run HERE,
-    //     outside the serialised send queue, so several concurrent chats pace
-    //     in parallel and stay real-time. Only paced once, on the first chunk.
-    //   - Broadcast (alerts fan-out): heavy pacing + rate caps run inside the
-    //     queue (in sendWithTimeout); here we only apply optional body variation.
+    // Anti-ban pacing for REPLIES (not broadcasts). Human sequence is
+    // read → typing → reply, run HERE outside the serialised send queue so
+    // several concurrent chats pace in parallel and stay real-time.
     if (antiban.enabled && !broadcast) {
+      // 1. Read receipt: a real person opens the chat before replying, so the
+      //    sender sees the message marked read. Only the message we're actually
+      //    replying to (replyTo), best-effort. Skipped when there's no key.
+      if (replyTo) {
+        const quoted = messageStore.get(replyTo);
+        if (quoted?.key) {
+          try { await sock.readMessages([quoted.key]); } catch { /* non-fatal */ }
+        }
+      }
+      // 2. Typing indicator + tiny jitter.
       try { await antiban.beforeSend({ chatId, sock, broadcast: false, textLength: String(message).length }); }
       catch { /* non-fatal */ }
     }
