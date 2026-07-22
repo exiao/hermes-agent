@@ -132,3 +132,57 @@ def test_modal_cli_result_is_consumed_from_the_write_result_file(monkeypatch, tm
 
     assert result["modal_call_id"] == "fc-test"
     assert result["modal_log_url"] == "https://modal.test/log"
+
+
+def _load_worker_module(monkeypatch, tmp_path):
+    """Import the Modal worker module with its import-time guards satisfied.
+
+    The module imports ``modal`` and validates that a memo-evaluator profile
+    (SOUL.md + skills/) exists at import time, so point it at a throwaway
+    profile fixture. Skips cleanly when ``modal`` is not installed.
+    """
+    modal = pytest.importorskip("modal")  # noqa: F841 -- import guard only
+    profile = tmp_path / "profile"
+    (profile / "skills").mkdir(parents=True)
+    (profile / "SOUL.md").write_text("test soul", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MODAL_MEMO_EVALUATOR_PROFILE", str(profile))
+    import importlib
+
+    return importlib.import_module("hermes_cli.kanban_modal_worker")
+
+
+def test_worker_parses_verdict_even_with_a_stray_startup_line(monkeypatch, tmp_path):
+    worker = _load_worker_module(monkeypatch, tmp_path)
+
+    # Quiet mode can still emit a warning line before the final JSON response.
+    stdout = (
+        "  \u26a0 tirith security scanner enabled but not available\n"
+        '{"outcome":"complete","summary":"Memo passed the rubric.","metadata":{"score":8}}\n'
+    )
+    result = worker._parse_worker_result(stdout)
+    assert result["outcome"] == "complete"
+    assert result["summary"] == "Memo passed the rubric."
+    assert result["metadata"]["score"] == 8
+
+
+def test_worker_extracts_the_last_object_when_prose_contains_braces(monkeypatch, tmp_path):
+    worker = _load_worker_module(monkeypatch, tmp_path)
+
+    # A JSON-looking snippet inside {braces} in prose must not shadow the real
+    # final verdict object.
+    stdout = (
+        'Example shape: {"outcome":"block"} is one option.\n'
+        '{"outcome":"complete","summary":"real verdict"}'
+    )
+    result = worker._parse_worker_result(stdout)
+    assert result["summary"] == "real verdict"
+
+
+def test_worker_binds_the_memo_evaluator_model_and_anthropic_proxy_secret(monkeypatch, tmp_path):
+    worker = _load_worker_module(monkeypatch, tmp_path)
+
+    # The memo-evaluator runs a Claude model through the Anthropic-format billing
+    # proxy; the worker must pin that model and require the Anthropic proxy secret
+    # keys, not an OpenAI-format secret that does not exist in the workspace.
+    assert worker.MEMO_EVALUATOR_MODEL == "claude-fable-5"
+    assert worker.MEMO_EVALUATOR_PROVIDER == "anthropic"

@@ -23,22 +23,42 @@ PROFILE_SOURCE = Path(
 ).expanduser()
 SOUL_SOURCE = PROFILE_SOURCE / "SOUL.md"
 SKILLS_SOURCE = PROFILE_SOURCE / "skills"
-PROXY_BASE_URL = "https://proxy.getbloom.app"
+# The memo-evaluator runs a Claude model through the shared billing proxy, which
+# only speaks the Anthropic Messages API. The proxy hostname and its inbound gate
+# key both live in the existing ``research-proxy`` Modal secret (ANTHROPIC_BASE_URL
+# + ANTHROPIC_API_KEY, where the key equals the proxy gate key — Hermes sends it as
+# ``x-api-key`` and the proxy strips it and injects the real OAuth subscription).
 PROXY_SECRET = modal.Secret.from_name(
-    "bloom-llm-proxy", required_keys=["OPENAI_API_KEY"]
+    "research-proxy",
+    required_keys=["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"],
 )
+# Model the memo-evaluator profile is pinned to (see its config.yaml). Passed
+# explicitly because the image bakes only SOUL.md + skills/, not a config.yaml,
+# so there is no on-disk model default inside the container.
+MEMO_EVALUATOR_MODEL = "claude-fable-5"
+MEMO_EVALUATOR_PROVIDER = "anthropic"
 
-if not SOUL_SOURCE.is_file() or not SKILLS_SOURCE.is_dir():
-    raise RuntimeError(
-        "Set HERMES_MODAL_MEMO_EVALUATOR_PROFILE to a profile containing SOUL.md and skills/."
-    )
+# The profile source (SOUL.md + skills/) is only present on the machine that
+# builds/launches the app; inside the Modal container the module is re-imported
+# with only the baked ``/opt/memo-evaluator`` payload, so these local paths do
+# not exist. Guard the source check and the ``add_local_*`` mounts on
+# ``modal.is_local()`` — validating the source at container-import time crashes
+# every remote run.
+if modal.is_local():
+    if not SOUL_SOURCE.is_file() or not SKILLS_SOURCE.is_dir():
+        raise RuntimeError(
+            "Set HERMES_MODAL_MEMO_EVALUATOR_PROFILE to a profile containing SOUL.md and skills/."
+        )
 
-image = (
-    modal.Image.debian_slim(python_version="3.13")
-    .pip_install("hermes-agent>=0.18.2,<0.19")
-    .add_local_file(SOUL_SOURCE, "/opt/memo-evaluator/SOUL.md")
-    .add_local_dir(SKILLS_SOURCE, "/opt/memo-evaluator/skills")
+_base_image = modal.Image.debian_slim(python_version="3.13").pip_install(
+    "hermes-agent>=0.18.2,<0.19"
 )
+if modal.is_local():
+    image = _base_image.add_local_file(
+        SOUL_SOURCE, "/opt/memo-evaluator/SOUL.md"
+    ).add_local_dir(SKILLS_SOURCE, "/opt/memo-evaluator/skills")
+else:
+    image = _base_image
 app = modal.App(APP_NAME)
 
 
@@ -46,8 +66,46 @@ def _block(reason: str, *, kind: str = "transient") -> dict[str, Any]:
     return {"outcome": "block", "reason": reason, "kind": kind}
 
 
+def _extract_last_json_object(text: str) -> str:
+    """Return the last balanced top-level JSON object in ``text``.
+
+    Quiet-mode ``hermes chat -Q`` writes only the final response to stdout, but
+    a stray startup line (an interpreter warning, a security-scanner notice) can
+    still precede it. Scanning for the last balanced ``{...}`` recovers the model
+    verdict without assuming the whole stream is pure JSON.
+    """
+    depth = 0
+    start = -1
+    candidates: list[str] = []
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append(text[start : i + 1])
+    if not candidates:
+        raise ValueError("no JSON object found in worker output")
+    return candidates[-1]
+
+
 def _parse_worker_result(text: str) -> dict[str, Any]:
-    result = json.loads(text.strip())
+    result = json.loads(_extract_last_json_object(text))
     if not isinstance(result, dict):
         raise ValueError("worker result must be a JSON object")
     outcome = result.get("outcome")
@@ -64,8 +122,6 @@ def _parse_worker_result(text: str) -> dict[str, Any]:
     timeout=3600,
     env={
         "HERMES_HOME": "/opt/memo-evaluator",
-        "HERMES_INFERENCE_PROVIDER": "custom",
-        "OPENAI_BASE_URL": PROXY_BASE_URL,
     },
 )
 def evaluate_memo(request_json: str) -> str:
@@ -88,7 +144,18 @@ or {"outcome":"block","reason":"...","kind":"needs_input|capability|transient"}.
 Task brief follows:
 """ + brief
     completed = subprocess.run(
-        ["hermes", "--cli", "chat", "-q", prompt],
+        [
+            "hermes",
+            "--cli",
+            "chat",
+            "-Q",
+            "-q",
+            prompt,
+            "-m",
+            MEMO_EVALUATOR_MODEL,
+            "--provider",
+            MEMO_EVALUATOR_PROVIDER,
+        ],
         check=False,
         capture_output=True,
         text=True,
