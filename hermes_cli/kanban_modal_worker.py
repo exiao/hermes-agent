@@ -64,7 +64,10 @@ if modal.is_local():
         )
 
 _base_image = modal.Image.debian_slim(python_version="3.13").pip_install(
-    "hermes-agent>=0.18.2,<0.19"
+    # The worker runs Hermes with ``--provider anthropic``; the native
+    # Anthropic SDK is an optional extra, so install it here or the adapter
+    # raises ImportError before evaluating any brief.
+    "hermes-agent[anthropic]>=0.18.2,<0.19"
 )
 if modal.is_local():
     image = _base_image.add_local_file(
