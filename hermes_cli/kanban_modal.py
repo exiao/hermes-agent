@@ -247,13 +247,37 @@ def _run_modal(request: dict[str, Any], *, timeout: int | None = None) -> dict[s
         result_path.unlink(missing_ok=True)
 
 
+def _spawned_run_id(task_id: str) -> int | None:
+    """Return the run id pinned into the env when this shim was spawned.
+
+    ``spawn_modal_worker`` records the claimed run in ``HERMES_KANBAN_RUN_ID``.
+    A delayed/previous shim that survives a reclaim must complete only the run
+    it was spawned for — not whatever run happens to be current when it finally
+    starts — so a stale Modal response cannot land on a re-claimed new attempt.
+    Mirrors the local worker's env-pinned guard (``_worker_run_id_for``).
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") not in (None, task_id):
+        return None
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def run_modal_shim(task_id: str, workspace: str) -> bool:
     """Run Modal then map its response to a local Kanban completion or block."""
     from hermes_cli import kanban_db as kb
 
-    expected_run_id: int | None = None
+    # Prefer the run id pinned at spawn; only fall back to the request's fresh
+    # read when the env var is absent (e.g. a direct call in a test).
+    expected_run_id: int | None = _spawned_run_id(task_id)
     try:
-        request, expected_run_id = _build_modal_request(task_id, workspace)
+        request, request_run_id = _build_modal_request(task_id, workspace)
+        if expected_run_id is None:
+            expected_run_id = request_run_id
         timeout = None
         with kb.connect_closing() as conn:
             task = kb.get_task(conn, task_id)

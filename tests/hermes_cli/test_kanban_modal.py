@@ -93,6 +93,50 @@ def test_modal_completion_strips_reserved_metadata_keys():
         assert kb.list_attachments(conn, task_id) == []
 
 
+def test_modal_shim_pins_the_spawned_run_id(monkeypatch):
+    """A stale shim must complete only the run it was spawned for.
+
+    The shim reads ``HERMES_KANBAN_RUN_ID`` (pinned at spawn); if the task was
+    reclaimed into a new run after this shim was launched, applying its result
+    with the OLD run id must not touch the new attempt.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="grade memo", assignee="memo-evaluator")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        stale_run_id = task.current_run_id
+        # Simulate a reclaim → re-claim: the task now runs under a NEW run.
+        assert kb.reclaim_task(conn, task_id) is True
+        reclaimed = kb.claim_task(conn, task_id)
+        assert reclaimed is not None
+        assert reclaimed.current_run_id != stale_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(stale_run_id))
+
+    def _fake_run(_request, *, timeout=None):
+        return {
+            "outcome": "complete",
+            "summary": "stale result",
+            "modal_call_id": "fc-stale",
+            "modal_log_url": "https://modal.test/log",
+        }
+
+    monkeypatch.setattr(kanban_modal, "_run_modal", _fake_run)
+
+    # The stale run id no longer matches current_run_id, so the completion is
+    # rejected (apply_modal_result returns False) and the task stays running.
+    assert kanban_modal.run_modal_shim(task_id, "/tmp/workspace") is False
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+
+
 def test_configured_spawn_routes_only_memo_evaluator_to_modal(monkeypatch):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_modal
