@@ -245,29 +245,6 @@ def test_modal_mode_is_bridged_everywhere(tmp_path):
         assert output.split() == ["MODAL_BRIDGE_RESULT", "direct", "direct"], name
 
 
-def test_modal_mode_is_scoped_for_multiplexed_profile(tmp_path, monkeypatch):
-    """A multiplexed profile must temporarily replace the initial mode."""
-    initial_home = tmp_path / "initial"
-    profile_home = tmp_path / "profile"
-    initial_home.mkdir()
-    profile_home.mkdir()
-    (profile_home / "config.yaml").write_text(
-        "terminal:\n  backend: modal\n  modal_mode: direct\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(initial_home))
-    monkeypatch.setenv("TERMINAL_ENV", "modal")
-    monkeypatch.setenv("TERMINAL_MODAL_MODE", "managed")
-
-    from gateway.run import _profile_runtime_scope
-    from tools.terminal_tool import _get_env_config
-
-    with _profile_runtime_scope(profile_home):
-        assert os.environ["TERMINAL_MODAL_MODE"] == "direct"
-        assert _get_env_config()["modal_mode"] == "direct"
-    assert os.environ["TERMINAL_MODAL_MODE"] == "managed"
-
-
 def test_docker_run_as_host_user_is_bridged_everywhere():
     """Explicit pin for the bug we just fixed.
 

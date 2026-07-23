@@ -1711,34 +1711,9 @@ def _profile_runtime_scope(profile_home: "Path"):
 
     home_token = set_hermes_home_override(str(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
-    terminal_env_names: tuple[str, ...] = ()
-    terminal_env_snapshot: dict[str, str | None] = {}
-    try:
-        from hermes_cli.config import (
-            TERMINAL_CONFIG_ENV_MAP,
-            apply_terminal_config_to_env,
-        )
-
-        terminal_env_names = tuple(TERMINAL_CONFIG_ENV_MAP.values())
-        terminal_env_snapshot = {
-            name: os.environ.get(name) for name in terminal_env_names
-        }
-        # A multiplexed turn must not inherit the initial profile's terminal
-        # selection.  apply_terminal_config_to_env() normally preserves an
-        # existing launcher bridge, so override it here while the profile home
-        # is scoped; the snapshot keeps the process safe for the next turn.
-        apply_terminal_config_to_env(override=True)
-    except Exception:
-        logger.debug("profile terminal config scope setup failed", exc_info=True)
     try:
         yield
     finally:
-        for name in terminal_env_names:
-            previous = terminal_env_snapshot[name]
-            if previous is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = previous
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
 
