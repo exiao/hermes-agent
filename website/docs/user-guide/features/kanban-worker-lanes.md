@@ -86,17 +86,30 @@ When you create profiles for your fleet, choose names that match the *role* you 
 
 ### Modal memo-evaluator lane (opt-in)
 
-`memo-evaluator` is the only profile lane with a supported remote backend. It remains local by default. To send that lane through Modal, change one config value:
+`memo-evaluator` is the only profile lane with a supported remote backend. It remains local by default. To send that lane through Modal:
 
-```yaml
-kanban:
-  worker_backends:
-    memo-evaluator: modal
-```
+1. Install and configure the Modal CLI on the **dispatcher** host (it is an optional extra, absent even from `hermes-agent[all]`):
+
+   ```bash
+   uv pip install modal   # or: pip install modal
+   modal setup            # authenticate the CLI once
+   ```
+
+   Without the `modal` CLI on `PATH`, every `memo-evaluator` run is blocked as `transient` (the shim never reaches the remote worker).
+
+2. Provision the `research-proxy` Modal secret (`ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL`) and ensure the `memo-evaluator` profile's `SOUL.md` and `skills/` exist locally.
+
+3. Flip the backend for that lane:
+
+   ```yaml
+   kanban:
+     worker_backends:
+       memo-evaluator: modal
+   ```
 
 The dispatcher still starts a local shim. The shim serializes the bounded worker brief (including comments), runs `modal run` synchronously, and applies the returned completion or block through the local Kanban database. The remote container never receives Kanban database paths or lifecycle credentials. A successful completion records the Modal function-call id and dashboard log URL in both run metadata and a `modal-shim` comment.
 
-The Modal image bakes only the `memo-evaluator` profile's `SOUL.md` and `skills/`; it reads `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` from the named `research-proxy` Modal secret and routes LLM calls (model `claude-fable-5`) through that Anthropic-Messages proxy. Before enabling the backend, ensure that profile assets exist locally and that the Modal secret has been provisioned. Values other than `memo-evaluator` remain local, even if a config entry asks for Modal.
+The Modal image bakes only the `memo-evaluator` profile's `SOUL.md` and `skills/`; it reads `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` from the named `research-proxy` Modal secret and routes LLM calls (model `claude-fable-5`) through that Anthropic-Messages proxy. Values other than `memo-evaluator` remain local, even if a config entry asks for Modal.
 
 ### Orchestrator profile lane
 

@@ -212,7 +212,11 @@ def _run_modal(request: dict[str, Any], *, timeout: int | None = None) -> dict[s
     """Synchronously invoke the Modal app and parse its structured response."""
     modal_bin = shutil.which("modal")
     if modal_bin is None:
-        raise RuntimeError("Modal CLI is not installed or not on PATH")
+        raise RuntimeError(
+            "Modal CLI is not installed or not on PATH; install it on the "
+            "dispatcher host with `uv pip install modal` and run `modal setup` "
+            "before enabling the memo-evaluator Modal backend"
+        )
     fd, result_name = tempfile.mkstemp(prefix="hermes-kanban-modal-", suffix=".json")
     os.close(fd)
     result_path = Path(result_name)
