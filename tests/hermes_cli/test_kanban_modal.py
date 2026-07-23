@@ -137,6 +137,49 @@ def test_modal_shim_pins_the_spawned_run_id(monkeypatch):
     assert task.status == "running"
 
 
+def test_modal_shim_skips_the_remote_call_when_reclaimed(monkeypatch):
+    """A stale shim must not launch (and pay for) a duplicate remote evaluation.
+
+    When a shim from a reclaimed attempt starts after the task was claimed again,
+    the env-pinned run id no longer matches the task's current run. The shim must
+    skip ``_run_modal`` entirely — not just reject the result afterward — so no
+    duplicate paid Modal call is made against the new task state.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="grade memo", assignee="memo-evaluator")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        stale_run_id = task.current_run_id
+        assert kb.reclaim_task(conn, task_id) is True
+        reclaimed = kb.claim_task(conn, task_id)
+        assert reclaimed is not None
+        assert reclaimed.current_run_id != stale_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(stale_run_id))
+
+    called = {"ran": False}
+
+    def _fake_run(_request, *, timeout=None):
+        called["ran"] = True
+        raise AssertionError("stale shim must not invoke Modal")
+
+    monkeypatch.setattr(kanban_modal, "_run_modal", _fake_run)
+
+    # The pre-invocation guard returns False without ever calling _run_modal.
+    assert kanban_modal.run_modal_shim(task_id, "/tmp/workspace") is False
+    assert called["ran"] is False
+    # The current (reclaimed) attempt is left untouched for its own shim to own.
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+
+
 def test_modal_shim_threads_task_runtime_into_the_request(monkeypatch):
     """A >1h / uncapped task's runtime must reach the remote so it isn't
     killed at the function default. The shim adds max_runtime_seconds to the

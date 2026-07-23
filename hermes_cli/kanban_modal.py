@@ -351,11 +351,32 @@ def run_modal_shim(task_id: str, workspace: str) -> bool:
 
     # Prefer the run id pinned at spawn; only fall back to the request's fresh
     # read when the env var is absent (e.g. a direct call in a test).
-    expected_run_id: int | None = _spawned_run_id(task_id)
+    spawned_run_id = _spawned_run_id(task_id)
+    expected_run_id: int | None = spawned_run_id
     try:
         request, request_run_id = _build_modal_request(task_id, workspace)
         if expected_run_id is None:
             expected_run_id = request_run_id
+        # Pre-invocation staleness guard: if this shim was spawned for a specific
+        # run (env-pinned) but the task has since been reclaimed into a newer run,
+        # skip the paid Modal call entirely. Without this the stale shim still
+        # launches — and pays for — a duplicate remote evaluation against the new
+        # task state; only the *result* was being rejected afterward. Leave the
+        # current attempt untouched (no lifecycle write) so its own shim owns it.
+        if (
+            spawned_run_id is not None
+            and request_run_id is not None
+            and request_run_id != spawned_run_id
+        ):
+            _log.warning(
+                "modal shim for %s was spawned for run %s but the task is now on "
+                "run %s; skipping the remote call to avoid a duplicate paid "
+                "evaluation",
+                task_id,
+                spawned_run_id,
+                request_run_id,
+            )
+            return False
         timeout = None
         with kb.connect_closing() as conn:
             task = kb.get_task(conn, task_id)
