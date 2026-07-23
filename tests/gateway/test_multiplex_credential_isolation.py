@@ -6,6 +6,7 @@ profiles with different keys never see each other's, and an unscoped read in
 multiplex mode fails closed instead of leaking.
 """
 import asyncio
+import json
 import os
 
 import pytest
@@ -1060,6 +1061,76 @@ class TestApiKeyProviderBaseUrlUsesScope:
 
 
 class TestProfileTerminalConfigIsolation:
+    def test_cleanup_uses_lifetime_recorded_when_scoped_environment_was_created(
+        self, tmp_path, monkeypatch
+    ):
+        """The unscoped reaper must retain a profile's longer-lived sandbox.
+
+        The cleanup thread starts with a fresh ContextVar context, so this
+        deliberately invokes cleanup after both profile scopes have exited. A
+        default-profile lifetime of 60 seconds must reap profile A after 120
+        seconds while preserving profile B's 300-second environment.
+        """
+        from gateway.run import _profile_runtime_scope
+        from tools import terminal_tool
+
+        class FakeEnvironment:
+            env = {}
+            cwd = "/tmp"
+
+            def __init__(self):
+                self.cleaned_up = False
+
+            def execute(self, _command, **_kwargs):
+                return {"output": "ok", "returncode": 0}
+
+            def cleanup(self):
+                self.cleaned_up = True
+
+        profile_a = tmp_path / "profile-a"
+        profile_b = tmp_path / "profile-b"
+        for profile, lifetime in ((profile_a, 60), (profile_b, 300)):
+            profile.mkdir()
+            (profile / "config.yaml").write_text(
+                f"terminal:\n  backend: local\n  lifetime_seconds: {lifetime}\n",
+                encoding="utf-8",
+            )
+
+        now = [1_000.0]
+        created = []
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_LIFETIME_SECONDS", "60")
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+        monkeypatch.setattr(terminal_tool, "_last_activity", {})
+        monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+        monkeypatch.setattr(terminal_tool, "_environment_lifetimes", {}, raising=False)
+        monkeypatch.setattr(terminal_tool.time, "time", lambda: now[0])
+        monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(
+            terminal_tool,
+            "_check_all_guards",
+            lambda _command, _env_type, **_kwargs: {"approved": True},
+        )
+        monkeypatch.setattr(
+            terminal_tool,
+            "_create_environment",
+            lambda **_kwargs: created.append(FakeEnvironment()) or created[-1],
+        )
+
+        with _profile_runtime_scope(profile_a):
+            assert json.loads(terminal_tool.terminal_tool("echo a"))["exit_code"] == 0
+        with _profile_runtime_scope(profile_b):
+            assert json.loads(terminal_tool.terminal_tool("echo b"))["exit_code"] == 0
+
+        now[0] += 120
+        # Mirrors the shared cleanup worker's default-profile fallback outside
+        # either profile ContextVar scope.
+        terminal_tool._cleanup_inactive_envs(lifetime_seconds=60)
+
+        assert created[0].cleaned_up is True
+        assert created[1].cleaned_up is False
+        assert "profile:profile-b:default" in terminal_tool._active_environments
+
     def test_concurrent_profile_scopes_keep_terminal_config_task_local(
         self, tmp_path, monkeypatch
     ):

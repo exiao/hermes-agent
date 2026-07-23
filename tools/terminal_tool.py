@@ -986,6 +986,10 @@ Do NOT use vim/nano/interactive tools without pty=true — they hang without a p
 # Global state for environment lifecycle management
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
+# The cleanup worker has no profile ContextVar scope. Record the lifetime that
+# configured each environment so it can reap a profile-partitioned entry without
+# falling back to the process/default profile's terminal settings.
+_environment_lifetimes: Dict[str, int] = {}
 _env_lock = threading.Lock()
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
@@ -1653,7 +1657,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
-    """Clean up environments that have been inactive for longer than lifetime_seconds."""
+    """Clean up inactive environments using their recorded lifetime when present."""
     current_time = time.time()
 
     # Check the process registry -- skip cleanup for sandboxes with active
@@ -1674,9 +1678,11 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
 
     with _env_lock:
         for task_id, last_time in list(_last_activity.items()):
-            if current_time - last_time > lifetime_seconds:
+            environment_lifetime = _environment_lifetimes.get(task_id, lifetime_seconds)
+            if current_time - last_time > environment_lifetime:
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
+                _environment_lifetimes.pop(task_id, None)
                 if env is not None:
                     envs_to_stop.append((task_id, env))
 
@@ -1842,6 +1848,7 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
             environment_task_id = task_id
             env = _active_environments.pop(environment_task_id, None)
         _last_activity.pop(environment_task_id, None)
+        _environment_lifetimes.pop(environment_task_id, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
@@ -2361,6 +2368,9 @@ def terminal_tool(
                     with _env_lock:
                         _active_environments[effective_task_id] = new_env
                         _last_activity[effective_task_id] = time.time()
+                        _environment_lifetimes[effective_task_id] = config.get(
+                            "lifetime_seconds", 300
+                        )
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 

@@ -943,7 +943,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     """
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
-        _get_env_config, _last_activity, _start_cleanup_thread,
+        _environment_lifetimes, _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks,
         _creation_locks_lock,
         _scoped_environment_task_id,
@@ -1087,6 +1087,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             with _env_lock:
                 _active_environments[task_id] = terminal_env
                 _last_activity[task_id] = time.time()
+                _environment_lifetimes[task_id] = config.get("lifetime_seconds", 300)
 
             _start_cleanup_thread()
             logger.info("%s environment ready for task %s", env_type, task_id[:8])

@@ -14,6 +14,7 @@ def _make_env_config(**overrides):
         "cwd": "/workspace",
         "host_cwd": None,
         "timeout": 180,
+        "lifetime_seconds": 300,
         "container_cpu": 2,
         "container_memory": 4096,
         "container_disk": 20480,
@@ -103,6 +104,7 @@ class TestFileToolsContainerConfig:
         monkeypatch.setattr(file_tools, "_file_ops_cache", {})
         monkeypatch.setattr(terminal_tool, "_active_environments", {})
         monkeypatch.setattr(terminal_tool, "_last_activity", {})
+        monkeypatch.setattr(terminal_tool, "_environment_lifetimes", {})
         monkeypatch.setattr(terminal_tool, "_creation_locks", {})
         monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _make_env_config())
         monkeypatch.setattr(terminal_tool, "_create_environment", fake_create_environment)
@@ -124,6 +126,10 @@ class TestFileToolsContainerConfig:
         assert {kwargs["task_id"] for kwargs, _environment in created} == {
             "profile:profile-a:default",
             "profile:profile-b:default",
+        }
+        assert terminal_tool._environment_lifetimes == {
+            "profile:profile-a:default": 300,
+            "profile:profile-b:default": 300,
         }
 
         unscoped_first = file_tools._get_file_ops("session-c")

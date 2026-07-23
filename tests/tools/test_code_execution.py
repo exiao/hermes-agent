@@ -49,6 +49,51 @@ from tools.code_execution_tool import (
 )
 
 
+def test_remote_execution_environments_keep_scoped_lifetimes(monkeypatch):
+    """Remote execute_code must not share a profile's cleanup lifetime."""
+    from tools import code_execution_tool, terminal_tool
+    from tools.terminal_config import reset_terminal_config_scope, set_terminal_config_scope
+
+    config = {
+        "env_type": "local",
+        "cwd": "/tmp",
+        "timeout": 30,
+        "local_persistent": False,
+        "lifetime_seconds": 300,
+        "host_cwd": None,
+    }
+    created = []
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_environment_lifetimes", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_create_environment",
+        lambda **_kwargs: created.append(MagicMock()) or created[-1],
+    )
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+
+    profile_a = set_terminal_config_scope({}, environment_key="profile:profile-a")
+    try:
+        code_execution_tool._get_or_create_env("session-a")
+    finally:
+        reset_terminal_config_scope(profile_a)
+
+    profile_b = set_terminal_config_scope({}, environment_key="profile:profile-b")
+    try:
+        code_execution_tool._get_or_create_env("session-b")
+    finally:
+        reset_terminal_config_scope(profile_b)
+
+    assert len(created) == 2
+    assert terminal_tool._environment_lifetimes == {
+        "profile:profile-a:default": 300,
+        "profile:profile-b:default": 300,
+    }
+
+
 def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
     """Mock dispatcher that returns canned responses for each tool."""
     if function_name == "terminal":
