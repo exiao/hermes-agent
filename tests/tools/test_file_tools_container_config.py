@@ -83,3 +83,51 @@ class TestFileToolsContainerConfig:
 
         assert captured["task_id"] == "default"
         assert captured["cwd"] == "/workspace/session"
+
+    def test_multiplexed_profile_scopes_do_not_share_file_operations(self, monkeypatch):
+        """File tools must use the profile-qualified terminal environment key."""
+        from tools import terminal_tool
+        from tools.terminal_config import (
+            reset_terminal_config_scope,
+            set_terminal_config_scope,
+        )
+
+        created = []
+
+        def fake_create_environment(**kwargs):
+            environment = MagicMock()
+            environment.cwd = kwargs["cwd"]
+            created.append((kwargs, environment))
+            return environment
+
+        monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+        monkeypatch.setattr(terminal_tool, "_last_activity", {})
+        monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+        monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _make_env_config())
+        monkeypatch.setattr(terminal_tool, "_create_environment", fake_create_environment)
+        monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+
+        profile_a = set_terminal_config_scope({}, environment_key="profile:profile-a")
+        try:
+            file_ops_a = file_tools._get_file_ops("session-a")
+        finally:
+            reset_terminal_config_scope(profile_a)
+
+        profile_b = set_terminal_config_scope({}, environment_key="profile:profile-b")
+        try:
+            file_ops_b = file_tools._get_file_ops("session-b")
+        finally:
+            reset_terminal_config_scope(profile_b)
+
+        assert file_ops_a is not file_ops_b
+        assert {kwargs["task_id"] for kwargs, _environment in created} == {
+            "profile:profile-a:default",
+            "profile:profile-b:default",
+        }
+
+        unscoped_first = file_tools._get_file_ops("session-c")
+        unscoped_second = file_tools._get_file_ops("session-d")
+
+        assert unscoped_first is unscoped_second
+        assert created[-1][0]["task_id"] == "default"

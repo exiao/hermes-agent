@@ -935,24 +935,25 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     Thread-safe: uses the same per-task creation locks as terminal_tool to
     prevent duplicate sandbox creation from concurrent tool calls.
 
-    Note: subagent task_ids are collapsed to "default" via
-    ``_resolve_container_task_id`` so delegate_task children share the
-    parent's container and its cached file_ops. RL/benchmark task_ids with
-    a registered env override keep their isolation.
+    Note: subagent task_ids are collapsed to "default" via the terminal
+    environment-key helper so delegate_task children share the parent's
+    container and its cached file_ops. Multiplexed profiles partition that
+    shared cache, while RL/benchmark task_ids with an environment override
+    keep their isolation.
     """
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks,
         _creation_locks_lock,
-        _resolve_container_task_id,
+        _scoped_environment_task_id,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
     )
     import time
 
     raw_task_id = task_id or "default"
-    task_id = _resolve_container_task_id(raw_task_id)
+    task_id = _scoped_environment_task_id(raw_task_id)
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
