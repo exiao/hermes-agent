@@ -139,6 +139,32 @@ _MODAL_MAX_TIMEOUT = 24 * 60 * 60
 _DEFAULT_TIMEOUT = 3600
 
 
+def _resolve_function_timeout(max_runtime: Any) -> int | dict[str, Any]:
+    """Map a task's ``max_runtime_seconds`` to a Modal function timeout.
+
+    Returns an int timeout to apply, or a ``block`` result dict when the task's
+    runtime cannot be honored remotely. A runtime above Modal's hard 24h cap is
+    rejected (not silently clamped): clamping would kill a longer task
+    mid-evaluation and requeue it as a transient failure forever, so surface it
+    as a capability block up front — before any paid remote spawn — so a human
+    reroutes it to a backend without the cap. ``None`` / unparseable means
+    uncapped and uses Modal's 24h ceiling.
+    """
+    if max_runtime is not None:
+        try:
+            max_runtime = int(max_runtime)
+        except (TypeError, ValueError):
+            max_runtime = None
+    if max_runtime is not None and max_runtime > _MODAL_MAX_TIMEOUT:
+        return _block(
+            f"Task max_runtime_seconds ({max_runtime}s) exceeds Modal's "
+            f"{_MODAL_MAX_TIMEOUT}s function-timeout cap; run it on a backend "
+            "without the 24h limit.",
+            kind="capability",
+        )
+    return _MODAL_MAX_TIMEOUT if max_runtime is None else min(max_runtime, _MODAL_MAX_TIMEOUT)
+
+
 @app.function(
     image=image,
     secrets=[PROXY_SECRET],
@@ -202,13 +228,17 @@ def main() -> str:
     """
     request_json = sys.stdin.read()
     # Honor the task's runtime contract: a >1h or uncapped (None) task must not
-    # be killed at the 1h function default. Uncapped uses Modal's 24h ceiling.
+    # be killed at the 1h function default. Uncapped uses Modal's 24h ceiling; a
+    # value above the cap is rejected as a capability block (see the helper).
     fn = evaluate_memo
     try:
         max_runtime = json.loads(request_json).get("max_runtime_seconds")
     except (TypeError, ValueError):
         max_runtime = None
-    timeout = _MODAL_MAX_TIMEOUT if max_runtime is None else min(int(max_runtime), _MODAL_MAX_TIMEOUT)
+    resolved = _resolve_function_timeout(max_runtime)
+    if isinstance(resolved, dict):
+        return json.dumps(resolved)
+    timeout = resolved
     if timeout != _DEFAULT_TIMEOUT:
         fn = evaluate_memo.with_options(timeout=timeout)
     call = fn.spawn(request_json)

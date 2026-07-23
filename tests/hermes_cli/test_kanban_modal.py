@@ -384,3 +384,103 @@ def test_worker_binds_the_memo_evaluator_model_and_anthropic_proxy_secret(monkey
     # keys, not an OpenAI-format secret that does not exist in the workspace.
     assert worker.MEMO_EVALUATOR_MODEL == "claude-fable-5"
     assert worker.MEMO_EVALUATOR_PROVIDER == "anthropic"
+
+
+def test_worker_uncapped_runtime_uses_modal_24h_ceiling(monkeypatch, tmp_path):
+    worker = _load_worker_module(monkeypatch, tmp_path)
+
+    # A task with no runtime cap must run to Modal's 24h function-timeout ceiling,
+    # not the 1h function default.
+    assert worker._resolve_function_timeout(None) == worker._MODAL_MAX_TIMEOUT
+
+
+def test_worker_runtime_within_cap_is_honored(monkeypatch, tmp_path):
+    worker = _load_worker_module(monkeypatch, tmp_path)
+
+    # A 2h task keeps its exact runtime; a string is coerced.
+    assert worker._resolve_function_timeout(7200) == 7200
+    assert worker._resolve_function_timeout("7200") == 7200
+
+
+def test_worker_rejects_runtime_above_modal_cap_as_capability_block(monkeypatch, tmp_path):
+    worker = _load_worker_module(monkeypatch, tmp_path)
+
+    # A 48h task exceeds Modal's 24h function-timeout cap. Silently clamping to
+    # 24h would kill it mid-evaluation and requeue it as a transient failure
+    # forever; the worker must reject it up front as a capability block so a
+    # human reroutes it — before any paid remote spawn.
+    result = worker._resolve_function_timeout(48 * 60 * 60)
+    assert isinstance(result, dict)
+    assert result["outcome"] == "block"
+    assert result["kind"] == "capability"
+    assert "exceeds Modal" in result["reason"]
+
+
+def test_worker_unparseable_runtime_falls_back_to_ceiling(monkeypatch, tmp_path):
+    worker = _load_worker_module(monkeypatch, tmp_path)
+
+    # A malformed value is treated as uncapped, not an error.
+    assert worker._resolve_function_timeout("not-a-number") == worker._MODAL_MAX_TIMEOUT
+
+
+def test_run_modal_terminates_the_modal_child_group_on_timeout(monkeypatch, tmp_path):
+    """A per-task runtime timeout must tear down the Modal CLI process group.
+
+    Killing only the shim would orphan the ``modal run`` child (and its paid
+    remote call); the shim forwards termination to the whole group so a requeued
+    attempt can't launch a duplicate evaluation.
+    """
+    import subprocess
+
+    from hermes_cli import kanban_modal
+
+    monkeypatch.setattr(kanban_modal.shutil, "which", lambda _bin: "/usr/bin/modal")
+
+    class _FakeProc:
+        def __init__(self):
+            self.pid = 4242
+            self.returncode = None
+            self._alive = True
+            self.signals: list[int] = []
+
+        def communicate(self, input=None, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="modal", timeout=timeout or 1)
+
+        def poll(self):
+            return None if self._alive else self.returncode
+
+        def wait(self, timeout=None):
+            # First SIGTERM: still alive (force the SIGKILL escalation). After a
+            # SIGKILL was delivered, report exit.
+            if any(s == getattr(kanban_modal.signal, "SIGKILL", None) for s in self.signals):
+                self._alive = False
+                self.returncode = -9
+                return self.returncode
+            raise subprocess.TimeoutExpired(cmd="modal", timeout=timeout or 1)
+
+        def send_signal(self, sig):
+            self.signals.append(sig)
+
+    fake = _FakeProc()
+    monkeypatch.setattr(kanban_modal.subprocess, "Popen", lambda *a, **k: fake)
+
+    captured_groups: list[tuple[int, int]] = []
+
+    def _fake_killpg(pgid, sig):
+        captured_groups.append((pgid, sig))
+        fake.signals.append(sig)
+
+    monkeypatch.setattr(kanban_modal.os, "killpg", _fake_killpg, raising=False)
+    monkeypatch.setattr(kanban_modal.os, "getpgid", lambda pid: pid, raising=False)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        kanban_modal._run_modal({"task_id": "t_x", "brief": "grade"}, timeout=1)
+
+    # SIGTERM then SIGKILL were sent to the child's process group (pid==pgid).
+    sigterm = kanban_modal.signal.SIGTERM
+    sigkill = getattr(kanban_modal.signal, "SIGKILL", sigterm)
+    assert (4242, sigterm) in captured_groups
+    assert (4242, sigkill) in captured_groups
+    # The global tracker is cleared so a later spawn isn't mistaken for this one.
+    assert kanban_modal._active_modal_proc is None
+

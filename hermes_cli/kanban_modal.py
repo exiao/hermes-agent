@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,13 @@ from typing import Any
 _MODAL_LANE = "memo-evaluator"
 _MAX_MODAL_BRIEF_CHARS = 64_000
 _log = logging.getLogger(__name__)
+
+# The currently-running ``modal run`` child, tracked so a reclaim SIGTERM to the
+# shim can forward termination to it. Without this the dispatcher would kill only
+# the shim PID, orphaning the Modal CLI (and its paid remote call) to be
+# duplicated when the task is requeued. Set while ``_run_modal`` blocks on the
+# child; cleared in its ``finally``.
+_active_modal_proc: subprocess.Popen | None = None
 
 # Metadata keys the local Kanban lifecycle treats as trusted, host-side
 # directives (they make ``complete_task`` copy/attach/unlink host files at the
@@ -209,7 +217,16 @@ def _build_modal_request(task_id: str, workspace: str) -> tuple[dict[str, Any], 
 
 
 def _run_modal(request: dict[str, Any], *, timeout: int | None = None) -> dict[str, Any]:
-    """Synchronously invoke the Modal app and parse its structured response."""
+    """Synchronously invoke the Modal app and parse its structured response.
+
+    The ``modal run`` child is launched in its own process group and tracked in
+    ``_active_modal_proc`` so a reclaim/timeout SIGTERM delivered to this shim can
+    be forwarded to the whole group (see ``_terminate_active_modal``). Killing
+    only the shim would orphan the Modal CLI and its paid remote call, which a
+    requeued attempt would then duplicate.
+    """
+    global _active_modal_proc
+
     modal_bin = shutil.which("modal")
     if modal_bin is None:
         raise RuntimeError(
@@ -220,8 +237,9 @@ def _run_modal(request: dict[str, Any], *, timeout: int | None = None) -> dict[s
     fd, result_name = tempfile.mkstemp(prefix="hermes-kanban-modal-", suffix=".json")
     os.close(fd)
     result_path = Path(result_name)
+    proc: subprocess.Popen | None = None
     try:
-        completed = subprocess.run(  # noqa: S603 -- fixed CLI, request piped via stdin
+        proc = subprocess.Popen(  # noqa: S603 -- fixed CLI, request piped via stdin
             [
                 modal_bin,
                 "run",
@@ -229,17 +247,30 @@ def _run_modal(request: dict[str, Any], *, timeout: int | None = None) -> dict[s
                 str(result_path),
                 _modal_runner_path(),
             ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            # Own process group so the shim can forward SIGTERM/SIGKILL to the
+            # Modal CLI (and any grandchild it spawns), not just its direct pid.
+            start_new_session=True,
+        )
+        _active_modal_proc = proc
+        try:
             # Pass the (potentially ~64KB) request over stdin, not as an argv
             # element: Windows caps the ENTIRE command line at 32,767 chars, so a
             # large brief in ``--request-json`` would overflow the spawn there.
-            input=json.dumps(request, separators=(",", ":")),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(f"Modal run exited with status {completed.returncode}")
+            _stdout, _stderr = proc.communicate(
+                input=json.dumps(request, separators=(",", ":")),
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # The task's runtime cap elapsed. Tear the whole Modal group down so
+            # the remote call can't keep billing after we've given up on it.
+            _terminate_active_modal(proc)
+            raise
+        if proc.returncode != 0:
+            raise RuntimeError(f"Modal run exited with status {proc.returncode}")
         try:
             parsed = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -248,7 +279,50 @@ def _run_modal(request: dict[str, Any], *, timeout: int | None = None) -> dict[s
             raise RuntimeError("Modal run returned a non-object result")
         return parsed
     finally:
+        if proc is not None and _active_modal_proc is proc:
+            _active_modal_proc = None
         result_path.unlink(missing_ok=True)
+
+
+def _terminate_active_modal(proc: subprocess.Popen) -> None:
+    """SIGTERM then SIGKILL the Modal CLI's whole process group.
+
+    Called when the shim is being torn down (its own SIGTERM handler) or when
+    the per-task timeout elapses. Signalling the group — not just ``proc.pid`` —
+    stops any grandchild the Modal CLI spawned so no orphaned remote call keeps
+    running after the shim exits.
+    """
+    if proc.poll() is not None:
+        return
+    _signal_process_group(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_process_group(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _log.warning("Modal CLI child %s did not exit after SIGKILL", proc.pid)
+
+
+def _signal_process_group(proc: subprocess.Popen, sig: int) -> None:
+    """Signal the child's process group, falling back to the bare pid.
+
+    ``start_new_session=True`` makes the child a group leader, so ``killpg`` on
+    its pid reaches the Modal CLI and any grandchild. On platforms without
+    ``killpg`` (Windows), fall back to signalling the process directly.
+    """
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    try:
+        if killpg is not None and getpgid is not None:
+            killpg(getpgid(proc.pid), sig)
+        else:
+            proc.send_signal(sig)
+    except (ProcessLookupError, OSError):
+        pass
 
 
 def _spawned_run_id(task_id: str) -> int | None:
@@ -330,10 +404,39 @@ def run_modal_shim(task_id: str, workspace: str) -> bool:
             )
 
 
+def _install_shim_signal_forwarding() -> None:
+    """Forward a reclaim/timeout SIGTERM to the in-flight Modal CLI child.
+
+    The dispatcher (``enforce_max_runtime`` / ``reclaim_task``) signals only the
+    recorded shim pid. Without this handler the shim would exit while its
+    ``modal run`` child — and the paid remote call — kept running, so a requeued
+    attempt could launch a duplicate evaluation. On SIGTERM/SIGINT we tear the
+    Modal process group down first, then exit non-zero so the run is recorded as
+    a failure/timeout rather than a phantom success.
+    """
+    def _handler(signum, _frame):
+        proc = _active_modal_proc
+        if proc is not None:
+            _terminate_active_modal(proc)
+        # 128 + signal number is the conventional "terminated by signal" code.
+        raise SystemExit(128 + signum)
+
+    for _sig_name in ("SIGTERM", "SIGINT"):
+        _sig = getattr(signal, _sig_name, None)
+        if _sig is not None:
+            try:
+                signal.signal(_sig, _handler)
+            except (ValueError, OSError):
+                # Not on the main thread (e.g. a direct in-process test call);
+                # signal forwarding is a best-effort dispatcher-path safeguard.
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a Kanban memo evaluator via Modal")
     parser.add_argument("--task-id", required=True)
     args = parser.parse_args(argv)
+    _install_shim_signal_forwarding()
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "")
     return 0 if run_modal_shim(args.task_id, workspace) else 1
 
