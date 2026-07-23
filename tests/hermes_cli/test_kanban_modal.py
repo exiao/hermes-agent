@@ -137,6 +137,45 @@ def test_modal_shim_pins_the_spawned_run_id(monkeypatch):
     assert task.status == "running"
 
 
+def test_modal_shim_threads_task_runtime_into_the_request(monkeypatch):
+    """A >1h / uncapped task's runtime must reach the remote so it isn't
+    killed at the function default. The shim adds max_runtime_seconds to the
+    request payload it hands to Modal."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="long memo",
+            assignee="memo-evaluator",
+            max_runtime_seconds=7200,
+        )
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+
+    captured: dict = {}
+
+    def _fake_run(request, *, timeout=None):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return {
+            "outcome": "complete",
+            "summary": "ok",
+            "modal_call_id": "fc-1",
+            "modal_log_url": "https://modal.test/log",
+        }
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setattr(kanban_modal, "_run_modal", _fake_run)
+
+    assert kanban_modal.run_modal_shim(task_id, "/tmp/workspace") is True
+    assert captured["request"]["max_runtime_seconds"] == 7200
+    assert captured["timeout"] == 7200
+
+
 def test_configured_spawn_routes_only_memo_evaluator_to_modal(monkeypatch):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_modal

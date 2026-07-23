@@ -287,6 +287,9 @@ def run_modal_shim(task_id: str, workspace: str) -> bool:
             task = kb.get_task(conn, task_id)
             if task is not None and task.max_runtime_seconds:
                 timeout = int(task.max_runtime_seconds)
+        # Thread the per-task runtime into the remote function timeout too, so a
+        # >1h or uncapped task isn't silently killed at the function default.
+        request["max_runtime_seconds"] = timeout
         result = _run_modal(request, timeout=timeout)
         with kb.connect_closing() as conn:
             return apply_modal_result(

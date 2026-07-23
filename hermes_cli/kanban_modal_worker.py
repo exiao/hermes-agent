@@ -132,10 +132,17 @@ def _parse_worker_result(text: str) -> dict[str, Any]:
     raise ValueError("worker result must declare a complete or block outcome")
 
 
+# Modal caps a function timeout at 24h; use that as the ceiling for an
+# uncapped ``memo-evaluator`` task. The default here only applies when the shim
+# doesn't override it via ``with_options`` (see ``main``).
+_MODAL_MAX_TIMEOUT = 24 * 60 * 60
+_DEFAULT_TIMEOUT = 3600
+
+
 @app.function(
     image=image,
     secrets=[PROXY_SECRET],
-    timeout=3600,
+    timeout=_DEFAULT_TIMEOUT,
     env={
         "HERMES_HOME": "/opt/memo-evaluator",
     },
@@ -194,7 +201,17 @@ def main() -> str:
     brief cannot overflow the Windows 32,767-char command-line limit.
     """
     request_json = sys.stdin.read()
-    call = evaluate_memo.spawn(request_json)
+    # Honor the task's runtime contract: a >1h or uncapped (None) task must not
+    # be killed at the 1h function default. Uncapped uses Modal's 24h ceiling.
+    fn = evaluate_memo
+    try:
+        max_runtime = json.loads(request_json).get("max_runtime_seconds")
+    except (TypeError, ValueError):
+        max_runtime = None
+    timeout = _MODAL_MAX_TIMEOUT if max_runtime is None else min(int(max_runtime), _MODAL_MAX_TIMEOUT)
+    if timeout != _DEFAULT_TIMEOUT:
+        fn = evaluate_memo.with_options(timeout=timeout)
+    call = fn.spawn(request_json)
     result = json.loads(call.get())
     result["modal_call_id"] = call.object_id
     result["modal_log_url"] = call.get_dashboard_url()
