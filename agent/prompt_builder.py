@@ -963,7 +963,7 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 # a mid-process backend switch rebuilds the string. Kept in-module (not on
 # disk) because the probe captures live backend state that may change
 # across Hermes restarts.
-_BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
+_BACKEND_PROBE_CACHE: dict[tuple[str, str, str], str] = {}
 
 
 _WINDOWS_BASH_SHELL_HINT = (
@@ -985,8 +985,13 @@ def _probe_remote_backend(env_type: str) -> str | None:
     per process. Used only for non-local backends where the agent's tools
     operate on a different machine than the host Hermes runs on.
     """
-    cwd_hint = os.getenv("TERMINAL_CWD", "")
-    cache_key = (env_type, cwd_hint)
+    from tools.terminal_config import (
+        get_terminal_env,
+        get_terminal_environment_key,
+    )
+
+    cwd_hint = get_terminal_env("TERMINAL_CWD", "") or ""
+    cache_key = (env_type, cwd_hint, get_terminal_environment_key() or "")
     cached = _BACKEND_PROBE_CACHE.get(cache_key)
     if cached is not None:
         return cached or None
@@ -1130,7 +1135,9 @@ def build_environment_hints() -> str:
 
     hints: list[str] = []
 
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    from tools.terminal_config import get_terminal_env
+
+    backend = (get_terminal_env("TERMINAL_ENV") or "local").strip().lower()
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS
 
     if not is_remote_backend:

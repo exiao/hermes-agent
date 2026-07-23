@@ -74,6 +74,11 @@ from tools.tool_backend_helpers import (
     nous_tool_gateway_unavailable_message,
     resolve_modal_backend_state,
 )
+from tools.terminal_config import (
+    get_terminal_env,
+    get_terminal_environment_key,
+    has_terminal_config_scope,
+)
 
 
 def _safe_parse_import_env(
@@ -685,7 +690,7 @@ def _sudo_nopasswd_works() -> bool:
     cache) so an expired sudo timestamp cannot make a later command silently
     block waiting for a password.
     """
-    terminal_env = os.getenv("TERMINAL_ENV", "local").strip().lower() or "local"
+    terminal_env = (get_terminal_env("TERMINAL_ENV", "local") or "local").strip().lower()
     if terminal_env != "local":
         return False
 
@@ -1032,7 +1037,7 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     # ``container_config`` only carries container_* keys, so read
     # lifetime_seconds from the env var the rest of the module uses.
     try:
-        lifetime = int(os.getenv("TERMINAL_LIFETIME_SECONDS", "300"))
+        lifetime = int(get_terminal_env("TERMINAL_LIFETIME_SECONDS", "300") or "300")
     except (TypeError, ValueError):
         lifetime = 300
     lifetime = max(60, lifetime)
@@ -1150,14 +1155,13 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # A registered workspace cwd IS the session's working directory until
         # a `cd` changes it.
         record_session_cwd(task_id, new_cwd)
-        # The live env is cached under the raw task_id for per-session surfaces
-        # (ACP/gateway/dashboard) and under the collapsed container id for
-        # isolation-keyed rollouts. Try the raw id first, then the container id,
-        # so a CWD-only override (which collapses to "default") still finds and
-        # updates the originating session's env.
-        container_id = _resolve_container_task_id(task_id)
+        # Multiplexed profile turns add a profile partition to this cache key;
+        # unscoped surfaces retain the legacy raw-id fallback below.
+        container_id = _scoped_environment_task_id(task_id)
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = _active_environments.get(container_id)
+            if env is None and get_terminal_environment_key() is None:
+                env = _active_environments.get(task_id)
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -1207,6 +1211,17 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     return "default"
 
 
+def _scoped_environment_task_id(task_id: Optional[str]) -> str:
+    """Return the terminal cache key, partitioned by the active profile scope."""
+    if task_id and task_id.startswith("profile:"):
+        return task_id
+    container_task_id = _resolve_container_task_id(task_id)
+    environment_key = get_terminal_environment_key()
+    if environment_key:
+        return f"{environment_key}:{container_task_id}"
+    return container_task_id
+
+
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     """Return the env overrides for *task_id*, raw key first then collapsed.
 
@@ -1235,7 +1250,7 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
     Without this wrapper, a single malformed env var (e.g. TERMINAL_TIMEOUT=5m)
     causes an unhandled ValueError that kills every terminal command.
     """
-    raw = os.getenv(name, default)
+    raw = get_terminal_env(name, default)
     try:
         return converter(raw)
     except (ValueError, json.JSONDecodeError):
@@ -1256,7 +1271,7 @@ def _safe_getcwd() -> str:
     try:
         return os.getcwd()
     except FileNotFoundError:
-        return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
+        return get_terminal_env("TERMINAL_CWD") or os.path.expanduser("~")
 
 
 # Path prefixes that identify a *host* working directory which cannot exist
@@ -1331,7 +1346,11 @@ def _ensure_terminal_env_bridged() -> None:
     default — never an explicit selection.
     """
     global _terminal_config_bridge_attempted
-    if "TERMINAL_ENV" in os.environ or _terminal_config_bridge_attempted:
+    if (
+        has_terminal_config_scope()
+        or "TERMINAL_ENV" in os.environ
+        or _terminal_config_bridge_attempted
+    ):
         return
     _terminal_config_bridge_attempted = True
     try:
@@ -1351,9 +1370,9 @@ def _get_env_config() -> Dict[str, Any]:
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
-    env_type = os.getenv("TERMINAL_ENV", "local")
+    env_type = get_terminal_env("TERMINAL_ENV", "local") or "local"
     
-    mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
+    mount_docker_cwd = (get_terminal_env("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false") or "false").lower() in {"true", "1", "yes"}
     container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
     docker_backend = env_type == "docker"
 
@@ -1395,12 +1414,12 @@ def _get_env_config() -> Dict[str, Any]:
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    cwd = get_terminal_env("TERMINAL_CWD", default_cwd) or default_cwd
     if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
         cwd = os.path.expanduser(cwd)
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
+        docker_cwd_source = get_terminal_env("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
@@ -1418,40 +1437,40 @@ def _get_env_config() -> Dict[str, Any]:
 
     return {
         "env_type": env_type,
-        "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
-        "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
+        "modal_mode": coerce_modal_mode(get_terminal_env("TERMINAL_MODAL_MODE", "auto")),
+        "docker_image": get_terminal_env("TERMINAL_DOCKER_IMAGE", default_image) or default_image,
         "docker_forward_env": docker_forward_env,
-        "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
-        "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
-        "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "singularity_image": get_terminal_env("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}") or f"docker://{default_image}",
+        "modal_image": get_terminal_env("TERMINAL_MODAL_IMAGE", default_image) or default_image,
+        "daytona_image": get_terminal_env("TERMINAL_DAYTONA_IMAGE", default_image) or default_image,
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
-        "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
-        "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
+        "ssh_host": get_terminal_env("TERMINAL_SSH_HOST", "") or "",
+        "ssh_user": get_terminal_env("TERMINAL_SSH_USER", "") or "",
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
-        "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        "ssh_key": get_terminal_env("TERMINAL_SSH_KEY", "") or "",
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
-        "ssh_persistent": os.getenv(
+        "ssh_persistent": (get_terminal_env(
             "TERMINAL_SSH_PERSISTENT",
-            os.getenv("TERMINAL_PERSISTENT_SHELL", "true"),
-        ).lower() in {"true", "1", "yes"},
-        "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
+            get_terminal_env("TERMINAL_PERSISTENT_SHELL", "true"),
+        ) or "true").lower() in {"true", "1", "yes"},
+        "local_persistent": (get_terminal_env("TERMINAL_LOCAL_PERSISTENT", "false") or "false").lower() in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
         # daytona -- ignored for local/ssh)
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
-        "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
+        "container_persistent": (get_terminal_env("TERMINAL_CONTAINER_PERSISTENT", "true") or "true").lower() in {"true", "1", "yes"},
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
-        "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
-        "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
+        "docker_run_as_host_user": (get_terminal_env("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false") or "false").lower() in {"true", "1", "yes"},
+        "docker_network": (get_terminal_env("TERMINAL_DOCKER_NETWORK", "true") or "true").lower() in {"true", "1", "yes"},
         "docker_extra_args": docker_extra_args,
         # Cross-process container reuse (issue #20561).  The docs claim
         # "ONE long-lived container shared across sessions" — this toggle
@@ -1459,16 +1478,16 @@ def _get_env_config() -> Dict[str, Any]:
         # attaching to it instead of always starting a fresh one.  Set to
         # ``false`` for hard per-process isolation (no reuse, container is
         # removed on exit).
-        "docker_persist_across_processes": os.getenv(
+        "docker_persist_across_processes": (get_terminal_env(
             "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"
-        ).lower() in {"true", "1", "yes"},
+        ) or "true").lower() in {"true", "1", "yes"},
         # Startup orphan reaper for hermes-tagged containers left behind by
         # crashed / SIGKILL'd previous processes that bypassed atexit.
         # Conservative: only sweeps Exited containers older than 2× the
         # idle-reap window AND scoped to the current profile. Issue #20561.
-        "docker_orphan_reaper": os.getenv(
+        "docker_orphan_reaper": (get_terminal_env(
             "TERMINAL_DOCKER_ORPHAN_REAPER", "true"
-        ).lower() in {"true", "1", "yes"},
+        ) or "true").lower() in {"true", "1", "yes"},
     }
 
 
@@ -1734,9 +1753,12 @@ def _stop_cleanup_thread():
 
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
-    lookup = _resolve_container_task_id(task_id)
+    lookup = _scoped_environment_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        env = _active_environments.get(lookup)
+        if env is None and get_terminal_environment_key() is None:
+            env = _active_environments.get(task_id)
+        return env
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -1809,19 +1831,20 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
+    environment_task_id = _scoped_environment_task_id(task_id)
     env = None
     with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+        env = _active_environments.pop(environment_task_id, None)
+        _last_activity.pop(environment_task_id, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
+        _creation_locks.pop(environment_task_id, None)
 
     # Invalidate stale file_ops cache entry
     try:
         from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
+        clear_file_ops_cache(environment_task_id)
     except ImportError:
         pass
 
@@ -1843,14 +1866,14 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
         elif hasattr(env, 'terminate'):
             env.terminate()
 
-        logger.info("Manually cleaned up environment for task: %s", task_id)
+        logger.info("Manually cleaned up environment for task: %s", environment_task_id)
 
     except Exception as e:
         error_str = str(e)
         if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
+            logger.info("Environment for task %s already cleaned up", environment_task_id)
         else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+            logger.warning("Error cleaning up environment for task %s: %s", environment_task_id, e)
 
 
 def _atexit_cleanup():
@@ -2161,7 +2184,8 @@ def terminal_tool(
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
-        effective_task_id = _resolve_container_task_id(task_id)
+        # Multiplexed profiles partition that shared container by profile.
+        effective_task_id = _scoped_environment_task_id(task_id)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -2238,15 +2262,12 @@ def terminal_tool(
         # instead of each creating their own (wasting Modal resources).
         env = None
         with _env_lock:
-            # Prefer the collapsed container id, but fall back to an env cached
-            # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
-            # with a CWD-only override collapse to "default" for container
-            # sharing, yet an env may already be cached under the originating
-            # task_id; honor it instead of spawning a duplicate.
-            _existing_key = (
-                effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
-            )
+            # The profile-partitioned key prevents a multiplexed profile from
+            # reusing another profile's configured terminal environment. Legacy
+            # unscoped callers retain their raw task-id fallback.
+            _existing_key = effective_task_id if effective_task_id in _active_environments else None
+            if _existing_key is None and get_terminal_environment_key() is None:
+                _existing_key = task_id if task_id and task_id in _active_environments else None
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
                 env = _active_environments[_existing_key]
@@ -2264,10 +2285,9 @@ def terminal_tool(
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
-                    _existing_key = (
-                        effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
-                    )
+                    _existing_key = effective_task_id if effective_task_id in _active_environments else None
+                    if _existing_key is None and get_terminal_environment_key() is None:
+                        _existing_key = task_id if task_id and task_id in _active_environments else None
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
                         env = _active_environments[_existing_key]

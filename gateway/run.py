@@ -1687,7 +1687,7 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
 
-    Combines the two seams the multiplexer needs:
+    Combines the profile-local seams the multiplexer needs:
       1. ``set_hermes_home_override`` — redirects ``get_hermes_home()`` (config,
          skills, memory, SOUL, sessions) to the profile's home. Contextvar, so
          it propagates into the agent worker thread via ``copy_context()``.
@@ -1695,6 +1695,9 @@ def _profile_runtime_scope(profile_home: "Path"):
          authoritative credential source, so ``get_secret`` reads this profile's
          keys and never the process-global ``os.environ`` (which in a
          multiplexer may hold another profile's values).
+      3. ``set_terminal_config_scope`` — overlays this profile's terminal config
+         for terminal consumers without mutating process-global ``TERMINAL_*``
+         values while this scope spans awaited work.
 
     Only used on the multiplexed inbound path. Single-profile gateways never
     enter this scope, so their behavior is unchanged. Loading the profile's
@@ -1708,12 +1711,35 @@ def _profile_runtime_scope(profile_home: "Path"):
         set_secret_scope,
         reset_secret_scope,
     )
+    from tools.terminal_config import (
+        reset_terminal_config_scope,
+        set_terminal_config_scope,
+    )
 
     home_token = set_hermes_home_override(str(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    terminal_env = {
+        name: value for name, value in os.environ.items()
+        if name.startswith("TERMINAL_")
+    }
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env
+
+        # Apply config to an isolated mapping, not os.environ. With a terminal
+        # section the profile's YAML stays authoritative; otherwise the process
+        # launch settings remain the fallback exactly as they do outside multiplex.
+        apply_terminal_config_to_env(env=terminal_env)
+    except Exception:
+        logger.debug("profile terminal config scope setup failed", exc_info=True)
+    terminal_scope_token = set_terminal_config_scope(
+        terminal_env,
+        environment_key=f"profile:{Path(profile_home).name}",
+    )
     try:
         yield
     finally:
+        if terminal_scope_token is not None:
+            reset_terminal_config_scope(terminal_scope_token)
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
 

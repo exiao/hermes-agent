@@ -5,6 +5,9 @@ interpolation) rather than mocking it, proving the property that matters: two
 profiles with different keys never see each other's, and an unscoped read in
 multiplex mode fails closed instead of leaking.
 """
+import asyncio
+import os
+
 import pytest
 
 from pathlib import Path
@@ -1054,3 +1057,149 @@ class TestApiKeyProviderBaseUrlUsesScope:
         assert creds["base_url"] == "https://cli-user.example/v1", (
             "single-profile base URL must still read os.environ, byte-identical"
         )
+
+
+class TestProfileTerminalConfigIsolation:
+    def test_concurrent_profile_scopes_keep_terminal_config_task_local(
+        self, tmp_path, monkeypatch
+    ):
+        """Overlapping profile turns cannot see each other's terminal settings."""
+        from gateway.run import _profile_runtime_scope
+        from tools import terminal_tool
+        from tools.terminal_tool import _get_env_config, _scoped_environment_task_id
+
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+
+        profile_a = tmp_path / "profile-a"
+        profile_b = tmp_path / "profile-b"
+        profile_a.mkdir()
+        profile_b.mkdir()
+        (profile_a / "config.yaml").write_text(
+            """terminal:
+  backend: modal
+  modal_mode: direct
+  modal_image: profile-a-image
+  docker_volumes:
+    - /profile-a:/workspace
+""",
+            encoding="utf-8",
+        )
+        (profile_b / "config.yaml").write_text(
+            """terminal:
+  backend: docker
+  modal_mode: managed
+  docker_image: profile-b-image
+  docker_volumes:
+    - /profile-b:/workspace
+""",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_MODAL_MODE", "auto")
+        monkeypatch.setenv("TERMINAL_MODAL_IMAGE", "process-image")
+        monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", "[]")
+
+        ready = asyncio.Event()
+        release = asyncio.Event()
+
+        async def observe(profile_home):
+            with _profile_runtime_scope(profile_home):
+                first = _get_env_config()
+                environment_key = _scoped_environment_task_id(None)
+                marker = object()
+                with terminal_tool._env_lock:
+                    terminal_tool._active_environments[environment_key] = marker
+                ready.set()
+                await release.wait()
+                second = _get_env_config()
+                assert terminal_tool.get_active_env("default") is marker
+            return first, second, environment_key
+
+        async def run_profiles():
+            task_a = asyncio.create_task(observe(profile_a))
+            await ready.wait()
+            ready.clear()
+            task_b = asyncio.create_task(observe(profile_b))
+            await ready.wait()
+            release.set()
+            return await asyncio.gather(task_a, task_b)
+
+        (a_first, a_second, a_environment_key), (
+            b_first,
+            b_second,
+            b_environment_key,
+        ) = asyncio.run(run_profiles())
+
+        for config in (a_first, a_second):
+            assert config["env_type"] == "modal"
+            assert config["modal_mode"] == "direct"
+            assert config["modal_image"] == "profile-a-image"
+        for config in (b_first, b_second):
+            assert config["env_type"] == "docker"
+            assert config["modal_mode"] == "managed"
+            assert config["docker_image"] == "profile-b-image"
+            assert config["docker_volumes"] == ["/profile-b:/workspace"]
+
+        assert os.environ["TERMINAL_ENV"] == "local"
+        assert os.environ["TERMINAL_MODAL_MODE"] == "auto"
+        assert os.environ["TERMINAL_MODAL_IMAGE"] == "process-image"
+        assert os.environ["TERMINAL_DOCKER_VOLUMES"] == "[]"
+        assert a_environment_key != b_environment_key
+
+    def test_profile_scoped_backend_probes_do_not_share_image_cache(self, monkeypatch):
+        """Backend probes must not return a different profile's image result."""
+        from agent import prompt_builder
+        from tools import terminal_tool
+        from tools.terminal_config import (
+            get_terminal_env,
+            reset_terminal_config_scope,
+            set_terminal_config_scope,
+        )
+
+        class FakeEnvironment:
+            def __init__(self, image):
+                self.image = image
+
+            def execute(self, _command, timeout):
+                return {
+                    "returncode": 0,
+                    "output": f"os=Linux\nkernel=1\nhome=/root\ncwd=/root\nuser={self.image}\n",
+                }
+
+        def fake_config():
+            return {
+                "modal_image": get_terminal_env("TERMINAL_MODAL_IMAGE"),
+                "cwd": "/root",
+                "timeout": 1,
+            }
+
+        monkeypatch.setattr(terminal_tool, "_get_env_config", fake_config)
+        monkeypatch.setattr(
+            terminal_tool,
+            "_create_environment",
+            lambda *, image, **_kwargs: FakeEnvironment(image),
+        )
+        prompt_builder._clear_backend_probe_cache()
+
+        first_token = set_terminal_config_scope(
+            {"TERMINAL_MODAL_IMAGE": "profile-a-image"},
+            environment_key="profile:profile-a",
+        )
+        try:
+            first = prompt_builder._probe_remote_backend("modal")
+        finally:
+            reset_terminal_config_scope(first_token)
+
+        second_token = set_terminal_config_scope(
+            {"TERMINAL_MODAL_IMAGE": "profile-b-image"},
+            environment_key="profile:profile-b",
+        )
+        try:
+            second = prompt_builder._probe_remote_backend("modal")
+        finally:
+            reset_terminal_config_scope(second_token)
+
+        assert first is not None
+        assert second is not None
+        assert "profile-a-image" in first
+        assert "profile-b-image" in second
