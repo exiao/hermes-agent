@@ -1835,6 +1835,12 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     env = None
     with _env_lock:
         env = _active_environments.pop(environment_task_id, None)
+        # Preserve the legacy raw-task fallback for unscoped callers.  Tests
+        # and older integrations may register an environment under its raw
+        # task id, while a profile scope must never fall back across profiles.
+        if env is None and get_terminal_environment_key() is None:
+            environment_task_id = task_id
+            env = _active_environments.pop(environment_task_id, None)
         _last_activity.pop(environment_task_id, None)
 
     # Clean up per-task creation lock
