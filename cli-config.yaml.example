@@ -288,10 +288,11 @@ terminal:
 # -----------------------------------------------------------------------------
 # terminal:
 #   backend: "modal"
+#   modal_mode: "auto"  # auto | direct | managed; use direct for private im-... image IDs
 #   cwd: "/workspace"  # Path INSIDE the sandbox (default: /root)
 #   timeout: 180
 #   lifetime_seconds: 300
-#   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+#   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"  # Registry image or Modal im-... ID
 
 # -----------------------------------------------------------------------------
 # OPTION 6: Daytona cloud execution

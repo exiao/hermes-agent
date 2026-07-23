@@ -25,6 +25,7 @@ mirrors the pattern used in tests/hermes_cli/test_config_drift.py.
 
 import ast
 import inspect
+import os
 
 
 def _extract_dict_values(source: str, dict_name: str) -> set[str]:
@@ -189,6 +190,34 @@ def test_save_config_set_supports_critical_bridged_keys():
         f"keys to .env: {sorted(missing)}.  Add them to TERMINAL_CONFIG_ENV_MAP "
         f"in hermes_cli/config.py (set_config_value bridges through it)."
     )
+
+
+def test_modal_mode_is_bridged_everywhere(monkeypatch, tmp_path):
+    """Private Modal image IDs require profile ``modal_mode: direct`` to win.
+
+    ``modal_mode`` was present in the canonical config map and consumed by
+    terminal_tool, but missing from the CLI and gateway startup bridges. That
+    made profile YAML silently fall back to ``auto``, which can route an
+    account-scoped ``im-...`` image through the Nous-managed gateway instead
+    of the user's direct Modal account.
+    """
+    import cli
+    import gateway.run as gr
+
+    exact_mapping = '"modal_mode": "TERMINAL_MODAL_MODE"'
+    assert exact_mapping in inspect.getsource(cli.load_cli_config)
+    assert exact_mapping in inspect.getsource(gr)
+    assert "modal_mode" in _save_config_env_sync_keys()
+    assert "TERMINAL_MODAL_MODE" in _terminal_tool_env_var_names()
+
+    (tmp_path / "config.yaml").write_text(
+        "terminal:\n  backend: modal\n  modal_mode: direct\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_hermes_home", tmp_path)
+    monkeypatch.setenv("TERMINAL_MODAL_MODE", "managed")
+    cli.load_cli_config()
+    assert os.environ["TERMINAL_MODAL_MODE"] == "direct"
 
 
 def test_docker_run_as_host_user_is_bridged_everywhere():

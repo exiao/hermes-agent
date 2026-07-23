@@ -1811,6 +1811,7 @@ if _config_path.exists():
             ).strip().lower()
             _terminal_env_map = {
                 "backend": "TERMINAL_ENV",
+                "modal_mode": "TERMINAL_MODAL_MODE",
                 "cwd": "TERMINAL_CWD",
                 "timeout": "TERMINAL_TIMEOUT",
                 "home_mode": "TERMINAL_HOME_MODE",

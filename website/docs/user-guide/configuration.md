@@ -124,6 +124,7 @@ terminal:
   home_mode: auto   # auto | real | profile — subprocess HOME policy
   env_passthrough: []  # Env var names to forward to sandboxed execution (terminal + execute_code)
   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
+  modal_mode: auto  # auto | direct | managed
   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"                 # Container image for Modal backend
   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"               # Container image for Daytona backend
 ```
@@ -345,13 +346,19 @@ Runs commands in a [Modal](https://modal.com) cloud sandbox. Each task gets an i
 ```yaml
 terminal:
   backend: modal
+  modal_mode: auto                  # auto | direct | managed
+  modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"
   container_cpu: 1                 # CPU cores
   container_memory: 5120           # MB (5GB)
   container_disk: 51200            # MB (50GB)
   container_persistent: true       # Snapshot/restore filesystem
 ```
 
-**Required:** Either `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` environment variables, or a `~/.modal.toml` config file.
+`modal_image` accepts a registry image name or a Modal image ID (`im-...`). Modal image IDs are account-scoped, so private `im-...` images require `modal_mode: direct` and credentials for the Modal account that owns the image.
+
+**Modes:** `auto` (default) prefers the Nous-managed Tool Gateway when available, then falls back to direct Modal. `direct` always uses your Modal account. `managed` always uses the Nous-managed gateway.
+
+**Required:** Direct mode needs either `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` environment variables or a `~/.modal.toml` config file. Managed mode needs Nous Portal Tool Gateway access.
 
 **Persistence:** When enabled, the sandbox filesystem is snapshotted on cleanup and restored on next session. Snapshots are tracked in `~/.hermes/modal_snapshots.json`. This preserves filesystem state, not live processes, PID space, or background jobs.
 
