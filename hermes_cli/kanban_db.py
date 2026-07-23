@@ -5576,6 +5576,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    scan_prose_artifacts: bool = True,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -5604,6 +5605,16 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    ``scan_prose_artifacts`` (default True) controls the legacy
+    prose-artifact promotion in :func:`_merge_completion_prose_artifacts`,
+    which discovers scratch-workspace file paths named in ``summary`` /
+    ``result`` and copies them into Kanban attachments. Callers applying an
+    **untrusted** completion (e.g. a remote Modal worker verdict) must pass
+    ``False``: a prompt-injected summary could otherwise name an arbitrary
+    workspace file (``<workspace>/.env``) and expose it to later board
+    users. Trusted local workers keep the default so their promised
+    deliverables survive scratch cleanup.
     """
     now = int(time.time())
 
@@ -5634,9 +5645,10 @@ def complete_task(
     else:
         verified_cards = []
 
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
-    )
+    if scan_prose_artifacts:
+        metadata = _merge_completion_prose_artifacts(
+            conn, task_id, metadata, summary=summary, result=result,
+        )
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(

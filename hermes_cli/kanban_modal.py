@@ -112,12 +112,19 @@ def apply_modal_result(
         # call was in flight) has ``complete_task`` return False on the run-id
         # mismatch; writing the comment unconditionally would smear the old call
         # id / log url onto the new attempt's audit history.
+        #
+        # ``scan_prose_artifacts=False``: the remote worker is untrusted and
+        # mount-less, so a prompt-injected summary must not be able to name a
+        # workspace file (e.g. ``<workspace>/.env``) and have the host-side prose
+        # scanner promote it into Kanban attachments. Stripping the reserved
+        # metadata keys above does not cover the prose route.
         completed = kb.complete_task(
             conn,
             task_id,
             summary=summary.strip(),
             metadata=metadata,
             expected_run_id=expected_run_id,
+            scan_prose_artifacts=False,
         )
         if completed:
             kb.add_comment(
@@ -403,33 +410,41 @@ def run_modal_shim(task_id: str, workspace: str) -> bool:
             if expected_run_id is None:
                 task = kb.get_task(conn, task_id)
                 expected_run_id = task.current_run_id if task else None
-            kb.add_comment(conn, task_id, "modal-shim", str(exc))
-            return kb.block_task(
+            # Block first; only record the shim note if the run-validated
+            # transition landed, so a stale shim (task reclaimed mid-call) can't
+            # smear this attempt's audit onto the new one.
+            blocked = kb.block_task(
                 conn,
                 task_id,
                 reason=str(exc),
                 kind="capability",
                 expected_run_id=expected_run_id,
             )
+            if blocked:
+                kb.add_comment(conn, task_id, "modal-shim", str(exc))
+            return blocked
     except Exception as exc:
         _log.error("modal Kanban shim failed for %s: %s", task_id, exc)
         with kb.connect_closing() as conn:
             if expected_run_id is None:
                 task = kb.get_task(conn, task_id)
                 expected_run_id = task.current_run_id if task else None
-            kb.add_comment(
-                conn,
-                task_id,
-                "modal-shim",
-                "Modal worker invocation failed; see the worker log for details.",
-            )
-            return kb.block_task(
+            # Same run-validated gating as the capability path above.
+            blocked = kb.block_task(
                 conn,
                 task_id,
                 reason="Modal worker invocation failed; see the worker log.",
                 kind="transient",
                 expected_run_id=expected_run_id,
             )
+            if blocked:
+                kb.add_comment(
+                    conn,
+                    task_id,
+                    "modal-shim",
+                    "Modal worker invocation failed; see the worker log for details.",
+                )
+            return blocked
 
 
 def _install_shim_signal_forwarding() -> None:

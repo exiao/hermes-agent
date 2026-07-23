@@ -4065,6 +4065,36 @@ def test_complete_task_preserves_legacy_artifact_path_from_summary(kanban_home):
     assert persisted.parent == kb.task_attachments_dir(t)
 
 
+def test_complete_task_suppresses_prose_artifacts_when_disabled(kanban_home):
+    """An untrusted completion must not promote workspace files named in prose.
+
+    A remote Modal verdict is untrusted: a prompt-injected summary could name an
+    existing workspace file (e.g. ``<workspace>/.env``) and the host-side prose
+    scanner would otherwise copy it into Kanban attachments. Passing
+    ``scan_prose_artifacts=False`` disables that promotion.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="untrusted verdict")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        secret = ws / ".env"
+        secret.write_text("API_KEY=super-secret", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            summary=f"Graded — see {secret}",
+            scan_prose_artifacts=False,
+        )
+        run = kb.latest_run(conn, t)
+
+    # No artifact was promoted, and no attachment leaked the workspace file.
+    assert not (run.metadata or {}).get("artifacts")
+    attach_dir = kb.task_attachments_dir(t)
+    assert not attach_dir.exists() or not any(attach_dir.iterdir())
+
+
 def test_complete_task_leaves_non_scratch_artifact_paths_unchanged(
     kanban_home,
     tmp_path,

@@ -220,6 +220,49 @@ def test_modal_shim_skips_the_remote_call_when_reclaimed(monkeypatch):
     assert task.status == "running"
 
 
+def test_modal_shim_failure_comment_is_gated_on_the_claimed_run(monkeypatch):
+    """A failure from a stale shim must not smear the new attempt's audit.
+
+    When the Modal invocation errors after the shim was reclaimed and the task
+    re-claimed, the block is rejected on the run-id mismatch; the shim note must
+    only be written when that run-validated block actually landed.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="grade memo", assignee="memo-evaluator")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        stale_run_id = task.current_run_id
+        assert kb.reclaim_task(conn, task_id) is True
+        reclaimed = kb.claim_task(conn, task_id)
+        assert reclaimed is not None
+        assert reclaimed.current_run_id != stale_run_id
+
+    # Pin the STALE run and skip the pre-invocation guard by making the request
+    # build report the stale run id, then fail inside _run_modal.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(stale_run_id))
+    monkeypatch.setattr(
+        kanban_modal,
+        "_build_modal_request",
+        lambda _tid, _ws: ({"task_id": task_id, "brief": "b"}, stale_run_id),
+    )
+
+    def _boom(_request, *, timeout=None):
+        raise RuntimeError("modal exploded")
+
+    monkeypatch.setattr(kanban_modal, "_run_modal", _boom)
+
+    # The block is rejected (stale run), so it returns False and writes no note.
+    assert kanban_modal.run_modal_shim(task_id, "/tmp/workspace") is False
+    with kb.connect_closing() as conn:
+        comments = kb.list_comments(conn, task_id)
+    assert not any("worker log" in (c.body or "") for c in comments)
+
+
 def test_modal_shim_threads_task_runtime_into_the_request(monkeypatch):
     """A >1h / uncapped task's runtime must reach the remote so it isn't
     killed at the function default. The shim adds max_runtime_seconds to the
