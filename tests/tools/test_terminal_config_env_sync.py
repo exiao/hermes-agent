@@ -26,6 +26,9 @@ mirrors the pattern used in tests/hermes_cli/test_config_drift.py.
 import ast
 import inspect
 import os
+from pathlib import Path
+import subprocess
+import sys
 
 
 def _extract_dict_values(source: str, dict_name: str) -> set[str]:
@@ -192,7 +195,7 @@ def test_save_config_set_supports_critical_bridged_keys():
     )
 
 
-def test_modal_mode_is_bridged_everywhere(monkeypatch, tmp_path):
+def test_modal_mode_is_bridged_everywhere(tmp_path):
     """Private Modal image IDs require profile ``modal_mode: direct`` to win.
 
     ``modal_mode`` was present in the canonical config map and consumed by
@@ -201,12 +204,6 @@ def test_modal_mode_is_bridged_everywhere(monkeypatch, tmp_path):
     account-scoped ``im-...`` image through the Nous-managed gateway instead
     of the user's direct Modal account.
     """
-    import cli
-    import gateway.run as gr
-
-    exact_mapping = '"modal_mode": "TERMINAL_MODAL_MODE"'
-    assert exact_mapping in inspect.getsource(cli.load_cli_config)
-    assert exact_mapping in inspect.getsource(gr)
     assert "modal_mode" in _save_config_env_sync_keys()
     assert "TERMINAL_MODAL_MODE" in _terminal_tool_env_var_names()
 
@@ -214,10 +211,41 @@ def test_modal_mode_is_bridged_everywhere(monkeypatch, tmp_path):
         "terminal:\n  backend: modal\n  modal_mode: direct\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(cli, "_hermes_home", tmp_path)
-    monkeypatch.setenv("TERMINAL_MODAL_MODE", "managed")
-    cli.load_cli_config()
-    assert os.environ["TERMINAL_MODAL_MODE"] == "direct"
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    env["TERMINAL_MODAL_MODE"] = "managed"
+    env.pop("HERMES_PROFILE", None)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    startup_paths = {
+        "cli": "import cli; cli.load_cli_config()",
+        "gateway": "import gateway.run",
+    }
+    for name, startup in startup_paths.items():
+        script = "\n".join(
+            [
+                "import os",
+                startup,
+                "from tools.terminal_tool import _get_env_config",
+                "print('MODAL_BRIDGE_RESULT', "
+                "os.environ.get('TERMINAL_MODAL_MODE'), "
+                "_get_env_config()['modal_mode'])",
+            ]
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert result.returncode == 0, f"{name}: {result.stderr}"
+        output = next(
+            line for line in result.stdout.splitlines() if line.startswith("MODAL_BRIDGE_RESULT")
+        )
+        assert output.split() == ["MODAL_BRIDGE_RESULT", "direct", "direct"], name
 
 
 def test_docker_run_as_host_user_is_bridged_everywhere():
