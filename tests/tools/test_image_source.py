@@ -108,6 +108,20 @@ class TestNonLocalBackendConfinement:
     """The security model: under a sandbox backend, host reads are confined to
     the media caches; every other path is read inside the sandbox."""
 
+    def test_backend_detection_uses_context_local_terminal_config(self, monkeypatch):
+        """A profile-local backend must override the process default."""
+        isrc = importlib.import_module("tools.image_source")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        from tools.terminal_config import reset_terminal_config_scope, set_terminal_config_scope
+
+        token = set_terminal_config_scope(
+            {"TERMINAL_ENV": "docker"}, environment_key="profile:test:default"
+        )
+        try:
+            assert isrc._is_local_terminal_backend() is False
+        finally:
+            reset_terminal_config_scope(token)
+
     @pytest.mark.asyncio
     async def test_media_cache_path_host_read(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"

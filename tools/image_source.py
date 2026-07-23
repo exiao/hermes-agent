@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from tools.terminal_config import get_terminal_env
+
 # Raw-bytes INGEST budget — what the resolver will load before handing off.
 # This is deliberately the 50MB download cap (tools/vision_tools._VISION_MAX_DOWNLOAD_BYTES),
 # NOT the 20MB provider payload cap. The 20MB cap (_MAX_BASE64_BYTES) is a
@@ -204,7 +206,10 @@ def _is_local_terminal_backend() -> bool:
     Mirrors ``tools.browser_tool._is_local_backend`` and terminal_tool's own
     dispatch, which key off ``TERMINAL_ENV``.
     """
-    return os.getenv("TERMINAL_ENV", "local").strip().lower() in ("local", "")
+    return (get_terminal_env("TERMINAL_ENV", "local") or "local").strip().lower() in (
+        "local",
+        "",
+    )
 
 
 def _media_cache_roots() -> list:
