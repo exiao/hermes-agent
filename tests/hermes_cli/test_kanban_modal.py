@@ -137,6 +137,46 @@ def test_modal_shim_pins_the_spawned_run_id(monkeypatch):
     assert task.status == "running"
 
 
+def test_modal_audit_comment_is_only_written_on_a_validated_completion():
+    """A rejected (stale-run) completion must not smear its audit onto the task.
+
+    ``apply_modal_result`` completes first and only records the Modal call-id /
+    log-url audit comment when the run-validated ``complete_task`` actually
+    landed. A stale shim whose run id no longer matches must leave no misleading
+    audit history on the new attempt.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_modal
+
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="grade memo", assignee="memo-evaluator")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        stale_run_id = task.current_run_id
+        assert kb.reclaim_task(conn, task_id) is True
+        reclaimed = kb.claim_task(conn, task_id)
+        assert reclaimed is not None
+        assert reclaimed.current_run_id != stale_run_id
+
+        result = {
+            "outcome": "complete",
+            "summary": "stale verdict",
+            "modal_call_id": "fc-stale",
+            "modal_log_url": "https://modal.test/log",
+        }
+        # Applying with the STALE run id: complete_task returns False, so no audit
+        # comment is written.
+        assert (
+            kanban_modal.apply_modal_result(
+                conn, task_id, result, expected_run_id=stale_run_id
+            )
+            is False
+        )
+        comments = kb.list_comments(conn, task_id)
+    assert not any("Modal audit" in (c.body or "") for c in comments)
+
+
 def test_modal_shim_skips_the_remote_call_when_reclaimed(monkeypatch):
     """A stale shim must not launch (and pay for) a duplicate remote evaluation.
 
@@ -464,6 +504,25 @@ def test_worker_unparseable_runtime_falls_back_to_ceiling(monkeypatch, tmp_path)
 
     # A malformed value is treated as uncapped, not an error.
     assert worker._resolve_function_timeout("not-a-number") == worker._MODAL_MAX_TIMEOUT
+
+
+def test_worker_main_handles_non_dict_request_json(monkeypatch, tmp_path):
+    """A valid-JSON-but-non-dict request must not crash the entrypoint.
+
+    ``json.loads`` of a bare list/string succeeds, but ``.get`` on it raises
+    AttributeError. The runtime resolution must swallow that and fall back to
+    uncapped rather than crashing the Modal local entrypoint.
+    """
+    worker = _load_worker_module(monkeypatch, tmp_path)
+    import json as _json
+
+    for payload in ("[1, 2, 3]", '"just a string"', "42"):
+        try:
+            max_runtime = _json.loads(payload).get("max_runtime_seconds")
+        except (TypeError, ValueError, AttributeError, _json.JSONDecodeError):
+            max_runtime = None
+        # Same recovery the entrypoint applies → treated as uncapped.
+        assert worker._resolve_function_timeout(max_runtime) == worker._MODAL_MAX_TIMEOUT
 
 
 def test_run_modal_terminates_the_modal_child_group_on_timeout(monkeypatch, tmp_path):

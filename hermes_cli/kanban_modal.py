@@ -107,19 +107,26 @@ def apply_modal_result(
             for key in stripped:
                 metadata.pop(key, None)
         metadata.update(audit)
-        kb.add_comment(
-            conn,
-            task_id,
-            "modal-shim",
-            f"Modal audit: call {audit['modal_call_id']} — {audit['modal_log_url']}",
-        )
-        return kb.complete_task(
+        # Complete first, then record the audit comment only if the run-validated
+        # completion actually landed. A stale shim (task reclaimed while its Modal
+        # call was in flight) has ``complete_task`` return False on the run-id
+        # mismatch; writing the comment unconditionally would smear the old call
+        # id / log url onto the new attempt's audit history.
+        completed = kb.complete_task(
             conn,
             task_id,
             summary=summary.strip(),
             metadata=metadata,
             expected_run_id=expected_run_id,
         )
+        if completed:
+            kb.add_comment(
+                conn,
+                task_id,
+                "modal-shim",
+                f"Modal audit: call {audit['modal_call_id']} — {audit['modal_log_url']}",
+            )
+        return completed
 
     if outcome == "block":
         reason = result.get("reason")

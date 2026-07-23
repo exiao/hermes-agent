@@ -233,7 +233,10 @@ def main() -> str:
     fn = evaluate_memo
     try:
         max_runtime = json.loads(request_json).get("max_runtime_seconds")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError, json.JSONDecodeError):
+        # AttributeError guards valid-but-non-dict JSON (a list/str/number has no
+        # ``.get``); treat any malformed request as uncapped rather than crashing
+        # the entrypoint.
         max_runtime = None
     resolved = _resolve_function_timeout(max_runtime)
     if isinstance(resolved, dict):
