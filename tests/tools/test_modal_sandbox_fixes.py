@@ -258,6 +258,57 @@ class TestModalEnvironmentDefaults:
 
         assert calls == ["recover", "sync"]
 
+    def test_ensure_live_sandbox_reuses_recovery_image(self, monkeypatch):
+        """Respawn should preserve a sandbox restored from a snapshot."""
+        import threading
+        import tools.environments.modal as modal_module
+        from tools.environments.modal import ModalEnvironment
+
+        resolved = []
+
+        class _Worker:
+            def run_coroutine(self, coro, timeout=300):
+                coro.close()
+                return "app", "replacement"
+
+        async def _create_sandbox(image):
+            return "unused", image
+
+        env = ModalEnvironment.__new__(ModalEnvironment)
+        env._respawn_lock = threading.RLock()
+        env._respawning = False
+        env._sandbox_is_live = lambda: False
+        env._task_id = "test"
+        env._recovery_image_spec = "im-persisted"
+        env._create_sandbox = _create_sandbox
+        env._worker = _Worker()
+        env._sync_manager = None
+        env._snapshot_ready = True
+        env.init_session = lambda: None
+        monkeypatch.setattr(
+            modal_module,
+            "_resolve_modal_image",
+            lambda spec: resolved.append(spec) or f"resolved:{spec}",
+        )
+
+        env._ensure_live_sandbox()
+
+        assert resolved == ["im-persisted"]
+        assert env._sandbox == "replacement"
+
+    def test_ensure_live_sandbox_surfaces_indeterminate_poll(self):
+        """A poll error must not abandon a possibly live sandbox."""
+        import threading
+        from tools.environments.modal import ModalEnvironment
+
+        env = ModalEnvironment.__new__(ModalEnvironment)
+        env._respawn_lock = threading.RLock()
+        env._respawning = False
+        env._sandbox_is_live = lambda: None
+
+        with pytest.raises(RuntimeError, match="Unable to determine"):
+            env._ensure_live_sandbox()
+
 
 # =========================================================================
 # Test 7: ensurepip fix in ModalEnvironment

@@ -199,6 +199,7 @@ class ModalEnvironment(BaseEnvironment):
 
         restored_snapshot_id = None
         restored_from_legacy_key = False
+        self._recovery_image_spec = image
         if self._persistent:
             restored_snapshot_id, restored_from_legacy_key = _get_snapshot_restore_candidate(
                 self._task_id
@@ -260,10 +261,10 @@ class ModalEnvironment(BaseEnvironment):
             )
             return app, sandbox
 
-        # Keep the factory + base image so a sandbox torn down by a cancelled
-        # command can be re-created mid-session (see _ensure_live_sandbox).
+        # Keep the factory + recovery image so a sandbox torn down by a
+        # cancelled command can be re-created mid-session (see
+        # _ensure_live_sandbox).
         self._create_sandbox = _create_sandbox
-        self._base_image = image
         # Reentrant: _ensure_live_sandbox holds this while calling init_session(),
         # which itself goes through _run_bash -> _ensure_live_sandbox.
         self._respawn_lock = threading.RLock()
@@ -271,6 +272,7 @@ class ModalEnvironment(BaseEnvironment):
 
         try:
             target_image_spec = restored_snapshot_id or image
+            self._recovery_image_spec = target_image_spec
             try:
                 effective_image = _resolve_modal_image(target_image_spec)
                 self._app, self._sandbox = self._worker.run_coroutine(
@@ -284,6 +286,7 @@ class ModalEnvironment(BaseEnvironment):
                     restored_snapshot_id[:20], exc,
                 )
                 _delete_direct_snapshot(self._task_id, restored_snapshot_id)
+                self._recovery_image_spec = image
                 base_image = _resolve_modal_image(image)
                 self._app, self._sandbox = self._worker.run_coroutine(
                     _create_sandbox(base_image), timeout=300,
@@ -421,31 +424,33 @@ class ModalEnvironment(BaseEnvironment):
     # Execution
     # ------------------------------------------------------------------
 
-    def _sandbox_is_live(self) -> bool:
-        """True when the current sandbox can still accept execs.
+    def _sandbox_is_live(self) -> bool | None:
+        """Return whether the current sandbox can still accept execs.
 
         `Sandbox.poll()` returns None while running and an exit code once it has
-        terminated. Any SDK error here is treated as "not live" so we rebuild
-        rather than keep firing execs at a dead sandbox.
+        terminated. An SDK or timeout error is indeterminate, not proof that the
+        sandbox is dead, so callers must surface it instead of replacing a
+        potentially live sandbox.
         """
         if self._sandbox is None:
             return False
         try:
             return self._worker.run_coroutine(self._sandbox.poll.aio(), timeout=30) is None
-        except Exception:
-            return False
+        except Exception as exc:
+            logger.warning("Modal: could not determine sandbox liveness: %s", exc)
+            return None
 
     def _ensure_live_sandbox(self) -> None:
         """Re-create the sandbox if the previous one is gone.
 
         A cancelled command terminates the whole sandbox, so the next command in
         the same session would otherwise hit a dead sandbox forever (exit 1, no
-        output). Rebuilding from the BASE image is deliberate: a snapshot
-        restore could carry back the state that wedged the previous sandbox, and
-        the credential/skills mounts are re-applied by the same factory either
-        way. Files under ~/.hermes are re-synced so the fresh sandbox matches
-        what the session expects; work written elsewhere in the old sandbox does
-        not survive, which is the same guarantee as any other sandbox loss.
+        output). Rebuilding from the last image used by this environment preserves
+        a restored persistent filesystem; the credential/skills mounts are
+        re-applied by the same factory either way. Files under ~/.hermes are
+        re-synced so the fresh sandbox matches what the session expects, while
+        work written elsewhere survives when the environment was restored from
+        a persistent image.
 
         Reentrancy: the re-sync and init_session() below issue their OWN commands
         through _run_bash, which calls back into here. `_respawning` makes those
@@ -455,15 +460,18 @@ class ModalEnvironment(BaseEnvironment):
         with self._respawn_lock:
             if self._respawning:
                 return
-            if self._sandbox_is_live():
+            sandbox_live = self._sandbox_is_live()
+            if sandbox_live is None:
+                raise RuntimeError("Unable to determine whether the Modal sandbox is live")
+            if sandbox_live:
                 return
             logger.warning(
                 "Modal: sandbox for task=%s is gone (likely a cancelled command); "
                 "creating a replacement", self._task_id,
             )
-            base_image = _resolve_modal_image(self._base_image)
+            recovery_image = _resolve_modal_image(self._recovery_image_spec)
             self._app, self._sandbox = self._worker.run_coroutine(
-                self._create_sandbox(base_image), timeout=300,
+                self._create_sandbox(recovery_image), timeout=300,
             )
             logger.info("Modal: sandbox re-created (task=%s)", self._task_id)
             self._respawning = True
