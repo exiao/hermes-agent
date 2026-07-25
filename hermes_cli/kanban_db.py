@@ -3349,20 +3349,23 @@ def _default_assignee() -> Optional[str]:
 def _default_max_runtime_seconds() -> Optional[int]:
     """Resolve ``kanban.default_max_runtime_seconds`` from config, or None.
 
-    A task created without an explicit ``--max-runtime`` previously stored
-    NULL, and ``enforce_max_runtime`` only considers rows where
-    ``max_runtime_seconds IS NOT NULL`` — so an uncapped task could run
-    forever. One real dev run burned 214.7 hours (~$82 of Modal sandbox time)
-    before anything reclaimed it, and 91% of dev runs had no cap at all.
+    A task created without an explicit ``--max-runtime`` stores NULL, and
+    ``enforce_max_runtime`` only considers rows where ``max_runtime_seconds
+    IS NOT NULL`` — so an uncapped task is never reclaimed by that path. On a
+    real board 91% of one lane's runs (879 of 970 over 30 days) had no cap.
 
-    Applying an operator-configured default at create time closes that gap
-    without changing the enforcement path. Best-effort: any config-load
-    failure (test stubs, exotic envs) resolves to None, preserving the old
-    uncapped behavior rather than inventing a limit.
+    This is a **backstop, not the primary reaper**. The primary mechanism is
+    ``kanban.dispatch_stale_timeout_seconds``, which reclaims a worker whose
+    heartbeat has gone quiet — strictly better, because it kills hung workers
+    while letting long *healthy* runs finish. A wall-clock cap cannot tell the
+    two apart, so set it high enough to only catch the genuinely runaway.
+
+    Best-effort: any config-load failure (test stubs, exotic envs) resolves to
+    None, preserving the old uncapped behavior rather than inventing a limit.
     """
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
         raw = kanban_cfg.get("default_max_runtime_seconds")
         if raw is None or raw == "":

@@ -2,11 +2,13 @@
 
 Regression context: ``enforce_max_runtime`` only reclaims rows where
 ``max_runtime_seconds IS NOT NULL``. Tasks created without an explicit
-``--max-runtime`` stored NULL, so nothing ever reclaimed them. On Eric's board
-91% of dev runs (879/970) had no cap, and one run (t_7c4131f0) burned 214.7
-hours of Modal sandbox time (~$82) before anything noticed.
+``--max-runtime`` stored NULL, so that path never reclaimed them. On a real
+board 91% of one lane's runs (879/970 over 30 days) had no cap at all.
 
-These tests pin the precedence contract:
+This is a BACKSTOP behind ``dispatch_stale_timeout_seconds`` (which reclaims
+on a stale heartbeat and so spares long healthy runs), not a replacement for
+it. These tests pin the precedence contract:
+
   explicit value > config default > uncapped
 """
 from __future__ import annotations
@@ -74,7 +76,7 @@ class TestDefaultMaxRuntimeResolver:
     def _resolve(self, monkeypatch, cfg):
         from hermes_cli import kanban_db as kb
         import hermes_cli.config as hc
-        monkeypatch.setattr(hc, "load_config", lambda: cfg)
+        monkeypatch.setattr(hc, "load_config_readonly", lambda: cfg)
         return kb._default_max_runtime_seconds()
 
     def test_reads_configured_value(self, monkeypatch):
@@ -108,8 +110,26 @@ class TestDefaultMaxRuntimeResolver:
         def boom():
             raise RuntimeError("no config here")
 
-        monkeypatch.setattr(hc, "load_config", boom)
+        monkeypatch.setattr(hc, "load_config_readonly", boom)
         assert kb._default_max_runtime_seconds() is None
+
+    def test_resolver_does_not_mutate_the_shared_config(self, monkeypatch):
+        """It reads the CACHED dict (no deepcopy), so it must never write to it.
+
+        ``load_config_readonly`` hands back the live cache; mutating it would
+        corrupt config for every later caller in the process. This pins the
+        read-only contract that made the accessor switch safe.
+        """
+        from hermes_cli import kanban_db as kb
+        import hermes_cli.config as hc
+
+        cfg = {"kanban": {"default_max_runtime_seconds": 5400}}
+        import copy
+        before = copy.deepcopy(cfg)
+        monkeypatch.setattr(hc, "load_config_readonly", lambda: cfg)
+
+        assert kb._default_max_runtime_seconds() == 5400
+        assert cfg == before, "resolver mutated the shared config cache"
 
 
 class TestTimeoutEnforcementStillGatesOnNull:
