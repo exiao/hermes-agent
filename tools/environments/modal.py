@@ -57,15 +57,12 @@ def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = Fals
     child pid itself can be signalled (signalling -<pid> there would target a
     nonexistent group and leave the command running).
 
-    The group id is published by the setsid'd shell ITSELF, reading its own
-    pgid once it is running. Publishing ``$!`` from the parent would name the
-    forked process before ``setsid(2)`` had necessarily executed, so a cancel
-    landing in that window would signal a group that does not exist yet, get
-    ESRCH, and let the command establish itself unkilled.
-
-    Reading the pgid needs a working ``ps``. If that is missing or fails the
-    shell publishes ``P:<own pid>`` instead of a malformed ``G:``, so cancel()
-    still has a real target to signal.
+    The group id is published by the setsid'd shell ITSELF: ``setsid`` makes
+    that shell a session AND process-group leader, so its pgid is exactly its
+    own ``$$``, no ``ps`` required. Publishing ``$!`` from the parent instead
+    would name the forked process before ``setsid(2)`` had necessarily
+    executed, so a cancel landing in that window would signal a group that does
+    not exist yet, get ESRCH, and let the command establish itself unkilled.
 
     A cancel can also arrive before the command has even started, while the
     exec is still queued. cancel() drops a cancel marker first, so the wrapper
@@ -80,15 +77,9 @@ def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = Fals
     flags = "-l -c" if login else "-c"
     quoted = shlex.quote(cmd_string)
     cancel_file = f"{pid_file}.cancel"
-    # Runs inside the setsid'd shell: publish the group we actually lead, then
-    # become the command. Falls back to our own pid when ps is unavailable, so
-    # the record is never a target-less "G:".
-    inner = (
-        f"__pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' '); "
-        f'if [ -n "$__pgid" ]; then echo G:$__pgid > {pid_file}; '
-        f"else echo P:$$ > {pid_file}; fi; "
-        f"exec bash {flags} {quoted}"
-    )
+    # Runs inside the setsid'd shell, which leads its own process group, so
+    # $$ IS the pgid. Publish it, then become the command.
+    inner = f"echo G:$$ > {pid_file}; exec bash {flags} {quoted}"
     return (
         f"mkdir -p {_MODAL_PGID_DIR} 2>/dev/null; "
         # Cancelled before we got scheduled: never start the command.

@@ -97,11 +97,9 @@ def test_wrapper_runs_command_in_its_own_process_group():
 
     assert "setsid" in wrapped
     assert shlex.quote("echo hi") in wrapped
-    # the group id is published by the setsid'd shell reading its OWN pgid,
-    # not by the parent guessing $! before setsid(2) has run
-    assert "ps -o pgid= -p $$" in wrapped
-    assert "echo G:$__pgid" in wrapped
-    assert "/tmp/.hermes-pgid/abc" in wrapped
+    # setsid makes that shell the group leader, so its $$ IS the pgid: publish
+    # it from inside rather than guessing $! before setsid(2) has run
+    assert "echo G:$$ > /tmp/.hermes-pgid/abc" in wrapped
 
 
 def test_group_id_is_not_published_from_the_parents_bang_pid():
@@ -115,16 +113,17 @@ def test_group_id_is_not_published_from_the_parents_bang_pid():
     assert "echo G:$__hermes_pid" not in wrapped
 
 
-def test_publication_falls_back_to_a_pid_when_ps_is_unavailable():
-    """An image with setsid but no working ps must not record a bare "G:".
+def test_publication_needs_no_external_binaries():
+    """Deriving the pgid via ps/tr breaks on images without procps.
 
-    A target-less record resolves to "-", signals nothing, and the command
-    survives cancellation.
+    A failed substitution there wrote a target-less "G:", which cancel()
+    resolved to "-" and signalled nothing, so the command survived. $$ inside
+    the setsid'd shell is the pgid by definition and needs no binaries.
     """
     wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
 
-    assert 'if [ -n "$__pgid" ]; then echo G:$__pgid' in wrapped
-    assert "else echo P:$$ >" in wrapped
+    assert "ps -o pgid=" not in wrapped
+    assert "tr -d" not in wrapped
 
 
 def test_wrapper_propagates_the_real_exit_code():
