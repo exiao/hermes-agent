@@ -3346,6 +3346,35 @@ def _default_assignee() -> Optional[str]:
         return None
 
 
+def _default_max_runtime_seconds() -> Optional[int]:
+    """Resolve ``kanban.default_max_runtime_seconds`` from config, or None.
+
+    A task created without an explicit ``--max-runtime`` previously stored
+    NULL, and ``enforce_max_runtime`` only considers rows where
+    ``max_runtime_seconds IS NOT NULL`` — so an uncapped task could run
+    forever. One real dev run burned 214.7 hours (~$82 of Modal sandbox time)
+    before anything reclaimed it, and 91% of dev runs had no cap at all.
+
+    Applying an operator-configured default at create time closes that gap
+    without changing the enforcement path. Best-effort: any config-load
+    failure (test stubs, exotic envs) resolves to None, preserving the old
+    uncapped behavior rather than inventing a limit.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        raw = kanban_cfg.get("default_max_runtime_seconds")
+        if raw is None or raw == "":
+            return None
+        val = int(raw)
+        # 0 / negative is an explicit "no cap" opt-out, not a 0-second limit
+        # that would insta-kill every worker.
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
 def _is_spec_less(title: str, body: Optional[str], assignee: Optional[str]) -> bool:
     """Return True when a task has no spec a worker could act on.
 
@@ -3416,7 +3445,9 @@ def create_task(
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
-    re-queues the task. ``None`` means no cap (default).
+    re-queues the task. ``None`` falls back to the operator's
+    ``kanban.default_max_runtime_seconds`` config value; if that is also
+    unset, the task runs uncapped.
 
     ``skills`` is an optional list of skill names to force-load into
     the worker when dispatched. Stored as JSON; the dispatcher passes
@@ -3712,6 +3743,18 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # An explicit max_runtime_seconds always wins; otherwise fall
+                # back to the operator's kanban.default_max_runtime_seconds so
+                # a task can't run unbounded. enforce_max_runtime only
+                # considers rows where max_runtime_seconds IS NOT NULL, so a
+                # NULL here means "never reclaimed, bills until something else
+                # notices".
+                effective_max_runtime = (
+                    max_runtime_seconds
+                    if max_runtime_seconds is not None
+                    else _default_max_runtime_seconds()
+                )
+
                 # Fail-fast: a persistent-workspace task (dir/worktree) with no
                 # resolvable path is an un-spawnable zombie. By this point the
                 # board-default and project-worktree resolution have both run,
@@ -3786,7 +3829,7 @@ def create_task(
                         project_id,
                         tenant,
                         idempotency_key,
-                        int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                        int(effective_max_runtime) if effective_max_runtime is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         1 if goal_mode else 0,
