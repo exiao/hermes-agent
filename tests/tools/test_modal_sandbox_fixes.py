@@ -30,9 +30,13 @@ def test_modal_run_bash_consumes_pre_execute_liveness_check(monkeypatch):
     """Base execute's preflight must not cause a second sandbox poll."""
     from tools.environments.modal import ModalEnvironment
 
+    import threading
+
     env = ModalEnvironment.__new__(ModalEnvironment)
     env._sandbox = object()
     env._worker = object()
+    env._respawn_lock = threading.RLock()
+    env._respawning = False
     env._sandbox_generation = 7
     env._sandbox_checked_generation = 7
     ensure_calls = []
@@ -287,6 +291,8 @@ class TestModalEnvironmentDefaults:
 
         calls = []
         env = ModalEnvironment.__new__(ModalEnvironment)
+        env._sandbox_generation = 0
+        env._sandbox_checked_generation = None
         env._ensure_live_sandbox = lambda: calls.append("recover")
         env._sync_manager = type("SyncManager", (), {
             "sync": lambda _self: calls.append("sync"),
@@ -315,6 +321,8 @@ class TestModalEnvironmentDefaults:
         env = ModalEnvironment.__new__(ModalEnvironment)
         env._respawn_lock = threading.RLock()
         env._respawning = False
+        env._sandbox_generation = 0
+        env._sandbox_checked_generation = None
         env._sandbox_is_live = lambda: False
         env._task_id = "test"
         env._recovery_image_spec = "im-persisted"
