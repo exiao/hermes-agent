@@ -11,6 +11,7 @@ import logging
 import shlex
 import tarfile
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -33,6 +34,40 @@ logger = logging.getLogger(__name__)
 
 _SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
 _DIRECT_SNAPSHOT_NAMESPACE = "direct"
+
+# Where per-command process-group id files live inside the sandbox. Under /tmp
+# so they never land in a filesystem snapshot or a synced directory.
+_MODAL_PGID_DIR = "/tmp/.hermes-pgid"
+# Seconds a cancelled command gets to exit on SIGTERM before SIGKILL.
+_MODAL_CANCEL_GRACE_SECONDS = 5
+
+
+def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = False) -> str:
+    """Run cmd_string in its own process group, recording the group id.
+
+    The Modal SDK's ContainerProcess exposes no kill, so cancellation used to
+    terminate the entire sandbox. Instead, start the command with setsid so it
+    leads a new process group, and write that group's id where cancel() can
+    read it. Signalling -<pgid> then reaches the command and every descendant
+    it spawned, leaving the sandbox untouched.
+
+    The exit status of the wrapped command is propagated unchanged, so callers
+    (and the agent) see the real exit code, stdout, and stderr. setsid is
+    present in coreutils/util-linux on every image we ship, but fall back to a
+    plain background job if it is missing: cancellation then reaches only the
+    command itself, which still beats destroying the sandbox.
+    """
+    flags = "-l -c" if login else "-c"
+    quoted = shlex.quote(cmd_string)
+    return (
+        f"mkdir -p {_MODAL_PGID_DIR} 2>/dev/null; "
+        f"if command -v setsid >/dev/null 2>&1; then "
+        f"setsid bash {flags} {quoted} & "
+        f"else bash {flags} {quoted} & fi; "
+        f"__hermes_pid=$!; echo $__hermes_pid > {pid_file}; "
+        f"wait $__hermes_pid; __hermes_rc=$?; "
+        f"rm -f {pid_file} 2>/dev/null; exit $__hermes_rc"
+    )
 
 
 def _load_snapshots() -> dict:
@@ -412,16 +447,43 @@ class ModalEnvironment(BaseEnvironment):
         sandbox = self._sandbox
         worker = self._worker
 
+        # Run the command in its own process group and record that group's
+        # leader PID, so cancel() can signal the command (and every descendant
+        # it spawned) without touching the sandbox itself.
+        pid_file = f"{_MODAL_PGID_DIR}/{uuid.uuid4().hex}"
+        wrapped = _wrap_for_group_cancel(cmd_string, pid_file, login=login)
+
         def cancel():
-            worker.run_coroutine(sandbox.terminate.aio(), timeout=15)
+            # Signal the command's process GROUP, not the sandbox. Terminating
+            # the sandbox here used to wedge the whole session: every later exec
+            # hit a dead sandbox and returned exit 1 with empty output forever.
+            # SIGTERM first so the command can clean up, then SIGKILL for
+            # anything that ignores or blocks TERM.
+            script = (
+                f'pgid=$(cat {pid_file} 2>/dev/null) || exit 0; '
+                '[ -n "$pgid" ] || exit 0; '
+                'kill -TERM -"$pgid" 2>/dev/null; '
+                f'for _ in $(seq 1 {_MODAL_CANCEL_GRACE_SECONDS}); do '
+                'kill -0 -"$pgid" 2>/dev/null || exit 0; sleep 1; done; '
+                'kill -KILL -"$pgid" 2>/dev/null; exit 0'
+            )
+
+            async def _cancel():
+                process = await sandbox.exec.aio("bash", "-c", script)
+                await process.wait.aio()
+
+            try:
+                worker.run_coroutine(
+                    _cancel(), timeout=_MODAL_CANCEL_GRACE_SECONDS + 15
+                )
+            except Exception as exc:
+                # A failed cancel leaves a runaway command, which is bad but
+                # recoverable. Tearing down the sandbox is worse.
+                logger.warning("Modal: could not cancel command: %s", exc)
 
         def exec_fn() -> tuple[str, int]:
             async def _do():
-                args = ["bash"]
-                if login:
-                    args.extend(["-l", "-c", cmd_string])
-                else:
-                    args.extend(["-c", cmd_string])
+                args = ["bash", "-c", wrapped]
                 process = await sandbox.exec.aio(*args, timeout=timeout)
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
