@@ -6992,6 +6992,10 @@ def decompose_triage_task(
     # _append_event calls.
     now = int(time.time())
     child_ids: list[str] = []
+    # This direct INSERT bypasses create_task(), so apply the same configured
+    # backstop that ordinary task creation uses. A missing/disabled default
+    # remains NULL, preserving the uncapped behavior.
+    default_max_runtime = _default_max_runtime_seconds()
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
@@ -7112,8 +7116,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, "
+                " max_runtime_seconds) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7125,6 +7130,7 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    default_max_runtime,
                 ),
             )
             _append_event(
