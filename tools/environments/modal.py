@@ -165,7 +165,13 @@ class ModalEnvironment(BaseEnvironment):
     """Modal cloud execution via native Modal sandboxes.
 
     Spawn-per-call via _ThreadedProcessHandle wrapping async SDK calls.
-    cancel_fn wired to sandbox.terminate for interrupt support.
+
+    Cancelling a command tears down the whole sandbox (the Modal SDK's
+    ContainerProcess exposes no per-process kill), so the environment must be
+    able to bring a fresh sandbox back up. `_ensure_live_sandbox` re-creates one
+    on demand; without it a single timed-out command left `self._sandbox`
+    pointing at a terminated sandbox and every later exec returned exit 1 with
+    empty output for the rest of the session.
     """
 
     _stdin_mode = "heredoc"
@@ -253,6 +259,15 @@ class ModalEnvironment(BaseEnvironment):
                 **create_kwargs,
             )
             return app, sandbox
+
+        # Keep the factory + base image so a sandbox torn down by a cancelled
+        # command can be re-created mid-session (see _ensure_live_sandbox).
+        self._create_sandbox = _create_sandbox
+        self._base_image = image
+        # Reentrant: _ensure_live_sandbox holds this while calling init_session(),
+        # which itself goes through _run_bash -> _ensure_live_sandbox.
+        self._respawn_lock = threading.RLock()
+        self._respawning = False
 
         try:
             target_image_spec = restored_snapshot_id or image
@@ -405,15 +420,88 @@ class ModalEnvironment(BaseEnvironment):
     # Execution
     # ------------------------------------------------------------------
 
+    def _sandbox_is_live(self) -> bool:
+        """True when the current sandbox can still accept execs.
+
+        `Sandbox.poll()` returns None while running and an exit code once it has
+        terminated. Any SDK error here is treated as "not live" so we rebuild
+        rather than keep firing execs at a dead sandbox.
+        """
+        if self._sandbox is None:
+            return False
+        try:
+            return self._worker.run_coroutine(self._sandbox.poll.aio(), timeout=30) is None
+        except Exception:
+            return False
+
+    def _ensure_live_sandbox(self) -> None:
+        """Re-create the sandbox if the previous one is gone.
+
+        A cancelled command terminates the whole sandbox, so the next command in
+        the same session would otherwise hit a dead sandbox forever (exit 1, no
+        output). Rebuilding from the BASE image is deliberate: a snapshot
+        restore could carry back the state that wedged the previous sandbox, and
+        the credential/skills mounts are re-applied by the same factory either
+        way. Files under ~/.hermes are re-synced so the fresh sandbox matches
+        what the session expects; work written elsewhere in the old sandbox does
+        not survive, which is the same guarantee as any other sandbox loss.
+
+        Reentrancy: the re-sync and init_session() below issue their OWN commands
+        through _run_bash, which calls back into here. `_respawning` makes those
+        nested calls no-ops so the fresh sandbox is used as-is instead of
+        recursing (an RLock alone would recurse forever, not deadlock).
+        """
+        with self._respawn_lock:
+            if self._respawning:
+                return
+            if self._sandbox_is_live():
+                return
+            logger.warning(
+                "Modal: sandbox for task=%s is gone (likely a cancelled command); "
+                "creating a replacement", self._task_id,
+            )
+            base_image = _resolve_modal_image(self._base_image)
+            self._app, self._sandbox = self._worker.run_coroutine(
+                self._create_sandbox(base_image), timeout=300,
+            )
+            logger.info("Modal: sandbox re-created (task=%s)", self._task_id)
+            self._respawning = True
+            try:
+                if self._sync_manager is not None:
+                    try:
+                        self._sync_manager.sync(force=True)
+                    except Exception as e:
+                        logger.warning("Modal: re-sync after respawn failed: %s", e)
+                # The new sandbox has no captured env snapshot; rebuild it so
+                # later commands don't fall back to a bare shell.
+                self._snapshot_ready = False
+                try:
+                    self.init_session()
+                except Exception as e:
+                    logger.warning("Modal: init_session after respawn failed: %s", e)
+            finally:
+                self._respawning = False
+
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
+        self._ensure_live_sandbox()
         sandbox = self._sandbox
         worker = self._worker
 
         def cancel():
-            worker.run_coroutine(sandbox.terminate.aio(), timeout=15)
+            # The Modal SDK's ContainerProcess has no kill/terminate, so the only
+            # way to stop a runaway command is to tear down its sandbox. Mark the
+            # sandbox dead so the next command rebuilds instead of exec'ing into
+            # a terminated one.
+            if sandbox is None:
+                return
+            try:
+                worker.run_coroutine(sandbox.terminate.aio(), timeout=15)
+            finally:
+                if self._sandbox is sandbox:
+                    self._sandbox = None
 
         def exec_fn() -> tuple[str, int]:
             async def _do():
