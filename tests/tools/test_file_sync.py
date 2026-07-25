@@ -123,6 +123,24 @@ class TestDeletion:
         deleted_paths = delete.call_args[0][0]
         assert any("cred_b.json" in p for p in deleted_paths)
 
+    def test_reset_remote_state_replays_deletions(self, tmp_files):
+        delete = MagicMock()
+        mgr = _make_manager(tmp_files, delete=delete)
+
+        mgr.sync(force=True)
+        os.unlink(tmp_files["cred_b.json"])
+        del tmp_files["cred_b.json"]
+        mgr._get_files_fn = _make_get_files(tmp_files)
+        mgr.sync(force=True)
+        delete.reset_mock()
+
+        # A replacement sandbox restored from an older snapshot may contain
+        # the file that was already deleted from the original sandbox.
+        mgr.reset_remote_state()
+        mgr.sync(force=True)
+
+        delete.assert_called_once_with(["/root/.hermes/cred_b.json"])
+
     def test_no_delete_when_no_removals(self, tmp_files):
         delete = MagicMock()
         mgr = _make_manager(tmp_files, delete=delete)

@@ -158,6 +158,8 @@ class FileSyncManager:
         self._delete_fn = delete_fn
         self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
+        self._deleted_remote_paths: set[str] = set()
+        self._remote_state_reset = False
         self._upload_only_host_paths: set[str] = set()
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
@@ -167,10 +169,13 @@ class FileSyncManager:
 
         A newly created sandbox has no files from the previous remote
         environment, so mtime and content-hash tracking from that environment
-        must not suppress the first upload into its replacement.
+        must not suppress the first upload into its replacement. Deletion
+        tombstones are retained so files restored from an older snapshot are
+        removed again during the next forced sync.
         """
         self._synced_files.clear()
         self._pushed_hashes.clear()
+        self._remote_state_reset = True
         self._last_sync_time = 0.0
 
     def sync(self, *, force: bool = False) -> None:
@@ -190,6 +195,8 @@ class FileSyncManager:
         current_files = self._get_files_fn()
         self._upload_only_host_paths.update(_credential_host_paths())
         current_remote_paths = {remote for _, remote in current_files}
+        new_deleted = set(self._deleted_remote_paths)
+        new_deleted.difference_update(current_remote_paths)
 
         # --- Uploads: new or changed files ---
         to_upload: list[tuple[str, str]] = []
@@ -205,14 +212,26 @@ class FileSyncManager:
 
         # --- Deletes: synced paths no longer in current set ---
         to_delete = [p for p in self._synced_files if p not in current_remote_paths]
+        if self._remote_state_reset:
+            to_delete.extend(
+                p for p in self._deleted_remote_paths
+                if p not in current_remote_paths and p not in to_delete
+            )
 
         if not to_upload and not to_delete:
+            if self._remote_state_reset:
+                self._deleted_remote_paths = new_deleted
+                self._remote_state_reset = False
             self._last_sync_time = _monotonic()
             return
 
         # Snapshot for rollback (only when there's work to do)
         prev_files = dict(self._synced_files)
         prev_hashes = dict(self._pushed_hashes)
+        new_deleted.update(to_delete)
+        # Preserve tombstones even if a transport operation fails. They are
+        # the local desired state needed to reconcile a replacement remote.
+        self._deleted_remote_paths.update(to_delete)
 
         if to_upload:
             logger.debug("file_sync: uploading %d file(s)", len(to_upload))
@@ -241,6 +260,8 @@ class FileSyncManager:
                 self._pushed_hashes.pop(p, None)
 
             self._synced_files = new_files
+            self._deleted_remote_paths = set() if self._remote_state_reset else new_deleted
+            self._remote_state_reset = False
             self._last_sync_time = _monotonic()
 
         except Exception as exc:
