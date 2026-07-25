@@ -43,30 +43,48 @@ _MODAL_CANCEL_GRACE_SECONDS = 5
 
 
 def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = False) -> str:
-    """Run cmd_string in its own process group, recording the group id.
+    """Run cmd_string in its own process group, recording how to signal it.
 
     The Modal SDK's ContainerProcess exposes no kill, so cancellation used to
     terminate the entire sandbox. Instead, start the command with setsid so it
-    leads a new process group, and write that group's id where cancel() can
+    leads a new process group, and record that group's id where cancel() can
     read it. Signalling -<pgid> then reaches the command and every descendant
     it spawned, leaving the sandbox untouched.
 
+    The recorded value is tagged with how it must be signalled: ``G:<pid>``
+    when setsid gave the command its own process group, ``P:<pid>`` for the
+    no-setsid fallback, where the child shares the wrapper's group and only the
+    child pid itself can be signalled (signalling -<pid> there would target a
+    nonexistent group and leave the command running).
+
+    A cancel can also arrive before the command has even started, while the
+    exec is still queued. cancel() drops a cancel marker first, so the wrapper
+    both refuses to start when the marker is already present and re-checks
+    immediately after publishing its pid, closing that window from both sides.
+
     The exit status of the wrapped command is propagated unchanged, so callers
-    (and the agent) see the real exit code, stdout, and stderr. setsid is
-    present in coreutils/util-linux on every image we ship, but fall back to a
-    plain background job if it is missing: cancellation then reaches only the
-    command itself, which still beats destroying the sandbox.
+    (and the agent) see the real exit code, stdout, and stderr.
     """
     flags = "-l -c" if login else "-c"
     quoted = shlex.quote(cmd_string)
+    cancel_file = f"{pid_file}.cancel"
     return (
         f"mkdir -p {_MODAL_PGID_DIR} 2>/dev/null; "
+        # Cancelled before we got scheduled: never start the command.
+        f"if [ -e {cancel_file} ]; then rm -f {cancel_file} 2>/dev/null; "
+        f"exit {128 + 15}; fi; "
         f"if command -v setsid >/dev/null 2>&1; then "
-        f"setsid bash {flags} {quoted} & "
-        f"else bash {flags} {quoted} & fi; "
-        f"__hermes_pid=$!; echo $__hermes_pid > {pid_file}; "
+        f"setsid bash {flags} {quoted} & __hermes_pid=$!; "
+        f"__hermes_target=-$__hermes_pid; "
+        f"echo G:$__hermes_pid > {pid_file}; "
+        f"else bash {flags} {quoted} & __hermes_pid=$!; "
+        f"__hermes_target=$__hermes_pid; "
+        f"echo P:$__hermes_pid > {pid_file}; fi; "
+        # Cancelled while we were starting up: honour it now.
+        f"if [ -e {cancel_file} ]; then "
+        f'kill -TERM "$__hermes_target" 2>/dev/null; fi; '
         f"wait $__hermes_pid; __hermes_rc=$?; "
-        f"rm -f {pid_file} 2>/dev/null; exit $__hermes_rc"
+        f"rm -f {pid_file} {cancel_file} 2>/dev/null; exit $__hermes_rc"
     )
 
 
@@ -459,13 +477,26 @@ class ModalEnvironment(BaseEnvironment):
             # hit a dead sandbox and returned exit 1 with empty output forever.
             # SIGTERM first so the command can clean up, then SIGKILL for
             # anything that ignores or blocks TERM.
+            #
+            # The cancel marker is written FIRST so a cancel that arrives before
+            # the command starts (exec still queued) is not lost: the wrapper
+            # checks for it both before launching and right after publishing its
+            # pid. The recorded pid is tagged G: (own process group, signal the
+            # group) or P: (no setsid, signal the pid itself).
             script = (
-                f'pgid=$(cat {pid_file} 2>/dev/null) || exit 0; '
-                '[ -n "$pgid" ] || exit 0; '
-                'kill -TERM -"$pgid" 2>/dev/null; '
-                f'for _ in $(seq 1 {_MODAL_CANCEL_GRACE_SECONDS}); do '
-                'kill -0 -"$pgid" 2>/dev/null || exit 0; sleep 1; done; '
-                'kill -KILL -"$pgid" 2>/dev/null; exit 0'
+                f"mkdir -p {_MODAL_PGID_DIR} 2>/dev/null; "
+                f"touch {pid_file}.cancel 2>/dev/null; "
+                f"rec=$(cat {pid_file} 2>/dev/null) || exit 0; "
+                '[ -n "$rec" ] || exit 0; '
+                'case "$rec" in '
+                'G:*) target=-${rec#G:} ;; '
+                'P:*) target=${rec#P:} ;; '
+                '*) exit 0 ;; '
+                'esac; '
+                'kill -TERM "$target" 2>/dev/null; '
+                f"for _ in $(seq 1 {_MODAL_CANCEL_GRACE_SECONDS}); do "
+                'kill -0 "$target" 2>/dev/null || exit 0; sleep 1; done; '
+                'kill -KILL "$target" 2>/dev/null; exit 0'
             )
 
             async def _cancel():

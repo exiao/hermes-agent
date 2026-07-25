@@ -97,8 +97,8 @@ def test_wrapper_runs_command_in_its_own_process_group():
 
     assert "setsid" in wrapped
     assert shlex.quote("echo hi") in wrapped
-    # the group leader's pid is recorded for cancel() to read
-    assert "echo $__hermes_pid > /tmp/.hermes-pgid/abc" in wrapped
+    # the group leader's pid is recorded, tagged as a GROUP target
+    assert "echo G:$__hermes_pid > /tmp/.hermes-pgid/abc" in wrapped
 
 
 def test_wrapper_propagates_the_real_exit_code():
@@ -117,6 +117,31 @@ def test_wrapper_falls_back_when_setsid_is_absent():
     assert "else bash -c" in wrapped
 
 
+def test_fallback_records_a_pid_target_not_a_group_target():
+    """Without setsid the child shares our group; -pid would hit nothing.
+
+    Signalling -<pid> in the fallback targets a process group that does not
+    exist (ESRCH), silently leaving the command running on every cancel.
+    """
+    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
+
+    # the setsid branch targets the group, the fallback targets the bare pid
+    assert "__hermes_target=-$__hermes_pid" in wrapped
+    assert "__hermes_target=$__hermes_pid" in wrapped
+    assert "echo P:$__hermes_pid > /tmp/x" in wrapped
+
+
+def test_wrapper_refuses_to_start_when_already_cancelled():
+    """A cancel that lands while the exec is queued must not be lost."""
+    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
+
+    # checked before launching...
+    assert "if [ -e /tmp/x.cancel ]; then rm -f /tmp/x.cancel" in wrapped
+    assert f"exit {128 + 15}" in wrapped
+    # ...and again right after the pid is published, closing the window
+    assert 'kill -TERM "$__hermes_target"' in wrapped
+
+
 def test_wrapper_honors_login_shell():
     wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x", login=True)
 
@@ -131,6 +156,12 @@ def test_wrapper_quotes_the_command():
     assert shlex.quote(nasty) in wrapped
 
 
+def test_wrapper_cleans_up_its_bookkeeping_files():
+    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
+
+    assert "rm -f /tmp/x /tmp/x.cancel" in wrapped
+
+
 def test_pgid_files_live_outside_synced_and_snapshotted_paths():
     """Cancellation bookkeeping must not leak into user files or snapshots."""
     assert _MODAL_PGID_DIR.startswith("/tmp/")
@@ -141,9 +172,13 @@ def test_pgid_files_live_outside_synced_and_snapshotted_paths():
 # ---------------------------------------------------------------------------
 
 
+def _cancel_scripts(env):
+    """The cancel execs, found by content (exec order is thread-dependent)."""
+    return [c for c in env._sandbox.commands if "rec=$(cat " in c]
+
+
 def _cancel_script(env):
-    """The cancel exec, found by content (exec order is thread-dependent)."""
-    scripts = [c for c in env._sandbox.commands if "kill -TERM" in c]
+    scripts = _cancel_scripts(env)
     assert scripts, f"cancel never exec'd a kill; saw {env._sandbox.commands}"
     return scripts[-1]
 
@@ -157,9 +192,24 @@ def test_cancel_signals_the_process_group_and_spares_the_sandbox():
 
     assert env._sandbox.terminated is False, "cancel tore down the sandbox"
     cancel_script = _cancel_script(env)
-    # signals the GROUP (-$pgid), not just the leader pid
-    assert 'kill -TERM -"$pgid"' in cancel_script
-    assert 'kill -KILL -"$pgid"' in cancel_script
+    # resolves the recorded tag into a group (-pid) or bare-pid target
+    assert "G:*) target=-${rec#G:}" in cancel_script
+    assert "P:*) target=${rec#P:}" in cancel_script
+    assert 'kill -TERM "$target"' in cancel_script
+    assert 'kill -KILL "$target"' in cancel_script
+
+
+def test_cancel_marks_before_reading_so_a_queued_command_still_dies():
+    """Cancel arriving before the command starts must not be silently dropped."""
+    env = _env_with_fakes()
+
+    handle = env._run_bash("sleep 300")
+    handle.kill()
+
+    script = _cancel_script(env)
+    marker = script.index("touch ")
+    read = script.index("rec=$(cat ")
+    assert marker < read, "cancel read the pid file before marking the intent"
 
 
 def test_cancel_escalates_to_sigkill_after_a_grace_period():
@@ -171,8 +221,8 @@ def test_cancel_escalates_to_sigkill_after_a_grace_period():
 
     script = _cancel_script(env)
     assert f"seq 1 {_MODAL_CANCEL_GRACE_SECONDS}" in script
-    # stops escalating early once the group is gone
-    assert 'kill -0 -"$pgid"' in script
+    # stops escalating early once the target is gone
+    assert 'kill -0 "$target"' in script
 
 
 def test_cancel_is_a_noop_when_the_command_already_finished():
@@ -210,6 +260,6 @@ def test_each_command_gets_its_own_pid_file():
     env._run_bash("sleep 300").kill()
     env._run_bash("sleep 300").kill()
 
-    cancels = [c for c in env._sandbox.commands if "kill -TERM" in c]
+    cancels = _cancel_scripts(env)
     assert len(cancels) == 2
     assert cancels[0] != cancels[1], "commands shared a pid file"
