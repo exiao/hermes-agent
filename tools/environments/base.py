@@ -340,6 +340,23 @@ class _ThreadedProcessHandle:
             except Exception as exc:
                 self._error = exc
                 self._returncode = 1
+                # Surface the failure on the handle's stdout. Without this the
+                # agent sees a bare "exit 1" with EMPTY output and cannot tell a
+                # backend/transport failure (sandbox died, connection reset,
+                # coroutine timeout) apart from a command that legitimately
+                # failed. Observed cost: Modal-backed lanes repeatedly parked
+                # tasks with "every shell command exits 1 with no output" and
+                # asked a human to "reset the execution backend", when the same
+                # task succeeded on a later retry.
+                try:
+                    os.write(
+                        self._write_fd,
+                        (
+                            f"[backend error] {type(exc).__name__}: {exc}"
+                        ).encode("utf-8", errors="replace"),
+                    )
+                except OSError:
+                    pass
             finally:
                 try:
                     os.close(self._write_fd)

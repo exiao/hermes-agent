@@ -6,7 +6,11 @@ init_session() failure handling, and the CWD marker contract.
 
 from unittest.mock import MagicMock
 
-from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
+from tools.environments.base import (
+    BaseEnvironment,
+    _BoundedOutputCollector,
+    _ThreadedProcessHandle,
+)
 
 
 class _TestableEnv(BaseEnvironment):
@@ -520,3 +524,53 @@ class TestCwdMarker:
         env1 = _TestableEnv()
         env2 = _TestableEnv()
         assert env1._cwd_marker != env2._cwd_marker
+
+
+class TestThreadedProcessHandleBackendErrors:
+    """A backend/transport failure must be VISIBLE to the caller.
+
+    Regression: SDK-backed environments (Modal, Daytona) run commands through
+    ``_ThreadedProcessHandle``. When ``exec_fn`` raised (sandbox died, connection
+    reset, coroutine timeout) the handle recorded exit code 1 and wrote NOTHING
+    to stdout, so the agent saw a bare "exit 1" with empty output and could not
+    distinguish a dead backend from a command that legitimately failed. Modal
+    lanes responded by parking tasks and asking a human to "reset the execution
+    backend", even though the same task succeeded on a later retry.
+    """
+
+    def test_backend_exception_is_written_to_stdout(self):
+        def boom():
+            raise RuntimeError("modal sandbox died: connection reset")
+
+        handle = _ThreadedProcessHandle(boom)
+        handle.wait(timeout=5)
+        output = handle.stdout.read()
+
+        assert handle.returncode == 1
+        # The whole point: output is no longer empty and names the real cause.
+        assert output != ""
+        assert "RuntimeError" in output
+        assert "modal sandbox died" in output
+
+    def test_successful_command_output_is_unchanged(self):
+        def ok():
+            return ("hello world\n", 0)
+
+        handle = _ThreadedProcessHandle(ok)
+        handle.wait(timeout=5)
+
+        assert handle.returncode == 0
+        assert handle.stdout.read() == "hello world\n"
+
+    def test_genuine_nonzero_exit_is_not_annotated(self):
+        """A real command that fails must NOT be relabelled as a backend error."""
+        def failing_command():
+            return ("ls: no such file\n", 2)
+
+        handle = _ThreadedProcessHandle(failing_command)
+        handle.wait(timeout=5)
+        output = handle.stdout.read()
+
+        assert handle.returncode == 2
+        assert output == "ls: no such file\n"
+        assert "backend error" not in output
