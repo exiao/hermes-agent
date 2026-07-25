@@ -132,15 +132,33 @@ class TestDefaultMaxRuntimeResolver:
         assert cfg == before, "resolver mutated the shared config cache"
 
 
-class TestTimeoutEnforcementStillGatesOnNull:
-    """Guard the assumption this whole fix rests on."""
+class TestTimeoutEnforcementBehavior:
+    def test_detector_reclaims_capped_but_not_uncapped_tasks(self, kb_conn, monkeypatch):
+        """Exercise the reclaim behavior instead of pinning SQL source text."""
+        kb, conn = kb_conn
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(kb, "_default_max_runtime_seconds", lambda: None)
 
-    def test_detector_query_requires_non_null_cap(self):
-        import inspect
-        from hermes_cli import kanban_db as kb
-
-        src = inspect.getsource(kb.enforce_max_runtime)
-        assert "max_runtime_seconds IS NOT NULL" in src, (
-            "enforce_max_runtime no longer filters on a non-NULL cap; "
-            "the default-cap fix may be unnecessary or the reclaim path changed."
+        capped = kb.create_task(
+            conn, title="capped", assignee="worker", max_runtime_seconds=1
         )
+        uncapped = kb.create_task(conn, title="uncapped", assignee="worker")
+
+        for tid in (capped, uncapped):
+            kb.claim_task(conn, tid)
+            kb._set_worker_pid(conn, tid, 999999)
+            old_started = int(kb.time.time()) - 30
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET started_at = ? "
+                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                    (old_started, tid),
+                )
+
+        timed_out = kb.enforce_max_runtime(
+            conn, signal_fn=lambda _pid, _sig: None
+        )
+
+        assert timed_out == [capped]
+        assert kb.get_task(conn, capped).status == "ready"
+        assert kb.get_task(conn, uncapped).status == "running"
