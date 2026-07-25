@@ -413,7 +413,8 @@ class ModalEnvironment(BaseEnvironment):
         self._worker.run_coroutine(_rm(), timeout=15)
 
     def _before_execute(self) -> None:
-        """Sync files to sandbox via FileSyncManager (rate-limited internally)."""
+        """Recover the sandbox before wrapping and syncing each command."""
+        self._ensure_live_sandbox()
         self._sync_manager.sync()
 
     # ------------------------------------------------------------------

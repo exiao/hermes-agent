@@ -243,6 +243,21 @@ class TestModalEnvironmentDefaults:
         assert env._worker.stop_calls == 1
         assert env._app is None
 
+    def test_before_execute_recovers_before_file_sync(self):
+        """Recovery must happen before sync and command cwd wrapping."""
+        from tools.environments.modal import ModalEnvironment
+
+        calls = []
+        env = ModalEnvironment.__new__(ModalEnvironment)
+        env._ensure_live_sandbox = lambda: calls.append("recover")
+        env._sync_manager = type("SyncManager", (), {
+            "sync": lambda _self: calls.append("sync"),
+        })()
+
+        env._before_execute()
+
+        assert calls == ["recover", "sync"]
+
 
 # =========================================================================
 # Test 7: ensurepip fix in ModalEnvironment
