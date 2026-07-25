@@ -26,6 +26,27 @@ except ImportError:
     pytest.skip("hermes-agent tools not importable (missing deps)", allow_module_level=True)
 
 
+def test_modal_run_bash_consumes_pre_execute_liveness_check(monkeypatch):
+    """Base execute's preflight must not cause a second sandbox poll."""
+    from tools.environments.modal import ModalEnvironment
+
+    env = ModalEnvironment.__new__(ModalEnvironment)
+    env._sandbox = object()
+    env._worker = object()
+    env._sandbox_check_done = True
+    ensure_calls = []
+    monkeypatch.setattr(
+        env, "_ensure_live_sandbox", lambda: ensure_calls.append("checked")
+    )
+
+    env._run_bash("true")
+    assert ensure_calls == []
+    assert env._sandbox_check_done is False
+
+    env._run_bash("true")
+    assert ensure_calls == ["checked"]
+
+
 # =========================================================================
 # Test 1: Tool resolution includes terminal + file tools
 # =========================================================================

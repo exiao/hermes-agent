@@ -269,6 +269,11 @@ class ModalEnvironment(BaseEnvironment):
         # which itself goes through _run_bash -> _ensure_live_sandbox.
         self._respawn_lock = threading.RLock()
         self._respawning = False
+        # _before_execute() performs the liveness check needed before BaseEnvironment
+        # wraps a command; _run_bash() consumes this marker so normal execution
+        # does not poll the same live sandbox a second time. Direct _run_bash()
+        # callers still take the guard below.
+        self._sandbox_check_done = False
 
         try:
             target_image_spec = restored_snapshot_id or image
@@ -417,8 +422,10 @@ class ModalEnvironment(BaseEnvironment):
 
     def _before_execute(self) -> None:
         """Recover the sandbox before wrapping and syncing each command."""
+        self._sandbox_check_done = False
         self._ensure_live_sandbox()
         self._sync_manager.sync()
+        self._sandbox_check_done = True
 
     # ------------------------------------------------------------------
     # Execution
@@ -496,7 +503,10 @@ class ModalEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
-        self._ensure_live_sandbox()
+        if self._sandbox_check_done:
+            self._sandbox_check_done = False
+        else:
+            self._ensure_live_sandbox()
         sandbox = self._sandbox
         worker = self._worker
 
