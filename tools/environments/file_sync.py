@@ -260,7 +260,7 @@ class FileSyncManager:
                 self._pushed_hashes.pop(p, None)
 
             self._synced_files = new_files
-            self._deleted_remote_paths = set() if self._remote_state_reset else new_deleted
+            self._deleted_remote_paths = new_deleted
             self._remote_state_reset = False
             self._last_sync_time = _monotonic()
 

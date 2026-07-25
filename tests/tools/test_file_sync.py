@@ -138,6 +138,13 @@ class TestDeletion:
         # the file that was already deleted from the original sandbox.
         mgr.reset_remote_state()
         mgr.sync(force=True)
+        delete.assert_called_once_with(["/root/.hermes/cred_b.json"])
+
+        # The recovery image can be reused for another cancellation, so the
+        # same deletion must remain queued for every subsequent reset.
+        delete.reset_mock()
+        mgr.reset_remote_state()
+        mgr.sync(force=True)
 
         delete.assert_called_once_with(["/root/.hermes/cred_b.json"])
 
