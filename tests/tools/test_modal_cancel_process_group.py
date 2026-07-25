@@ -23,6 +23,7 @@ except ImportError:
 
 from tools.environments.modal import (  # noqa: E402
     _MODAL_CANCEL_GRACE_SECONDS,
+    _MODAL_EXEC_TIMEOUT_HEADROOM,
     _MODAL_PGID_DIR,
     ModalEnvironment,
     _wrap_for_group_cancel,
@@ -297,6 +298,31 @@ def test_cancel_failure_does_not_destroy_the_sandbox():
     handle.kill()  # must swallow, not raise
 
     assert env._sandbox.terminated is False
+
+
+def test_sdk_exec_deadline_has_headroom_over_the_local_deadline():
+    """The local deadline must fire first so cancellation actually runs.
+
+    _wait_for_process kills at exactly `timeout`. If the SDK's exec deadline
+    were also `timeout`, Modal could reap the outer bash first while the real
+    command, a background child in its own setsid session, kept running: the
+    handle would report completion and cancel() would never reap the group.
+    """
+    env = _env_with_fakes()
+    captured = {}
+
+    class _Exec:
+        async def aio(self, *args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return _FakeProc()
+
+    env._sandbox.exec = _Exec()
+
+    handle = env._run_bash("echo hi", timeout=120)
+    handle.wait(timeout=5)
+
+    assert captured["timeout"] > 120, "SDK deadline must not race the local one"
+    assert captured["timeout"] == 120 + _MODAL_EXEC_TIMEOUT_HEADROOM
 
 
 def test_each_command_gets_its_own_pid_file():

@@ -40,6 +40,11 @@ _DIRECT_SNAPSHOT_NAMESPACE = "direct"
 _MODAL_PGID_DIR = "/tmp/.hermes-pgid"
 # Seconds a cancelled command gets to exit on SIGTERM before SIGKILL.
 _MODAL_CANCEL_GRACE_SECONDS = 5
+# Headroom on the SDK exec deadline so the LOCAL deadline in
+# _wait_for_process always fires first and cancellation runs. If Modal's
+# deadline won, it would kill the outer bash while the setsid'd command kept
+# running, and no group cancellation would ever be issued.
+_MODAL_EXEC_TIMEOUT_HEADROOM = 15
 
 
 def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = False) -> str:
@@ -536,7 +541,16 @@ class ModalEnvironment(BaseEnvironment):
         def exec_fn() -> tuple[str, int]:
             async def _do():
                 args = ["bash", "-c", wrapped]
-                process = await sandbox.exec.aio(*args, timeout=timeout)
+                # Give the SDK's own deadline headroom over the local one in
+                # _wait_for_process, which is exactly `timeout`. If Modal fired
+                # first it would kill the outer bash while the real command,
+                # now a background child in its own setsid session, kept
+                # running: the handle would report completion and cancel()
+                # would never be invoked to reap the group. The local deadline
+                # must always win so cancellation is what stops a command.
+                process = await sandbox.exec.aio(
+                    *args, timeout=timeout + _MODAL_EXEC_TIMEOUT_HEADROOM
+                )
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
                 exit_code = await process.wait.aio()
