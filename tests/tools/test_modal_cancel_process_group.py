@@ -97,8 +97,22 @@ def test_wrapper_runs_command_in_its_own_process_group():
 
     assert "setsid" in wrapped
     assert shlex.quote("echo hi") in wrapped
-    # the group leader's pid is recorded, tagged as a GROUP target
-    assert "echo G:$__hermes_pid > /tmp/.hermes-pgid/abc" in wrapped
+    # the group id is published by the setsid'd shell reading its OWN pgid,
+    # not by the parent guessing $! before setsid(2) has run
+    assert "ps -o pgid= -p $$" in wrapped
+    assert "echo G:$(ps -o pgid= -p $$ | tr -d " in wrapped
+    assert "/tmp/.hermes-pgid/abc" in wrapped
+
+
+def test_group_id_is_not_published_from_the_parents_bang_pid():
+    """$! names the forked process before setsid(2) creates the group.
+
+    Publishing G:$! would let a cancel in that window signal a group that does
+    not exist yet (ESRCH) and leave the command running.
+    """
+    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
+
+    assert "echo G:$__hermes_pid" not in wrapped
 
 
 def test_wrapper_propagates_the_real_exit_code():
@@ -125,9 +139,6 @@ def test_fallback_records_a_pid_target_not_a_group_target():
     """
     wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
 
-    # the setsid branch targets the group, the fallback targets the bare pid
-    assert "__hermes_target=-$__hermes_pid" in wrapped
-    assert "__hermes_target=$__hermes_pid" in wrapped
     assert "echo P:$__hermes_pid > /tmp/x" in wrapped
 
 
@@ -138,10 +149,19 @@ def test_wrapper_refuses_to_start_when_already_cancelled():
     # checked before launching...
     assert "if [ -e /tmp/x.cancel ]; then rm -f /tmp/x.cancel" in wrapped
     assert f"exit {128 + 15}" in wrapped
-    # ...and again right after the pid is published, closing the window.
-    assert 'kill -TERM "$__hermes_target"' in wrapped
+
+
+def test_wrapper_kills_the_child_when_cancel_races_publication():
+    """Cancel landing after fork but before the pgid is published still kills.
+
+    The child pid is valid the moment fork returns, unlike the group, so the
+    post-launch marker check signals it directly and escalates.
+    """
+    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
+
+    assert 'kill -TERM "$__hermes_pid"' in wrapped
     assert f"seq 1 {_MODAL_CANCEL_GRACE_SECONDS}" in wrapped
-    assert 'kill -KILL "$__hermes_target"' in wrapped
+    assert 'kill -KILL "$__hermes_pid"' in wrapped
 
 
 def test_wrapper_honors_login_shell():
@@ -199,6 +219,19 @@ def test_cancel_signals_the_process_group_and_spares_the_sandbox():
     assert "P:*) target=${rec#P:}" in cancel_script
     assert 'kill -TERM "$target"' in cancel_script
     assert 'kill -KILL "$target"' in cancel_script
+
+
+def test_cancel_waits_for_a_late_published_pid():
+    """A missing pid file means "not yet", not "nothing to kill"."""
+    env = _env_with_fakes()
+
+    handle = env._run_bash("sleep 300")
+    handle.kill()
+
+    script = _cancel_script(env)
+    # retries the read instead of bailing on the first miss
+    assert f"for _ in $(seq 1 {_MODAL_CANCEL_GRACE_SECONDS}); do" in script
+    assert "rec=$(cat " in script
 
 
 def test_cancel_marks_before_reading_so_a_queued_command_still_dies():

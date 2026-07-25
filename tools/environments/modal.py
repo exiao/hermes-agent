@@ -51,16 +51,24 @@ def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = Fals
     read it. Signalling -<pgid> then reaches the command and every descendant
     it spawned, leaving the sandbox untouched.
 
-    The recorded value is tagged with how it must be signalled: ``G:<pid>``
+    The recorded value is tagged with how it must be signalled: ``G:<pgid>``
     when setsid gave the command its own process group, ``P:<pid>`` for the
     no-setsid fallback, where the child shares the wrapper's group and only the
     child pid itself can be signalled (signalling -<pid> there would target a
     nonexistent group and leave the command running).
 
+    The group id is published by the setsid'd shell ITSELF, reading its own
+    pgid once it is running. Publishing ``$!`` from the parent would name the
+    forked process before ``setsid(2)`` had necessarily executed, so a cancel
+    landing in that window would signal a group that does not exist yet, get
+    ESRCH, and let the command establish itself unkilled.
+
     A cancel can also arrive before the command has even started, while the
     exec is still queued. cancel() drops a cancel marker first, so the wrapper
-    both refuses to start when the marker is already present and re-checks
-    immediately after publishing its pid, closing that window from both sides.
+    refuses to start when the marker is already present, and re-checks after
+    the child exists. That post-check signals the direct child pid (valid the
+    moment fork returns, unlike the group) and escalates to SIGKILL, so a
+    cancel racing publication still kills the command.
 
     The exit status of the wrapped command is propagated unchanged, so callers
     (and the agent) see the real exit code, stdout, and stderr.
@@ -68,25 +76,28 @@ def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = Fals
     flags = "-l -c" if login else "-c"
     quoted = shlex.quote(cmd_string)
     cancel_file = f"{pid_file}.cancel"
+    # Runs inside the setsid'd shell: publish the group we actually lead, then
+    # become the command.
+    inner = (
+        f"echo G:$(ps -o pgid= -p $$ | tr -d ' ') > {pid_file}; "
+        f"exec bash {flags} {quoted}"
+    )
     return (
         f"mkdir -p {_MODAL_PGID_DIR} 2>/dev/null; "
         # Cancelled before we got scheduled: never start the command.
         f"if [ -e {cancel_file} ]; then rm -f {cancel_file} 2>/dev/null; "
         f"exit {128 + 15}; fi; "
         f"if command -v setsid >/dev/null 2>&1; then "
-        f"setsid bash {flags} {quoted} & __hermes_pid=$!; "
-        f"__hermes_target=-$__hermes_pid; "
-        f"echo G:$__hermes_pid > {pid_file}; "
+        f"setsid bash -c {shlex.quote(inner)} & __hermes_pid=$!; "
         f"else bash {flags} {quoted} & __hermes_pid=$!; "
-        f"__hermes_target=$__hermes_pid; "
         f"echo P:$__hermes_pid > {pid_file}; fi; "
-        # Cancelled while we were starting up: honour it now, including
-        # escalation if the command ignores the late SIGTERM.
+        # Cancelled while we were starting up: kill the child directly (its pid
+        # is valid immediately, unlike the group) and escalate.
         f"if [ -e {cancel_file} ]; then "
-        f'kill -TERM "$__hermes_target" 2>/dev/null; '
+        f'kill -TERM "$__hermes_pid" 2>/dev/null; '
         f"for _ in $(seq 1 {_MODAL_CANCEL_GRACE_SECONDS}); do "
-        f'kill -0 "$__hermes_target" 2>/dev/null || break; sleep 1; done; '
-        f'kill -KILL "$__hermes_target" 2>/dev/null; fi; '
+        f'kill -0 "$__hermes_pid" 2>/dev/null || break; sleep 1; done; '
+        f'kill -KILL "$__hermes_pid" 2>/dev/null; fi; '
         f"wait $__hermes_pid; __hermes_rc=$?; "
         f"rm -f {pid_file} {cancel_file} 2>/dev/null; exit $__hermes_rc"
     )
@@ -484,13 +495,21 @@ class ModalEnvironment(BaseEnvironment):
             #
             # The cancel marker is written FIRST so a cancel that arrives before
             # the command starts (exec still queued) is not lost: the wrapper
-            # checks for it both before launching and right after publishing its
-            # pid. The recorded pid is tagged G: (own process group, signal the
-            # group) or P: (no setsid, signal the pid itself).
+            # checks for it both before launching and once the child exists, and
+            # kills the child itself in that window. A missing pid file here
+            # therefore means "the wrapper will honour the marker", not "nothing
+            # to do". The recorded pid is tagged G: (own process group, signal
+            # the group) or P: (no setsid, signal the pid itself).
             script = (
                 f"mkdir -p {_MODAL_PGID_DIR} 2>/dev/null; "
                 f"touch {pid_file}.cancel 2>/dev/null; "
-                f"rec=$(cat {pid_file} 2>/dev/null) || exit 0; "
+                f"rec=''; "
+                # The pgid is published by the setsid'd shell a moment after the
+                # exec starts; wait briefly for it rather than giving up. If it
+                # never appears the wrapper's own marker check does the killing.
+                f"for _ in $(seq 1 {_MODAL_CANCEL_GRACE_SECONDS}); do "
+                f"rec=$(cat {pid_file} 2>/dev/null) && [ -n \"$rec\" ] && break; "
+                "sleep 1; done; "
                 '[ -n "$rec" ] || exit 0; '
                 'case "$rec" in '
                 'G:*) target=-${rec#G:} ;; '
