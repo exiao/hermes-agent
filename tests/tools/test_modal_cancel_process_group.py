@@ -100,7 +100,7 @@ def test_wrapper_runs_command_in_its_own_process_group():
     # the group id is published by the setsid'd shell reading its OWN pgid,
     # not by the parent guessing $! before setsid(2) has run
     assert "ps -o pgid= -p $$" in wrapped
-    assert "echo G:$(ps -o pgid= -p $$ | tr -d " in wrapped
+    assert "echo G:$__pgid" in wrapped
     assert "/tmp/.hermes-pgid/abc" in wrapped
 
 
@@ -113,6 +113,18 @@ def test_group_id_is_not_published_from_the_parents_bang_pid():
     wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
 
     assert "echo G:$__hermes_pid" not in wrapped
+
+
+def test_publication_falls_back_to_a_pid_when_ps_is_unavailable():
+    """An image with setsid but no working ps must not record a bare "G:".
+
+    A target-less record resolves to "-", signals nothing, and the command
+    survives cancellation.
+    """
+    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
+
+    assert 'if [ -n "$__pgid" ]; then echo G:$__pgid' in wrapped
+    assert "else echo P:$$ >" in wrapped
 
 
 def test_wrapper_propagates_the_real_exit_code():

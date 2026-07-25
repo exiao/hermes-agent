@@ -63,6 +63,10 @@ def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = Fals
     landing in that window would signal a group that does not exist yet, get
     ESRCH, and let the command establish itself unkilled.
 
+    Reading the pgid needs a working ``ps``. If that is missing or fails the
+    shell publishes ``P:<own pid>`` instead of a malformed ``G:``, so cancel()
+    still has a real target to signal.
+
     A cancel can also arrive before the command has even started, while the
     exec is still queued. cancel() drops a cancel marker first, so the wrapper
     refuses to start when the marker is already present, and re-checks after
@@ -77,9 +81,12 @@ def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = Fals
     quoted = shlex.quote(cmd_string)
     cancel_file = f"{pid_file}.cancel"
     # Runs inside the setsid'd shell: publish the group we actually lead, then
-    # become the command.
+    # become the command. Falls back to our own pid when ps is unavailable, so
+    # the record is never a target-less "G:".
     inner = (
-        f"echo G:$(ps -o pgid= -p $$ | tr -d ' ') > {pid_file}; "
+        f"__pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' '); "
+        f'if [ -n "$__pgid" ]; then echo G:$__pgid > {pid_file}; '
+        f"else echo P:$$ > {pid_file}; fi; "
         f"exec bash {flags} {quoted}"
     )
     return (
