@@ -138,8 +138,10 @@ def test_wrapper_refuses_to_start_when_already_cancelled():
     # checked before launching...
     assert "if [ -e /tmp/x.cancel ]; then rm -f /tmp/x.cancel" in wrapped
     assert f"exit {128 + 15}" in wrapped
-    # ...and again right after the pid is published, closing the window
+    # ...and again right after the pid is published, closing the window.
     assert 'kill -TERM "$__hermes_target"' in wrapped
+    assert f"seq 1 {_MODAL_CANCEL_GRACE_SECONDS}" in wrapped
+    assert 'kill -KILL "$__hermes_target"' in wrapped
 
 
 def test_wrapper_honors_login_shell():

@@ -80,9 +80,13 @@ def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = Fals
         f"else bash {flags} {quoted} & __hermes_pid=$!; "
         f"__hermes_target=$__hermes_pid; "
         f"echo P:$__hermes_pid > {pid_file}; fi; "
-        # Cancelled while we were starting up: honour it now.
+        # Cancelled while we were starting up: honour it now, including
+        # escalation if the command ignores the late SIGTERM.
         f"if [ -e {cancel_file} ]; then "
-        f'kill -TERM "$__hermes_target" 2>/dev/null; fi; '
+        f'kill -TERM "$__hermes_target" 2>/dev/null; '
+        f"for _ in $(seq 1 {_MODAL_CANCEL_GRACE_SECONDS}); do "
+        f'kill -0 "$__hermes_target" 2>/dev/null || break; sleep 1; done; '
+        f'kill -KILL "$__hermes_target" 2>/dev/null; fi; '
         f"wait $__hermes_pid; __hermes_rc=$?; "
         f"rm -f {pid_file} {cancel_file} 2>/dev/null; exit $__hermes_rc"
     )
