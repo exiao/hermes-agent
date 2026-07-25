@@ -33,7 +33,8 @@ def test_modal_run_bash_consumes_pre_execute_liveness_check(monkeypatch):
     env = ModalEnvironment.__new__(ModalEnvironment)
     env._sandbox = object()
     env._worker = object()
-    env._sandbox_check_done = True
+    env._sandbox_generation = 7
+    env._sandbox_checked_generation = 7
     ensure_calls = []
     monkeypatch.setattr(
         env, "_ensure_live_sandbox", lambda: ensure_calls.append("checked")
@@ -41,10 +42,26 @@ def test_modal_run_bash_consumes_pre_execute_liveness_check(monkeypatch):
 
     env._run_bash("true")
     assert ensure_calls == []
-    assert env._sandbox_check_done is False
+    assert env._sandbox_checked_generation is None
 
     env._run_bash("true")
     assert ensure_calls == ["checked"]
+
+
+def test_modal_delete_batches_command_arguments_under_limit():
+    """Recovery tombstones must not create an oversized rm command."""
+    from tools.environments.file_sync import quoted_rm_command
+    from tools.environments.modal import _MODAL_DELETE_MAX_COMMAND_BYTES, _batch_remote_paths
+
+    paths = [f"/root/.hermes/cache/{index:05d}/" + ("x" * 80) for index in range(2000)]
+    batches = _batch_remote_paths(paths)
+
+    assert [path for batch in batches for path in batch] == paths
+    assert all(
+        len(quoted_rm_command(batch).encode()) <= _MODAL_DELETE_MAX_COMMAND_BYTES
+        for batch in batches
+    )
+    assert len(batches) > 1
 
 
 # =========================================================================

@@ -33,6 +33,25 @@ logger = logging.getLogger(__name__)
 
 _SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
 _DIRECT_SNAPSHOT_NAMESPACE = "direct"
+_MODAL_DELETE_MAX_COMMAND_BYTES = 48 * 1024
+
+
+def _batch_remote_paths(remote_paths: list[str]) -> list[list[str]]:
+    """Split rm arguments below Modal's exec command-size limit."""
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_bytes = len("rm -f ".encode())
+    for remote_path in remote_paths:
+        arg_bytes = len((shlex.quote(remote_path) + " ").encode())
+        if current and current_bytes + arg_bytes > _MODAL_DELETE_MAX_COMMAND_BYTES:
+            batches.append(current)
+            current = []
+            current_bytes = len("rm -f ".encode())
+        current.append(remote_path)
+        current_bytes += arg_bytes
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _load_snapshots() -> dict:
@@ -273,7 +292,8 @@ class ModalEnvironment(BaseEnvironment):
         # wraps a command; _run_bash() consumes this marker so normal execution
         # does not poll the same live sandbox a second time. Direct _run_bash()
         # callers still take the guard below.
-        self._sandbox_check_done = False
+        self._sandbox_generation = 0
+        self._sandbox_checked_generation: int | None = None
 
         try:
             target_image_spec = restored_snapshot_id or image
@@ -411,21 +431,26 @@ class ModalEnvironment(BaseEnvironment):
         dest.write_bytes(tar_bytes)
 
     def _modal_delete(self, remote_paths: list[str]) -> None:
-        """Batch-delete remote files via exec."""
-        rm_cmd = quoted_rm_command(remote_paths)
+        """Batch-delete remote files via exec within Modal's command limit."""
+        batches = _batch_remote_paths(remote_paths)
+        if not batches:
+            return
 
         async def _rm():
-            proc = await self._sandbox.exec.aio("bash", "-c", rm_cmd)
-            await proc.wait.aio()
+            for batch in batches:
+                proc = await self._sandbox.exec.aio(
+                    "bash", "-c", quoted_rm_command(batch)
+                )
+                await proc.wait.aio()
 
         self._worker.run_coroutine(_rm(), timeout=15)
 
     def _before_execute(self) -> None:
         """Recover the sandbox before wrapping and syncing each command."""
-        self._sandbox_check_done = False
+        self._sandbox_checked_generation = None
         self._ensure_live_sandbox()
         self._sync_manager.sync()
-        self._sandbox_check_done = True
+        self._sandbox_checked_generation = self._sandbox_generation
 
     # ------------------------------------------------------------------
     # Execution
@@ -480,6 +505,7 @@ class ModalEnvironment(BaseEnvironment):
             self._app, self._sandbox = self._worker.run_coroutine(
                 self._create_sandbox(recovery_image), timeout=300,
             )
+            self._sandbox_generation += 1
             logger.info("Modal: sandbox re-created (task=%s)", self._task_id)
             self._respawning = True
             try:
@@ -503,9 +529,14 @@ class ModalEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
-        if self._sandbox_check_done:
-            self._sandbox_check_done = False
-        else:
+        with self._respawn_lock:
+            checked = (
+                self._sandbox is not None
+                and self._sandbox_checked_generation == self._sandbox_generation
+            )
+            if checked:
+                self._sandbox_checked_generation = None
+        if not checked:
             self._ensure_live_sandbox()
         sandbox = self._sandbox
         worker = self._worker
@@ -517,9 +548,16 @@ class ModalEnvironment(BaseEnvironment):
             # a terminated one.
             if sandbox is None:
                 return
+            with self._respawn_lock:
+                # Invalidate any preflight check that raced with cancellation.
+                self._sandbox_generation += 1
+                self._sandbox_checked_generation = None
             try:
                 worker.run_coroutine(sandbox.terminate.aio(), timeout=15)
-            finally:
+            except Exception as exc:
+                logger.warning("Modal: sandbox termination was not confirmed: %s", exc)
+                return
+            with self._respawn_lock:
                 if self._sandbox is sandbox:
                     self._sandbox = None
 
