@@ -43,6 +43,18 @@ def _make_manager(tmp_files, remote_base="/root/.hermes", upload=None, delete=No
 
 
 class TestMtimeSkip:
+    def test_reset_remote_state_reuploads_everything(self, tmp_files):
+        upload = MagicMock()
+        mgr = _make_manager(tmp_files, upload=upload)
+
+        mgr.sync(force=True)
+        upload.reset_mock()
+
+        mgr.reset_remote_state()
+        mgr.sync(force=True)
+
+        assert upload.call_count == 3
+
     def test_unchanged_files_not_re_uploaded(self, tmp_files):
         upload = MagicMock()
         mgr = _make_manager(tmp_files, upload=upload)

@@ -162,6 +162,17 @@ class FileSyncManager:
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
 
+    def reset_remote_state(self) -> None:
+        """Forget the state of a remote environment that was replaced.
+
+        A newly created sandbox has no files from the previous remote
+        environment, so mtime and content-hash tracking from that environment
+        must not suppress the first upload into its replacement.
+        """
+        self._synced_files.clear()
+        self._pushed_hashes.clear()
+        self._last_sync_time = 0.0
+
     def sync(self, *, force: bool = False) -> None:
         """Run a sync cycle: upload changed files, delete removed files.
 

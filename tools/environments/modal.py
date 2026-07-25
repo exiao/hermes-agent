@@ -469,6 +469,7 @@ class ModalEnvironment(BaseEnvironment):
             try:
                 if self._sync_manager is not None:
                     try:
+                        self._sync_manager.reset_remote_state()
                         self._sync_manager.sync(force=True)
                     except Exception as e:
                         logger.warning("Modal: re-sync after respawn failed: %s", e)
@@ -529,37 +530,38 @@ class ModalEnvironment(BaseEnvironment):
 
     def cleanup(self):
         """Snapshot the filesystem (if persistent) then stop the sandbox."""
-        if self._sandbox is None:
-            return
-
-        if self._sync_manager:
-            logger.info("Modal: syncing files from sandbox...")
-            self._sync_manager.sync_back()
-
-        if self._persistent:
-            try:
-                async def _snapshot():
-                    img = await self._sandbox.snapshot_filesystem.aio()
-                    return img.object_id
-
-                try:
-                    snapshot_id = self._worker.run_coroutine(_snapshot(), timeout=60)
-                except Exception:
-                    snapshot_id = None
-
-                if snapshot_id:
-                    _store_direct_snapshot(self._task_id, snapshot_id)
-                    logger.info(
-                        "Modal: saved filesystem snapshot %s for task %s",
-                        snapshot_id[:20], self._task_id,
-                    )
-            except Exception as e:
-                logger.warning("Modal: filesystem snapshot failed: %s", e)
-
         try:
-            self._worker.run_coroutine(self._sandbox.terminate.aio(), timeout=15)
-        except Exception:
-            pass
+            if self._sandbox is None:
+                return
+
+            if self._sync_manager:
+                logger.info("Modal: syncing files from sandbox...")
+                self._sync_manager.sync_back()
+
+            if self._persistent:
+                try:
+                    async def _snapshot():
+                        img = await self._sandbox.snapshot_filesystem.aio()
+                        return img.object_id
+
+                    try:
+                        snapshot_id = self._worker.run_coroutine(_snapshot(), timeout=60)
+                    except Exception:
+                        snapshot_id = None
+
+                    if snapshot_id:
+                        _store_direct_snapshot(self._task_id, snapshot_id)
+                        logger.info(
+                            "Modal: saved filesystem snapshot %s for task %s",
+                            snapshot_id[:20], self._task_id,
+                        )
+                except Exception as e:
+                    logger.warning("Modal: filesystem snapshot failed: %s", e)
+
+            try:
+                self._worker.run_coroutine(self._sandbox.terminate.aio(), timeout=15)
+            except Exception:
+                pass
         finally:
             self._worker.stop()
             self._sandbox = None

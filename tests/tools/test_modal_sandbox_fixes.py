@@ -222,6 +222,27 @@ class TestModalEnvironmentDefaults:
             "Tilde ~ is not expanded by subprocess.run(cwd=...)."
         )
 
+    def test_cleanup_stops_worker_when_sandbox_is_already_gone(self):
+        """A cancelled sandbox must not leave its async worker running."""
+        from tools.environments.modal import ModalEnvironment
+
+        class _Worker:
+            def __init__(self):
+                self.stop_calls = 0
+
+            def stop(self):
+                self.stop_calls += 1
+
+        env = ModalEnvironment.__new__(ModalEnvironment)
+        env._sandbox = None
+        env._app = object()
+        env._worker = _Worker()
+
+        env.cleanup()
+
+        assert env._worker.stop_calls == 1
+        assert env._app is None
+
 
 # =========================================================================
 # Test 7: ensurepip fix in ModalEnvironment
