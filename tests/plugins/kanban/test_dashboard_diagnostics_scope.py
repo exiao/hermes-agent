@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-import pytest
+import pytest  # type: ignore[unresolved-import]  # dev-only dep; ty env lacks it
 
 from hermes_cli import kanban_db as kb
 
@@ -178,6 +178,117 @@ def _scanned_task_ids(conn):
             # the ids are the quoted 't_<hex>' literals in the IN clause.
             captured.update(re.findall(r"'(t_[0-9a-f]+)'", stmt))
     return captured
+
+
+def _emit_event_at(conn, task_id, kind, payload, ts):
+    """Insert a task_events row with an explicit ``created_at``.
+
+    Used to build a deterministic blocked→unblocked cycle sequence inside the
+    ``block_unblock_cycling`` rule's sliding window (the rule counts
+    ``blocked`` events that follow an ``unblocked`` event, chronological by id).
+    """
+    conn.execute(
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+        "VALUES (?, NULL, ?, ?, ?)",
+        (task_id, kind, json.dumps(payload), ts),
+    )
+    conn.commit()
+
+
+def test_board_load_keeps_done_card_with_block_cycle_diagnostic(board_db):
+    """A ``done`` card that cycled blocked→unblocked enough times to trigger
+    ``block_unblock_cycling`` and then completed *without* any
+    hallucination-warning event must still surface on the board-load pass.
+
+    ``_rule_block_unblock_cycling`` has no current-status gate (it counts
+    recent ``blocked``/``unblocked`` events regardless of the card's current
+    status), so the drawer path (``task_ids=[id]``) still shows the diagnostic
+    on a completed card. The board-load candidate query must re-include such a
+    done card, otherwise ``/board`` badges and ``/diagnostics`` disagree for
+    the same task. Re-inclusion keys off ``blocked``/``unblocked`` events (NOT
+    ``_WARNING_EVENT_KINDS``), so the done-history scan stays bounded to the
+    small set of done cards with a recent block-cycle signal.
+    """
+    conn = board_db
+    now = int(time.time())
+    cycled = kb.create_task(conn, title="done, cycled", assignee="x")
+    _set_status(conn, cycled, "done")
+    # 3 blocked-after-unblocked cycles within the 24h window (default
+    # threshold). Sequence by ascending id (insertion order): blocked,
+    # unblocked, blocked (cycle 1), unblocked, blocked (cycle 2), unblocked,
+    # blocked (cycle 3). Then a clean completed event — no hallucination
+    # warning, so the ``_WARNING_EVENT_KINDS`` branch does NOT catch this card.
+    seq = [
+        ("blocked", now - 700),
+        ("unblocked", now - 690),
+        ("blocked", now - 680),   # cycle 1
+        ("unblocked", now - 670),
+        ("blocked", now - 660),   # cycle 2
+        ("unblocked", now - 650),
+        ("blocked", now - 640),   # cycle 3
+        ("completed", now - 600),
+    ]
+    for kind, ts in seq:
+        _emit_event_at(conn, cycled, kind, {}, ts)
+
+    # Control: a plain done card with no block-cycle and no warning event —
+    # must stay excluded from the board-load candidate scan.
+    plain = kb.create_task(conn, title="done plain", assignee="x")
+    _set_status(conn, plain, "done")
+
+    # Drawer path confirms the rule engine still fires on the done card.
+    drawer = plugin_api._compute_task_diagnostics(conn, task_ids=[cycled])
+    assert cycled in drawer, "drawer path lost the block_unblock_cycling badge"
+    assert "block_unblock_cycling" in {d["kind"] for d in drawer[cycled]}
+
+    # Board-load path must agree: the cycled done card stays in scope.
+    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+    assert cycled in diags, (
+        "done card with active block_unblock_cycling was dropped by the "
+        "board-load candidate query — /board and /diagnostics disagree"
+    )
+    assert "block_unblock_cycling" in {d["kind"] for d in diags[cycled]}
+    assert plain not in diags, "plain done card was flagged on board load"
+
+    # The cycled card's history must be materialised (it's a candidate); the
+    # plain done card's history must NOT be materialised.
+    scanned = _scanned_task_ids(conn)
+    assert cycled in scanned, "cycled done card was dropped from the scan"
+    assert plain not in scanned, "plain done card's history was materialised"
+
+
+def test_board_load_skips_done_card_whose_block_cycle_aged_out(board_db):
+    """A ``done`` card whose block-cycle events all fell outside the sliding
+    window (so ``_rule_block_unblock_cycling`` no longer fires) must NOT be
+    re-included by the block-cycle branch — the board-load pass must not
+    re-materialise a done card's history for a diagnostic that can't fire.
+    """
+    conn = board_db
+    now = int(time.time())
+    # 3 cycles, but all ~48h ago — outside the default 24h window.
+    aged = kb.create_task(conn, title="done, aged cycles", assignee="x")
+    _set_status(conn, aged, "done")
+    seq = [
+        ("blocked", now - 48 * 3600 - 700),
+        ("unblocked", now - 48 * 3600 - 690),
+        ("blocked", now - 48 * 3600 - 680),
+        ("unblocked", now - 48 * 3600 - 670),
+        ("blocked", now - 48 * 3600 - 660),
+        ("unblocked", now - 48 * 3600 - 650),
+        ("blocked", now - 48 * 3600 - 640),
+        ("completed", now - 48 * 3600 - 600),
+    ]
+    for kind, ts in seq:
+        _emit_event_at(conn, aged, kind, {}, ts)
+
+    diags = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+    assert aged not in diags, (
+        "done card with aged-out block cycles was flagged on board load"
+    )
+    scanned = _scanned_task_ids(conn)
+    assert aged not in scanned, (
+        "done card with aged-out block cycles had its history materialised"
+    )
 
 
 def test_board_load_skips_done_card_whose_warning_was_cleared(board_db):

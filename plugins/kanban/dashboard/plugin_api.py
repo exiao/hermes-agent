@@ -301,43 +301,73 @@ def _compute_task_diagnostics(
             tuple(task_ids),
         ).fetchall()
     else:
-        # Board-load path. Two rules can fire on a card that is NOT live/stuck:
-        # ``hallucinated_cards`` (a blocked completion leaves the card in its
-        # prior state) and ``prose_phantom_refs`` (an advisory that fires on a
-        # *successful* completion, so it legitimately surfaces on a ``done``
-        # card). Both key off the ``_WARNING_EVENT_KINDS`` events. Every other
-        # rule requires a live/stuck status. So the candidate set is:
+        # Board-load path. The rules that can fire on a card that is NOT
+        # live/stuck:
+        #   - ``hallucinated_cards`` (a blocked completion leaves the card in
+        #     its prior state) and ``prose_phantom_refs`` (an advisory that
+        #     fires on a *successful* completion, so it legitimately surfaces
+        #     on a ``done`` card). Both key off the ``_WARNING_EVENT_KINDS``
+        #     events.
+        #   - ``block_unblock_cycling`` counts recent ``blocked``/``unblocked``
+        #     events in a sliding window and has *no current-status gate*, so
+        #     it still fires on a ``done`` card that cycled blocked→unblocked
+        #     and then completed. Without re-including that card here, /board
+        #     badges and /diagnostics disagree for the same task (the drawer
+        #     path still shows the badge).
+        # Every other rule requires a live/stuck status. So the candidate set:
         #   (a) all non-terminal cards, PLUS
-        #   (b) ``done`` cards that carry one of those warning events.
-        # ``archived`` is excluded from both branches (the prior fleet query
+        #   (b) ``done`` cards that carry an active warning event, PLUS
+        #   (c) ``done`` cards with a recent block→unblock cycle (the small set
+        #       that ``block_unblock_cycling`` can still fire on).
+        # ``archived`` is excluded from all branches (the prior fleet query
         # used ``status != 'archived'``; archived is hidden from the default
-        # board/diagnostics view, so it must not surface here via a stale event).
+        # board/diagnostics view, so it must not surface here via a stale
+        # event).
         # This drops the per-card event/run scan over the entire done column
         # (hundreds of cards, ~15K-and-growing events, zero badges) — the
         # actual hotspot — while preserving every diagnostic that can fire.
         #
-        # Branch (b) uses a correlated ``EXISTS`` (not ``IN (SELECT DISTINCT
+        # Branches (b)/(c) use correlated ``EXISTS`` (not ``IN (SELECT DISTINCT
         # ... WHERE kind ...)``): ``task_events`` has no index on ``kind``, so
         # the ``IN`` form forces a full table scan of the (growing) event log.
-        # ``EXISTS (... WHERE e.task_id = t.id AND e.kind IN (...))`` lets SQLite
-        # drive the ``idx_events_task`` index (leading column ``task_id``) and
-        # probe only the small set of done cards. ``UNION ALL`` (not ``UNION``)
-        # because the two branches are disjoint by status — no dedup needed.
+        # ``EXISTS (... WHERE e.task_id = t.id ...)`` lets SQLite drive the
+        # ``idx_events_task`` index (leading column ``task_id``) and probe only
+        # the small set of done cards. ``UNION ALL`` (not ``UNION``) because the
+        # branches are disjoint by status — no dedup needed.
         #
-        # The re-include predicate matches the rule engine's
+        # Branch (b) re-include matches the rule engine's
         # ``_active_hallucination_events``: a warning event counts only when no
         # ``completed``/``edited`` event arrives *strictly after* it (greater
         # ``id``). A done card whose warning was later cleared by a subsequent
         # completion/edit yields zero badges, so re-including it would just
         # re-materialise its (potentially large) event/run history on every
-        # board load for nothing — the inner ``NOT EXISTS`` excludes it. Both
-        # correlated subqueries filter on ``e.task_id = t.id``, so each rides
-        # the ``idx_events_task`` index rather than scanning the event log.
+        # board load for nothing — the inner ``NOT EXISTS`` excludes it.
+        #
+        # Branch (c) re-include mirrors ``_rule_block_unblock_cycling``'s
+        # sliding window: only ``blocked``/``unblocked`` events at or after
+        # ``now - block_cycle_window_seconds`` can contribute a cycle. A done
+        # card whose cycles all aged out of the window can no longer fire the
+        # rule, so it is NOT re-included (the ``e.created_at >= ?`` cutoff
+        # excludes it). The predicate requires at least one ``blocked`` event
+        # that follows an ``unblocked`` event within the window — the minimal
+        # cycle signal the rule counts — so a done card with recent isolated
+        # blocks but no unblock is not pulled in. Both correlated subqueries
+        # filter on ``e.task_id = t.id``, so each rides ``idx_events_task``
+        # rather than scanning the event log.
         terminal = tuple(sorted(_DIAGNOSTIC_TERMINAL_STATUSES))
         reinclude = tuple(sorted(_DIAGNOSTIC_WARNING_REINCLUDE_STATUSES))
         status_ph = ",".join(["?"] * len(terminal))
         reinclude_ph = ",".join(["?"] * len(reinclude))
         kind_ph = ",".join(["?"] * len(_WARNING_EVENT_KINDS))
+        # Block-cycle window cutoff (matches _rule_block_unblock_cycling's
+        # cfg["block_cycle_window_seconds"], default 24h). Only done cards with
+        # a blocked/unblocked event at or after this timestamp can fire the
+        # rule, so the branch is bounded by recent activity, never the full
+        # done column.
+        block_window = float(
+            diag_config.get("block_cycle_window_seconds", 24 * 3600)
+        )
+        block_cutoff = int(time.time() - block_window)
         rows = conn.execute(
             f"SELECT * FROM tasks WHERE status NOT IN ({status_ph}) "
             f"UNION ALL "
@@ -347,8 +377,22 @@ def _compute_task_diagnostics(
             f"            AND NOT EXISTS (SELECT 1 FROM task_events c "
             f"                WHERE c.task_id = t.id "
             f"                AND c.kind IN ('completed', 'edited') "
-            f"                AND c.id > e.id))",
-            terminal + reinclude + tuple(_WARNING_EVENT_KINDS),
+            f"                AND c.id > e.id)) "
+            f"UNION ALL "
+            f"SELECT t.* FROM tasks t WHERE t.status IN ({reinclude_ph}) "
+            f"AND EXISTS (SELECT 1 FROM task_events e "
+            f"            WHERE e.task_id = t.id AND e.kind = 'blocked' "
+            f"            AND e.created_at >= ? "
+            f"            AND EXISTS (SELECT 1 FROM task_events u "
+            f"                WHERE u.task_id = t.id AND u.kind = 'unblocked' "
+            f"                AND u.created_at >= ? AND u.id < e.id))",
+            (
+                terminal
+                + reinclude
+                + tuple(_WARNING_EVENT_KINDS)
+                + reinclude
+                + (block_cutoff, block_cutoff)
+            ),
         ).fetchall()
 
     if not rows:
