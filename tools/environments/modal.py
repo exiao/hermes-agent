@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 _SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
 _DIRECT_SNAPSHOT_NAMESPACE = "direct"
 _MODAL_DELETE_MAX_COMMAND_BYTES = 48 * 1024
+# Per-batch deadline for remote deletes. Deliberately per batch rather than one
+# aggregate budget for the whole loop: a large tombstone set would otherwise
+# delete a prefix, blow the shared deadline, get rolled back by the
+# transactional FileSyncManager, and retry the full set forever.
+_DELETE_BATCH_TIMEOUT_SECONDS = 15
 
 
 def _batch_remote_paths(remote_paths: list[str]) -> list[list[str]]:
@@ -431,19 +436,43 @@ class ModalEnvironment(BaseEnvironment):
         dest.write_bytes(tar_bytes)
 
     def _modal_delete(self, remote_paths: list[str]) -> None:
-        """Batch-delete remote files via exec within Modal's command limit."""
+        """Batch-delete remote files via exec within Modal's command limit.
+
+        Two correctness requirements, both driven by ``FileSyncManager.sync()``
+        being transactional: it only commits the deletion set (and stops
+        replaying it) when this callback returns without raising.
+
+        1. **Every batch's exit code is checked.** Silently discarding a
+           nonzero ``rm`` status (read-only path, remote I/O error) would let
+           sync commit a deletion that never happened, so the stale credential
+           / skill / cache file survives until the next sandbox reset.
+        2. **The timeout is per batch, not for the whole loop.** A single
+           aggregate deadline means a large tombstone set can delete an initial
+           subset, time out, get rolled back, and retry the *complete* set on
+           every later preflight, so reconciliation never converges.
+        """
         batches = _batch_remote_paths(remote_paths)
         if not batches:
             return
 
-        async def _rm():
-            for batch in batches:
+        for batch in batches:
+            async def _rm_batch(batch=batch):
                 proc = await self._sandbox.exec.aio(
                     "bash", "-c", quoted_rm_command(batch)
                 )
-                await proc.wait.aio()
+                exit_code = await proc.wait.aio()
+                if exit_code != 0:
+                    stderr = ""
+                    try:
+                        stderr = (await proc.stderr.read.aio() or "")[:400]
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"Modal remote delete failed (exit {exit_code}) for "
+                        f"{len(batch)} path(s): {stderr}"
+                    )
 
-        self._worker.run_coroutine(_rm(), timeout=15)
+            self._worker.run_coroutine(_rm_batch(), timeout=_DELETE_BATCH_TIMEOUT_SECONDS)
 
     def _before_execute(self) -> None:
         """Recover the sandbox before wrapping and syncing each command."""
