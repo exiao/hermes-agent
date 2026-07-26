@@ -63,11 +63,20 @@ _cancel_id_counter = itertools.count()
 # PID still existing: a descendant that traps TERM outlives the wrapper bash,
 # so gating on ``/proc/$pid`` would skip the escalation and leak it (measured:
 # a trapping child survived the guarded version and died under this one).
-# A missing/stale PID file is a no-op, never an error: by the time cancel runs
-# the command may already have exited.
+#
+# The PID file may not exist yet: an interrupt that lands while
+# ``sandbox.exec`` is still starting the command can reach cancel() first, and
+# giving up immediately would leave the command running remotely. So poll
+# briefly for it. If it never appears the command never started, and a no-op
+# is the correct answer.
 _CANCEL_SCRIPT = r"""
 pidfile="$1"
-[ -f "$pidfile" ] || { echo "cancelled=0"; exit 0; }
+waited=0
+while [ ! -s "$pidfile" ] && [ "$waited" -lt 50 ]; do
+  sleep 0.1
+  waited=$((waited+1))
+done
+[ -s "$pidfile" ] || { echo "cancelled=0"; exit 0; }
 pid=$(cat "$pidfile" 2>/dev/null)
 rm -f "$pidfile" 2>/dev/null
 [ -n "$pid" ] && [ -d "/proc/$pid" ] || { echo "cancelled=0"; exit 0; }

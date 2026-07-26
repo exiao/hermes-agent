@@ -302,3 +302,63 @@ def test_live_cancel_reaches_a_descendant_that_ignores_term():
 
     assert "n=0" not in before_out, "the TERM-ignoring child never started"
     assert "n=0" in after_out, f"TERM-ignoring descendant survived cancel: {after_out!r}"
+
+
+@_live_only
+def test_live_cancel_that_arrives_before_the_command_registers():
+    """Regression: an interrupt can beat the PID file into existence.
+
+    ``/stop`` landing while ``sandbox.exec`` is still starting the command
+    used to make cancel report ``cancelled=0`` and return, leaving the command
+    running remotely until its SDK timeout. Cancel now waits briefly for the
+    PID file to appear.
+    """
+    import asyncio
+
+    modal = pytest.importorskip("modal")
+
+    marker = "hermes_late_starter"
+
+    async def _run():
+        app = await modal.App.lookup.aio("hermes-cancel-e2e", create_if_missing=True)
+        sandbox = await modal.Sandbox.create.aio(
+            "sleep", "infinity", image=modal.Image.debian_slim(), app=app, timeout=300,
+        )
+        try:
+            pidfile = modal_env._cancel_pidfile("live-race")
+            inner = f"sleep 2; exec -a {marker} sleep 900"
+
+            # Fire the canceller FIRST, so it arrives before the PID file.
+            killer = await sandbox.exec.aio(
+                "bash", "-c", modal_env._CANCEL_SCRIPT, "--", pidfile, timeout=60,
+            )
+            await asyncio.sleep(0.5)
+            target = await sandbox.exec.aio(
+                "bash", "-c", modal_env._cancellable_command(inner, pidfile), timeout=300,
+            )
+
+            kill_out = await killer.stdout.read.aio()
+            await killer.wait.aio()
+            try:
+                await asyncio.wait_for(target.wait.aio(), timeout=30)
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+
+            count = (
+                'n=0; self=$$; for d in /proc/[0-9]*; do p=${d#/proc/}; '
+                '[ "$p" = "$self" ] && continue; '
+                'c=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null); '
+                f'case "$c" in *{marker}*) n=$((n+1));; esac; done; echo "n=$n"'
+            )
+            chk = await sandbox.exec.aio("bash", "-c", count)
+            out = await chk.stdout.read.aio()
+            await chk.wait.aio()
+            return kill_out, out
+        finally:
+            await sandbox.terminate.aio()
+
+    kill_out, after_out = asyncio.run(_run())
+
+    assert "cancelled=1" in kill_out, f"cancel gave up before the command registered: {kill_out!r}"
+    assert "n=0" in after_out, f"command survived an early cancel: {after_out!r}"
