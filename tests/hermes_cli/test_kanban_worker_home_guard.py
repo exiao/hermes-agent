@@ -1,25 +1,18 @@
-"""Tests: kanban worker spawn never inherits a stray ambient HERMES_HOME.
+"""Tests: kanban worker spawn preserves valid homes and pins board context.
 
-Regression coverage for the leaked-home bug: ``_default_spawn`` builds the child
-env from ``dict(os.environ)`` and then calls ``resolve_profile_env(profile)`` to
-point the worker at its profile home. For every NAMED profile that resolves to a
-fixed ``<root>/profiles/<name>`` path, so a stray ambient ``HERMES_HOME`` is
-harmless. But ``resolve_profile_env("default")`` returns
-``get_default_hermes_root()``, which READS ``HERMES_HOME`` from the ambient
-environment.
+A child environment begins as ``dict(os.environ)``, so a nested dispatcher can
+carry stale kanban-path pins. The dispatcher must derive fresh child pins from
+the accepted worker home. An explicit ``HERMES_HOME`` remains valid even for a
+fresh Docker/custom root containing only ``.env``, ``kanban.db``, or other state.
 
-So when the dispatching process has a stray ``HERMES_HOME`` (an e2e test home, a
-Docker path, a leftover export), every ``default``-profile worker silently
-inherits it: the child resolves its config, memories, skills AND its kanban DB
-under that foreign home. Workers then run against an empty board and report
-completions the real board never records.
-
-The guard: when the ROOT (non-profile) home is what we're handing the child,
-resolve it from the real platform default rather than the ambient env var.
+An explicit ``HERMES_KANBAN_HOME`` is the stronger task-dispatch context. It
+wins over an ambient home inherited from another gateway request or test without
+mutating the gateway process's ``os.environ``.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 
@@ -63,21 +56,18 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str, *, assignee: str) -> dic
     return captured
 
 
-def test_default_profile_worker_ignores_stray_ambient_hermes_home(
+def test_default_profile_worker_uses_explicit_board_home_over_ambient_home(
     monkeypatch, tmp_path,
 ):
-    """A stray ambient HERMES_HOME must not redefine the default profile's home.
-
-    This is the real-world failure: an e2e test exported
-    ``HERMES_HOME=/tmp/e2ehome2`` into the gateway process. Every dispatched
-    ``default`` worker then resolved its kanban DB under that throwaway home and
-    operated on an empty board.
-    """
+    """An explicit board root must beat a stray ambient HERMES_HOME."""
     from hermes_cli import kanban_db as kb
 
     stray = tmp_path / "e2ehome-stray"
     stray.mkdir()
+    board_home = tmp_path / "dispatcher-home"
+    board_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(stray))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -86,55 +76,40 @@ def test_default_profile_worker_ignores_stray_ambient_hermes_home(
         kb, monkeypatch, str(workspace), assignee="default",
     )
 
-    child_home = captured["env"].get("HERMES_HOME", "")
-    assert child_home, "worker spawn must always pin an explicit HERMES_HOME"
-    assert str(stray) not in child_home, (
-        "default-profile worker inherited the stray ambient HERMES_HOME "
-        f"({child_home!r}); a leaked test/Docker home must never redefine "
-        "which board the worker reads"
-    )
+    assert captured["env"]["HERMES_HOME"] == str(board_home)
+    assert captured["env"]["HERMES_KANBAN_DB"] == str(board_home / "kanban.db")
+    assert os.environ["HERMES_HOME"] == str(stray)
 
-
-def test_named_profile_worker_ignores_bare_scratch_hermes_home(
+def test_named_profile_worker_uses_explicit_board_home_over_ambient_home(
     monkeypatch, tmp_path,
 ):
-    """A bare scratch home is ignored for named profiles too.
-
-    The leak is not default-only: ``<root>`` itself derives from
-    ``HERMES_HOME``, so a stray value relocates named profiles as well.
-    """
+    """An explicit board root also anchors a named-profile worker."""
     from hermes_cli import kanban_db as kb
 
     stray = tmp_path / "e2ehome-stray"
     stray.mkdir()
+    board_home = tmp_path / "dispatcher-home"
+    (board_home / "profiles" / "dev").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(stray))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="dev")
 
-    child_home = captured["env"].get("HERMES_HOME", "")
-    assert str(stray) not in child_home, (
-        "named-profile worker resolved under the stray ambient HERMES_HOME "
-        f"({child_home!r})"
-    )
+    assert captured["env"]["HERMES_HOME"] == str(board_home / "profiles" / "dev")
 
-
-def test_unprovisioned_profile_does_not_leak_stray_home(monkeypatch, tmp_path):
-    """An unknown profile must drop the stray home, not inherit it.
-
-    ``resolve_profile_env`` raises ``FileNotFoundError`` when the profile dir
-    does not exist (the common case on a fresh CI runner). ``env`` was seeded
-    from ``dict(os.environ)``, so the except branch must actively remove the
-    rejected home rather than leaving the inherited value in place — otherwise
-    the leak survives exactly where profiles are not provisioned.
-    """
+def test_unprovisioned_profile_keeps_explicit_board_home(monkeypatch, tmp_path):
+    """An unknown profile retains the board root for consistent child context."""
     from hermes_cli import kanban_db as kb
 
     stray = tmp_path / "e2ehome-stray"
     stray.mkdir()
+    board_home = tmp_path / "dispatcher-home"
+    board_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(stray))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -143,12 +118,7 @@ def test_unprovisioned_profile_does_not_leak_stray_home(monkeypatch, tmp_path):
         kb, monkeypatch, str(workspace), assignee="no-such-profile-xyz",
     )
 
-    child_home = captured["env"].get("HERMES_HOME", "")
-    assert str(stray) not in child_home, (
-        "worker for an unprovisioned profile inherited the stray ambient "
-        f"HERMES_HOME ({child_home!r})"
-    )
-
+    assert captured["env"]["HERMES_HOME"] == str(board_home)
 
 def test_relocated_home_with_config_is_still_honored(monkeypatch, tmp_path):
     """A REAL relocated home (Docker/custom) must keep working.
@@ -171,4 +141,45 @@ def test_relocated_home_with_config_is_still_honored(monkeypatch, tmp_path):
 
     assert captured["env"]["HERMES_HOME"] == str(real_home / "profiles" / "dev"), (
         "a legitimate relocated home must still resolve its profiles"
+    )
+
+
+def test_relocated_configless_home_is_still_honored(monkeypatch, tmp_path):
+    """A custom root with only state files is still an explicit deployment root."""
+    from hermes_cli import kanban_db as kb
+
+    real_home = tmp_path / "opt-data"
+    real_home.mkdir()
+    (real_home / "kanban.db").touch()
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="default")
+
+    assert captured["env"]["HERMES_HOME"] == str(real_home)
+    assert captured["env"]["HERMES_KANBAN_DB"] == str(real_home / "kanban.db")
+
+
+def test_spawn_replaces_inherited_kanban_path_pins(monkeypatch, tmp_path):
+    """Stale child pins cannot redirect a new worker away from its home."""
+    from hermes_cli import kanban_db as kb
+
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    foreign_db = tmp_path / "foreign" / "kanban.db"
+    foreign_workspaces = tmp_path / "foreign" / "workspaces"
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(foreign_db))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(foreign_workspaces))
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="default")
+
+    assert captured["env"]["HERMES_KANBAN_DB"] == str(real_home / "kanban.db")
+    assert captured["env"]["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
+        real_home / "kanban" / "workspaces"
     )

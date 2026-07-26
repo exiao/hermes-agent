@@ -10316,53 +10316,34 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     #
-    # Guard against a STRAY ambient HERMES_HOME. resolve_profile_env() ->
-    # get_profile_dir() -> get_default_hermes_root() reads HERMES_HOME from
-    # os.environ, so a leaked value in the dispatching process (an e2e test
-    # home, a leftover export) silently redefines where EVERY worker's home
-    # lives: its config, memories, skills, and — critically — its kanban DB.
-    # Workers then run against a different board than the one the task was
-    # claimed from, completing tasks the real board never records.
-    #
-    # A RELOCATED home is legitimate and must be preserved (Docker, custom
-    # deployments, and the isolated homes tests build). The discriminator is
-    # whether it looks like a real Hermes home at all: a configured home has a
-    # config.yaml (or a profiles/ tree). A bare scratch directory that has
-    # neither was never a Hermes home — it is a leak, and we fall back to the
-    # platform default so worker homes stay a function of the profile name.
+    # An explicit HERMES_HOME is a deployment root even when it has not yet
+    # created config.yaml or profiles/ (for example a fresh Docker volume with
+    # only kanban.db or .env). Do not infer intent from optional markers. An
+    # explicit board root is the stronger dispatcher context, however, so it
+    # wins over an ambient home leaked from another request or test.
     from hermes_cli.profiles import resolve_profile_env
-    _stray_home = None
-    _ambient_home = os.environ.get("HERMES_HOME")
-    if _ambient_home:
-        _ambient_path = Path(_ambient_home)
-        if not (
-            (_ambient_path / "config.yaml").is_file()
-            or (_ambient_path / "profiles").is_dir()
-        ):
-            _stray_home = os.environ.pop("HERMES_HOME", None)
-            _log.warning(
-                "kanban: ignoring stray HERMES_HOME=%s for worker spawn "
-                "(no config.yaml or profiles/); resolving %s from the platform "
-                "default home instead",
-                _ambient_home, profile_arg,
-            )
-    try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        #
-        # A stray ambient home must not survive this path: `env` was seeded
-        # from dict(os.environ), so leaving it alone would hand the child the
-        # very value we just rejected. Drop it and let the child fall back to
-        # its platform default home.
-        if _stray_home is not None:
-            env.pop("HERMES_HOME", None)
-    finally:
-        if _stray_home is not None:
-            os.environ["HERMES_HOME"] = _stray_home
+    _board_home = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    if _board_home:
+        from hermes_constants import get_default_hermes_root
+
+        _spawn_root = get_default_hermes_root(home=_board_home)
+        _profile_home = (
+            _spawn_root
+            if profile_arg == "default"
+            else _spawn_root / "profiles" / profile_arg
+        )
+        # Keep the root for an unprovisioned profile so the child CLI has the
+        # same board context while it reports the missing profile.
+        env["HERMES_HOME"] = str(
+            _profile_home if _profile_home.is_dir() else _spawn_root
+        )
+    else:
+        try:
+            env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        except FileNotFoundError:
+            # Defer the missing-profile error to the CLI. Preserve the explicit
+            # dispatch root rather than guessing it from on-disk markers.
+            pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -10438,12 +10419,24 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
-    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
-    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    # Derive child pins from the accepted home rather than inherited child pins
+    # from a previous spawn, which can otherwise redirect this task's worker.
+    from hermes_constants import get_default_hermes_root
+
+    _spawn_root = get_default_hermes_root(home=env.get("HERMES_HOME"))
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+    if resolved_board == DEFAULT_BOARD:
+        env["HERMES_KANBAN_DB"] = str(_spawn_root / "kanban.db")
+        env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(
+            _spawn_root / "kanban" / "workspaces"
+        )
+    else:
+        _board_root = _spawn_root / "kanban" / "boards" / resolved_board
+        env["HERMES_KANBAN_DB"] = str(_board_root / "kanban.db")
+        env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_board_root / "workspaces")
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
     # board slug still forces it to the right directory.
-    resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
     # Pin the dispatcher's resolved FD-headroom threshold into the worker env.
     # _spawn_worker rewrites HERMES_HOME to the assignee profile (above), so a
