@@ -1658,7 +1658,10 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "Reason: {reason}\n\n"
     "If the task is genuinely done, call kanban_complete now with a short "
     "summary of what you did. If something still blocks completion, call "
-    "kanban_block with the reason instead."
+    "kanban_block with the reason instead. If this is a PR that is CLEAN with "
+    "green CI and no unresolved review threads, and reviewDecision is "
+    "REVIEW_REQUIRED, its only remaining gate is human approval: you cannot "
+    "obtain it, so call kanban_block(kind=\"needs_input\", reason=...) instead."
 )
 
 

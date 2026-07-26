@@ -411,6 +411,10 @@ def test_kanban_goal_continuation_escalates_unobtainable_human_review():
     assert "no unresolved review threads" in prompt
     assert 'kanban_block(kind="needs_input", reason=...)' in prompt
 
+    finalize_prompt = goals.KANBAN_GOAL_FINALIZE_TEMPLATE
+    assert "reviewDecision is REVIEW_REQUIRED" in finalize_prompt
+    assert 'kanban_block(kind="needs_input", reason=...)' in finalize_prompt
+
 
 def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
     # Judge says done, but worker never terminated → one finalize nudge,
