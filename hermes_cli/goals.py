@@ -1644,11 +1644,10 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "Take the next concrete step toward completing the task. When the work "
     "is genuinely finished, call kanban_complete with a summary. If you are "
     "blocked and need human input, call kanban_block with a reason. If a PR "
-    "is CLEAN with green CI and no unresolved review threads but reviewDecision "
-    "is none, its only remaining gate is human approval: you cannot obtain it, "
-    "so call kanban_block "
-    "instead of consuming another continuation. Do not stop without calling "
-    "one of them."
+    "is CLEAN with green CI and no unresolved review threads, and reviewDecision "
+    "is REVIEW_REQUIRED, its only remaining gate is human approval: you cannot "
+    "obtain it, so call kanban_block(kind=\"needs_input\", reason=...) instead "
+    "of consuming another continuation. Do not stop without calling one of them."
 )
 
 # Fed when the judge believes the work is done but the worker never called

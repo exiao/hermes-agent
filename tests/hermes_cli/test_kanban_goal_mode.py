@@ -406,9 +406,10 @@ def test_kanban_goal_continuation_escalates_unobtainable_human_review():
     """A worker must hand off a human-only PR gate instead of consuming turns."""
     prompt = goals.KANBAN_GOAL_CONTINUATION_TEMPLATE
 
-    assert "reviewDecision is none" in prompt
+    assert "reviewDecision is REVIEW_REQUIRED" in prompt
+    assert "reviewDecision is none" not in prompt
     assert "no unresolved review threads" in prompt
-    assert "kanban_block" in prompt
+    assert 'kanban_block(kind="needs_input", reason=...)' in prompt
 
 
 def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
