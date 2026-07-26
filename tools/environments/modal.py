@@ -42,8 +42,8 @@ _MODAL_PGID_DIR = "/tmp/.hermes-pgid"
 _MODAL_CANCEL_GRACE_SECONDS = 5
 # Headroom on the SDK exec deadline so the LOCAL deadline in
 # _wait_for_process always fires first and cancellation runs. If Modal's
-# deadline won, it would kill the outer bash while the setsid'd command kept
-# running, and no group cancellation would ever be issued.
+# deadline won, it would kill the outer bash while the backgrounded command
+# kept running, and no group cancellation would ever be issued.
 _MODAL_EXEC_TIMEOUT_HEADROOM = 15
 
 
