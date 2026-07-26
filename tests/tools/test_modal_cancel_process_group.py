@@ -137,6 +137,18 @@ def test_wrapper_refuses_to_start_when_already_cancelled():
     assert 'kill -TERM -"$__hermes_pgid"' in wrapped
 
 
+def test_late_marker_branch_escalates_to_sigkill():
+    """That branch is the ONLY cancellation path when it fires.
+
+    cancel() found no pid file in that window and exited, so a TERM-only
+    branch would let a TERM-ignoring command survive in wait().
+    """
+    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
+
+    assert f"seq 1 {_MODAL_CANCEL_GRACE_SECONDS}" in wrapped
+    assert 'kill -KILL -"$__hermes_pgid"' in wrapped
+
+
 
 def test_wrapper_honors_login_shell():
     wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x", login=True)

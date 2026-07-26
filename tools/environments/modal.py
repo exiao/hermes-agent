@@ -80,9 +80,15 @@ def _wrap_for_group_cancel(cmd_string: str, pid_file: str, *, login: bool = Fals
         # Job control: the background job leads a new group, and $! IS its pgid.
         f"set -m; bash {flags} {quoted} & __hermes_pgid=$!; "
         f"echo $__hermes_pgid > {pid_file}; "
-        # Cancelled while we were starting: honour the marker now.
+        # Cancelled while we were starting: honour the marker now. cancel()
+        # read no pid file in that window, so this is the ONLY cancellation
+        # path for this command; escalate to SIGKILL like cancel() would,
+        # otherwise a TERM-ignoring command survives in wait().
         f"if [ -e {cancel_file} ]; then "
-        f'kill -TERM -"$__hermes_pgid" 2>/dev/null; fi; '
+        f'kill -TERM -"$__hermes_pgid" 2>/dev/null; '
+        f"for _ in $(seq 1 {_MODAL_CANCEL_GRACE_SECONDS}); do "
+        f'kill -0 -"$__hermes_pgid" 2>/dev/null || break; sleep 1; done; '
+        f'kill -KILL -"$__hermes_pgid" 2>/dev/null; fi; '
         f"wait $__hermes_pgid; __hermes_rc=$?; "
         f"rm -f {pid_file} {cancel_file} 2>/dev/null; exit $__hermes_rc"
     )
@@ -513,7 +519,7 @@ class ModalEnvironment(BaseEnvironment):
                 # Give the SDK's own deadline headroom over the local one in
                 # _wait_for_process, which is exactly `timeout`. If Modal fired
                 # first it would kill the outer bash while the real command,
-                # now a background child in its own setsid session, kept
+                # now a background job in its own process group, kept
                 # running: the handle would report completion and cancel()
                 # would never be invoked to reap the group. The local deadline
                 # must always win so cancellation is what stops a command.
