@@ -93,87 +93,49 @@ def _env_with_fakes():
 
 
 def test_wrapper_runs_command_in_its_own_process_group():
-    """setsid gives the command a process group cancel() can signal."""
+    """Job control gives the command a process group cancel() can signal."""
     wrapped = _wrap_for_group_cancel("echo hi", "/tmp/.hermes-pgid/abc")
 
-    assert "setsid" in wrapped
+    assert "set -m" in wrapped
     assert shlex.quote("echo hi") in wrapped
-    # setsid makes that shell the group leader, so its $$ IS the pgid: publish
-    # it from inside rather than guessing $! before setsid(2) has run
-    assert "echo G:$$ > /tmp/.hermes-pgid/abc" in wrapped
+    # under `set -m` the backgrounded job leads a new group whose id IS $!,
+    # so the pid recorded for cancel() is a valid group target immediately
+    assert "echo $__hermes_pgid > /tmp/.hermes-pgid/abc" in wrapped
 
 
-def test_group_id_is_not_published_from_the_parents_bang_pid():
-    """$! names the forked process before setsid(2) creates the group.
+def test_group_id_needs_no_external_binaries_or_publication_window():
+    """setsid/ps derivations added a window where the pgid was not yet valid.
 
-    Publishing G:$! would let a cancel in that window signal a group that does
-    not exist yet (ESRCH) and leave the command running.
+    Job control assigns the group at fork, so there is no window and no
+    dependency on binaries that a slim image may not ship.
     """
     wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
 
-    assert "echo G:$__hermes_pid" not in wrapped
-
-
-def test_publication_needs_no_external_binaries():
-    """Deriving the pgid via ps/tr breaks on images without procps.
-
-    A failed substitution there wrote a target-less "G:", which cancel()
-    resolved to "-" and signalled nothing, so the command survived. $$ inside
-    the setsid'd shell is the pgid by definition and needs no binaries.
-    """
-    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
-
+    assert "setsid" not in wrapped
     assert "ps -o pgid=" not in wrapped
-    assert "tr -d" not in wrapped
+
+
 
 
 def test_wrapper_propagates_the_real_exit_code():
     """A wrapped command must not mask the command's own status."""
     wrapped = _wrap_for_group_cancel("false", "/tmp/x")
 
-    assert "wait $__hermes_pid" in wrapped
+    assert "wait $__hermes_pgid" in wrapped
     assert "exit $__hermes_rc" in wrapped
 
 
-def test_wrapper_falls_back_when_setsid_is_absent():
-    """No setsid still runs the command rather than failing the exec."""
-    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
-
-    assert "command -v setsid" in wrapped
-    assert "else bash -c" in wrapped
-
-
-def test_fallback_records_a_pid_target_not_a_group_target():
-    """Without setsid the child shares our group; -pid would hit nothing.
-
-    Signalling -<pid> in the fallback targets a process group that does not
-    exist (ESRCH), silently leaving the command running on every cancel.
-    """
-    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
-
-    assert "echo P:$__hermes_pid > /tmp/x" in wrapped
 
 
 def test_wrapper_refuses_to_start_when_already_cancelled():
     """A cancel that lands while the exec is queued must not be lost."""
     wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
 
-    # checked before launching...
-    assert "if [ -e /tmp/x.cancel ]; then rm -f /tmp/x.cancel" in wrapped
-    assert f"exit {128 + 15}" in wrapped
+    # refuses to launch when the marker is already there...
+    assert f"if [ -e /tmp/x.cancel ]; then exit {128 + 15}; fi" in wrapped
+    # ...and honours a marker that appears while the job was starting
+    assert 'kill -TERM -"$__hermes_pgid"' in wrapped
 
-
-def test_wrapper_kills_the_child_when_cancel_races_publication():
-    """Cancel landing after fork but before the pgid is published still kills.
-
-    The child pid is valid the moment fork returns, unlike the group, so the
-    post-launch marker check signals it directly and escalates.
-    """
-    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
-
-    assert 'kill -TERM "$__hermes_pid"' in wrapped
-    assert f"seq 1 {_MODAL_CANCEL_GRACE_SECONDS}" in wrapped
-    assert 'kill -KILL "$__hermes_pid"' in wrapped
 
 
 def test_wrapper_honors_login_shell():
@@ -208,7 +170,7 @@ def test_pgid_files_live_outside_synced_and_snapshotted_paths():
 
 def _cancel_scripts(env):
     """The cancel execs, found by content (exec order is thread-dependent)."""
-    return [c for c in env._sandbox.commands if "rec=$(cat " in c]
+    return [c for c in env._sandbox.commands if "pgid=$(cat " in c]
 
 
 def _cancel_script(env):
@@ -226,24 +188,10 @@ def test_cancel_signals_the_process_group_and_spares_the_sandbox():
 
     assert env._sandbox.terminated is False, "cancel tore down the sandbox"
     cancel_script = _cancel_script(env)
-    # resolves the recorded tag into a group (-pid) or bare-pid target
-    assert "G:*) target=-${rec#G:}" in cancel_script
-    assert "P:*) target=${rec#P:}" in cancel_script
-    assert 'kill -TERM "$target"' in cancel_script
-    assert 'kill -KILL "$target"' in cancel_script
+    # signals the GROUP (-pgid), reaching every descendant
+    assert 'kill -TERM -"$pgid"' in cancel_script
+    assert 'kill -KILL -"$pgid"' in cancel_script
 
-
-def test_cancel_waits_for_a_late_published_pid():
-    """A missing pid file means "not yet", not "nothing to kill"."""
-    env = _env_with_fakes()
-
-    handle = env._run_bash("sleep 300")
-    handle.kill()
-
-    script = _cancel_script(env)
-    # retries the read instead of bailing on the first miss
-    assert f"for _ in $(seq 1 {_MODAL_CANCEL_GRACE_SECONDS}); do" in script
-    assert "rec=$(cat " in script
 
 
 def test_cancel_marks_before_reading_so_a_queued_command_still_dies():
@@ -255,7 +203,7 @@ def test_cancel_marks_before_reading_so_a_queued_command_still_dies():
 
     script = _cancel_script(env)
     marker = script.index("touch ")
-    read = script.index("rec=$(cat ")
+    read = script.index("pgid=$(cat ")
     assert marker < read, "cancel read the pid file before marking the intent"
 
 
@@ -268,8 +216,8 @@ def test_cancel_escalates_to_sigkill_after_a_grace_period():
 
     script = _cancel_script(env)
     assert f"seq 1 {_MODAL_CANCEL_GRACE_SECONDS}" in script
-    # stops escalating early once the target is gone
-    assert 'kill -0 "$target"' in script
+    # stops escalating early once the group is gone
+    assert 'kill -0 -"$pgid"' in script
 
 
 def test_cancel_is_a_noop_when_the_command_already_finished():
@@ -305,7 +253,7 @@ def test_sdk_exec_deadline_has_headroom_over_the_local_deadline():
 
     _wait_for_process kills at exactly `timeout`. If the SDK's exec deadline
     were also `timeout`, Modal could reap the outer bash first while the real
-    command, a background child in its own setsid session, kept running: the
+    command, a background job in its own process group, kept running: the
     handle would report completion and cancel() would never reap the group.
     """
     env = _env_with_fakes()
