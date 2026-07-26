@@ -346,12 +346,14 @@ def _compute_task_diagnostics(
         status_ph = ",".join(["?"] * len(terminal))
         reinclude_ph = ",".join(["?"] * len(reinclude))
         kind_ph = ",".join(["?"] * len(_WARNING_EVENT_KINDS))
+        sqlite_int_max = (1 << 63) - 1
         try:
             block_cycle_threshold = kd._positive_int(
                 diag_config.get("block_cycle_threshold"), 3,
             )
         except OverflowError:
             block_cycle_threshold = 3
+        block_cycle_threshold = min(block_cycle_threshold, sqlite_int_max)
         try:
             block_cycle_window_seconds = float(
                 diag_config.get("block_cycle_window_seconds", 24 * 3600),
@@ -360,8 +362,12 @@ def _compute_task_diagnostics(
             block_cycle_window_seconds = 24 * 3600
         if not math.isfinite(block_cycle_window_seconds):
             block_cycle_window_seconds = 24 * 3600
-        block_cycle_cutoff = int(
-            time.time() - block_cycle_window_seconds,
+        # Clamp the bound value before SQLite binding. A huge finite YAML value
+        # like 1e100 means "look back forever" for unix timestamps, so 0 is the
+        # safe all-history lower bound and avoids INTEGER overflow.
+        block_cycle_cutoff = max(
+            0,
+            int(time.time() - min(block_cycle_window_seconds, sqlite_int_max)),
         )
         rows = conn.execute(
             f"SELECT * FROM tasks WHERE status NOT IN ({status_ph}) "

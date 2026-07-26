@@ -257,7 +257,9 @@ def test_board_load_handles_invalid_block_cycle_config(tmp_path, monkeypatch):
     cases = (
         {"block_cycle_window_seconds": None},
         {"block_cycle_window_seconds": "inf"},
+        {"block_cycle_window_seconds": 1e100},
         {"block_cycle_threshold": float("inf")},
+        {"block_cycle_threshold": 10**100},
     )
     for idx, diagnostics_config in enumerate(cases):
         monkeypatch.setattr(
