@@ -555,7 +555,13 @@ class ModalEnvironment(BaseEnvironment):
                     execution_started = True
                     pending_cancel = cancel_requested
                 if pending_cancel and _claim_cancel_dispatch():
-                    await _do_cancel()
+                    try:
+                        await _do_cancel()
+                    except Exception as exc:
+                        # Match the post-start cancellation path: a transient
+                        # cancellation transport failure must not prevent this
+                        # handle from draining and waiting for its target.
+                        logger.warning("Modal: could not cancel remote command: %s", exc)
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
                 exit_code = await process.wait.aio()

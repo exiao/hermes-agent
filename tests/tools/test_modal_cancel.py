@@ -301,6 +301,35 @@ def test_execute_cancels_after_delayed_modal_exec_startup():
     assert result["returncode"] == 143
 
 
+def test_execute_drains_target_when_pending_cancel_replay_fails():
+    """A replay transport error must not replace the target's result with 1."""
+    class _FailingReplaySandbox(_StartupBlockingSandbox):
+        async def exec_aio(self, *args, **kwargs):
+            if modal_env._CANCEL_SCRIPT in args:
+                self.cancel_after_target_start = self.target_returned.is_set()
+                raise RuntimeError("cancel transport down")
+            return await super().exec_aio(*args, **kwargs)
+
+    sandbox = _FailingReplaySandbox()
+    env = _make_env(sandbox)
+    BaseEnvironment.__init__(env, cwd="/root", timeout=5)
+    env._before_execute = lambda: None
+
+    def wait_then_cancel(handle, *, timeout, bounded_capture):
+        assert sandbox.target_starting.wait(2), "target exec never entered startup"
+        handle.kill()
+        sandbox.release_target.set()
+        handle.wait(timeout=2)
+        return {"output": handle.stdout.read(), "returncode": handle.returncode}
+
+    env._wait_for_process = wait_then_cancel
+
+    result = env.execute("sleep 300")
+
+    assert sandbox.cancel_after_target_start
+    assert result["returncode"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Live E2E — real Modal sandboxes, real cancellation.
 # ---------------------------------------------------------------------------
