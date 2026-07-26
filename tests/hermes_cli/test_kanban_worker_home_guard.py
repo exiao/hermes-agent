@@ -121,6 +121,35 @@ def test_named_profile_worker_ignores_bare_scratch_hermes_home(
     )
 
 
+def test_unprovisioned_profile_does_not_leak_stray_home(monkeypatch, tmp_path):
+    """An unknown profile must drop the stray home, not inherit it.
+
+    ``resolve_profile_env`` raises ``FileNotFoundError`` when the profile dir
+    does not exist (the common case on a fresh CI runner). ``env`` was seeded
+    from ``dict(os.environ)``, so the except branch must actively remove the
+    rejected home rather than leaving the inherited value in place — otherwise
+    the leak survives exactly where profiles are not provisioned.
+    """
+    from hermes_cli import kanban_db as kb
+
+    stray = tmp_path / "e2ehome-stray"
+    stray.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(stray))
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(
+        kb, monkeypatch, str(workspace), assignee="no-such-profile-xyz",
+    )
+
+    child_home = captured["env"].get("HERMES_HOME", "")
+    assert str(stray) not in child_home, (
+        "worker for an unprovisioned profile inherited the stray ambient "
+        f"HERMES_HOME ({child_home!r})"
+    )
+
+
 def test_relocated_home_with_config_is_still_honored(monkeypatch, tmp_path):
     """A REAL relocated home (Docker/custom) must keep working.
 

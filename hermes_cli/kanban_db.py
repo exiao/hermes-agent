@@ -10353,7 +10353,13 @@ def _default_spawn(
         # _apply_profile_override() via HERMES_PROFILE (set below).
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
-        pass
+        #
+        # A stray ambient home must not survive this path: `env` was seeded
+        # from dict(os.environ), so leaving it alone would hand the child the
+        # very value we just rejected. Drop it and let the child fall back to
+        # its platform default home.
+        if _stray_home is not None:
+            env.pop("HERMES_HOME", None)
     finally:
         if _stray_home is not None:
             os.environ["HERMES_HOME"] = _stray_home
