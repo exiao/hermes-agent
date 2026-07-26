@@ -8,6 +8,7 @@ unless Modal credentials and the SDK are present.
 import asyncio
 import os
 import shlex
+import subprocess
 import threading
 
 import pytest
@@ -46,6 +47,16 @@ def test_pidfile_write_cannot_break_the_command():
     """A read-only /tmp must not turn every command into a failure."""
     tagged = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
     assert "|| true" in tagged.split("echo hi")[0]
+
+
+def test_cancellable_command_cleans_pidfile_and_preserves_exit_status(tmp_path):
+    pidfile = tmp_path / "command.pid"
+    tagged = modal_env._cancellable_command("exit 37", str(pidfile))
+
+    result = subprocess.run(["bash", "-c", tagged], capture_output=True, text=True)
+
+    assert result.returncode == 37
+    assert not pidfile.exists()
 
 
 class _Reader:

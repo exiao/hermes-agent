@@ -109,9 +109,11 @@ def _cancellable_command(cmd_string: str, pidfile: str) -> str:
     command, hence the ``|| true``.
     """
     quoted = shlex.quote(pidfile)
+    cleanup = shlex.quote(f"rm -f {quoted} 2>/dev/null")
     return (
         f"mkdir -p {shlex.quote(_CANCEL_DIR)} 2>/dev/null; "
         f"echo $$ > {quoted} 2>/dev/null || true; "
+        f"trap {cleanup} EXIT; "
         f"{cmd_string}"
     )
 
