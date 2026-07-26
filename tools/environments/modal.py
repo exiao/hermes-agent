@@ -7,6 +7,7 @@ wrapper, while preserving Hermes' persistent snapshot behavior across sessions.
 import asyncio
 import base64
 import io
+import itertools
 import logging
 import shlex
 import tarfile
@@ -33,6 +34,67 @@ logger = logging.getLogger(__name__)
 
 _SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
 _DIRECT_SNAPSHOT_NAMESPACE = "direct"
+
+# Cancellation
+# ------------
+# Modal's ``ContainerProcess`` exposes only poll/wait/stdout/stderr — there is
+# no kill. The obvious workaround, ``sandbox.terminate()``, cancels the command
+# by destroying the entire sandbox: ``poll()`` then returns an exit code and
+# every later ``exec`` raises ``NotFoundError``, so one interrupted command
+# bricks the session (measured against modal==1.3.4).
+#
+# The sandbox itself, however, still accepts ``exec``. So we cancel a command
+# the way a shell would: tag it with a unique token in its environment, then
+# run a second exec that signals the tagged process group. The sandbox, its
+# filesystem, and every other running command survive.
+_CANCEL_TOKEN_ENV = "HERMES_CANCEL_TOKEN"
+_CANCEL_TIMEOUT_SECONDS = 20
+_cancel_token_counter = itertools.count()
+
+# Matches the token against each process's own environment block, so it can
+# never signal an untagged process. ``$$`` (this shell) and its parent are
+# skipped because the wrapper below exports nothing, but a stray inherited
+# value would otherwise make the canceller kill itself. TERM first so the
+# command can run traps, then KILL for anything that ignored it.
+_CANCEL_SCRIPT = r"""
+token="$1"
+self=$$
+killed=0
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  [ "$pid" = "$self" ] || [ "$pid" = "$PPID" ] || {
+    if tr '\0' '\n' < "$d/environ" 2>/dev/null | grep -qx "HERMES_CANCEL_TOKEN=$token"; then
+      pgid=$(cut -d' ' -f5 "$d/stat" 2>/dev/null)
+      if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
+        kill -TERM -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+      else
+        kill -TERM "$pid" 2>/dev/null
+      fi
+      killed=$((killed+1))
+    fi
+  }
+done
+[ "$killed" = "0" ] && { echo "cancelled=0"; exit 0; }
+sleep 0.3
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  [ "$pid" = "$self" ] || [ "$pid" = "$PPID" ] || {
+    if tr '\0' '\n' < "$d/environ" 2>/dev/null | grep -qx "HERMES_CANCEL_TOKEN=$token"; then
+      kill -KILL "$pid" 2>/dev/null
+    fi
+  }
+done
+echo "cancelled=$killed"
+"""
+
+
+def _cancellable_command(cmd_string: str, token: str) -> str:
+    """Tag ``cmd_string`` so ``_CANCEL_SCRIPT`` can find it by token.
+
+    The export is inherited by every descendant, so signalling the tagged
+    process group reaches the whole command tree, not just the outer bash.
+    """
+    return f"export {_CANCEL_TOKEN_ENV}={shlex.quote(token)}; {cmd_string}"
 
 
 def _load_snapshots() -> dict:
@@ -165,7 +227,8 @@ class ModalEnvironment(BaseEnvironment):
     """Modal cloud execution via native Modal sandboxes.
 
     Spawn-per-call via _ThreadedProcessHandle wrapping async SDK calls.
-    cancel_fn wired to sandbox.terminate for interrupt support.
+    cancel_fn signals the running command by token (see _CANCEL_SCRIPT) so an
+    interrupt or timeout never destroys the sandbox.
     """
 
     _stdin_mode = "heredoc"
@@ -411,17 +474,42 @@ class ModalEnvironment(BaseEnvironment):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
         sandbox = self._sandbox
         worker = self._worker
+        token = f"hermes-{id(self):x}-{next(_cancel_token_counter)}"
+        tagged_command = _cancellable_command(cmd_string, token)
 
         def cancel():
-            worker.run_coroutine(sandbox.terminate.aio(), timeout=15)
+            """Signal only this command, leaving the sandbox usable.
+
+            Previously this called ``sandbox.terminate()``, which cancelled the
+            command by destroying the session: every subsequent command in the
+            same environment then failed with an empty exit 1 forever. Killing
+            by token keeps the sandbox, its filesystem, and any concurrently
+            running command intact.
+            """
+            if sandbox is None:
+                return
+            try:
+                async def _do_cancel():
+                    proc = await sandbox.exec.aio(
+                        "bash", "-c", _CANCEL_SCRIPT, "--", token,
+                        timeout=_CANCEL_TIMEOUT_SECONDS,
+                    )
+                    return await proc.wait.aio()
+
+                worker.run_coroutine(_do_cancel(), timeout=_CANCEL_TIMEOUT_SECONDS + 10)
+            except Exception as exc:
+                # Best-effort: the caller has already stopped waiting on this
+                # command. Leaving a stray process behind is strictly better
+                # than tearing down a live sandbox.
+                logger.warning("Modal: could not cancel remote command: %s", exc)
 
         def exec_fn() -> tuple[str, int]:
             async def _do():
                 args = ["bash"]
                 if login:
-                    args.extend(["-l", "-c", cmd_string])
+                    args.extend(["-l", "-c", tagged_command])
                 else:
-                    args.extend(["-c", cmd_string])
+                    args.extend(["-c", tagged_command])
                 process = await sandbox.exec.aio(*args, timeout=timeout)
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
