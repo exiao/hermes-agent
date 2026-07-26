@@ -59,8 +59,12 @@ _CANCEL_TIMEOUT_SECONDS = 20
 _cancel_id_counter = itertools.count()
 
 # TERM the process group first so the command can run traps, then KILL
-# whatever ignored it. A missing/stale PID file is a no-op, never an error:
-# by the time cancel runs the command may already have exited.
+# whatever ignored it. The KILL escalation is NOT conditional on the recorded
+# PID still existing: a descendant that traps TERM outlives the wrapper bash,
+# so gating on ``/proc/$pid`` would skip the escalation and leak it (measured:
+# a trapping child survived the guarded version and died under this one).
+# A missing/stale PID file is a no-op, never an error: by the time cancel runs
+# the command may already have exited.
 _CANCEL_SCRIPT = r"""
 pidfile="$1"
 [ -f "$pidfile" ] || { echo "cancelled=0"; exit 0; }
@@ -68,15 +72,17 @@ pid=$(cat "$pidfile" 2>/dev/null)
 rm -f "$pidfile" 2>/dev/null
 [ -n "$pid" ] && [ -d "/proc/$pid" ] || { echo "cancelled=0"; exit 0; }
 pgid=$(cut -d' ' -f5 "/proc/$pid/stat" 2>/dev/null)
-if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
-  kill -TERM -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+[ -n "$pgid" ] && [ "$pgid" != "0" ] || pgid=""
+if [ -n "$pgid" ]; then
+  kill -TERM -"$pgid" 2>/dev/null || true
 else
-  kill -TERM "$pid" 2>/dev/null
+  kill -TERM "$pid" 2>/dev/null || true
 fi
 sleep 0.3
-if [ -d "/proc/$pid" ]; then
-  kill -KILL -"$pgid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+if [ -n "$pgid" ]; then
+  kill -KILL -"$pgid" 2>/dev/null || true
 fi
+[ -d "/proc/$pid" ] && kill -KILL "$pid" 2>/dev/null
 echo "cancelled=1"
 """
 
