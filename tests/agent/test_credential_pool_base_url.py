@@ -88,6 +88,7 @@ def test_swap_credential_prefers_configured_proxy_over_entry_base_url(tmp_path, 
     agent = AIAgent.__new__(AIAgent)
     agent.api_mode = "anthropic_messages"
     agent.provider = "anthropic"
+    agent.model = "claude-sonnet-4-5"
     agent.base_url = "http://127.0.0.1:18801"
     agent.api_key = "old-key"
     agent._anthropic_api_key = "old-key"
@@ -132,6 +133,7 @@ def test_swap_credential_uses_entry_url_when_no_user_override(tmp_path, monkeypa
     agent = AIAgent.__new__(AIAgent)
     agent.api_mode = "anthropic_messages"
     agent.provider = "anthropic"
+    agent.model = "claude-sonnet-4-5"
     agent.base_url = "https://api.anthropic.com"
     agent.api_key = "old-key"
     agent._anthropic_api_key = "old-key"

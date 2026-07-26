@@ -339,7 +339,6 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
 # profiles). New providers should set default_aux_model on their profile instead.
 _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "gemini": "gemini-3-flash-preview",
-    "google-gemini-cli": "gemini-3.1-flash-lite-preview",
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
     "stepfun": "step-3.5-flash",
@@ -3754,36 +3753,6 @@ def _resolve_auto(
 # below — never look up auth env vars ad-hoc.
 
 
-class _AsyncGeminiCloudCodeCompletions:
-    """Async facade over GeminiCloudCodeClient's sync completion method."""
-
-    def __init__(self, sync_completions):
-        self._sync_completions = sync_completions
-
-    async def create(self, **kwargs: Any) -> Any:
-        return await asyncio.to_thread(self._sync_completions.create, **kwargs)
-
-
-class _AsyncGeminiCloudCodeChat:
-    def __init__(self, sync_chat):
-        self.completions = _AsyncGeminiCloudCodeCompletions(sync_chat.completions)
-
-
-class AsyncGeminiCloudCodeAuxiliaryClient:
-    """Async-compatible wrapper for google-gemini-cli auxiliary calls."""
-
-    def __init__(self, sync_client):
-        self._sync_client = sync_client
-        self.api_key = getattr(sync_client, "api_key", "google-oauth")
-        self.base_url = getattr(sync_client, "base_url", "cloudcode-pa://google")
-        self.chat = _AsyncGeminiCloudCodeChat(sync_client.chat)
-
-    def close(self) -> None:
-        close = getattr(self._sync_client, "close", None)
-        if close:
-            close()
-
-
 def _to_async_client(sync_client, model: str, is_vision: bool = False):
     """Convert a sync client to its async counterpart, preserving Codex routing.
 
@@ -3803,13 +3772,6 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
 
         if isinstance(sync_client, GeminiNativeClient):
             return AsyncGeminiNativeClient(sync_client), model
-    except ImportError:
-        pass
-    try:
-        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
-
-        if isinstance(sync_client, GeminiCloudCodeClient):
-            return AsyncGeminiCloudCodeAuxiliaryClient(sync_client), model
     except ImportError:
         pass
     try:
@@ -4531,39 +4493,6 @@ def resolve_provider_client(
             return resolve_provider_client("nous", model, async_mode)
         if provider == "openai-codex":
             return resolve_provider_client("openai-codex", model, async_mode)
-        if provider == "google-gemini-cli":
-            try:
-                from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials
-                from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
-            except ImportError as exc:
-                logger.warning(
-                    "resolve_provider_client: google-gemini-cli requested but "
-                    "Gemini Cloud Code support is unavailable: %s", exc)
-                return None, None
-            try:
-                creds = resolve_gemini_oauth_runtime_credentials()
-            except Exception as exc:
-                logger.warning(
-                    "resolve_provider_client: google-gemini-cli requested but "
-                    "OAuth credentials are unavailable: %s", exc)
-                return None, None
-            api_key = str(creds.get("api_key", "")).strip()
-            base_url = str(creds.get("base_url", "")).strip() or "cloudcode-pa://google"
-            if not api_key:
-                logger.warning(
-                    "resolve_provider_client: google-gemini-cli requested but "
-                    "OAuth access token is empty (run: hermes login --provider google-gemini-cli)")
-                return None, None
-            final_model = _normalize_resolved_model(
-                model or _get_aux_model_for_provider(provider), provider)
-            client = GeminiCloudCodeClient(
-                api_key=api_key,
-                base_url=base_url,
-                project_id=str(creds.get("project_id", "") or ""),
-            )
-            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
-                    else (client, final_model))
         if provider == "xai-oauth":
             return resolve_provider_client("xai-oauth", model, async_mode)
         # Other OAuth providers not directly supported
