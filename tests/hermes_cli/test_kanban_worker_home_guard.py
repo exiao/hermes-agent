@@ -1,13 +1,9 @@
-"""Tests: kanban worker spawn preserves valid homes and pins board context.
+"""Regression coverage for worker home and shared-board spawn pins.
 
-A child environment begins as ``dict(os.environ)``, so a nested dispatcher can
-carry stale kanban-path pins. The dispatcher must derive fresh child pins from
-the accepted worker home. An explicit ``HERMES_HOME`` remains valid even for a
-fresh Docker/custom root containing only ``.env``, ``kanban.db``, or other state.
-
-An explicit ``HERMES_KANBAN_HOME`` is the stronger task-dispatch context. It
-wins over an ambient home inherited from another gateway request or test without
-mutating the gateway process's ``os.environ``.
+``HERMES_HOME`` is the worker profile root and can be a deliberate custom path
+without config.yaml or a profiles tree. ``HERMES_KANBAN_HOME`` and the per-path
+Kanban overrides are independent shared-board locations. Worker spawning must
+preserve both scopes without mutating the gateway process environment.
 """
 
 from __future__ import annotations
@@ -56,130 +52,95 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str, *, assignee: str) -> dic
     return captured
 
 
-def test_default_profile_worker_uses_explicit_board_home_over_ambient_home(
-    monkeypatch, tmp_path,
-):
-    """An explicit board root must beat a stray ambient HERMES_HOME."""
-    from hermes_cli import kanban_db as kb
-
-    stray = tmp_path / "e2ehome-stray"
-    stray.mkdir()
-    board_home = tmp_path / "dispatcher-home"
-    board_home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(stray))
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
-
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-
-    captured = _capture_spawn_env(
-        kb, monkeypatch, str(workspace), assignee="default",
-    )
-
-    assert captured["env"]["HERMES_HOME"] == str(board_home)
-    assert captured["env"]["HERMES_KANBAN_DB"] == str(board_home / "kanban.db")
-    assert os.environ["HERMES_HOME"] == str(stray)
-
-def test_named_profile_worker_uses_explicit_board_home_over_ambient_home(
-    monkeypatch, tmp_path,
-):
-    """An explicit board root also anchors a named-profile worker."""
-    from hermes_cli import kanban_db as kb
-
-    stray = tmp_path / "e2ehome-stray"
-    stray.mkdir()
-    board_home = tmp_path / "dispatcher-home"
-    (board_home / "profiles" / "dev").mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(stray))
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
-
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-
-    captured = _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="dev")
-
-    assert captured["env"]["HERMES_HOME"] == str(board_home / "profiles" / "dev")
-
-def test_unprovisioned_profile_keeps_explicit_board_home(monkeypatch, tmp_path):
-    """An unknown profile retains the board root for consistent child context."""
-    from hermes_cli import kanban_db as kb
-
-    stray = tmp_path / "e2ehome-stray"
-    stray.mkdir()
-    board_home = tmp_path / "dispatcher-home"
-    board_home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(stray))
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
-
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-
-    captured = _capture_spawn_env(
-        kb, monkeypatch, str(workspace), assignee="no-such-profile-xyz",
-    )
-
-    assert captured["env"]["HERMES_HOME"] == str(board_home)
-
-def test_relocated_home_with_config_is_still_honored(monkeypatch, tmp_path):
-    """A REAL relocated home (Docker/custom) must keep working.
-
-    The guard must only reject bare scratch dirs. A home carrying a
-    ``config.yaml`` is a deliberate deployment choice, not a leak, and
-    dropping it would break Docker and custom installs.
-    """
-    from hermes_cli import kanban_db as kb
-
-    real_home = tmp_path / "opt-data"
-    (real_home / "profiles" / "dev").mkdir(parents=True)
-    (real_home / "config.yaml").write_text("agent:\n  interface: tui\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(real_home))
-
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-
-    captured = _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="dev")
-
-    assert captured["env"]["HERMES_HOME"] == str(real_home / "profiles" / "dev"), (
-        "a legitimate relocated home must still resolve its profiles"
-    )
-
-
-def test_relocated_configless_home_is_still_honored(monkeypatch, tmp_path):
+def test_default_worker_preserves_configless_custom_home(monkeypatch, tmp_path):
     """A custom root with only state files is still an explicit deployment root."""
     from hermes_cli import kanban_db as kb
 
-    real_home = tmp_path / "opt-data"
-    real_home.mkdir()
-    (real_home / "kanban.db").touch()
-    monkeypatch.setenv("HERMES_HOME", str(real_home))
-
+    home = tmp_path / "opt-data"
+    home.mkdir()
+    (home / "kanban.db").touch()
+    monkeypatch.setenv("HERMES_HOME", str(home))
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="default")
 
-    assert captured["env"]["HERMES_HOME"] == str(real_home)
-    assert captured["env"]["HERMES_KANBAN_DB"] == str(real_home / "kanban.db")
+    assert captured["env"]["HERMES_HOME"] == str(home)
+    assert captured["env"]["HERMES_KANBAN_DB"] == str(home / "kanban.db")
 
 
-def test_spawn_replaces_inherited_kanban_path_pins(monkeypatch, tmp_path):
-    """Stale child pins cannot redirect a new worker away from its home."""
+def test_named_worker_keeps_profile_home_separate_from_board_home(
+    monkeypatch, tmp_path,
+):
+    """A shared board location must not replace the worker profile's home."""
     from hermes_cli import kanban_db as kb
 
-    real_home = tmp_path / "real-home"
-    real_home.mkdir()
-    foreign_db = tmp_path / "foreign" / "kanban.db"
-    foreign_workspaces = tmp_path / "foreign" / "workspaces"
-    monkeypatch.setenv("HERMES_HOME", str(real_home))
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(foreign_db))
-    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(foreign_workspaces))
+    profile_root = tmp_path / "profile-root"
+    (profile_root / "profiles" / "dev").mkdir(parents=True)
+    board_home = tmp_path / "shared-board"
+    board_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_root))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
 
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="dev")
+
+    assert captured["env"]["HERMES_HOME"] == str(profile_root / "profiles" / "dev")
+    assert captured["env"]["HERMES_KANBAN_DB"] == str(board_home / "kanban.db")
+
+
+def test_default_worker_keeps_profile_home_separate_from_board_home(
+    monkeypatch, tmp_path,
+):
+    """The same separation applies to the default profile."""
+    from hermes_cli import kanban_db as kb
+
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
+    board_home = tmp_path / "shared-board"
+    board_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="default")
 
-    assert captured["env"]["HERMES_KANBAN_DB"] == str(real_home / "kanban.db")
-    assert captured["env"]["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
-        real_home / "kanban" / "workspaces"
-    )
+    assert captured["env"]["HERMES_HOME"] == str(profile_home)
+    assert captured["env"]["HERMES_KANBAN_DB"] == str(board_home / "kanban.db")
+
+
+def test_spawn_preserves_explicit_per_path_board_overrides(monkeypatch, tmp_path):
+    """The dispatcher's highest-precedence DB/workspace pins reach the child."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / "profile-home"
+    home.mkdir()
+    board_db = tmp_path / "external-board" / "kanban.db"
+    board_workspaces = tmp_path / "external-board" / "workspaces"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board_db))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(board_workspaces))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="default")
+
+    assert captured["env"]["HERMES_KANBAN_DB"] == str(board_db)
+    assert captured["env"]["HERMES_KANBAN_WORKSPACES_ROOT"] == str(board_workspaces)
+
+
+def test_spawn_never_mutates_gateway_hermes_home(monkeypatch, tmp_path):
+    """Worker derivation cannot race concurrent gateway users of os.environ."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / "profile-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    _capture_spawn_env(kb, monkeypatch, str(workspace), assignee="default")
+
+    assert os.environ["HERMES_HOME"] == str(home)
