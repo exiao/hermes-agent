@@ -68,6 +68,96 @@ def test_modal_delete_batches_command_arguments_under_limit():
     assert len(batches) > 1
 
 
+class TestModalDeleteFailurePropagation:
+    """`FileSyncManager.sync()` is transactional: it commits the deletion set
+    and stops replaying it only when the delete callback returns WITHOUT
+    raising. So `_modal_delete` must surface remote failures, and must not let
+    one aggregate deadline cover every batch.
+    """
+
+    @staticmethod
+    def _env(exit_codes, record):
+        """A ModalEnvironment stub whose exec returns the given exit codes."""
+        import asyncio
+        import threading
+        from types import SimpleNamespace
+        from tools.environments.modal import ModalEnvironment
+
+        codes = list(exit_codes)
+
+        def _make_proc(code):
+            async def _wait():
+                return code
+
+            async def _read():
+                return "permission denied"
+
+            return SimpleNamespace(
+                wait=SimpleNamespace(aio=_wait),
+                stderr=SimpleNamespace(read=SimpleNamespace(aio=_read)),
+            )
+
+        async def _exec(*args, **kwargs):
+            record.setdefault("commands", []).append(args[-1])
+            return _make_proc(codes.pop(0) if codes else 0)
+
+        class _Worker:
+            def run_coroutine(self, coro, timeout=None):
+                record.setdefault("timeouts", []).append(timeout)
+                return asyncio.run(coro)
+
+        env = ModalEnvironment.__new__(ModalEnvironment)
+        env._sandbox = SimpleNamespace(exec=SimpleNamespace(aio=_exec))
+        env._worker = _Worker()
+        env._respawn_lock = threading.RLock()
+        return env
+
+    def test_nonzero_batch_exit_raises_so_sync_retries(self):
+        """A failed rm must NOT be silently committed as a successful delete."""
+        record = {}
+        env = self._env([1], record)
+
+        with pytest.raises(RuntimeError, match="Modal remote delete failed"):
+            env._modal_delete(["/root/.hermes/gh_token"])
+
+    def test_all_batches_succeed_returns_cleanly(self):
+        record = {}
+        env = self._env([0], record)
+        env._modal_delete(["/root/.hermes/gh_token"])  # must not raise
+
+    def test_timeout_is_applied_per_batch_not_once_for_all(self):
+        """Each batch gets its own deadline, so a big tombstone set can converge."""
+        from tools.environments.modal import (
+            _DELETE_BATCH_TIMEOUT_SECONDS,
+            _batch_remote_paths,
+        )
+
+        paths = [f"/root/.hermes/cache/{i:05d}/" + ("x" * 80) for i in range(2000)]
+        batch_count = len(_batch_remote_paths(paths))
+        assert batch_count > 1, "fixture must span multiple batches"
+
+        record = {}
+        env = self._env([0] * batch_count, record)
+        env._modal_delete(paths)
+
+        # One run_coroutine call per batch, each with the full per-batch budget.
+        assert len(record["timeouts"]) == batch_count
+        assert set(record["timeouts"]) == {_DELETE_BATCH_TIMEOUT_SECONDS}
+
+    def test_later_batch_failure_still_raises(self):
+        """Failure in a non-first batch must propagate, not be swallowed."""
+        from tools.environments.modal import _batch_remote_paths
+
+        paths = [f"/root/.hermes/cache/{i:05d}/" + ("x" * 80) for i in range(2000)]
+        batch_count = len(_batch_remote_paths(paths))
+        codes = [0] * (batch_count - 1) + [1]
+
+        record = {}
+        env = self._env(codes, record)
+        with pytest.raises(RuntimeError, match="Modal remote delete failed"):
+            env._modal_delete(paths)
+
+
 # =========================================================================
 # Test 1: Tool resolution includes terminal + file tools
 # =========================================================================
