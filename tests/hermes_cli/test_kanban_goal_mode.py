@@ -402,6 +402,15 @@ def test_loop_blocks_on_budget_exhaustion(monkeypatch):
     assert "turn budget" in blocked["reason"].lower()
 
 
+def test_kanban_goal_continuation_escalates_unobtainable_human_review():
+    """A worker must hand off a human-only PR gate instead of consuming turns."""
+    prompt = goals.KANBAN_GOAL_CONTINUATION_TEMPLATE
+
+    assert "reviewDecision is none" in prompt
+    assert "no unresolved review threads" in prompt
+    assert "kanban_block" in prompt
+
+
 def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
     # Judge says done, but worker never terminated → one finalize nudge,
     # then worker completes.
