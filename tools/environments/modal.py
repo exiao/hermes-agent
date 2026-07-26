@@ -44,57 +44,61 @@ _DIRECT_SNAPSHOT_NAMESPACE = "direct"
 # bricks the session (measured against modal==1.3.4).
 #
 # The sandbox itself, however, still accepts ``exec``. So we cancel a command
-# the way a shell would: tag it with a unique token in its environment, then
-# run a second exec that signals the tagged process group. The sandbox, its
-# filesystem, and every other running command survive.
-_CANCEL_TOKEN_ENV = "HERMES_CANCEL_TOKEN"
+# the way a shell would: have the command record its own PID, then run a
+# second exec that signals that process group. The sandbox, its filesystem,
+# and every other running command survive.
+#
+# Why a PID file rather than an environment marker: the command runs under
+# ``_wrap_command``, which sources the session's ``export -p`` snapshot. Any
+# variable we export is therefore overwritten by the snapshot's value on every
+# later command, and a shell-builtin-only command (``while :; do :; done``)
+# never spawns a child carrying it at all. ``$$`` is written by the shell
+# itself, so it is correct in both cases. Both verified against live Modal.
+_CANCEL_DIR = "/tmp/.hermes-cancel"
 _CANCEL_TIMEOUT_SECONDS = 20
-_cancel_token_counter = itertools.count()
+_cancel_id_counter = itertools.count()
 
-# Matches the token against each process's own environment block, so it can
-# never signal an untagged process. ``$$`` (this shell) and its parent are
-# skipped because the wrapper below exports nothing, but a stray inherited
-# value would otherwise make the canceller kill itself. TERM first so the
-# command can run traps, then KILL for anything that ignored it.
+# TERM the process group first so the command can run traps, then KILL
+# whatever ignored it. A missing/stale PID file is a no-op, never an error:
+# by the time cancel runs the command may already have exited.
 _CANCEL_SCRIPT = r"""
-token="$1"
-self=$$
-killed=0
-for d in /proc/[0-9]*; do
-  pid=${d#/proc/}
-  [ "$pid" = "$self" ] || [ "$pid" = "$PPID" ] || {
-    if tr '\0' '\n' < "$d/environ" 2>/dev/null | grep -qx "HERMES_CANCEL_TOKEN=$token"; then
-      pgid=$(cut -d' ' -f5 "$d/stat" 2>/dev/null)
-      if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
-        kill -TERM -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-      else
-        kill -TERM "$pid" 2>/dev/null
-      fi
-      killed=$((killed+1))
-    fi
-  }
-done
-[ "$killed" = "0" ] && { echo "cancelled=0"; exit 0; }
+pidfile="$1"
+[ -f "$pidfile" ] || { echo "cancelled=0"; exit 0; }
+pid=$(cat "$pidfile" 2>/dev/null)
+rm -f "$pidfile" 2>/dev/null
+[ -n "$pid" ] && [ -d "/proc/$pid" ] || { echo "cancelled=0"; exit 0; }
+pgid=$(cut -d' ' -f5 "/proc/$pid/stat" 2>/dev/null)
+if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
+  kill -TERM -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+else
+  kill -TERM "$pid" 2>/dev/null
+fi
 sleep 0.3
-for d in /proc/[0-9]*; do
-  pid=${d#/proc/}
-  [ "$pid" = "$self" ] || [ "$pid" = "$PPID" ] || {
-    if tr '\0' '\n' < "$d/environ" 2>/dev/null | grep -qx "HERMES_CANCEL_TOKEN=$token"; then
-      kill -KILL "$pid" 2>/dev/null
-    fi
-  }
-done
-echo "cancelled=$killed"
+if [ -d "/proc/$pid" ]; then
+  kill -KILL -"$pgid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+fi
+echo "cancelled=1"
 """
 
 
-def _cancellable_command(cmd_string: str, token: str) -> str:
-    """Tag ``cmd_string`` so ``_CANCEL_SCRIPT`` can find it by token.
+def _cancel_pidfile(command_id: str) -> str:
+    return f"{_CANCEL_DIR}/{command_id}"
 
-    The export is inherited by every descendant, so signalling the tagged
-    process group reaches the whole command tree, not just the outer bash.
+
+def _cancellable_command(cmd_string: str, pidfile: str) -> str:
+    """Prefix ``cmd_string`` so it records its own PID for cancellation.
+
+    ``$$`` is the shell's own PID, written before the command runs, so this
+    works for shell builtins that never fork and survives the env snapshot
+    that ``_wrap_command`` sources. Writing the file must never break the
+    command, hence the ``|| true``.
     """
-    return f"export {_CANCEL_TOKEN_ENV}={shlex.quote(token)}; {cmd_string}"
+    quoted = shlex.quote(pidfile)
+    return (
+        f"mkdir -p {shlex.quote(_CANCEL_DIR)} 2>/dev/null; "
+        f"echo $$ > {quoted} 2>/dev/null || true; "
+        f"{cmd_string}"
+    )
 
 
 def _load_snapshots() -> dict:
@@ -474,8 +478,8 @@ class ModalEnvironment(BaseEnvironment):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
         sandbox = self._sandbox
         worker = self._worker
-        token = f"hermes-{id(self):x}-{next(_cancel_token_counter)}"
-        tagged_command = _cancellable_command(cmd_string, token)
+        pidfile = _cancel_pidfile(f"{id(self):x}-{next(_cancel_id_counter)}")
+        tagged_command = _cancellable_command(cmd_string, pidfile)
 
         def cancel():
             """Signal only this command, leaving the sandbox usable.
@@ -483,15 +487,15 @@ class ModalEnvironment(BaseEnvironment):
             Previously this called ``sandbox.terminate()``, which cancelled the
             command by destroying the session: every subsequent command in the
             same environment then failed with an empty exit 1 forever. Killing
-            by token keeps the sandbox, its filesystem, and any concurrently
-            running command intact.
+            the recorded process group keeps the sandbox, its filesystem, and
+            any concurrently running command intact.
             """
             if sandbox is None:
                 return
             try:
                 async def _do_cancel():
                     proc = await sandbox.exec.aio(
-                        "bash", "-c", _CANCEL_SCRIPT, "--", token,
+                        "bash", "-c", _CANCEL_SCRIPT, "--", pidfile,
                         timeout=_CANCEL_TIMEOUT_SECONDS,
                     )
                     return await proc.wait.aio()

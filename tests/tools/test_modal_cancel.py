@@ -1,8 +1,8 @@
 """Cancellation contract for the Modal backend.
 
-The unit tests here assert BEHAVIOR (what cancel does to the sandbox), not the
-text of the kill script. The live test at the bottom drives a real Modal
-sandbox and is skipped unless Modal credentials and the SDK are present.
+These assert BEHAVIOR (what cancel does to the sandbox), not the text of the
+kill script. The live tests at the bottom drive real Modal sandboxes and skip
+unless Modal credentials and the SDK are present.
 """
 
 import os
@@ -13,19 +13,35 @@ import pytest
 modal_env = pytest.importorskip("tools.environments.modal")
 
 
-def test_cancellable_command_tags_and_preserves_the_original():
-    tagged = modal_env._cancellable_command("echo hi && ls", "tok-1")
+def test_cancellable_command_preserves_the_original_command():
+    tagged = modal_env._cancellable_command("echo hi && ls", "/tmp/.hermes-cancel/x")
     assert tagged.endswith("echo hi && ls")
-    assert f"export {modal_env._CANCEL_TOKEN_ENV}=tok-1;" in tagged
 
 
-def test_cancellable_command_quotes_the_token():
-    """A token is interpolated into a shell string, so it must be quoted."""
-    nasty = "a b; rm -rf /"
+def test_cancellable_command_records_the_shell_pid_not_an_env_var():
+    """Regression: an exported marker is clobbered by the env snapshot.
+
+    ``_wrap_command`` sources the session's ``export -p`` snapshot, so any
+    variable this prefix exports is replaced by the bootstrap value on every
+    later command — cancel would then match nothing. ``$$`` is written by the
+    shell itself and is immune.
+    """
+    tagged = modal_env._cancellable_command("sleep 300", "/tmp/.hermes-cancel/x")
+    assert "echo $$ >" in tagged
+    assert "export HERMES_CANCEL_TOKEN" not in tagged
+
+
+def test_cancellable_command_quotes_the_pidfile():
+    nasty = "/tmp/a b; rm -rf /"
     tagged = modal_env._cancellable_command("true", nasty)
-    assert tagged.startswith(
-        f"export {modal_env._CANCEL_TOKEN_ENV}={shlex.quote(nasty)};"
-    )
+    assert shlex.quote(nasty) in tagged
+    assert "; rm -rf /" not in tagged.replace(shlex.quote(nasty), "")
+
+
+def test_pidfile_write_cannot_break_the_command():
+    """A read-only /tmp must not turn every command into a failure."""
+    tagged = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
+    assert "|| true" in tagged.split("echo hi")[0]
 
 
 class _FakeProc:
@@ -41,17 +57,6 @@ class _Aio:
 
     async def aio(self, *args, **kwargs):
         return self._result
-
-    def __call__(self, *args, **kwargs):
-        return self._result
-
-
-class _RecordingSandbox:
-    def __init__(self):
-        self.exec_calls = []
-        self.terminated = False
-        self.exec = _SandboxExec(self)
-        self.terminate = _SandboxTerminate(self)
 
 
 class _SandboxExec:
@@ -69,6 +74,14 @@ class _SandboxTerminate:
 
     async def aio(self, *args, **kwargs):
         self._sandbox.terminated = True
+
+
+class _RecordingSandbox:
+    def __init__(self):
+        self.exec_calls = []
+        self.terminated = False
+        self.exec = _SandboxExec(self)
+        self.terminate = _SandboxTerminate(self)
 
 
 class _InlineWorker:
@@ -96,7 +109,7 @@ def test_cancel_does_not_terminate_the_sandbox():
     assert sandbox.terminated is False, "cancel must not tear down the sandbox"
 
 
-def test_cancel_issues_a_token_scoped_kill_through_the_same_sandbox():
+def test_cancel_issues_a_kill_through_the_same_sandbox():
     sandbox = _RecordingSandbox()
     env = _make_env(sandbox)
 
@@ -105,11 +118,10 @@ def test_cancel_issues_a_token_scoped_kill_through_the_same_sandbox():
 
     kill_calls = [c for c in sandbox.exec_calls if modal_env._CANCEL_SCRIPT in c]
     assert len(kill_calls) == 1, f"expected one cancel exec, got {sandbox.exec_calls}"
-    token = kill_calls[0][-1]
-    assert token.startswith("hermes-")
+    assert kill_calls[0][-1].startswith(modal_env._CANCEL_DIR)
 
 
-def test_each_command_gets_a_distinct_cancel_token():
+def test_each_command_gets_a_distinct_pidfile():
     """Cancelling command A must not be able to signal command B."""
     sandbox = _RecordingSandbox()
     env = _make_env(sandbox)
@@ -119,9 +131,9 @@ def test_each_command_gets_a_distinct_cancel_token():
     a.kill()
     b.kill()
 
-    tokens = [c[-1] for c in sandbox.exec_calls if modal_env._CANCEL_SCRIPT in c]
-    assert len(tokens) == 2
-    assert tokens[0] != tokens[1]
+    pidfiles = [c[-1] for c in sandbox.exec_calls if modal_env._CANCEL_SCRIPT in c]
+    assert len(pidfiles) == 2
+    assert pidfiles[0] != pidfiles[1]
 
 
 def test_cancel_failure_is_swallowed_and_leaves_the_sandbox_alone():
@@ -140,14 +152,15 @@ def test_cancel_failure_is_swallowed_and_leaves_the_sandbox_alone():
 
 
 # ---------------------------------------------------------------------------
-# Live E2E — real Modal sandbox, real cancellation.
+# Live E2E — real Modal sandboxes, real cancellation.
 # ---------------------------------------------------------------------------
 
 _LIVE = bool(os.environ.get("MODAL_TOKEN_ID") and os.environ.get("MODAL_TOKEN_SECRET"))
+_live_only = pytest.mark.skipif(not _LIVE, reason="requires live Modal credentials")
 
 
-@pytest.mark.skipif(not _LIVE, reason="requires live Modal credentials")
-def test_live_cancel_keeps_the_sandbox_and_its_state_usable():
+def _live_cancel_cycle(inner_command: str, name: str):
+    """Run ``inner_command``, cancel it, and report (rc, sandbox_alive, state)."""
     import asyncio
 
     modal = pytest.importorskip("modal")
@@ -161,29 +174,71 @@ def test_live_cancel_keeps_the_sandbox_and_its_state_usable():
             seed = await sandbox.exec.aio("bash", "-c", "echo persisted > /tmp/state")
             await seed.wait.aio()
 
-            token = "live-token-1"
+            pidfile = modal_env._cancel_pidfile(name)
             target = await sandbox.exec.aio(
-                "bash", "-c", modal_env._cancellable_command("sleep 300", token),
+                "bash", "-c", modal_env._cancellable_command(inner_command, pidfile),
                 timeout=300,
             )
             await asyncio.sleep(3)
 
             killer = await sandbox.exec.aio(
-                "bash", "-c", modal_env._CANCEL_SCRIPT, "--", token, timeout=30,
+                "bash", "-c", modal_env._CANCEL_SCRIPT, "--", pidfile, timeout=30,
             )
+            kill_out = await killer.stdout.read.aio()
             await killer.wait.aio()
 
             rc = await asyncio.wait_for(target.wait.aio(), timeout=30)
 
             after = await sandbox.exec.aio("bash", "-c", "cat /tmp/state")
-            out = await after.stdout.read.aio()
+            state = await after.stdout.read.aio()
             await after.wait.aio()
-            return rc, out, await sandbox.poll.aio()
+            return rc, state, await sandbox.poll.aio(), kill_out
         finally:
             await sandbox.terminate.aio()
 
-    rc, state, poll = asyncio.run(_run())
+    return asyncio.run(_run())
 
+
+@_live_only
+def test_live_cancel_keeps_the_sandbox_and_its_state_usable():
+    rc, state, poll, kill_out = _live_cancel_cycle("sleep 300", "live-sleep")
+
+    assert "cancelled=1" in kill_out
     assert rc != 0, "cancelled command should report a signal exit"
     assert "persisted" in state, "sandbox filesystem must survive cancellation"
     assert poll is None, "sandbox must still be running after a cancel"
+
+
+@_live_only
+def test_live_cancel_reaches_a_shell_builtin_only_command():
+    """Regression: a command that never forks has no tagged child process."""
+    rc, state, poll, kill_out = _live_cancel_cycle("while :; do :; done", "live-builtin")
+
+    assert "cancelled=1" in kill_out
+    assert rc != 0
+    assert poll is None
+
+
+@_live_only
+def test_live_cancel_survives_the_env_snapshot_being_sourced():
+    """Regression: the real path sources an ``export -p`` snapshot first."""
+    inner = (
+        "echo 'export HERMES_CANCEL_TOKEN=STALE' > /tmp/snap; "
+        "source /tmp/snap; sleep 300"
+    )
+    rc, state, poll, kill_out = _live_cancel_cycle(inner, "live-snapshot")
+
+    assert "cancelled=1" in kill_out
+    assert rc != 0
+    assert poll is None
+
+
+@_live_only
+def test_live_cancel_kills_the_whole_child_tree():
+    rc, state, poll, kill_out = _live_cancel_cycle(
+        "sleep 300 & sleep 300 & wait", "live-tree"
+    )
+
+    assert "cancelled=1" in kill_out
+    assert rc != 0
+    assert poll is None
