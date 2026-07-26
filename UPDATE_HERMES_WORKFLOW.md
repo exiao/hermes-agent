@@ -16,8 +16,8 @@ upstream  → https://github.com/NousResearch/hermes-agent.git (fetch only;
 
 | Branch | Role |
 |---|---|
-| `main` | Pristine mirror of `upstream/main`. Never commit here directly. |
-| `live-config` | Long-lived integration branch. All local-only changes documented in `~/.hermes/plans/hermes-patches/*.md` converge here as real commits. This is what the running gateway checks out. |
+| `main` | Pristine mirror of `upstream/main`. Never commit here directly. It is not the GitHub default branch. |
+| `live-config` | Long-lived integration branch and GitHub default branch. All local-only changes documented in `~/.hermes/plans/hermes-patches/*.md` converge here as real commits. This is what the running gateway checks out. |
 | `feat/*`, `fix/*` | Short-lived feature/fix branches off `live-config`. Merge back via PR-to-self on GitHub (keeps history reviewable). |
 
 ### Commit ↔ patch-note mapping (as of 2026-04-17)
@@ -44,7 +44,7 @@ Notes that stay as MD (not code in this repo):
 
 1. **Never push to `upstream`.** The push URL is physically broken; if you see it
    work, something was misconfigured — stop and restore it.
-2. **Never commit directly to `main`.** It exists only to track upstream.
+2. **Never commit directly to `main`.** It exists only to track upstream. Keep `live-config` as the GitHub default branch so fork-specific workflows are not erased by upstream mirror updates.
 3. **Work happens on feature branches**, merged into `live-config` via GitHub PR.
 4. **`git stash push --include-untracked`** before branch ops. Never
    `git checkout -f` or `reset --hard` without stashing first (per project
@@ -57,25 +57,30 @@ Notes that stay as MD (not code in this repo):
 
 ## Syncing with upstream
 
-```bash
-git stash push --include-untracked -m "pre-upstream-sync"  # save any WIP first
-git fetch upstream
-git checkout main
-git merge --ff-only upstream/main        # must fast-forward; if not, something
-                                         # committed to main directly — bad
-git push origin main                     # NOTE: agent safety guards block this;
-                                         # Eric must run it manually, or use
-                                         # HERMES_BACKUP_BYPASS=1
+Keep the mirror and integration updates separate:
 
-git checkout live-config
-git merge main                           # merge, not rebase — force-with-lease
-                                         # is blocked by safety guards so rebase
-                                         # can't be pushed. Merge keeps history
-                                         # but avoids the tooling conflict.
-# resolve any conflicts, then:
-git push origin live-config
-git stash pop                            # restore WIP if stashed
+```bash
+# 1. Refresh the upstream ref.
+git fetch upstream
+
+# 2. Eric updates the pristine origin mirror directly from upstream. This is a
+# protected-branch push and must be run by Eric after reviewing the ref.
+git push origin upstream/main:refs/heads/main
+
+# 3. Bring upstream into live-config through a normal reviewable PR.
+git fetch origin live-config
+git worktree add ~/projects/_worktrees/hermes-upstream-sync \
+  -b chore/sync-upstream origin/live-config
+cd ~/projects/_worktrees/hermes-upstream-sync
+git merge upstream/main
+# Resolve conflicts and run the affected tests, then commit the merge.
+git push origin HEAD:refs/heads/chore/sync-upstream
+gh pr create --repo exiao/hermes-agent --base live-config \
+  --head chore/sync-upstream --body-file /tmp/upstream-sync-pr.md
 ```
+
+Do not use `gh repo sync` without an explicit branch after changing the GitHub
+default to `live-config`; an unscoped sync can target the wrong branch.
 
 **Why merge, not rebase:** The `block-dangerous-merges` guards block
 `--force-with-lease` and `--force` pushes at three layers (PATH wrapper,

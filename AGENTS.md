@@ -4,10 +4,10 @@ For AI coding assistants and developers working on the hermes-agent repo.
 
 ## This checkout is a fork (read before editing)
 
-Eric's personal fork (`exiao/hermes-agent`), not upstream. Full story in `FORK_WORKFLOW.md`:
+Eric's personal fork (`exiao/hermes-agent`), not upstream. Full story in `UPDATE_HERMES_WORKFLOW.md`:
 
 - Remotes: `origin` = `exiao/hermes-agent` (fetch + push); `upstream` = `NousResearch/hermes-agent` (fetch only; push URL `DISABLED_NEVER_PUSH_UPSTREAM`, never work around it).
-- Branches: `main` mirrors upstream, never direct commits. `live-config` is the long-lived integration branch the running gateway checks out. Feature/fix work goes on short-lived `feat/*` / `fix/*` branches off `live-config`.
+- Branches: `main` mirrors upstream, never direct commits. `live-config` is the GitHub default and long-lived integration branch the running gateway checks out. Feature/fix work goes on short-lived `feat/*` / `fix/*` branches off `live-config`.
 - Every commit on `live-config` references a patch note in `~/.hermes/plans/hermes-patches/*.md`. About to commit without one? Write the note first.
 - Don't commit `config.yaml`, `.env`, or credentials — those live in `~/.hermes/` outside this repo.
 - Merges into `live-config` go via PR-to-self on GitHub unless the user explicitly asks for a local fast-forward.
