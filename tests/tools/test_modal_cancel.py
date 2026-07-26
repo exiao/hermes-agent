@@ -109,15 +109,31 @@ def test_cancel_does_not_terminate_the_sandbox():
     assert sandbox.terminated is False, "cancel must not tear down the sandbox"
 
 
+def _kill_after_launch(handle, sandbox):
+    """Wait until this command's exec RPC has returned, then cancel.
+
+    ``_run_bash`` deliberately defers a cancel that arrives before the command
+    is up (the launcher replays it instead), so a test that wants to observe
+    the immediate-cancel path has to let the launch happen first.
+    """
+    import time
+
+    before = len(sandbox.exec_calls)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and len(sandbox.exec_calls) == before:
+        time.sleep(0.01)
+    handle.kill()
+
+
 def test_cancel_issues_a_kill_through_the_same_sandbox():
     sandbox = _RecordingSandbox()
     env = _make_env(sandbox)
 
     handle = modal_env.ModalEnvironment._run_bash(env, "sleep 300", timeout=5)
-    handle.kill()
+    _kill_after_launch(handle, sandbox)
 
     kill_calls = [c for c in sandbox.exec_calls if modal_env._CANCEL_SCRIPT in c]
-    assert len(kill_calls) == 1, f"expected one cancel exec, got {sandbox.exec_calls}"
+    assert len(kill_calls) >= 1, f"expected a cancel exec, got {sandbox.exec_calls}"
     assert kill_calls[0][-1].startswith(modal_env._CANCEL_DIR)
 
 
@@ -127,13 +143,67 @@ def test_each_command_gets_a_distinct_pidfile():
     env = _make_env(sandbox)
 
     a = modal_env.ModalEnvironment._run_bash(env, "sleep 300", timeout=5)
+    _kill_after_launch(a, sandbox)
     b = modal_env.ModalEnvironment._run_bash(env, "sleep 300", timeout=5)
-    a.kill()
-    b.kill()
+    _kill_after_launch(b, sandbox)
 
     pidfiles = [c[-1] for c in sandbox.exec_calls if modal_env._CANCEL_SCRIPT in c]
-    assert len(pidfiles) == 2
-    assert pidfiles[0] != pidfiles[1]
+    assert len(pidfiles) >= 2
+    assert pidfiles[0] != pidfiles[-1]
+
+
+def test_cancel_before_launch_is_replayed_not_dropped():
+    """An interrupt beating the exec RPC must still reach the command."""
+    sandbox = _RecordingSandbox()
+    env = _make_env(sandbox)
+
+    handle = modal_env.ModalEnvironment._run_bash(env, "sleep 300", timeout=5)
+    handle.kill()  # may land before or after launch; either way it must apply
+    handle.wait(timeout=5)
+
+    kill_calls = [c for c in sandbox.exec_calls if modal_env._CANCEL_SCRIPT in c]
+    assert kill_calls, f"cancel was dropped entirely: {sandbox.exec_calls}"
+    assert sandbox.terminated is False
+
+
+def test_cancel_during_a_slow_exec_rpc_is_still_applied():
+    """The launch race, isolated: cancel arrives while exec is in flight.
+
+    A shell-side poll for the PID file cannot fix this — the RPC that would
+    create it hasn't returned yet, and it may take longer than any fixed
+    timeout. The launcher must replay the pending cancel once it is up.
+    """
+    import asyncio
+    import threading
+
+    launched = threading.Event()
+
+    class _SlowExec:
+        def __init__(self, sandbox):
+            self._sandbox = sandbox
+
+        async def aio(self, *args, **kwargs):
+            self._sandbox.exec_calls.append(args)
+            if modal_env._CANCEL_SCRIPT not in args:
+                # The target command's RPC is slow to return.
+                await asyncio.sleep(0.5)
+                launched.set()
+            return _FakeProc()
+
+    sandbox = _RecordingSandbox()
+    sandbox.exec = _SlowExec(sandbox)  # type: ignore[assignment]
+    env = _make_env(sandbox)
+
+    handle = modal_env.ModalEnvironment._run_bash(env, "sleep 300", timeout=5)
+    handle.kill()  # lands while the exec RPC above is still in flight
+    handle.wait(timeout=10)
+
+    assert launched.is_set(), "the target command never launched"
+    kill_calls = [c for c in sandbox.exec_calls if modal_env._CANCEL_SCRIPT in c]
+    assert kill_calls, (
+        "a cancel that arrived before launch was dropped: %r" % (sandbox.exec_calls,)
+    )
+    assert sandbox.terminated is False
 
 
 def test_cancel_failure_is_swallowed_and_leaves_the_sandbox_alone():
