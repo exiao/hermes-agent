@@ -150,6 +150,25 @@ def test_late_marker_branch_escalates_to_sigkill():
 
 
 
+def test_monitor_mode_is_scoped_so_it_cannot_announce_jobs():
+    """`set -m` must not turn on job-completion notices in the output.
+
+    Non-interactive bash only prints "[1]+ Done" style notifications in an
+    interactive shell; the sandbox exec is non-interactive, and this was
+    confirmed against real Modal (stderr byte-identical with and without
+    monitor mode, for `true`, `echo`, `exit 7` and `sleep`). Lock the shape
+    that keeps it that way: monitor mode is enabled inline in the wrapper we
+    exec, never exported to the command's own environment.
+    """
+    wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x")
+
+    # enabled in the wrapper itself, immediately before the job is launched
+    assert "set -m; bash" in wrapped
+    # not leaked into the child's environment where it would change behavior
+    assert "export SHELLOPTS" not in wrapped
+    assert "set -o monitor" not in wrapped
+
+
 def test_wrapper_honors_login_shell():
     wrapped = _wrap_for_group_cancel("echo hi", "/tmp/x", login=True)
 
