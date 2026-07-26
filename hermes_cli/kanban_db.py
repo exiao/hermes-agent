@@ -10315,7 +10315,37 @@ def _default_spawn(
     # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
+    #
+    # Guard against a STRAY ambient HERMES_HOME. resolve_profile_env() ->
+    # get_profile_dir() -> get_default_hermes_root() reads HERMES_HOME from
+    # os.environ, so a leaked value in the dispatching process (an e2e test
+    # home, a leftover export) silently redefines where EVERY worker's home
+    # lives: its config, memories, skills, and — critically — its kanban DB.
+    # Workers then run against a different board than the one the task was
+    # claimed from, completing tasks the real board never records.
+    #
+    # A RELOCATED home is legitimate and must be preserved (Docker, custom
+    # deployments, and the isolated homes tests build). The discriminator is
+    # whether it looks like a real Hermes home at all: a configured home has a
+    # config.yaml (or a profiles/ tree). A bare scratch directory that has
+    # neither was never a Hermes home — it is a leak, and we fall back to the
+    # platform default so worker homes stay a function of the profile name.
     from hermes_cli.profiles import resolve_profile_env
+    _stray_home = None
+    _ambient_home = os.environ.get("HERMES_HOME")
+    if _ambient_home:
+        _ambient_path = Path(_ambient_home)
+        if not (
+            (_ambient_path / "config.yaml").is_file()
+            or (_ambient_path / "profiles").is_dir()
+        ):
+            _stray_home = os.environ.pop("HERMES_HOME", None)
+            _log.warning(
+                "kanban: ignoring stray HERMES_HOME=%s for worker spawn "
+                "(no config.yaml or profiles/); resolving %s from the platform "
+                "default home instead",
+                _ambient_home, profile_arg,
+            )
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
     except FileNotFoundError:
@@ -10324,6 +10354,9 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    finally:
+        if _stray_home is not None:
+            os.environ["HERMES_HOME"] = _stray_home
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
