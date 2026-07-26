@@ -5,10 +5,14 @@ kill script. The live tests at the bottom drive real Modal sandboxes and skip
 unless Modal credentials and the SDK are present.
 """
 
+import asyncio
 import os
 import shlex
+import threading
 
 import pytest
+
+from tools.environments.base import BaseEnvironment
 
 modal_env = pytest.importorskip("tools.environments.modal")
 
@@ -44,8 +48,15 @@ def test_pidfile_write_cannot_break_the_command():
     assert "|| true" in tagged.split("echo hi")[0]
 
 
+class _Reader:
+    def __init__(self, value=""):
+        self.read = _Aio(value)
+
+
 class _FakeProc:
     def __init__(self):
+        self.stdout = _Reader()
+        self.stderr = _Reader()
         self.wait = _Aio(0)
 
 
@@ -219,6 +230,75 @@ def test_cancel_failure_is_swallowed_and_leaves_the_sandbox_alone():
     handle.kill()  # must not raise
 
     assert sandbox.terminated is False
+
+
+class _DynamicWait:
+    def __init__(self, was_cancelled):
+        self._was_cancelled = was_cancelled
+
+    async def aio(self):
+        return 143 if self._was_cancelled() else 0
+
+
+class _TargetProc:
+    def __init__(self, was_cancelled):
+        self.stdout = _Reader()
+        self.stderr = _Reader()
+        self.wait = _DynamicWait(was_cancelled)
+
+
+class _StartupBlockingSandbox:
+    """Delays target exec startup until the test asks it to complete."""
+
+    def __init__(self):
+        self.target_starting = threading.Event()
+        self.release_target = threading.Event()
+        self.target_returned = threading.Event()
+        self.cancelled = threading.Event()
+        self.cancel_after_target_start = False
+        self.exec = _StartupBlockingExec(self)
+
+    async def exec_aio(self, *args, **kwargs):
+        if modal_env._CANCEL_SCRIPT in args:
+            self.cancel_after_target_start = self.target_returned.is_set()
+            self.cancelled.set()
+            return _FakeProc()
+
+        self.target_starting.set()
+        await asyncio.to_thread(self.release_target.wait, 2)
+        self.target_returned.set()
+        return _TargetProc(self.cancelled.is_set)
+
+
+class _StartupBlockingExec:
+    def __init__(self, sandbox):
+        self._sandbox = sandbox
+
+    async def aio(self, *args, **kwargs):
+        return await self._sandbox.exec_aio(*args, **kwargs)
+
+
+def test_execute_cancels_after_delayed_modal_exec_startup():
+    """A pending interrupt must reach a command only after its exec startup ends."""
+    sandbox = _StartupBlockingSandbox()
+    env = _make_env(sandbox)
+    BaseEnvironment.__init__(env, cwd="/root", timeout=5)
+    env._before_execute = lambda: None
+
+    def wait_then_cancel(handle, *, timeout, bounded_capture):
+        assert sandbox.target_starting.wait(2), "target exec never entered startup"
+        handle.kill()
+        assert not sandbox.cancelled.is_set(), "cancel must wait for target startup"
+        sandbox.release_target.set()
+        handle.wait(timeout=2)
+        return {"output": handle.stdout.read(), "returncode": handle.returncode}
+
+    env._wait_for_process = wait_then_cancel
+
+    result = env.execute("sleep 300")
+
+    assert sandbox.cancel_after_target_start
+    assert result["returncode"] == 143
 
 
 # ---------------------------------------------------------------------------

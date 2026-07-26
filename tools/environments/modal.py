@@ -492,29 +492,34 @@ class ModalEnvironment(BaseEnvironment):
                   stdin_data: str | None = None):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
         sandbox = self._sandbox
+        if sandbox is None:
+            raise RuntimeError("Modal sandbox is not initialized")
         worker = self._worker
         pidfile = _cancel_pidfile(f"{id(self):x}-{next(_cancel_id_counter)}")
         tagged_command = _cancellable_command(cmd_string, pidfile)
 
-        # Cancellation can arrive before ``sandbox.exec`` has even started the
-        # command, in which case there is no remote PID file to act on yet and
-        # no amount of polling inside the sandbox closes the window (the RPC
-        # itself may be the slow part). Coordinate in-process instead: record
-        # that a cancel is pending, and have the launcher re-run it once the
-        # command is actually up. ``launched`` is set by exec_fn the moment
-        # the RPC returns.
-        state_lock = threading.Lock()
-        state = {"launched": False, "cancel_pending": False}
+        execution_lock = threading.Lock()
+        execution_started = False
+        cancel_requested = False
+        cancel_dispatched = False
 
-        def _fire_cancel():
+        async def _do_cancel() -> None:
+            proc = await sandbox.exec.aio(
+                "bash", "-c", _CANCEL_SCRIPT, "--", pidfile,
+                timeout=_CANCEL_TIMEOUT_SECONDS,
+            )
+            await proc.wait.aio()
+
+        def _claim_cancel_dispatch() -> bool:
+            nonlocal cancel_dispatched
+            with execution_lock:
+                if not execution_started or cancel_dispatched:
+                    return False
+                cancel_dispatched = True
+                return True
+
+        def _cancel_after_startup() -> None:
             try:
-                async def _do_cancel():
-                    proc = await sandbox.exec.aio(
-                        "bash", "-c", _CANCEL_SCRIPT, "--", pidfile,
-                        timeout=_CANCEL_TIMEOUT_SECONDS,
-                    )
-                    return await proc.wait.aio()
-
                 worker.run_coroutine(_do_cancel(), timeout=_CANCEL_TIMEOUT_SECONDS + 10)
             except Exception as exc:
                 # Best-effort: the caller has already stopped waiting on this
@@ -525,52 +530,32 @@ class ModalEnvironment(BaseEnvironment):
         def cancel():
             """Signal only this command, leaving the sandbox usable.
 
-            Previously this called ``sandbox.terminate()``, which cancelled the
-            command by destroying the session: every subsequent command in the
-            same environment then failed with an empty exit 1 forever. Killing
-            the recorded process group keeps the sandbox, its filesystem, and
-            any concurrently running command intact.
+            An interrupt may arrive while ``sandbox.exec.aio`` is still
+            creating the target. Remember it until that startup completes, so
+            cancellation cannot race ahead of the PID-file registration.
             """
+            nonlocal cancel_requested
             if sandbox is None:
                 return
-            with state_lock:
-                state["cancel_pending"] = True
-                launched = state["launched"]
-            if launched:
-                _fire_cancel()
-            # Otherwise exec_fn re-fires it as soon as the command is up, so a
-            # cancel that beats the launch is applied rather than dropped.
+            with execution_lock:
+                cancel_requested = True
+            if _claim_cancel_dispatch():
+                _cancel_after_startup()
 
         def exec_fn() -> tuple[str, int]:
             async def _do():
+                nonlocal execution_started
                 args = ["bash"]
                 if login:
                     args.extend(["-l", "-c", tagged_command])
                 else:
                     args.extend(["-c", tagged_command])
                 process = await sandbox.exec.aio(*args, timeout=timeout)
-
-                # The command is now running remotely. If a cancel landed
-                # while the RPC above was in flight it found no PID file and
-                # did nothing, so apply it now — otherwise the caller has
-                # already given up (exit 130) while the command runs on.
-                with state_lock:
-                    state["launched"] = True
-                    replay_cancel = state["cancel_pending"]
-                if replay_cancel:
-                    # Await directly: we are already on the worker loop, so
-                    # going back through run_coroutine would deadlock.
-                    try:
-                        killer = await sandbox.exec.aio(
-                            "bash", "-c", _CANCEL_SCRIPT, "--", pidfile,
-                            timeout=_CANCEL_TIMEOUT_SECONDS,
-                        )
-                        await killer.wait.aio()
-                    except Exception as exc:
-                        logger.warning(
-                            "Modal: could not apply pending cancel: %s", exc
-                        )
-
+                with execution_lock:
+                    execution_started = True
+                    pending_cancel = cancel_requested
+                if pending_cancel and _claim_cancel_dispatch():
+                    await _do_cancel()
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
                 exit_code = await process.wait.aio()
