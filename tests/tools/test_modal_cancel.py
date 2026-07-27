@@ -20,7 +20,7 @@ modal_env = pytest.importorskip("tools.environments.modal")
 
 def test_cancellable_command_preserves_the_original_command():
     tagged = modal_env._cancellable_command("echo hi && ls", "/tmp/.hermes-cancel/x")
-    assert "( echo hi && ls )" in tagged
+    assert tagged.endswith("echo hi && ls")
 
 
 def test_cancellable_command_records_the_shell_pid_not_an_env_var():
@@ -49,14 +49,40 @@ def test_pidfile_write_cannot_break_the_command():
     assert "|| true" in tagged.split("echo hi")[0]
 
 
-def test_cancellable_command_cleans_pidfile_and_preserves_exit_status(tmp_path):
+def test_cancellable_command_preserves_exit_status(tmp_path):
     pidfile = tmp_path / "command.pid"
     tagged = modal_env._cancellable_command("exit 37", str(pidfile))
 
     result = subprocess.run(["bash", "-c", tagged], capture_output=True, text=True)
 
     assert result.returncode == 37
-    assert not pidfile.exists()
+
+
+def test_cancellable_command_preserves_dollar_dollar_semantics(tmp_path):
+    """Regression: a subshell wrapper made `$$` point at the wrapper, not self.
+
+    Bash keeps `$$` as the parent shell's PID inside `( ... )`, so a command
+    that signals itself via `kill -TERM $$` hit the wrapper instead and came
+    back 143 rather than its own trapped 42.
+    """
+    pidfile = tmp_path / "command.pid"
+    tagged = modal_env._cancellable_command(
+        "trap 'exit 42' TERM; kill -TERM $$; sleep 3", str(pidfile)
+    )
+
+    result = subprocess.run(["bash", "-c", tagged], capture_output=True, text=True)
+
+    assert result.returncode == 42, (
+        "the command's own $$ trap must still fire; got %s" % result.returncode
+    )
+
+
+def test_cancellable_command_appends_nothing_after_the_command(tmp_path):
+    """Cleanup must live in Python, not tacked onto the command's shell."""
+    tagged = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
+    assert "trap" not in tagged
+    assert "__hermes_rc" not in tagged
+    assert tagged.endswith("echo hi")
 
 
 class _Reader:
@@ -555,47 +581,39 @@ def test_live_cancel_that_arrives_before_the_command_registers():
 
 
 @_live_only
-def test_live_pidfile_is_cleaned_when_the_command_installs_its_own_exit_trap():
-    """Regression: an EXIT trap for cleanup is clobbered by the command's own.
+def test_live_pidfile_is_cleaned_through_the_real_run_bash_path():
+    """Regression: the pid file must not leak, and cleanup must not use a trap.
 
     ``FileOperations._atomic_write`` installs an EXIT trap and then clears it
-    with ``trap - EXIT`` — the normal file-write path. A cleanup trap set by
-    the wrapper is silently discarded there, leaking the PID file on every
-    write. Cleanup must not depend on a trap surviving the command.
+    with ``trap - EXIT`` — the repo's normal file-write path — which silently
+    discards any cleanup trap the wrapper sets. Cleanup therefore lives in
+    ``_run_bash`` after the command completes, so this drives the real
+    ``_run_bash`` path rather than the wrapper helper alone.
     """
-    import asyncio
-
     modal = pytest.importorskip("modal")
 
-    async def _run():
-        app = await modal.App.lookup.aio("hermes-cancel-e2e", create_if_missing=True)
-        sandbox = await modal.Sandbox.create.aio(
-            "sleep", "infinity", image=modal.Image.debian_slim(), app=app, timeout=300,
+    env = modal_env.ModalEnvironment(
+        image="python:3.11-slim",
+        persistent_filesystem=False,
+        task_id="cancel-pidfile-cleanup",
+    )
+    try:
+        # Exactly what _atomic_write does: install a trap, then clear it.
+        inner = "trap 'echo user_cleanup' EXIT; trap - EXIT; echo wrote"
+        result = env.execute(inner, timeout=60)
+        assert "wrote" in result["output"], result
+        assert result["returncode"] == 0, result
+
+        listing = env.execute(
+            f"ls {modal_env._CANCEL_DIR} 2>/dev/null | wc -l", timeout=60
         )
-        try:
-            pidfile = modal_env._cancel_pidfile("live-trap-clobber")
-            # Exactly what _atomic_write does: install a trap, then clear it.
-            inner = "trap 'echo user_cleanup' EXIT; trap - EXIT; echo wrote"
-            proc = await sandbox.exec.aio(
-                "bash", "-c", modal_env._cancellable_command(inner, pidfile), timeout=60,
-            )
-            out = await proc.stdout.read.aio()
-            rc = await proc.wait.aio()
+        leftover = listing["output"].strip().splitlines()[0].strip()
+    finally:
+        env.cleanup()
 
-            chk = await sandbox.exec.aio(
-                "bash", "-c", f"[ -e {pidfile} ] && echo LEAKED || echo cleaned",
-            )
-            leaked = await chk.stdout.read.aio()
-            await chk.wait.aio()
-            return out, rc, leaked
-        finally:
-            await sandbox.terminate.aio()
-
-    out, rc, leaked = asyncio.run(_run())
-
-    assert "wrote" in out, "the command's own output must survive the wrapper"
-    assert rc == 0, f"the command's exit status must pass through, got {rc}"
-    assert "cleaned" in leaked, f"pid file leaked despite a normal exit: {leaked!r}"
+    # The listing command itself owns one live pid file while it runs, so the
+    # completed command's file must not still be sitting there beside it.
+    assert leftover in {"0", "1"}, f"pid files leaked: {leftover}"
 
 
 @_live_only
@@ -645,5 +663,3 @@ def test_cancellable_command_does_not_rely_on_an_exit_trap():
     """A command's own ``trap - EXIT`` must not be able to skip cleanup."""
     wrapped = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
     assert "trap" not in wrapped, "cleanup must not depend on an EXIT trap"
-    assert "rm -f" in wrapped
-    assert "exit $__hermes_rc" in wrapped

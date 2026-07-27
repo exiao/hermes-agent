@@ -114,25 +114,25 @@ def _cancellable_command(cmd_string: str, pidfile: str) -> str:
     that ``_wrap_command`` sources. Writing the file must never break the
     command, hence the ``|| true``.
 
-    Cleanup deliberately does NOT rely on an ``EXIT`` trap in the command's
-    own shell. Commands routinely install their own
-    (``FileOperations._atomic_write`` sets one and then clears it with
-    ``trap - EXIT``), which silently discards ours and leaks the PID file on
-    the normal file-write path.
+    Nothing is appended after the command, deliberately. Two earlier attempts
+    at in-shell cleanup both changed the command's semantics:
 
-    Running the command in a subshell fixes both halves: the command's traps
-    and any ``exit`` it calls are confined to that subshell, so cleanup after
-    it always runs, and ``$?`` is captured and re-raised so the caller still
-    sees the real exit status. A cancelled command never reaches the cleanup,
-    which is fine: cancel() removes the file itself.
+    - an ``EXIT`` trap is silently discarded by any command that installs its
+      own (``FileOperations._atomic_write`` sets one, then ``trap - EXIT``),
+      so the file leaked on the normal file-write path;
+    - wrapping in ``( ... )`` restores cleanup but breaks ``$$``: bash keeps
+      ``$$`` as the *parent* shell's PID inside a subshell, so a command doing
+      ``trap 'exit 42' TERM; kill -TERM $$`` signalled the wrapper instead of
+      itself and returned 143 where it used to return 42.
+
+    The PID file is removed by ``_run_bash`` once the command completes, which
+    touches nothing about the command's shell.
     """
     quoted = shlex.quote(pidfile)
     return (
         f"mkdir -p {shlex.quote(_CANCEL_DIR)} 2>/dev/null; "
         f"echo $$ > {quoted} 2>/dev/null || true; "
-        f"( {cmd_string} ); __hermes_rc=$?; "
-        f"rm -f {quoted} 2>/dev/null; "
-        f"exit $__hermes_rc"
+        f"{cmd_string}"
     )
 
 
@@ -592,6 +592,20 @@ class ModalEnvironment(BaseEnvironment):
                 output = stdout
                 if stderr:
                     output = f"{stdout}\n{stderr}" if stdout else stderr
+
+                # Drop the PID file here rather than appending cleanup to the
+                # command: anything appended in-shell either gets discarded by
+                # the command's own EXIT trap, or (if subshelled to survive
+                # that) changes what `$$` means to the command. Fire-and-forget
+                # — a leftover file is inert, and cancel() removes it too.
+                try:
+                    reaper = await sandbox.exec.aio(
+                        "bash", "-c", f"rm -f {shlex.quote(pidfile)} 2>/dev/null", timeout=15,
+                    )
+                    await reaper.wait.aio()
+                except Exception as exc:
+                    logger.debug("Modal: could not remove cancel pid file: %s", exc)
+
                 return output, exit_code
 
             return worker.run_coroutine(_do(), timeout=timeout + 30)
