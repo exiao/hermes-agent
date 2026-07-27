@@ -3,6 +3,8 @@
 Phase 0 — establish a baseline pin on the current (pre-OAuth) behavior so
 later phases can prove they didn't break loopback mode.
 """
+import contextlib
+
 import pytest
 
 # Phase 5 / Phase 6: these tests mutate ``web_server.app.state.auth_required``
@@ -15,15 +17,8 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
-_INITIAL_DASHBOARD_APP_STATE = (
-    getattr(web_server.app.state, "bound_host", None),
-    getattr(web_server.app.state, "bound_port", None),
-    getattr(web_server.app.state, "auth_required", None),
-)
-
-
-@pytest.fixture(autouse=True)
-def _restore_dashboard_app_state():
+@contextlib.contextmanager
+def _preserve_dashboard_app_state():
     state = web_server.app.state
     previous = (
         getattr(state, "bound_host", None),
@@ -34,6 +29,12 @@ def _restore_dashboard_app_state():
         yield
     finally:
         state.bound_host, state.bound_port, state.auth_required = previous
+
+
+@pytest.fixture(autouse=True)
+def _restore_dashboard_app_state():
+    with _preserve_dashboard_app_state():
+        yield
 
 
 @pytest.fixture
@@ -197,13 +198,18 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
     assert web_server.app.state.auth_required is False
 
 
-def test_start_server_loopback_does_not_leak_dashboard_app_state():
-    """A previous start_server probe must not affect later dashboard tests."""
-    assert (
-        getattr(web_server.app.state, "bound_host", None),
-        getattr(web_server.app.state, "bound_port", None),
-        getattr(web_server.app.state, "auth_required", None),
-    ) == _INITIAL_DASHBOARD_APP_STATE
+def test_start_server_loopback_does_not_leak_dashboard_app_state(monkeypatch):
+    """The state-preservation helper restores an actual start_server mutation."""
+    state = web_server.app.state
+    initial = state.bound_host, state.bound_port, state.auth_required
+    with _preserve_dashboard_app_state():
+        _stub_uvicorn_run(monkeypatch)
+        web_server.start_server(
+            host="127.0.0.1", port=9119,
+            open_browser=False, allow_public=False,
+        )
+        assert (state.bound_host, state.bound_port, state.auth_required) != initial
+    assert (state.bound_host, state.bound_port, state.auth_required) == initial
 
 
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
