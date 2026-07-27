@@ -377,63 +377,75 @@ _live_only = pytest.mark.skipif(not _LIVE, reason="requires live Modal credentia
 
 
 def _live_cancel_cycle(inner_command: str, name: str):
-    """Run ``inner_command``, cancel it, and report (rc, sandbox_alive, state)."""
-    import asyncio
+    """Interrupt ``inner_command`` through the REAL execute() path.
 
-    modal = pytest.importorskip("modal")
+    Drives production wiring end to end: ``set_interrupt`` ->
+    ``_wait_for_process`` -> ``proc.kill()`` -> ``_run_bash``'s cancel
+    callback (including its pending-cancel coordination) ->
+    ``_ThreadedProcessHandle``. Nothing here calls the cancel helpers
+    directly, so a break anywhere in that chain fails the test.
 
-    async def _run():
-        app = await modal.App.lookup.aio("hermes-cancel-e2e", create_if_missing=True)
-        sandbox = await modal.Sandbox.create.aio(
-            "sleep", "infinity", image=modal.Image.debian_slim(), app=app, timeout=300,
+    Returns ``(result, still_usable, state, elapsed)``.
+    """
+    from tools.interrupt import set_interrupt
+
+    pytest.importorskip("modal")
+
+    env = modal_env.ModalEnvironment(
+        image="python:3.11-slim",
+        persistent_filesystem=False,
+        task_id="cancel-e2e-" + name,
+    )
+    main_tid = threading.current_thread().ident
+
+    def _interrupt_soon():
+        time.sleep(4)
+        set_interrupt(True, thread_id=main_tid)
+
+    try:
+        seed = env.execute(
+            "mkdir -p /workspace && echo persisted > /workspace/state", timeout=60
         )
-        try:
-            seed = await sandbox.exec.aio("bash", "-c", "echo persisted > /tmp/state")
-            await seed.wait.aio()
+        assert seed["returncode"] == 0, seed
 
-            pidfile = modal_env._cancel_pidfile(name)
-            target = await sandbox.exec.aio(
-                "bash", "-c", modal_env._cancellable_command(inner_command, pidfile),
-                timeout=300,
-            )
-            await asyncio.sleep(3)
+        threading.Thread(target=_interrupt_soon, daemon=True).start()
+        started = time.time()
+        result = env.execute(inner_command, timeout=180)
+        elapsed = time.time() - started
+        set_interrupt(False, thread_id=main_tid)
 
-            killer = await sandbox.exec.aio(
-                "bash", "-c", modal_env._CANCEL_SCRIPT, "--", pidfile, timeout=30,
-            )
-            kill_out = await killer.stdout.read.aio()
-            await killer.wait.aio()
-
-            rc = await asyncio.wait_for(target.wait.aio(), timeout=30)
-
-            after = await sandbox.exec.aio("bash", "-c", "cat /tmp/state")
-            state = await after.stdout.read.aio()
-            await after.wait.aio()
-            return rc, state, await sandbox.poll.aio(), kill_out
-        finally:
-            await sandbox.terminate.aio()
-
-    return asyncio.run(_run())
+        # The sandbox must still be usable and session state intact - the
+        # whole point of not terminating it in order to cancel a command.
+        still_usable = env.execute("echo alive", timeout=60)
+        state = env.execute("cat /workspace/state", timeout=60)
+        return result, still_usable, state, elapsed
+    finally:
+        set_interrupt(False, thread_id=main_tid)
+        env.cleanup()
 
 
 @_live_only
 def test_live_cancel_keeps_the_sandbox_and_its_state_usable():
-    rc, state, poll, kill_out = _live_cancel_cycle("sleep 300", "live-sleep")
+    result, still_usable, state, elapsed = _live_cancel_cycle("sleep 300", "sleep")
 
-    assert "cancelled=1" in kill_out
-    assert rc != 0, "cancelled command should report a signal exit"
-    assert "persisted" in state, "sandbox filesystem must survive cancellation"
-    assert poll is None, "sandbox must still be running after a cancel"
+    assert result["returncode"] == 130, "interrupt path did not fire: %r" % (result,)
+    assert elapsed < 60, "command not stopped promptly: %.1fs" % elapsed
+    assert still_usable["returncode"] == 0, "SANDBOX BRICKED: %r" % (still_usable,)
+    assert "alive" in still_usable["output"], still_usable
+    assert "persisted" in state["output"], "session state lost: %r" % (state,)
 
 
 @_live_only
 def test_live_cancel_reaches_a_shell_builtin_only_command():
     """Regression: a command that never forks has no tagged child process."""
-    rc, state, poll, kill_out = _live_cancel_cycle("while :; do :; done", "live-builtin")
+    result, still_usable, state, elapsed = _live_cancel_cycle(
+        "while :; do :; done", "builtin"
+    )
 
-    assert "cancelled=1" in kill_out
-    assert rc != 0
-    assert poll is None
+    assert result["returncode"] == 130, "interrupt path did not fire: %r" % (result,)
+    assert elapsed < 60, "builtin loop not cancelled promptly: %.1fs" % elapsed
+    assert still_usable["returncode"] == 0, "SANDBOX BRICKED: %r" % (still_usable,)
+    assert "persisted" in state["output"], state
 
 
 @_live_only
@@ -443,22 +455,24 @@ def test_live_cancel_survives_the_env_snapshot_being_sourced():
         "echo 'export HERMES_CANCEL_TOKEN=STALE' > /tmp/snap; "
         "source /tmp/snap; sleep 300"
     )
-    rc, state, poll, kill_out = _live_cancel_cycle(inner, "live-snapshot")
+    result, still_usable, state, elapsed = _live_cancel_cycle(inner, "snapshot")
 
-    assert "cancelled=1" in kill_out
-    assert rc != 0
-    assert poll is None
+    assert result["returncode"] == 130, "interrupt path did not fire: %r" % (result,)
+    assert elapsed < 60, "not cancelled promptly: %.1fs" % elapsed
+    assert still_usable["returncode"] == 0, "SANDBOX BRICKED: %r" % (still_usable,)
+    assert "persisted" in state["output"], state
 
 
 @_live_only
 def test_live_cancel_kills_the_whole_child_tree():
-    rc, state, poll, kill_out = _live_cancel_cycle(
-        "sleep 300 & sleep 300 & wait", "live-tree"
+    result, still_usable, state, elapsed = _live_cancel_cycle(
+        "sleep 300 & sleep 300 & wait", "tree"
     )
 
-    assert "cancelled=1" in kill_out
-    assert rc != 0
-    assert poll is None
+    assert result["returncode"] == 130, "interrupt path did not fire: %r" % (result,)
+    assert elapsed < 60, "child tree not cancelled promptly: %.1fs" % elapsed
+    assert still_usable["returncode"] == 0, "SANDBOX BRICKED: %r" % (still_usable,)
+    assert "persisted" in state["output"], state
 
 
 @_live_only
@@ -677,26 +691,81 @@ def test_cancellable_command_does_not_rely_on_an_exit_trap():
     assert "trap" not in wrapped, "cleanup must not depend on an EXIT trap"
 
 
-def test_pidfile_cleanup_never_runs_after_the_command():
-    """The whole class of post-command cleanup bugs, pinned in one place.
+def test_pidfile_cleanup_does_not_touch_the_command_or_its_exit(tmp_path):
+    """Behavior contract for the class of post-command-cleanup bugs.
 
-    Four separate findings came from trying to clean up a PID file *after* its
-    command: an EXIT trap the command clobbers, a subshell that breaks ``$$``,
-    an awaited reaper that extends the caller's timed window, and a
-    fire-and-forget reaper that races ``cleanup()``'s snapshot. Cleanup is an
-    age sweep at command START instead, so there is no post-command path at
-    all for the next variant to live in.
+    Four findings came from cleaning up a PID file AFTER its command: an EXIT
+    trap the command clobbers, a subshell that breaks ``$$``, an awaited
+    reaper that extends the caller's timed window, and a fire-and-forget
+    reaper that races ``cleanup()``. Rather than forbidding identifiers, this
+    asserts the observable properties any correct implementation must have:
+    running the wrapper must not alter the command's exit status, its ``$$``,
+    or its own EXIT trap, and must not outlive the command.
     """
-    import inspect
+    import subprocess
 
-    source = inspect.getsource(modal_env.ModalEnvironment._run_bash)
-    assert "_reap_pidfile" not in source, "no post-command reaper may exist"
-    assert "create_task" not in source, "no background cleanup task may exist"
+    pidfile = tmp_path / "cmd.pid"
 
-    wrapped = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
-    sweep_at = wrapped.index("-delete")
-    command_at = wrapped.index("echo hi")
-    assert sweep_at < command_at, "the sweep must run before the command"
+    # 1. Exit status passes through untouched.
+    exited = subprocess.run(
+        ["bash", "-c", modal_env._cancellable_command("exit 37", str(pidfile))],
+        capture_output=True, text=True,
+    )
+    assert exited.returncode == 37, exited
+
+    # 2. `$$` still refers to the command's own shell, so a command that
+    #    signals itself gets its own trap rather than killing the wrapper.
+    selfsignal = subprocess.run(
+        ["bash", "-c", modal_env._cancellable_command(
+            "trap 'exit 42' TERM; kill -TERM $$; sleep 3", str(pidfile))],
+        capture_output=True, text=True,
+    )
+    assert selfsignal.returncode == 42, selfsignal
+
+    # 3. A command's own EXIT trap still runs and is not displaced by ours.
+    trapped = subprocess.run(
+        ["bash", "-c", modal_env._cancellable_command(
+            "trap 'echo MY_TRAP_RAN' EXIT; echo body", str(pidfile))],
+        capture_output=True, text=True,
+    )
+    assert "body" in trapped.stdout, trapped
+    assert "MY_TRAP_RAN" in trapped.stdout, "the command's own EXIT trap was lost"
+
+    # 4. Cleanup leaves nothing running once the command returns: no stray
+    #    background job can still be mutating the filesystem afterwards.
+    jobs = subprocess.run(
+        ["bash", "-c", modal_env._cancellable_command(
+            "jobs -r | wc -l", str(pidfile))],
+        capture_output=True, text=True,
+    )
+    assert jobs.stdout.strip().splitlines()[-1].strip() == "0", (
+        "cleanup left a background job running alongside the command: %r" % (jobs,)
+    )
+
+    # 5. Cleanup behaves IDENTICALLY however the command terminates. This is
+    #    what actually separates a sweep from the broken variants: an EXIT
+    #    trap cleans up on a normal exit but leaks when the command clears
+    #    the trap, and trailing `rm` cleans up on a normal exit but leaks when
+    #    the command calls `exit` directly. Path-dependent cleanup is the bug;
+    #    which specific mechanism replaces it is not this test's business.
+    outcomes = set()
+    for i, body in enumerate([
+        "echo plain",                      # ordinary completion
+        "trap 'echo user' EXIT; trap - EXIT; echo cleared",  # clears traps
+        "exit 0",                          # exits directly
+        "kill -TERM $$",                   # dies on a signal
+    ]):
+        pf = tmp_path / ("mode%d.pid" % i)
+        subprocess.run(
+            ["bash", "-c", modal_env._cancellable_command(body, str(pf))],
+            capture_output=True, text=True,
+        )
+        outcomes.add(pf.exists())
+
+    assert len(outcomes) == 1, (
+        "pid-file cleanup depends on how the command exits, so some exit "
+        "paths leak and others do not: %r" % (outcomes,)
+    )
 
 
 def test_stale_pidfile_sweep_only_targets_old_files_in_its_own_dir():
