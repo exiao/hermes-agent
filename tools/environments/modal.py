@@ -7,6 +7,7 @@ wrapper, while preserving Hermes' persistent snapshot behavior across sessions.
 import asyncio
 import base64
 import io
+import itertools
 import logging
 import shlex
 import tarfile
@@ -33,6 +34,159 @@ logger = logging.getLogger(__name__)
 
 _SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
 _DIRECT_SNAPSHOT_NAMESPACE = "direct"
+
+# Cancellation
+# ------------
+# Modal's ``ContainerProcess`` exposes only poll/wait/stdout/stderr — there is
+# no kill. The obvious workaround, ``sandbox.terminate()``, cancels the command
+# by destroying the entire sandbox: ``poll()`` then returns an exit code and
+# every later ``exec`` raises ``NotFoundError``, so one interrupted command
+# bricks the session (measured against modal==1.3.4).
+#
+# The sandbox itself, however, still accepts ``exec``. So we cancel a command
+# the way a shell would: have the command record its own PID, then run a
+# second exec that signals that process group. The sandbox, its filesystem,
+# and every other running command survive.
+#
+# Why a PID file rather than an environment marker: the command runs under
+# ``_wrap_command``, which sources the session's ``export -p`` snapshot. Any
+# variable we export is therefore overwritten by the snapshot's value on every
+# later command, and a shell-builtin-only command (``while :; do :; done``)
+# never spawns a child carrying it at all. ``$$`` is written by the shell
+# itself, so it is correct in both cases. Both verified against live Modal.
+_CANCEL_DIR = "/tmp/.hermes-cancel"
+_CANCEL_TIMEOUT_SECONDS = 20
+_cancel_id_counter = itertools.count()
+# Age after which a PID file cannot belong to a live command and is swept.
+_PIDFILE_MAX_AGE_MINUTES = 720
+
+# TERM the process group first so the command can run traps, then KILL
+# whatever ignored it. The KILL escalation is NOT conditional on the recorded
+# PID still existing: a descendant that traps TERM outlives the wrapper bash,
+# so gating on ``/proc/$pid`` would skip the escalation and leak it (measured:
+# a trapping child survived the guarded version and died under this one).
+#
+# The PID file may lag the exec RPC by a few ms, so poll briefly for it. This
+# only smooths that small window; the launch race proper (a cancel arriving
+# before ``sandbox.exec`` returns at all) is closed in Python by _run_bash,
+# which replays a pending cancel once the command is up. A file that never
+# appears means the command never started, and a no-op is correct.
+#
+# The PGID is read by skipping past the parenthesized ``comm`` field rather
+# than with ``cut -f5``: ``comm`` is the executable's basename and may contain
+# spaces, which shifts every positional field. Measured on a stat line whose
+# comm is ``(we ird)``, ``cut -f5`` returned the PPID (7) where the PGID was
+# 42; the sed form returns 42 for both spaced and unspaced comms.
+_CANCEL_SCRIPT = r"""
+pidfile="$1"
+waited=0
+while [ ! -s "$pidfile" ] && [ "$waited" -lt 20 ]; do
+  sleep 0.1
+  waited=$((waited+1))
+done
+[ -s "$pidfile" ] || { echo "cancelled=0"; exit 0; }
+read -r pid pgid < "$pidfile"
+rm -f "$pidfile" 2>/dev/null
+# The wrapper may already be gone while its children run on (``sleep 300 &``
+# exits the wrapper immediately but the child keeps the stdout handle open, so
+# the exec RPC is still pending). The recorded PGID therefore has to survive
+# the wrapper: re-derive it from /proc only as a fallback for an older file.
+if [ -z "$pgid" ] && [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+  pgid=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f3)
+fi
+[ -n "$pgid" ] && [ "$pgid" != "0" ] || pgid=""
+[ -n "$pgid" ] || [ -d "/proc/$pid" ] || { echo "cancelled=0"; exit 0; }
+
+# Collect the recorded shell and every descendant by walking /proc parent
+# links. The process group alone is not enough: a command that calls setsid
+# (or otherwise leaves the group) keeps running while a group-only signal
+# reports success. Walking the tree catches those; signalling the group as
+# well catches anything that reparented away from us.
+collect_tree() {
+  echo "$1"
+  for d in /proc/[0-9]*; do
+    child=${d#/proc/}
+    [ "$child" = "$1" ] && continue
+    cppid=$(sed 's/^.*) //' "$d/stat" 2>/dev/null | cut -d' ' -f2)
+    [ "$cppid" = "$1" ] && collect_tree "$child"
+  done
+}
+if [ -d "/proc/$pid" ]; then
+  targets=$(collect_tree "$pid")
+else
+  targets=""
+fi
+
+for sig in TERM KILL; do
+  [ -n "$pgid" ] && kill -"$sig" -"$pgid" 2>/dev/null
+  for target in $targets; do
+    kill -"$sig" "$target" 2>/dev/null
+  done
+  [ "$sig" = TERM ] && sleep 0.3
+done
+echo "cancelled=1"
+"""
+
+
+def _cancel_pidfile(command_id: str) -> str:
+    return f"{_CANCEL_DIR}/{command_id}"
+
+
+def _stale_pidfile_sweep() -> str:
+    """Shell to drop PID files older than a command could plausibly still hold.
+
+    Cleanup is a sweep, not a per-command teardown. Every attempt at the
+    latter created a new failure of the same class: an in-shell ``EXIT`` trap
+    is clobbered by the command's own; a subshell to survive that breaks
+    ``$$``; an awaited reaper extends the caller's timed window; a
+    fire-and-forget reaper then races ``cleanup()``'s snapshot. Each fix was
+    real and each spawned the next, which is the signal to change the shape
+    rather than patch again.
+
+    A PID file is inert metadata under ``/tmp``: nothing reads it except
+    ``cancel()``, which targets one exact path. So it does not need timely
+    removal at all — it needs to not accumulate. Sweeping files older than
+    ``_PIDFILE_MAX_AGE_MINUTES`` at command START has no completion path to
+    miss, nothing to await, and no task to race, and it bounds the directory
+    for any command that outlives its own cleanup (a cancel, a crash, a
+    sandbox reset).
+    """
+    return (
+        f"find {shlex.quote(_CANCEL_DIR)} -maxdepth 1 -type f "
+        f"-mmin +{_PIDFILE_MAX_AGE_MINUTES} -delete 2>/dev/null || true"
+    )
+
+
+def _cancellable_command(cmd_string: str, pidfile: str) -> str:
+    """Prefix ``cmd_string`` so it records its own PID for cancellation.
+
+    ``$$`` is the shell's own PID, written before the command runs, so this
+    works for shell builtins that never fork and survives the env snapshot
+    that ``_wrap_command`` sources. Writing the file must never break the
+    command, hence the ``|| true``.
+
+    Nothing is appended after the command, deliberately. Two attempts at
+    in-shell cleanup each changed the command's semantics:
+
+    - an ``EXIT`` trap is silently discarded by any command that installs its
+      own (``FileOperations._atomic_write`` sets one, then ``trap - EXIT``),
+      so the file leaked on the normal file-write path;
+    - wrapping in ``( ... )`` restores cleanup but breaks ``$$``: bash keeps
+      ``$$`` as the *parent* shell's PID inside a subshell, so a command doing
+      ``trap 'exit 42' TERM; kill -TERM $$`` signalled the wrapper instead of
+      itself and returned 143 where it used to return 42.
+
+    Stale files are reaped by the age sweep prefixed here, which runs before
+    the command and so cannot interact with how it exits.
+    """
+    quoted = shlex.quote(pidfile)
+    return (
+        f"mkdir -p {shlex.quote(_CANCEL_DIR)} 2>/dev/null; "
+        f"{_stale_pidfile_sweep()}; "
+        f"echo \"$$ $(sed 's/^.*) //' /proc/$$/stat 2>/dev/null "
+        f"| cut -d' ' -f3)\" > {quoted} 2>/dev/null || true; "
+        f"{cmd_string}"
+    )
 
 
 def _load_snapshots() -> dict:
@@ -165,7 +319,8 @@ class ModalEnvironment(BaseEnvironment):
     """Modal cloud execution via native Modal sandboxes.
 
     Spawn-per-call via _ThreadedProcessHandle wrapping async SDK calls.
-    cancel_fn wired to sandbox.terminate for interrupt support.
+    cancel_fn signals the running command by token (see _CANCEL_SCRIPT) so an
+    interrupt or timeout never destroys the sandbox.
     """
 
     _stdin_mode = "heredoc"
@@ -410,19 +565,76 @@ class ModalEnvironment(BaseEnvironment):
                   stdin_data: str | None = None):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
         sandbox = self._sandbox
+        if sandbox is None:
+            raise RuntimeError("Modal sandbox is not initialized")
         worker = self._worker
+        pidfile = _cancel_pidfile(f"{id(self):x}-{next(_cancel_id_counter)}")
+        tagged_command = _cancellable_command(cmd_string, pidfile)
+
+        execution_lock = threading.Lock()
+        execution_started = False
+        cancel_requested = False
+        cancel_dispatched = False
+
+        async def _do_cancel() -> None:
+            proc = await sandbox.exec.aio(
+                "bash", "-c", _CANCEL_SCRIPT, "--", pidfile,
+                timeout=_CANCEL_TIMEOUT_SECONDS,
+            )
+            await proc.wait.aio()
+
+        def _claim_cancel_dispatch() -> bool:
+            nonlocal cancel_dispatched
+            with execution_lock:
+                if not execution_started or cancel_dispatched:
+                    return False
+                cancel_dispatched = True
+                return True
+
+        def _cancel_after_startup() -> None:
+            try:
+                worker.run_coroutine(_do_cancel(), timeout=_CANCEL_TIMEOUT_SECONDS + 10)
+            except Exception as exc:
+                # Best-effort: the caller has already stopped waiting on this
+                # command. Leaving a stray process behind is strictly better
+                # than tearing down a live sandbox.
+                logger.warning("Modal: could not cancel remote command: %s", exc)
 
         def cancel():
-            worker.run_coroutine(sandbox.terminate.aio(), timeout=15)
+            """Signal only this command, leaving the sandbox usable.
+
+            An interrupt may arrive while ``sandbox.exec.aio`` is still
+            creating the target. Remember it until that startup completes, so
+            cancellation cannot race ahead of the PID-file registration.
+            """
+            nonlocal cancel_requested
+            if sandbox is None:
+                return
+            with execution_lock:
+                cancel_requested = True
+            if _claim_cancel_dispatch():
+                _cancel_after_startup()
 
         def exec_fn() -> tuple[str, int]:
             async def _do():
+                nonlocal execution_started
                 args = ["bash"]
                 if login:
-                    args.extend(["-l", "-c", cmd_string])
+                    args.extend(["-l", "-c", tagged_command])
                 else:
-                    args.extend(["-c", cmd_string])
+                    args.extend(["-c", tagged_command])
                 process = await sandbox.exec.aio(*args, timeout=timeout)
+                with execution_lock:
+                    execution_started = True
+                    pending_cancel = cancel_requested
+                if pending_cancel and _claim_cancel_dispatch():
+                    try:
+                        await _do_cancel()
+                    except Exception as exc:
+                        # Match the post-start cancellation path: a transient
+                        # cancellation transport failure must not prevent this
+                        # handle from draining and waiting for its target.
+                        logger.warning("Modal: could not cancel remote command: %s", exc)
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
                 exit_code = await process.wait.aio()
@@ -433,6 +645,7 @@ class ModalEnvironment(BaseEnvironment):
                 output = stdout
                 if stderr:
                     output = f"{stdout}\n{stderr}" if stdout else stderr
+
                 return output, exit_code
 
             return worker.run_coroutine(_do(), timeout=timeout + 30)
