@@ -476,6 +476,68 @@ def test_live_cancel_kills_the_whole_child_tree():
 
 
 @_live_only
+def test_live_cancel_reaches_a_descendant_that_left_the_process_group():
+    """Regression: a signal to the group alone misses a detached child.
+
+    A command that calls ``setsid`` puts its child in a NEW process group, so
+    a group-only kill terminates the wrapper, reports success, and leaves the
+    child running. Cancellation walks the /proc parent tree as well.
+    """
+    import asyncio
+
+    modal = pytest.importorskip("modal")
+
+    marker = "hermes_detached_child"
+    count = (
+        'n=0; self=$$; for d in /proc/[0-9]*; do p=${d#/proc/}; '
+        '[ "$p" = "$self" ] && continue; '
+        'c=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null); '
+        f'case "$c" in *{marker}*) n=$((n+1));; esac; done; echo "n=$n"'
+    )
+
+    async def _run():
+        app = await modal.App.lookup.aio("hermes-cancel-e2e", create_if_missing=True)
+        sandbox = await modal.Sandbox.create.aio(
+            "sleep", "infinity", image=modal.Image.debian_slim(), app=app, timeout=300,
+        )
+        try:
+            pidfile = modal_env._cancel_pidfile("live-detached")
+            inner = (
+                f"setsid bash -c 'exec -a {marker} sleep 900'; sleep 300"
+            )
+            target = await sandbox.exec.aio(
+                "bash", "-c", modal_env._cancellable_command(inner, pidfile), timeout=300,
+            )
+            await asyncio.sleep(3)
+
+            before = await sandbox.exec.aio("bash", "-c", count)
+            before_out = await before.stdout.read.aio()
+            await before.wait.aio()
+
+            killer = await sandbox.exec.aio(
+                "bash", "-c", modal_env._CANCEL_SCRIPT, "--", pidfile, timeout=30,
+            )
+            await killer.wait.aio()
+            try:
+                await asyncio.wait_for(target.wait.aio(), timeout=25)
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+
+            after = await sandbox.exec.aio("bash", "-c", count)
+            after_out = await after.stdout.read.aio()
+            await after.wait.aio()
+            return before_out, after_out
+        finally:
+            await sandbox.terminate.aio()
+
+    before_out, after_out = asyncio.run(_run())
+
+    assert "n=0" not in before_out, "the detached child never started"
+    assert "n=0" in after_out, f"detached child survived cancel: {after_out!r}"
+
+
+@_live_only
 def test_live_cancel_reaches_a_descendant_that_ignores_term():
     """Regression: gating the KILL escalation on the wrapper PID leaks children.
 

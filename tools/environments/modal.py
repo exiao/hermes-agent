@@ -90,16 +90,30 @@ rm -f "$pidfile" 2>/dev/null
 [ -n "$pid" ] && [ -d "/proc/$pid" ] || { echo "cancelled=0"; exit 0; }
 pgid=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f3)
 [ -n "$pgid" ] && [ "$pgid" != "0" ] || pgid=""
-if [ -n "$pgid" ]; then
-  kill -TERM -"$pgid" 2>/dev/null || true
-else
-  kill -TERM "$pid" 2>/dev/null || true
-fi
-sleep 0.3
-if [ -n "$pgid" ]; then
-  kill -KILL -"$pgid" 2>/dev/null || true
-fi
-[ -d "/proc/$pid" ] && kill -KILL "$pid" 2>/dev/null
+
+# Collect the recorded shell and every descendant by walking /proc parent
+# links. The process group alone is not enough: a command that calls setsid
+# (or otherwise leaves the group) keeps running while a group-only signal
+# reports success. Walking the tree catches those; signalling the group as
+# well catches anything that reparented away from us.
+collect_tree() {
+  echo "$1"
+  for d in /proc/[0-9]*; do
+    child=${d#/proc/}
+    [ "$child" = "$1" ] && continue
+    cppid=$(sed 's/^.*) //' "$d/stat" 2>/dev/null | cut -d' ' -f2)
+    [ "$cppid" = "$1" ] && collect_tree "$child"
+  done
+}
+targets=$(collect_tree "$pid")
+
+for sig in TERM KILL; do
+  [ -n "$pgid" ] && kill -"$sig" -"$pgid" 2>/dev/null
+  for target in $targets; do
+    kill -"$sig" "$target" 2>/dev/null
+  done
+  [ "$sig" = TERM ] && sleep 0.3
+done
 echo "cancelled=1"
 """
 
