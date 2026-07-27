@@ -19,12 +19,27 @@ from tools.environments.base import BaseEnvironment
 modal_env = pytest.importorskip("tools.environments.modal")
 
 
-def test_cancellable_command_preserves_the_original_command():
-    tagged = modal_env._cancellable_command("echo hi && ls", "/tmp/.hermes-cancel/x")
-    assert tagged.endswith("echo hi && ls")
+def test_cancellable_command_preserves_the_original_command(tmp_path):
+    """The wrapped command must still DO what the bare command does."""
+    import subprocess
+
+    pidfile = tmp_path / "cmd.pid"
+    marker = tmp_path / "ran"
+    inner = f"echo hi && echo second > {marker}"
+
+    bare = subprocess.run(["bash", "-c", inner], capture_output=True, text=True)
+    marker.unlink(missing_ok=True)
+    wrapped = subprocess.run(
+        ["bash", "-c", modal_env._cancellable_command(inner, str(pidfile))],
+        capture_output=True, text=True,
+    )
+
+    assert wrapped.stdout == bare.stdout, "wrapper changed the command's output"
+    assert wrapped.returncode == bare.returncode
+    assert marker.read_text() == "second\n", "the command's side effects must run"
 
 
-def test_cancellable_command_records_the_shell_pid_not_an_env_var():
+def test_cancellable_command_records_the_shell_pid_not_an_env_var(tmp_path):
     """Regression: an exported marker is clobbered by the env snapshot.
 
     ``_wrap_command`` sources the session's ``export -p`` snapshot, so any
@@ -32,22 +47,84 @@ def test_cancellable_command_records_the_shell_pid_not_an_env_var():
     later command — cancel would then match nothing. ``$$`` is written by the
     shell itself and is immune.
     """
-    tagged = modal_env._cancellable_command("sleep 300", "/tmp/.hermes-cancel/x")
-    assert "echo $$ >" in tagged
-    assert "export HERMES_CANCEL_TOKEN" not in tagged
+    import subprocess
+
+    pidfile = tmp_path / "cmd.pid"
+    # A shell BUILTIN never forks, so the recorded pid must be the shell's own
+    # and must still be live while the command runs.
+    tagged = modal_env._cancellable_command(
+        f'read -r _ < {tmp_path / "gate"} 2>/dev/null; :', str(pidfile)
+    )
+    (tmp_path / "gate").write_text("go\n")
+    proc = subprocess.run(["bash", "-c", tagged + f'; echo "$$" > {tmp_path / "self"}'],
+                          capture_output=True, text=True)
+
+    assert proc.returncode == 0, proc
+    recorded = pidfile.read_text().strip()
+    actual = (tmp_path / "self").read_text().strip()
+    assert recorded == actual, (
+        "recorded pid %r is not the command shell's own pid %r" % (recorded, actual)
+    )
 
 
-def test_cancellable_command_quotes_the_pidfile():
-    nasty = "/tmp/a b; rm -rf /"
-    tagged = modal_env._cancellable_command("true", nasty)
-    assert shlex.quote(nasty) in tagged
-    assert "; rm -rf /" not in tagged.replace(shlex.quote(nasty), "")
+def test_cancellable_command_quotes_the_pidfile(tmp_path):
+    """A hostile pidfile path must be data, never executable shell."""
+    import subprocess
+
+    canary = tmp_path / "canary"
+    canary.write_text("intact")
+    nasty = str(tmp_path / f"a b; rm -f {canary}")
+
+    proc = subprocess.run(
+        ["bash", "-c", modal_env._cancellable_command("echo ok", nasty)],
+        capture_output=True, text=True,
+    )
+
+    assert "ok" in proc.stdout, proc
+    assert canary.read_text() == "intact", "injected command executed"
+    # The whole hostile string must have been passed as ONE literal argument to
+    # the redirect, so bash complains about that exact path rather than running
+    # the `rm` after a `;`. Either it wrote the file or it failed on the literal
+    # path; both prove the injection never became shell syntax.
+    assert os.path.exists(nasty) or nasty in proc.stderr, (
+        "hostile pidfile path was not treated as one literal argument: %r" % (proc,)
+    )
 
 
-def test_pidfile_write_cannot_break_the_command():
-    """A read-only /tmp must not turn every command into a failure."""
-    tagged = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
-    assert "|| true" in tagged.split("echo hi")[0]
+def test_pidfile_write_cannot_break_the_command(tmp_path):
+    """An unwritable pid-file location must not fail an otherwise fine command.
+
+    The guard matters under ``set -e`` and inside ``&&`` chains, which real
+    commands use: there a failed redirect aborts the whole command rather than
+    printing a warning. Both shapes are exercised.
+    """
+    import subprocess
+
+    readonly = tmp_path / "ro"
+    readonly.mkdir()
+    readonly.chmod(0o500)
+    pidfile = str(readonly / "cmd.pid")
+    try:
+        plain = subprocess.run(
+            ["bash", "-c", modal_env._cancellable_command("echo hi", pidfile)],
+            capture_output=True, text=True,
+        )
+        errexit = subprocess.run(
+            ["bash", "-ec", modal_env._cancellable_command("echo hi", pidfile)],
+            capture_output=True, text=True,
+        )
+        chained = subprocess.run(
+            ["bash", "-c", modal_env._cancellable_command("echo hi && echo two", pidfile)],
+            capture_output=True, text=True,
+        )
+    finally:
+        readonly.chmod(0o700)
+
+    for label, proc in (("plain", plain), ("set -e", errexit), ("&&", chained)):
+        assert proc.returncode == 0, (
+            "unwritable pid path broke the command under %s: %r" % (label, proc)
+        )
+        assert "hi" in proc.stdout, (label, proc)
 
 
 def test_cancellable_command_preserves_exit_status(tmp_path):
@@ -76,14 +153,6 @@ def test_cancellable_command_preserves_dollar_dollar_semantics(tmp_path):
     assert result.returncode == 42, (
         "the command's own $$ trap must still fire; got %s" % result.returncode
     )
-
-
-def test_cancellable_command_appends_nothing_after_the_command(tmp_path):
-    """Cleanup must live in Python, not tacked onto the command's shell."""
-    tagged = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
-    assert "trap" not in tagged
-    assert "__hermes_rc" not in tagged
-    assert tagged.endswith("echo hi")
 
 
 class _Reader:
@@ -784,12 +853,6 @@ def test_cancel_script_reads_the_pgid_correctly_for_any_comm(tmp_path):
         )
 
 
-def test_cancellable_command_does_not_rely_on_an_exit_trap():
-    """A command's own ``trap - EXIT`` must not be able to skip cleanup."""
-    wrapped = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
-    assert "trap" not in wrapped, "cleanup must not depend on an EXIT trap"
-
-
 def test_pidfile_cleanup_does_not_touch_the_command_or_its_exit(tmp_path):
     """Behavior contract for the class of post-command-cleanup bugs.
 
@@ -867,14 +930,46 @@ def test_pidfile_cleanup_does_not_touch_the_command_or_its_exit(tmp_path):
     )
 
 
-def test_stale_pidfile_sweep_only_targets_old_files_in_its_own_dir():
-    sweep = modal_env._stale_pidfile_sweep()
+def test_stale_pidfile_sweep_only_targets_old_files_in_its_own_dir(tmp_path):
+    """Run the sweep: it must take only old files, only in its own directory."""
+    import subprocess
 
-    assert modal_env._CANCEL_DIR in sweep
-    assert "-maxdepth 1" in sweep, "must not recurse out of the cancel dir"
-    assert "-type f" in sweep
-    assert f"-mmin +{modal_env._PIDFILE_MAX_AGE_MINUTES}" in sweep
-    assert "|| true" in sweep, "a failed sweep must never break the command"
+    old_age = time.time() - (modal_env._PIDFILE_MAX_AGE_MINUTES + 60) * 60
+
+    fresh = tmp_path / "fresh.pid"
+    fresh.write_text("1")
+    stale = tmp_path / "stale.pid"
+    stale.write_text("2")
+    os.utime(stale, (old_age, old_age))
+
+    nested = tmp_path / "sub"
+    nested.mkdir()
+    nested_stale = nested / "stale.pid"
+    nested_stale.write_text("3")
+    os.utime(nested_stale, (old_age, old_age))
+    os.utime(nested, (old_age, old_age))
+
+    sweep = modal_env._stale_pidfile_sweep().replace(
+        shlex.quote(modal_env._CANCEL_DIR), shlex.quote(str(tmp_path))
+    )
+    subprocess.run(["bash", "-c", sweep], check=False)
+
+    assert fresh.exists(), "a live command's pid file was swept"
+    assert not stale.exists(), "a stale pid file was not swept"
+    assert nested_stale.exists(), "the sweep recursed out of its own directory"
+    assert nested.is_dir(), "the sweep deleted a directory"
+
+
+def test_stale_pidfile_sweep_cannot_fail_the_command(tmp_path):
+    """A sweep over a missing/unreadable dir must still exit 0."""
+    import subprocess
+
+    sweep = modal_env._stale_pidfile_sweep().replace(
+        shlex.quote(modal_env._CANCEL_DIR), shlex.quote(str(tmp_path / "nope"))
+    )
+    proc = subprocess.run(["bash", "-c", sweep], capture_output=True, text=True)
+
+    assert proc.returncode == 0, "a failing sweep would break every command: %r" % (proc,)
 
 
 def test_stale_pidfile_sweep_leaves_a_live_commands_file_alone(tmp_path):
