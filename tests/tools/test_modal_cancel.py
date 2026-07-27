@@ -60,7 +60,10 @@ def test_cancellable_command_records_the_shell_pid_not_an_env_var(tmp_path):
                           capture_output=True, text=True)
 
     assert proc.returncode == 0, proc
-    recorded = pidfile.read_text().strip()
+    # The file records "<pid> <pgid>"; the first field is the contract the
+    # cancel script reads. (On Linux the pgid is present; on platforms without
+    # /proc it is empty, which the cancel script re-derives.)
+    recorded = pidfile.read_text().split()[0]
     actual = (tmp_path / "self").read_text().strip()
     assert recorded == actual, (
         "recorded pid %r is not the command shell's own pid %r" % (recorded, actual)
