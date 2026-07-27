@@ -69,6 +69,12 @@ _cancel_id_counter = itertools.count()
 # before ``sandbox.exec`` returns at all) is closed in Python by _run_bash,
 # which replays a pending cancel once the command is up. A file that never
 # appears means the command never started, and a no-op is correct.
+#
+# The PGID is read by skipping past the parenthesized ``comm`` field rather
+# than with ``cut -f5``: ``comm`` is the executable's basename and may contain
+# spaces, which shifts every positional field. Measured on a stat line whose
+# comm is ``(we ird)``, ``cut -f5`` returned the PPID (7) where the PGID was
+# 42; the sed form returns 42 for both spaced and unspaced comms.
 _CANCEL_SCRIPT = r"""
 pidfile="$1"
 waited=0
@@ -80,7 +86,7 @@ done
 pid=$(cat "$pidfile" 2>/dev/null)
 rm -f "$pidfile" 2>/dev/null
 [ -n "$pid" ] && [ -d "/proc/$pid" ] || { echo "cancelled=0"; exit 0; }
-pgid=$(cut -d' ' -f5 "/proc/$pid/stat" 2>/dev/null)
+pgid=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f3)
 [ -n "$pgid" ] && [ "$pgid" != "0" ] || pgid=""
 if [ -n "$pgid" ]; then
   kill -TERM -"$pgid" 2>/dev/null || true
@@ -107,14 +113,26 @@ def _cancellable_command(cmd_string: str, pidfile: str) -> str:
     works for shell builtins that never fork and survives the env snapshot
     that ``_wrap_command`` sources. Writing the file must never break the
     command, hence the ``|| true``.
+
+    Cleanup deliberately does NOT rely on an ``EXIT`` trap in the command's
+    own shell. Commands routinely install their own
+    (``FileOperations._atomic_write`` sets one and then clears it with
+    ``trap - EXIT``), which silently discards ours and leaks the PID file on
+    the normal file-write path.
+
+    Running the command in a subshell fixes both halves: the command's traps
+    and any ``exit`` it calls are confined to that subshell, so cleanup after
+    it always runs, and ``$?`` is captured and re-raised so the caller still
+    sees the real exit status. A cancelled command never reaches the cleanup,
+    which is fine: cancel() removes the file itself.
     """
     quoted = shlex.quote(pidfile)
-    cleanup = shlex.quote(f"rm -f {quoted} 2>/dev/null")
     return (
         f"mkdir -p {shlex.quote(_CANCEL_DIR)} 2>/dev/null; "
         f"echo $$ > {quoted} 2>/dev/null || true; "
-        f"trap {cleanup} EXIT; "
-        f"{cmd_string}"
+        f"( {cmd_string} ); __hermes_rc=$?; "
+        f"rm -f {quoted} 2>/dev/null; "
+        f"exit $__hermes_rc"
     )
 
 

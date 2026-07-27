@@ -20,7 +20,7 @@ modal_env = pytest.importorskip("tools.environments.modal")
 
 def test_cancellable_command_preserves_the_original_command():
     tagged = modal_env._cancellable_command("echo hi && ls", "/tmp/.hermes-cancel/x")
-    assert tagged.endswith("echo hi && ls")
+    assert "( echo hi && ls )" in tagged
 
 
 def test_cancellable_command_records_the_shell_pid_not_an_env_var():
@@ -552,3 +552,98 @@ def test_live_cancel_that_arrives_before_the_command_registers():
 
     assert "cancelled=1" in kill_out, f"cancel gave up before the command registered: {kill_out!r}"
     assert "n=0" in after_out, f"command survived an early cancel: {after_out!r}"
+
+
+@_live_only
+def test_live_pidfile_is_cleaned_when_the_command_installs_its_own_exit_trap():
+    """Regression: an EXIT trap for cleanup is clobbered by the command's own.
+
+    ``FileOperations._atomic_write`` installs an EXIT trap and then clears it
+    with ``trap - EXIT`` — the normal file-write path. A cleanup trap set by
+    the wrapper is silently discarded there, leaking the PID file on every
+    write. Cleanup must not depend on a trap surviving the command.
+    """
+    import asyncio
+
+    modal = pytest.importorskip("modal")
+
+    async def _run():
+        app = await modal.App.lookup.aio("hermes-cancel-e2e", create_if_missing=True)
+        sandbox = await modal.Sandbox.create.aio(
+            "sleep", "infinity", image=modal.Image.debian_slim(), app=app, timeout=300,
+        )
+        try:
+            pidfile = modal_env._cancel_pidfile("live-trap-clobber")
+            # Exactly what _atomic_write does: install a trap, then clear it.
+            inner = "trap 'echo user_cleanup' EXIT; trap - EXIT; echo wrote"
+            proc = await sandbox.exec.aio(
+                "bash", "-c", modal_env._cancellable_command(inner, pidfile), timeout=60,
+            )
+            out = await proc.stdout.read.aio()
+            rc = await proc.wait.aio()
+
+            chk = await sandbox.exec.aio(
+                "bash", "-c", f"[ -e {pidfile} ] && echo LEAKED || echo cleaned",
+            )
+            leaked = await chk.stdout.read.aio()
+            await chk.wait.aio()
+            return out, rc, leaked
+        finally:
+            await sandbox.terminate.aio()
+
+    out, rc, leaked = asyncio.run(_run())
+
+    assert "wrote" in out, "the command's own output must survive the wrapper"
+    assert rc == 0, f"the command's exit status must pass through, got {rc}"
+    assert "cleaned" in leaked, f"pid file leaked despite a normal exit: {leaked!r}"
+
+
+@_live_only
+def test_live_cancel_parses_the_pgid_when_comm_contains_a_space():
+    """Regression: ``cut -f5`` on /proc/pid/stat breaks on a spaced comm.
+
+    ``comm`` is the executable basename and sits in parentheses as field 2, so
+    a space inside it shifts every later field: ``cut -f5`` then yields the
+    PPID instead of the PGID and cancel signals the wrong group.
+    """
+    import asyncio
+
+    modal = pytest.importorskip("modal")
+
+    async def _run():
+        app = await modal.App.lookup.aio("hermes-cancel-e2e", create_if_missing=True)
+        sandbox = await modal.Sandbox.create.aio(
+            "sleep", "infinity", image=modal.Image.debian_slim(), app=app, timeout=300,
+        )
+        try:
+            # A stat line with a spaced comm, ppid=7, pgid=42 — distinguishable.
+            line = "100 (we ird) S 7 42 42 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 99 0 0"
+            script = (
+                f"line='{line}'; "
+                "echo \"parsed=$(echo \"$line\" | sed 's/^.*) //' | cut -d' ' -f3)\""
+            )
+            proc = await sandbox.exec.aio("bash", "-c", script, timeout=60)
+            out = await proc.stdout.read.aio()
+            await proc.wait.aio()
+            return out
+        finally:
+            await sandbox.terminate.aio()
+
+    out = asyncio.run(_run())
+
+    assert "parsed=42" in out, f"pgid misparsed on a spaced comm: {out!r}"
+    assert "parsed=7" not in out, "parser returned the PPID instead of the PGID"
+
+
+def test_cancel_script_does_not_field_index_past_a_spaced_comm():
+    """The cancel script must not use a positional cut on /proc/pid/stat."""
+    assert "cut -d' ' -f5" not in modal_env._CANCEL_SCRIPT
+    assert "sed 's/^.*) //'" in modal_env._CANCEL_SCRIPT
+
+
+def test_cancellable_command_does_not_rely_on_an_exit_trap():
+    """A command's own ``trap - EXIT`` must not be able to skip cleanup."""
+    wrapped = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
+    assert "trap" not in wrapped, "cleanup must not depend on an EXIT trap"
+    assert "rm -f" in wrapped
+    assert "exit $__hermes_rc" in wrapped
