@@ -85,11 +85,17 @@ while [ ! -s "$pidfile" ] && [ "$waited" -lt 20 ]; do
   waited=$((waited+1))
 done
 [ -s "$pidfile" ] || { echo "cancelled=0"; exit 0; }
-pid=$(cat "$pidfile" 2>/dev/null)
+read -r pid pgid < "$pidfile"
 rm -f "$pidfile" 2>/dev/null
-[ -n "$pid" ] && [ -d "/proc/$pid" ] || { echo "cancelled=0"; exit 0; }
-pgid=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f3)
+# The wrapper may already be gone while its children run on (``sleep 300 &``
+# exits the wrapper immediately but the child keeps the stdout handle open, so
+# the exec RPC is still pending). The recorded PGID therefore has to survive
+# the wrapper: re-derive it from /proc only as a fallback for an older file.
+if [ -z "$pgid" ] && [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+  pgid=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f3)
+fi
 [ -n "$pgid" ] && [ "$pgid" != "0" ] || pgid=""
+[ -n "$pgid" ] || [ -d "/proc/$pid" ] || { echo "cancelled=0"; exit 0; }
 
 # Collect the recorded shell and every descendant by walking /proc parent
 # links. The process group alone is not enough: a command that calls setsid
@@ -105,7 +111,11 @@ collect_tree() {
     [ "$cppid" = "$1" ] && collect_tree "$child"
   done
 }
-targets=$(collect_tree "$pid")
+if [ -d "/proc/$pid" ]; then
+  targets=$(collect_tree "$pid")
+else
+  targets=""
+fi
 
 for sig in TERM KILL; do
   [ -n "$pgid" ] && kill -"$sig" -"$pgid" 2>/dev/null
@@ -173,7 +183,8 @@ def _cancellable_command(cmd_string: str, pidfile: str) -> str:
     return (
         f"mkdir -p {shlex.quote(_CANCEL_DIR)} 2>/dev/null; "
         f"{_stale_pidfile_sweep()}; "
-        f"echo $$ > {quoted} 2>/dev/null || true; "
+        f"echo \"$$ $(sed 's/^.*) //' /proc/$$/stat 2>/dev/null "
+        f"| cut -d' ' -f3)\" > {quoted} 2>/dev/null || true; "
         f"{cmd_string}"
     )
 

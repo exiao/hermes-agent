@@ -821,10 +821,10 @@ def test_cancel_script_reads_the_pgid_correctly_for_any_comm(tmp_path):
     import re
     import subprocess
 
-    # Lift the parser line out of the script and run it against fixtures.
+    # Lift the parser expression out of the script and run it against fixtures.
     parser = next(
-        line for line in modal_env._CANCEL_SCRIPT.splitlines()
-        if line.startswith("pgid=")
+        line.strip() for line in modal_env._CANCEL_SCRIPT.splitlines()
+        if line.strip().startswith("pgid=$(")
     )
     assert "/proc/$pid/stat" in parser, parser
     parser = parser.replace('"/proc/$pid/stat"', '"$STATFILE"')
@@ -990,3 +990,66 @@ def test_stale_pidfile_sweep_leaves_a_live_commands_file_alone(tmp_path):
 
     assert fresh.exists(), "a live command's pid file was swept"
     assert not old.exists(), "a stale pid file was not swept"
+
+
+@_live_only
+def test_live_cancel_reaches_a_child_that_outlives_the_wrapper():
+    """Regression: the wrapper can exit while its background child runs on.
+
+    ``sleep 300 &`` returns the wrapper immediately, but the child inherits
+    stdout so the exec RPC stays pending. Cancellation then arrives after the
+    recorded PID is gone. Deriving the PGID from ``/proc/$pid`` at cancel time
+    fails there and returned ``cancelled=0`` while the child kept running, so
+    the PGID is recorded alongside the PID while the wrapper is still alive.
+    """
+    import asyncio
+
+    modal = pytest.importorskip("modal")
+
+    marker = "hermes_bg_survivor"
+    count = (
+        'n=0; self=$$; for d in /proc/[0-9]*; do p=${d#/proc/}; '
+        '[ "$p" = "$self" ] && continue; '
+        'c=$(tr "\\\\0" " " < "$d/cmdline" 2>/dev/null); '
+        f'case "$c" in *{marker}*) n=$((n+1));; esac; done; echo "n=$n"'
+    )
+
+    async def _run():
+        app = await modal.App.lookup.aio("hermes-cancel-e2e", create_if_missing=True)
+        sandbox = await modal.Sandbox.create.aio(
+            "sleep", "infinity", image=modal.Image.debian_slim(), app=app, timeout=300,
+        )
+        try:
+            pidfile = modal_env._cancel_pidfile("live-bgchild")
+            # The wrapper exits after ~2s; the child must still be reachable.
+            inner = f"bash -c 'exec -a {marker} sleep 900' & sleep 2"
+            await sandbox.exec.aio(
+                "bash", "-c", modal_env._cancellable_command(inner, pidfile), timeout=120,
+            )
+            await asyncio.sleep(6)
+
+            before = await sandbox.exec.aio("bash", "-c", count)
+            before_out = await before.stdout.read.aio()
+            await before.wait.aio()
+
+            killer = await sandbox.exec.aio(
+                "bash", "-c", modal_env._CANCEL_SCRIPT, "--", pidfile, timeout=30,
+            )
+            kill_out = await killer.stdout.read.aio()
+            await killer.wait.aio()
+            await asyncio.sleep(1.5)
+
+            after = await sandbox.exec.aio("bash", "-c", count)
+            after_out = await after.stdout.read.aio()
+            await after.wait.aio()
+            return before_out, after_out, kill_out
+        finally:
+            await sandbox.terminate.aio()
+
+    before_out, after_out, kill_out = asyncio.run(_run())
+
+    assert "n=0" not in before_out, "the background child never started"
+    assert "cancelled=1" in kill_out, (
+        "cancel gave up because the wrapper had exited: %r" % (kill_out,)
+    )
+    assert "n=0" in after_out, f"background child survived cancel: {after_out!r}"
