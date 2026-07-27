@@ -15,6 +15,27 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+_INITIAL_DASHBOARD_APP_STATE = (
+    getattr(web_server.app.state, "bound_host", None),
+    getattr(web_server.app.state, "bound_port", None),
+    getattr(web_server.app.state, "auth_required", None),
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_dashboard_app_state():
+    state = web_server.app.state
+    previous = (
+        getattr(state, "bound_host", None),
+        getattr(state, "bound_port", None),
+        getattr(state, "auth_required", None),
+    )
+    try:
+        yield
+    finally:
+        state.bound_host, state.bound_port, state.auth_required = previous
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with
@@ -174,6 +195,15 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
         open_browser=False, allow_public=False,
     )
     assert web_server.app.state.auth_required is False
+
+
+def test_start_server_loopback_does_not_leak_dashboard_app_state():
+    """A previous start_server probe must not affect later dashboard tests."""
+    assert (
+        getattr(web_server.app.state, "bound_host", None),
+        getattr(web_server.app.state, "bound_port", None),
+        getattr(web_server.app.state, "auth_required", None),
+    ) == _INITIAL_DASHBOARD_APP_STATE
 
 
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
