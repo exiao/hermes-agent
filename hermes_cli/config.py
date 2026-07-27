@@ -2915,6 +2915,21 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Wall-clock backstop applied at task-creation time to any task
+        # created WITHOUT an explicit --max-runtime. An explicit per-task
+        # value always wins; 0 / negative / unset means "no default cap"
+        # (the historical behaviour).
+        #
+        # This is a BACKSTOP, not the primary reaper. `enforce_max_runtime`
+        # only reclaims rows where max_runtime_seconds IS NOT NULL, so an
+        # uncapped task is invisible to it — this key closes that gap. The
+        # primary mechanism remains dispatch_stale_timeout_seconds above,
+        # which kills on *lack of progress* (stale heartbeat) rather than
+        # wall-clock, and therefore lets long HEALTHY runs finish. A
+        # wall-clock cap cannot distinguish a hung worker from a slow one,
+        # so set this comfortably above your slowest legitimate run or you
+        # will truncate real work.
+        "default_max_runtime_seconds": 0,
         # FD-headroom preflight (corruption guard). Before opening the shared
         # kanban.db, `connect()` refuses when the process OR the host is within
         # this many file descriptors of an FD ceiling — opening a WAL board

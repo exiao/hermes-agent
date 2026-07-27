@@ -79,6 +79,27 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_applies_default_runtime_cap_to_children(kanban_home, monkeypatch):
+    """Direct child inserts must honor the same default as create_task."""
+    monkeypatch.setattr(kb, "_default_max_runtime_seconds", lambda: 5400)
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="fan out work")
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "child A"}, {"title": "child B"}],
+        )
+        caps = [
+            row["max_runtime_seconds"]
+            for row in conn.execute(
+                "SELECT max_runtime_seconds FROM tasks WHERE id IN (?, ?)",
+                child_ids,
+            ).fetchall()
+        ]
+    assert caps == [5400, 5400]
+
+
 def test_decompose_returns_none_when_task_missing(kanban_home):
     with kb.connect() as conn:
         result = kb.decompose_triage_task(
