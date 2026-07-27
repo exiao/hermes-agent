@@ -17,18 +17,25 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+_DASHBOARD_APP_STATE_ATTRS = ("bound_host", "bound_port", "auth_required")
+
+
 @contextlib.contextmanager
 def _preserve_dashboard_app_state():
     state = web_server.app.state
-    previous = (
-        getattr(state, "bound_host", None),
-        getattr(state, "bound_port", None),
-        getattr(state, "auth_required", None),
-    )
+    missing = object()
+    previous = {
+        attr: getattr(state, attr, missing) for attr in _DASHBOARD_APP_STATE_ATTRS
+    }
     try:
         yield
     finally:
-        state.bound_host, state.bound_port, state.auth_required = previous
+        for attr, value in previous.items():
+            if value is missing:
+                if hasattr(state, attr):
+                    delattr(state, attr)
+            else:
+                setattr(state, attr, value)
 
 
 @pytest.fixture(autouse=True)
@@ -201,15 +208,23 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
 def test_start_server_loopback_does_not_leak_dashboard_app_state(monkeypatch):
     """The state-preservation helper restores an actual start_server mutation."""
     state = web_server.app.state
-    initial = state.bound_host, state.bound_port, state.auth_required
+    initial = tuple(
+        getattr(state, attr, None) for attr in _DASHBOARD_APP_STATE_ATTRS
+    )
+    initial_attrs = {attr: hasattr(state, attr) for attr in _DASHBOARD_APP_STATE_ATTRS}
     with _preserve_dashboard_app_state():
         _stub_uvicorn_run(monkeypatch)
         web_server.start_server(
             host="127.0.0.1", port=9119,
             open_browser=False, allow_public=False,
         )
-        assert (state.bound_host, state.bound_port, state.auth_required) != initial
-    assert (state.bound_host, state.bound_port, state.auth_required) == initial
+        assert tuple(
+            getattr(state, attr, None) for attr in _DASHBOARD_APP_STATE_ATTRS
+        ) != initial
+    assert tuple(
+        getattr(state, attr, None) for attr in _DASHBOARD_APP_STATE_ATTRS
+    ) == initial
+    assert {attr: hasattr(state, attr) for attr in _DASHBOARD_APP_STATE_ATTRS} == initial_attrs
 
 
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
