@@ -741,10 +741,47 @@ def test_live_cancel_parses_the_pgid_when_comm_contains_a_space():
     assert "parsed=7" not in out, "parser returned the PPID instead of the PGID"
 
 
-def test_cancel_script_does_not_field_index_past_a_spaced_comm():
-    """The cancel script must not use a positional cut on /proc/pid/stat."""
-    assert "cut -d' ' -f5" not in modal_env._CANCEL_SCRIPT
-    assert "sed 's/^.*) //'" in modal_env._CANCEL_SCRIPT
+def test_cancel_script_reads_the_pgid_correctly_for_any_comm(tmp_path):
+    """Behavior contract: the parser must yield the real PGID, not a field index.
+
+    ``comm`` is the executable basename, sits parenthesized as field 2 of
+    /proc/pid/stat, and may contain spaces — which shifts every later field.
+    This runs the script's actual parser over synthetic stat lines instead of
+    asserting which shell tools it uses, so any correct implementation passes.
+    """
+    import re
+    import subprocess
+
+    # Lift the parser line out of the script and run it against fixtures.
+    parser = next(
+        line for line in modal_env._CANCEL_SCRIPT.splitlines()
+        if line.startswith("pgid=")
+    )
+    assert "/proc/$pid/stat" in parser, parser
+    parser = parser.replace('"/proc/$pid/stat"', '"$STATFILE"')
+
+    cases = [
+        # (comm, ppid, pgid)
+        ("sleep", "7", "42"),
+        ("we ird", "7", "42"),
+        ("many  spaces here", "3", "99"),
+        ("(nested)", "3", "99"),
+    ]
+    for comm, ppid, pgid in cases:
+        statfile = tmp_path / re.sub(r"\W+", "_", comm)
+        statfile.write_text(
+            f"100 ({comm}) S {ppid} {pgid} {pgid} 0 -1 4194304 "
+            "0 0 0 0 0 0 0 0 20 0 1 0 99 0 0\n"
+        )
+        out = subprocess.run(
+            ["bash", "-c", f'STATFILE={statfile}; {parser}; echo "$pgid"'],
+            capture_output=True, text=True,
+        )
+        got = out.stdout.strip()
+        assert got == pgid, (
+            "comm %r: parsed pgid %r, expected %r (ppid was %r)"
+            % (comm, got, pgid, ppid)
+        )
 
 
 def test_cancellable_command_does_not_rely_on_an_exit_trap():
