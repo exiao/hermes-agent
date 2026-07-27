@@ -8,6 +8,7 @@ unless Modal credentials and the SDK are present.
 import asyncio
 import os
 import shlex
+import time
 import subprocess
 import threading
 
@@ -581,39 +582,50 @@ def test_live_cancel_that_arrives_before_the_command_registers():
 
 
 @_live_only
-def test_live_pidfile_is_cleaned_through_the_real_run_bash_path():
-    """Regression: the pid file must not leak, and cleanup must not use a trap.
+def test_live_stale_pidfiles_are_swept_through_the_real_run_bash_path():
+    """Cleanup happens as an age sweep at command start, driven end to end.
 
-    ``FileOperations._atomic_write`` installs an EXIT trap and then clears it
-    with ``trap - EXIT`` — the repo's normal file-write path — which silently
-    discards any cleanup trap the wrapper sets. Cleanup therefore lives in
-    ``_run_bash`` after the command completes, so this drives the real
-    ``_run_bash`` path rather than the wrapper helper alone.
+    A completed command's PID file is inert, so it is not removed immediately;
+    it is swept once it is older than the max age. This drives the real
+    ``execute()`` path: it ages a planted file past the cutoff, runs a normal
+    command, and asserts the sweep took the stale file and left the live one.
     """
-    modal = pytest.importorskip("modal")
+    pytest.importorskip("modal")
 
     env = modal_env.ModalEnvironment(
         image="python:3.11-slim",
         persistent_filesystem=False,
-        task_id="cancel-pidfile-cleanup",
+        task_id="cancel-pidfile-sweep",
     )
     try:
-        # Exactly what _atomic_write does: install a trap, then clear it.
-        inner = "trap 'echo user_cleanup' EXIT; trap - EXIT; echo wrote"
-        result = env.execute(inner, timeout=60)
+        # A command that installs and clears its own EXIT trap, exactly like
+        # FileOperations._atomic_write, must still behave normally.
+        result = env.execute(
+            "trap 'echo user_cleanup' EXIT; trap - EXIT; echo wrote", timeout=60
+        )
         assert "wrote" in result["output"], result
         assert result["returncode"] == 0, result
 
-        listing = env.execute(
-            f"ls {modal_env._CANCEL_DIR} 2>/dev/null | wc -l", timeout=60
+        # Plant and verify in ONE command: the sweep runs at command start,
+        # so a file created afterwards survives that command by construction.
+        stale = f"{modal_env._CANCEL_DIR}/stale-probe"
+        before = env.execute(
+            f"mkdir -p {modal_env._CANCEL_DIR} && echo 999 > {stale} && "
+            f"touch -d '2 days ago' {stale} && "
+            f"{{ [ -e {stale} ] && echo present || echo gone; }}",
+            timeout=60,
         )
-        leftover = listing["output"].strip().splitlines()[0].strip()
+        assert "present" in before["output"], before
+
+        # Any subsequent command sweeps it as part of its own prefix.
+        env.execute("echo sweep_runs_here", timeout=60)
+        after = env.execute(
+            f"[ -e {stale} ] && echo present || echo gone", timeout=60
+        )
     finally:
         env.cleanup()
 
-    # The listing command itself owns one live pid file while it runs, so the
-    # completed command's file must not still be sitting there beside it.
-    assert leftover in {"0", "1"}, f"pid files leaked: {leftover}"
+    assert "gone" in after["output"], f"stale pid file was not swept: {after}"
 
 
 @_live_only
@@ -665,17 +677,53 @@ def test_cancellable_command_does_not_rely_on_an_exit_trap():
     assert "trap" not in wrapped, "cleanup must not depend on an EXIT trap"
 
 
-def test_pidfile_reaper_is_not_awaited_inside_the_timed_window():
-    """Regression: awaiting cleanup pushed a finished command past its deadline.
+def test_pidfile_cleanup_never_runs_after_the_command():
+    """The whole class of post-command cleanup bugs, pinned in one place.
 
-    ``exec_fn`` runs inside the window ``_wait_for_process`` is timing. If the
-    reaper RPC is awaited there, a command that finishes just under its
-    timeout can cross it and be cancelled despite having completed. The reaper
-    must be scheduled, not awaited.
+    Four separate findings came from trying to clean up a PID file *after* its
+    command: an EXIT trap the command clobbers, a subshell that breaks ``$$``,
+    an awaited reaper that extends the caller's timed window, and a
+    fire-and-forget reaper that races ``cleanup()``'s snapshot. Cleanup is an
+    age sweep at command START instead, so there is no post-command path at
+    all for the next variant to live in.
     """
     import inspect
 
     source = inspect.getsource(modal_env.ModalEnvironment._run_bash)
-    assert "asyncio.create_task(_reap_pidfile())" in source
-    assert "await _reap_pidfile()" not in source
-    assert "await reaper.wait.aio()" not in source
+    assert "_reap_pidfile" not in source, "no post-command reaper may exist"
+    assert "create_task" not in source, "no background cleanup task may exist"
+
+    wrapped = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
+    sweep_at = wrapped.index("-delete")
+    command_at = wrapped.index("echo hi")
+    assert sweep_at < command_at, "the sweep must run before the command"
+
+
+def test_stale_pidfile_sweep_only_targets_old_files_in_its_own_dir():
+    sweep = modal_env._stale_pidfile_sweep()
+
+    assert modal_env._CANCEL_DIR in sweep
+    assert "-maxdepth 1" in sweep, "must not recurse out of the cancel dir"
+    assert "-type f" in sweep
+    assert f"-mmin +{modal_env._PIDFILE_MAX_AGE_MINUTES}" in sweep
+    assert "|| true" in sweep, "a failed sweep must never break the command"
+
+
+def test_stale_pidfile_sweep_leaves_a_live_commands_file_alone(tmp_path):
+    """A running command's own PID file must survive the next command's sweep."""
+    import subprocess
+
+    fresh = tmp_path / "fresh.pid"
+    fresh.write_text("123")
+    old = tmp_path / "old.pid"
+    old.write_text("456")
+    old_age = time.time() - (modal_env._PIDFILE_MAX_AGE_MINUTES + 60) * 60
+    os.utime(old, (old_age, old_age))
+
+    sweep = modal_env._stale_pidfile_sweep().replace(
+        shlex.quote(modal_env._CANCEL_DIR), shlex.quote(str(tmp_path))
+    )
+    subprocess.run(["bash", "-c", sweep], check=False)
+
+    assert fresh.exists(), "a live command's pid file was swept"
+    assert not old.exists(), "a stale pid file was not swept"

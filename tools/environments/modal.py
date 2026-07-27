@@ -57,9 +57,8 @@ _DIRECT_SNAPSHOT_NAMESPACE = "direct"
 _CANCEL_DIR = "/tmp/.hermes-cancel"
 _CANCEL_TIMEOUT_SECONDS = 20
 _cancel_id_counter = itertools.count()
-# Strong refs for fire-and-forget pid-file reapers (asyncio keeps only weak
-# ones, so an unreferenced task can be garbage-collected before it runs).
-_reaper_tasks: set = set()
+# Age after which a PID file cannot belong to a live command and is swept.
+_PIDFILE_MAX_AGE_MINUTES = 720
 
 # TERM the process group first so the command can run traps, then KILL
 # whatever ignored it. The KILL escalation is NOT conditional on the recorded
@@ -109,6 +108,31 @@ def _cancel_pidfile(command_id: str) -> str:
     return f"{_CANCEL_DIR}/{command_id}"
 
 
+def _stale_pidfile_sweep() -> str:
+    """Shell to drop PID files older than a command could plausibly still hold.
+
+    Cleanup is a sweep, not a per-command teardown. Every attempt at the
+    latter created a new failure of the same class: an in-shell ``EXIT`` trap
+    is clobbered by the command's own; a subshell to survive that breaks
+    ``$$``; an awaited reaper extends the caller's timed window; a
+    fire-and-forget reaper then races ``cleanup()``'s snapshot. Each fix was
+    real and each spawned the next, which is the signal to change the shape
+    rather than patch again.
+
+    A PID file is inert metadata under ``/tmp``: nothing reads it except
+    ``cancel()``, which targets one exact path. So it does not need timely
+    removal at all — it needs to not accumulate. Sweeping files older than
+    ``_PIDFILE_MAX_AGE_MINUTES`` at command START has no completion path to
+    miss, nothing to await, and no task to race, and it bounds the directory
+    for any command that outlives its own cleanup (a cancel, a crash, a
+    sandbox reset).
+    """
+    return (
+        f"find {shlex.quote(_CANCEL_DIR)} -maxdepth 1 -type f "
+        f"-mmin +{_PIDFILE_MAX_AGE_MINUTES} -delete 2>/dev/null || true"
+    )
+
+
 def _cancellable_command(cmd_string: str, pidfile: str) -> str:
     """Prefix ``cmd_string`` so it records its own PID for cancellation.
 
@@ -117,8 +141,8 @@ def _cancellable_command(cmd_string: str, pidfile: str) -> str:
     that ``_wrap_command`` sources. Writing the file must never break the
     command, hence the ``|| true``.
 
-    Nothing is appended after the command, deliberately. Two earlier attempts
-    at in-shell cleanup both changed the command's semantics:
+    Nothing is appended after the command, deliberately. Two attempts at
+    in-shell cleanup each changed the command's semantics:
 
     - an ``EXIT`` trap is silently discarded by any command that installs its
       own (``FileOperations._atomic_write`` sets one, then ``trap - EXIT``),
@@ -128,12 +152,13 @@ def _cancellable_command(cmd_string: str, pidfile: str) -> str:
       ``trap 'exit 42' TERM; kill -TERM $$`` signalled the wrapper instead of
       itself and returned 143 where it used to return 42.
 
-    The PID file is removed by ``_run_bash`` once the command completes, which
-    touches nothing about the command's shell.
+    Stale files are reaped by the age sweep prefixed here, which runs before
+    the command and so cannot interact with how it exits.
     """
     quoted = shlex.quote(pidfile)
     return (
         f"mkdir -p {shlex.quote(_CANCEL_DIR)} 2>/dev/null; "
+        f"{_stale_pidfile_sweep()}; "
         f"echo $$ > {quoted} 2>/dev/null || true; "
         f"{cmd_string}"
     )
@@ -533,17 +558,6 @@ class ModalEnvironment(BaseEnvironment):
             )
             await proc.wait.aio()
 
-        async def _reap_pidfile() -> None:
-            """Remove a completed command's PID file. Best-effort, unawaited."""
-            try:
-                proc = await sandbox.exec.aio(
-                    "bash", "-c", f"rm -f {shlex.quote(pidfile)} 2>/dev/null",
-                    timeout=15,
-                )
-                await proc.wait.aio()
-            except Exception as exc:
-                logger.debug("Modal: could not remove cancel pid file: %s", exc)
-
         def _claim_cancel_dispatch() -> bool:
             nonlocal cancel_dispatched
             with execution_lock:
@@ -606,26 +620,6 @@ class ModalEnvironment(BaseEnvironment):
                 output = stdout
                 if stderr:
                     output = f"{stdout}\n{stderr}" if stdout else stderr
-
-                # Drop the PID file rather than appending cleanup to the
-                # command: anything appended in-shell either gets discarded by
-                # the command's own EXIT trap, or (if subshelled to survive
-                # that) changes what `$$` means to the command.
-                #
-                # Fire-and-forget, and deliberately NOT awaited: the command
-                # has already produced its result, so blocking here would keep
-                # _ThreadedProcessHandle.poll() pending past the caller's
-                # deadline and make _wait_for_process cancel a command that
-                # actually finished. A leftover file is inert (each command
-                # gets its own, and cancel() removes it too).
-                try:
-                    task = asyncio.create_task(_reap_pidfile())
-                    # Hold a strong reference: asyncio only keeps a weak one,
-                    # so an unreferenced task can be GC'd before it runs.
-                    _reaper_tasks.add(task)
-                    task.add_done_callback(_reaper_tasks.discard)
-                except Exception as exc:
-                    logger.debug("Modal: could not schedule pid file cleanup: %s", exc)
 
                 return output, exit_code
 
