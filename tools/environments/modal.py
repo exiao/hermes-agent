@@ -57,6 +57,9 @@ _DIRECT_SNAPSHOT_NAMESPACE = "direct"
 _CANCEL_DIR = "/tmp/.hermes-cancel"
 _CANCEL_TIMEOUT_SECONDS = 20
 _cancel_id_counter = itertools.count()
+# Strong refs for fire-and-forget pid-file reapers (asyncio keeps only weak
+# ones, so an unreferenced task can be garbage-collected before it runs).
+_reaper_tasks: set = set()
 
 # TERM the process group first so the command can run traps, then KILL
 # whatever ignored it. The KILL escalation is NOT conditional on the recorded
@@ -530,6 +533,17 @@ class ModalEnvironment(BaseEnvironment):
             )
             await proc.wait.aio()
 
+        async def _reap_pidfile() -> None:
+            """Remove a completed command's PID file. Best-effort, unawaited."""
+            try:
+                proc = await sandbox.exec.aio(
+                    "bash", "-c", f"rm -f {shlex.quote(pidfile)} 2>/dev/null",
+                    timeout=15,
+                )
+                await proc.wait.aio()
+            except Exception as exc:
+                logger.debug("Modal: could not remove cancel pid file: %s", exc)
+
         def _claim_cancel_dispatch() -> bool:
             nonlocal cancel_dispatched
             with execution_lock:
@@ -593,18 +607,25 @@ class ModalEnvironment(BaseEnvironment):
                 if stderr:
                     output = f"{stdout}\n{stderr}" if stdout else stderr
 
-                # Drop the PID file here rather than appending cleanup to the
+                # Drop the PID file rather than appending cleanup to the
                 # command: anything appended in-shell either gets discarded by
                 # the command's own EXIT trap, or (if subshelled to survive
-                # that) changes what `$$` means to the command. Fire-and-forget
-                # — a leftover file is inert, and cancel() removes it too.
+                # that) changes what `$$` means to the command.
+                #
+                # Fire-and-forget, and deliberately NOT awaited: the command
+                # has already produced its result, so blocking here would keep
+                # _ThreadedProcessHandle.poll() pending past the caller's
+                # deadline and make _wait_for_process cancel a command that
+                # actually finished. A leftover file is inert (each command
+                # gets its own, and cancel() removes it too).
                 try:
-                    reaper = await sandbox.exec.aio(
-                        "bash", "-c", f"rm -f {shlex.quote(pidfile)} 2>/dev/null", timeout=15,
-                    )
-                    await reaper.wait.aio()
+                    task = asyncio.create_task(_reap_pidfile())
+                    # Hold a strong reference: asyncio only keeps a weak one,
+                    # so an unreferenced task can be GC'd before it runs.
+                    _reaper_tasks.add(task)
+                    task.add_done_callback(_reaper_tasks.discard)
                 except Exception as exc:
-                    logger.debug("Modal: could not remove cancel pid file: %s", exc)
+                    logger.debug("Modal: could not schedule pid file cleanup: %s", exc)
 
                 return output, exit_code
 

@@ -663,3 +663,19 @@ def test_cancellable_command_does_not_rely_on_an_exit_trap():
     """A command's own ``trap - EXIT`` must not be able to skip cleanup."""
     wrapped = modal_env._cancellable_command("echo hi", "/tmp/.hermes-cancel/x")
     assert "trap" not in wrapped, "cleanup must not depend on an EXIT trap"
+
+
+def test_pidfile_reaper_is_not_awaited_inside_the_timed_window():
+    """Regression: awaiting cleanup pushed a finished command past its deadline.
+
+    ``exec_fn`` runs inside the window ``_wait_for_process`` is timing. If the
+    reaper RPC is awaited there, a command that finishes just under its
+    timeout can cross it and be cancelled despite having completed. The reaper
+    must be scheduled, not awaited.
+    """
+    import inspect
+
+    source = inspect.getsource(modal_env.ModalEnvironment._run_bash)
+    assert "asyncio.create_task(_reap_pidfile())" in source
+    assert "await _reap_pidfile()" not in source
+    assert "await reaper.wait.aio()" not in source
