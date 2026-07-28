@@ -241,6 +241,37 @@ async def test_no_text_reply_includes_local_path_when_we_have_the_file():
 
 
 @pytest.mark.asyncio
+async def test_no_text_reply_translates_quoted_cache_path_for_docker_backend(monkeypatch, tmp_path):
+    """Quoted media, like inbound media, must name the sandbox-visible cache path."""
+    hermes_home = tmp_path / "hermes"
+    host_path = hermes_home / "cache" / "images" / "quoted.png"
+    host_path.parent.mkdir(parents=True)
+    host_path.touch()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="inspect this",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_media_summary="an image (image/png, quoted.png)",
+        reply_to_media_paths=[str(host_path)],
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result is not None
+    assert "local copy: /root/.hermes/cache/images/quoted.png" in result
+    assert str(host_path) not in result
+
+
+@pytest.mark.asyncio
 async def test_no_text_reply_falls_back_when_media_unknown():
     """Platforms that expose no quoted-media metadata keep the old pointer."""
     runner = _make_runner()

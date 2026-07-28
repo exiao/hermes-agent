@@ -10714,6 +10714,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         reply_to_author_id=event.reply_to_author_id,
                         reply_to_author_name=event.reply_to_author_name,
                         reply_to_is_own_message=event.reply_to_is_own_message,
+                        reply_to_media_summary=event.reply_to_media_summary,
+                        reply_to_media_paths=list(getattr(event, "reply_to_media_paths", []) or []),
                         auto_skill=event.auto_skill,
                         channel_prompt=event.channel_prompt,
                         internal=event.internal,
@@ -12087,8 +12089,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # could parse it — "an image (image/png, chart.png)" tells the agent
                 # WHICH message is meant, where the generic fallback forces a guess.
                 media_summary = getattr(event, "reply_to_media_summary", None)
+                from tools.credential_files import to_agent_visible_cache_path
+
                 media_paths = [
-                    p for p in (getattr(event, "reply_to_media_paths", None) or []) if p
+                    to_agent_visible_cache_path(p)
+                    for p in (getattr(event, "reply_to_media_paths", None) or [])
+                    if p
                 ]
                 if media_summary:
                     pointer = f"[Replying to {media_summary}"

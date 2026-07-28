@@ -164,6 +164,8 @@ async def test_queue_preserves_reply_context():
         reply_to_text="the original message",
         reply_to_author_id="a1",
         reply_to_author_name="alice",
+        reply_to_media_summary="an image (image/png, diagram.png)",
+        reply_to_media_paths=["/tmp/diagram.png"],
     )
     result = await runner._handle_message(event)
 
@@ -173,6 +175,8 @@ async def test_queue_preserves_reply_context():
     assert queued.reply_to_text == "the original message"
     assert queued.reply_to_author_id == "a1"
     assert queued.reply_to_author_name == "alice"
+    assert queued.reply_to_media_summary == "an image (image/png, diagram.png)"
+    assert queued.reply_to_media_paths == ["/tmp/diagram.png"]
 
 
 @pytest.mark.asyncio
