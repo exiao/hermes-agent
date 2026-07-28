@@ -441,10 +441,9 @@ class SignalAdapter(BasePlatformAdapter):
         self._sent_message_timestamps: "OrderedDict[str, None]" = OrderedDict()
         self._max_sent_message_timestamps = 500
         # Local file paths of attachments this bot sent, keyed by the outbound
-        # Signal timestamp. Signal's quote.id IS that timestamp, so when the user
-        # quotes an image we sent, this resolves straight back to the file on
-        # disk — no re-download, and the agent can actually look at it again.
-        self._sent_attachment_paths: "OrderedDict[str, List[str]]" = OrderedDict()
+        # Signal timestamp. Signal timestamps are only unique within a
+        # conversation, so retain the destination too before resolving a quote.
+        self._sent_attachment_paths: "OrderedDict[str, Tuple[str, List[str]]]" = OrderedDict()
         self._max_sent_attachment_entries = 200
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
@@ -802,7 +801,9 @@ class SignalAdapter(BasePlatformAdapter):
         # it carried. Parse it so the agent knows WHICH image was quoted, and hand
         # back a local path when we sent that image ourselves.
         reply_to_media_summary = self._describe_quoted_attachments(quote_data)
-        reply_to_media_paths = self._resolve_quoted_media_paths(reply_to_id)
+        # Signal timestamps are only unique within a conversation, so lookup
+        # uses the current chat as well as the quoted timestamp.
+        reply_to_media_paths = self._resolve_quoted_media_paths(reply_to_id, chat_id)
 
         # Process attachments
         attachments_data = data_message.get("attachments", [])
@@ -967,18 +968,13 @@ class SignalAdapter(BasePlatformAdapter):
         cached_number = self._recipient_number_by_uuid.get(author)
         return bool(cached_number and cached_number == self._account_normalized)
 
-    def _remember_sent_attachments(self, timestamp: Any, paths: List[str]) -> None:
-        """Map an outbound Signal timestamp to the local files we attached.
-
-        Signal's ``quote.id`` is the timestamp of the quoted message, so this is
-        what lets a later "replying to this image" resolve back to the exact file
-        without re-downloading it from the server.
-        """
-        if timestamp is None or not paths:
+    def _remember_sent_attachments(self, timestamp: Any, chat_id: str, paths: List[str]) -> None:
+        """Map an outbound Signal timestamp and destination to local attached files."""
+        if timestamp is None or not chat_id or not paths:
             return
         key = str(timestamp)
         self._sent_attachment_paths.pop(key, None)
-        self._sent_attachment_paths[key] = list(paths)
+        self._sent_attachment_paths[key] = (chat_id, list(paths))
         while len(self._sent_attachment_paths) > self._max_sent_attachment_entries:
             self._sent_attachment_paths.popitem(last=False)
 
@@ -1021,16 +1017,16 @@ class SignalAdapter(BasePlatformAdapter):
             return descriptions[0]
         return f"{len(descriptions)} attachments: " + "; ".join(descriptions)
 
-    def _resolve_quoted_media_paths(self, quote_id: Optional[str]) -> List[str]:
-        """Return local paths for a quoted message's media, when we still have them.
-
-        Only hits for media this bot sent (tracked at send time). Quoted media the
-        USER sent was never on this machine, so it returns empty and the caller
-        falls back to naming the attachment rather than showing it.
-        """
-        if not quote_id:
+    def _resolve_quoted_media_paths(self, quote_id: Optional[str], chat_id: str) -> List[str]:
+        """Return local paths for quoted media sent to this Signal conversation."""
+        if not quote_id or not chat_id:
             return []
-        paths = self._sent_attachment_paths.get(str(quote_id)) or []
+        cached = self._sent_attachment_paths.get(str(quote_id))
+        if not cached:
+            return []
+        cached_chat_id, paths = cached
+        if cached_chat_id != chat_id:
+            return []
         return [p for p in paths if p and Path(p).exists()]
 
     def _remember_sent_message_timestamp(self, timestamp: Any) -> None:
@@ -1560,7 +1556,7 @@ class SignalAdapter(BasePlatformAdapter):
                             # Remember which local files went out under this
                             # timestamp, so quoting the image later resolves to it.
                             if isinstance(result, dict):
-                                self._remember_sent_attachments(result.get("timestamp"), att_batch)
+                                self._remember_sent_attachments(result.get("timestamp"), chat_id, att_batch)
                             await scheduler.report_rpc_duration(_rpc_duration, n)
                             logger.info(
                                 "Signal batch %d/%d: %d attachments sent in %.1fs "
@@ -1688,7 +1684,7 @@ class SignalAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
             if isinstance(result, dict):
-                self._remember_sent_attachments(result.get("timestamp"), [file_path])
+                self._remember_sent_attachments(result.get("timestamp"), chat_id, [file_path])
             return SendResult(success=True)
         return SendResult(success=False, error="RPC send with attachment failed")
 
@@ -1731,6 +1727,8 @@ class SignalAdapter(BasePlatformAdapter):
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
+            if isinstance(result, dict):
+                self._remember_sent_attachments(result.get("timestamp"), chat_id, [file_path])
             return SendResult(success=True)
         return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
 

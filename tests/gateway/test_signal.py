@@ -539,6 +539,8 @@ class TestSignalSendImageFile:
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         # Timestamp must be tracked for echo-back prevention
         assert 1234567890 in adapter._recent_sent_timestamps
+        # Local-file media must also be available if the user quotes it later.
+        assert adapter._resolve_quoted_media_paths("1234567890", "+155****4567") == [str(img_path)]
 
     @pytest.mark.asyncio
     async def test_send_image_file_to_group(self, monkeypatch, tmp_path):
@@ -2953,31 +2955,31 @@ class TestQuotedAttachments:
         real_file = tmp_path / "chart.png"
         real_file.write_bytes(b"\x89PNG\r\n\x1a\n")
 
-        adapter._remember_sent_attachments(1753650000000, [str(real_file)])
+        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(real_file)])
 
-        assert adapter._resolve_quoted_media_paths("1753650000000") == [str(real_file)]
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == [str(real_file)]
 
     def test_no_local_path_for_media_the_user_sent(self, monkeypatch):
         """A photo the USER took was never on this machine — no path, no lie."""
         adapter = _make_signal_adapter(monkeypatch)
-        assert adapter._resolve_quoted_media_paths("1753650000000") == []
-        assert adapter._resolve_quoted_media_paths(None) == []
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == []
+        assert adapter._resolve_quoted_media_paths(None, "+15559998888") == []
 
     def test_drops_paths_that_no_longer_exist(self, monkeypatch, tmp_path):
         """A since-deleted temp file must not be advertised to the agent."""
         adapter = _make_signal_adapter(monkeypatch)
         gone = tmp_path / "deleted.png"
         gone.write_bytes(b"x")
-        adapter._remember_sent_attachments(1753650000000, [str(gone)])
+        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(gone)])
         gone.unlink()
 
-        assert adapter._resolve_quoted_media_paths("1753650000000") == []
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == []
 
     def test_sent_attachment_cache_is_bounded_and_fifo(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
         adapter._max_sent_attachment_entries = 3
         for i in range(5):
-            adapter._remember_sent_attachments(i, [f"/tmp/{i}.png"])
+            adapter._remember_sent_attachments(i, "+15559998888", [f"/tmp/{i}.png"])
 
         assert len(adapter._sent_attachment_paths) == 3
         # Oldest evicted first.
@@ -2986,8 +2988,8 @@ class TestQuotedAttachments:
 
     def test_remembering_is_a_noop_without_paths(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
-        adapter._remember_sent_attachments(123, [])
-        adapter._remember_sent_attachments(None, ["/tmp/x.png"])
+        adapter._remember_sent_attachments(123, "+15559998888", [])
+        adapter._remember_sent_attachments(None, "+15559998888", ["/tmp/x.png"])
         assert len(adapter._sent_attachment_paths) == 0
 
 
@@ -3006,7 +3008,8 @@ async def test_quoted_image_envelope_end_to_end(monkeypatch, tmp_path):
 
     sent_image = tmp_path / "cc_verification_sheet.png"
     sent_image.write_bytes(b"\x89PNG\r\n\x1a\n")
-    adapter._remember_sent_attachments(1753650000000, [str(sent_image)])
+    adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(sent_image)])
+    adapter._remember_sent_message_timestamp(1753650000000)
 
     captured = {}
 
@@ -3083,3 +3086,40 @@ async def test_quoted_image_from_user_has_summary_but_no_path(monkeypatch):
     assert event is not None
     assert event.reply_to_media_summary == "an image (image/jpeg)"
     assert event.reply_to_media_paths == []
+
+
+@pytest.mark.asyncio
+async def test_quoted_timestamp_collision_from_another_chat_has_no_local_path(monkeypatch, tmp_path):
+    """A user quote cannot retrieve media solely by colliding with a cached timestamp."""
+    adapter = _make_signal_adapter(monkeypatch)
+    sent_image = tmp_path / "other-chat.png"
+    sent_image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    adapter._remember_sent_attachments(1753650000000, "+15558887777", [str(sent_image)])
+
+    captured = {}
+
+    async def _capture(event):
+        captured["event"] = event
+
+    monkeypatch.setattr(adapter, "handle_message", _capture)
+    envelope = {
+        "envelope": {
+            "source": "+15559998888",
+            "sourceName": "E X",
+            "timestamp": 1753650500000,
+            "dataMessage": {
+                "message": "what is this?",
+                "timestamp": 1753650500000,
+                "quote": {
+                    "id": 1753650000000,
+                    "author": "+15559998888",
+                    "attachments": [{"contentType": "image/png", "filename": "other-chat.png"}],
+                },
+                "attachments": [],
+            },
+        }
+    }
+
+    await adapter._handle_envelope(envelope)
+
+    assert captured["event"].reply_to_media_paths == []
