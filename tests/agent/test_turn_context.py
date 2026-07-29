@@ -512,3 +512,28 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
+
+
+def test_runtime_sync_keeps_local_anti_thrash_breaker_when_repair_fails(tmp_path):
+    """A sync recalibration cannot disarm a durable breaker on a DB write error."""
+    db_path = tmp_path / "state.db"
+    agent = _make_agent_with_cooldown(db_path, "sess-1")
+    db = agent._session_db
+    db.set_compression_ineffective_count("sess-1", 2)
+    agent.context_compressor._ineffective_compression_count = 2
+    # Force the per-turn runtime calibration through update_model(), which
+    # clears its local count before the turn-context code rehydrates it.
+    agent.model = "new-runtime-model"
+
+    with patch.object(
+        db,
+        "set_compression_ineffective_count",
+        side_effect=Exception("state DB locked"),
+    ):
+        _build(agent)
+
+    # update_model's reset write failed, so the durable row survives. The
+    # local gate must immediately mirror it even though there is no repair
+    # write to make in this turn.
+    assert db.get_compression_ineffective_count("sess-1") == 2
+    assert agent.context_compressor._ineffective_compression_count == 2
