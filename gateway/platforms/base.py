@@ -1717,7 +1717,7 @@ def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tup
         return None
     safe = validate_media_delivery_path(path)
     if safe:
-        return safe, match.end("path")
+        return safe, match.end()
     start = match.start("path")
     nl = scan_text.find("\n", start)
     limit = nl if nl != -1 else len(scan_text)

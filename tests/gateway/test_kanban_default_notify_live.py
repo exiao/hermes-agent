@@ -306,10 +306,19 @@ def test_add_default_notify_subs_bulk_active_only(tmp_path, monkeypatch):
         kb.complete_task(conn, done, summary="ok")
 
         kb.add_default_notify_subs(conn, platform="signal", chat_id=chat)
-        subscribed = {s["task_id"] for s in kb.list_notify_subs(conn)}
+        subscriptions = kb.list_notify_subs(conn)
+        subscribed = {s["task_id"] for s in subscriptions}
         assert subscribed == {active1, active2}, (
             f"only active tasks should be subscribed; got {subscribed}"
         )
+        # Default subscriptions begin caught up, just like an explicit
+        # subscribe, so enabling them never replays an active task's history.
+        for sub in subscriptions:
+            latest = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+                (sub["task_id"],),
+            ).fetchone()[0]
+            assert sub["last_event_id"] == latest
 
         # Idempotent: a second call adds no duplicate rows.
         kb.add_default_notify_subs(conn, platform="signal", chat_id=chat)

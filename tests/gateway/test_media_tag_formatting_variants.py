@@ -124,3 +124,10 @@ class TestEmphasisAndDedupeIntegration:
         p.write_text("localhost\n")
         media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{p}")
         assert [os.path.realpath(x) for x, _ in media] == [os.path.realpath(str(p))]
+
+    def test_quoted_unknown_extension_tag_leaves_no_dangling_quote(self, tmp_path):
+        p = tmp_path / "script.py"
+        p.write_text("print('hi')\n")
+        media, cleaned = BasePlatformAdapter.extract_media(f'Attached MEDIA:"{p}"')
+        assert [os.path.realpath(x) for x, _ in media] == [os.path.realpath(str(p))]
+        assert cleaned.strip() == "Attached"

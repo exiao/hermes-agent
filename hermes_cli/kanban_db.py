@@ -11752,8 +11752,11 @@ def add_default_notify_subs(
         conn.execute(
             f"""
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, notifier_profile, created_at)
-            SELECT id, ?, ?, ?, ?, ?
+                (task_id, platform, chat_id, thread_id, notifier_profile, created_at,
+                 last_event_id)
+            SELECT id, ?, ?, ?, ?, ?,
+                   COALESCE((SELECT MAX(id) FROM task_events
+                             WHERE task_id = tasks.id), 0)
               FROM tasks
              WHERE status NOT IN ({placeholders})
             """,
