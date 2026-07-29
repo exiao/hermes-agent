@@ -1700,6 +1700,31 @@ def test_superseded_completed_run_cannot_correct_newer_completion(kanban_home):
         conn.close()
 
 
+def test_owner_retry_cannot_correct_after_runless_manual_completion(kanban_home):
+    """A runless completion supersedes a delayed prior-run correction."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="runless completion", assignee="worker")
+        kb.claim_task(conn, tid)
+        original = kb.latest_run(conn, tid)
+        assert original is not None
+        assert kb.complete_task(conn, tid, result="first completion")
+
+        assert kb.set_status_direct(conn, tid, "ready")
+        assert kb.complete_task(conn, tid)
+
+        assert not kb.complete_task(
+            conn,
+            tid,
+            result="stale pushed handoff",
+            metadata={"commit_sha": "abc123"},
+            expected_run_id=original.id,
+        )
+        assert kb.get_task(conn, tid).result is None
+    finally:
+        conn.close()
+
+
 def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
     """A worker from an earlier attempt cannot close a later retry."""
     import hermes_cli.kanban_db as _kb

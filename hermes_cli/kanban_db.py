@@ -6239,8 +6239,10 @@ def complete_task(
                 "SELECT summary, metadata FROM task_runs WHERE id = ? AND task_id = ? "
                 "AND outcome = 'completed' AND id = ("
                 "SELECT MAX(id) FROM task_runs WHERE task_id = ? "
-                "AND outcome = 'completed')",
-                (int(expected_run_id), task_id, task_id),
+                "AND outcome = 'completed') AND id = ("
+                "SELECT run_id FROM task_events WHERE task_id = ? "
+                "AND kind = 'completed' ORDER BY id DESC LIMIT 1)",
+                (int(expected_run_id), task_id, task_id, task_id),
             ).fetchone()
             if (
                 task
