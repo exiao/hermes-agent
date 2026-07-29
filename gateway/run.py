@@ -21430,11 +21430,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # which must not divert normal platform delivery.
         if getattr(source, "delivered_via_upstream_relay", False) is True:
             return getattr(self, "adapters", {}).get(Platform.RELAY)
-        transport_ref = vars(source).get("_transport_adapter_ref")
-        if callable(transport_ref):
-            transport_adapter = transport_ref()
-            if transport_adapter is not None:
-                return transport_adapter
+        # A weak ref can outlive an adapter that a reconnect replaced. Only
+        # return it when it remains registered on this runner.
+        transport_adapter = self._registered_transport_adapter(source)
+        if transport_adapter is not None:
+            return transport_adapter
         profile = (getattr(source, "profile", None) or "").strip()
         _shared_listener = getattr(platform, "value", platform) in _PORT_BINDING_PLATFORM_VALUES
         if profile and not _shared_listener:
