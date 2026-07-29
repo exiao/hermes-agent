@@ -1024,9 +1024,14 @@ class SignalAdapter(BasePlatformAdapter):
                 try:
                     await asyncio.shield(copy_task)
                 except asyncio.CancelledError:
-                    copy_task.add_done_callback(
-                        lambda _task: self._discard_sent_attachment_snapshots([str(snapshot)])
-                    )
+                    def discard_cancelled_snapshot(task: asyncio.Task[None]) -> None:
+                        try:
+                            task.result()
+                        except (OSError, asyncio.CancelledError):
+                            pass
+                        self._discard_sent_attachment_snapshots([str(snapshot)])
+
+                    copy_task.add_done_callback(discard_cancelled_snapshot)
                     raise
                 byte_count += snapshot.stat().st_size
                 snapshots.append(str(snapshot))
