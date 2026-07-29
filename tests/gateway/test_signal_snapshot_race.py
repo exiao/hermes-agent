@@ -87,3 +87,37 @@ async def test_snapshot_wait_timeout_removes_pending_entry(monkeypatch, tmp_path
     release.set()
     await task
     monkeypatch.setattr(signal_module, "SIGNAL_QUOTE_SNAPSHOT_WAIT_SECONDS", original_wait)
+
+
+@pytest.mark.asyncio
+async def test_same_timestamp_in_two_chats_keeps_both_attachment_snapshots(monkeypatch, tmp_path):
+    """Signal timestamps may collide across chats without cancelling either copy."""
+    import gateway.platforms.signal as signal_module
+
+    adapter = _make_signal_adapter(monkeypatch)
+    first_source = tmp_path / "first.png"
+    second_source = tmp_path / "second.png"
+    first_source.write_bytes(b"first image")
+    second_source.write_bytes(b"second image")
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_copy(_copyfile, source, destination):
+        (first_started if source == first_source else second_started).set()
+        await release.wait()
+        Path(destination).write_bytes(Path(source).read_bytes())
+
+    monkeypatch.setattr(signal_module.asyncio, "to_thread", delayed_copy)
+    adapter._rpc = AsyncMock(return_value={"timestamp": 123})
+    first_send = asyncio.create_task(adapter.send_image_file("+15550000001", str(first_source)))
+    await first_started.wait()
+    second_send = asyncio.create_task(adapter.send_image_file("+15550000002", str(second_source)))
+    await second_started.wait()
+    release.set()
+
+    results = await asyncio.gather(first_send, second_send, return_exceptions=True)
+
+    assert not any(isinstance(result, BaseException) for result in results)
+    assert adapter._resolve_quoted_media_paths("123", "+15550000001")
+    assert adapter._resolve_quoted_media_paths("123", "+15550000002")

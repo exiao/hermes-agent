@@ -3069,10 +3069,10 @@ class TestQuotedAttachments:
         second.write_bytes(b"second")
 
         await adapter._remember_sent_attachments(1, "+15559998888", [str(first)])
-        first_snapshot = adapter._sent_attachment_paths["1"][1][0]
+        first_snapshot = adapter._sent_attachment_paths[("+15559998888", "1")][1][0]
         await adapter._remember_sent_attachments(2, "+15559998888", [str(second)])
 
-        assert list(adapter._sent_attachment_paths) == ["2"]
+        assert list(adapter._sent_attachment_paths) == [("+15559998888", "2")]
         assert not Path(first_snapshot).exists()
 
     @pytest.mark.asyncio
@@ -3179,7 +3179,7 @@ class TestQuotedAttachments:
         finish.set()
         await copied.wait()
         await asyncio.sleep(0)
-        assert adapter._sent_attachment_paths["123"][1]
+        assert adapter._sent_attachment_paths[("+15559998888", "123")][1]
 
 
 @pytest.mark.asyncio

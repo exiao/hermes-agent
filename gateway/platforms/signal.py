@@ -446,7 +446,7 @@ class SignalAdapter(BasePlatformAdapter):
         # Local file paths of attachments this bot sent, keyed by the outbound
         # Signal timestamp. Signal timestamps are only unique within a
         # conversation, so retain the destination too before resolving a quote.
-        self._sent_attachment_paths: "OrderedDict[str, Tuple[str, List[str], int]]" = OrderedDict()
+        self._sent_attachment_paths: "OrderedDict[Tuple[str, str], Tuple[str, List[str], int]]" = OrderedDict()
         self._max_sent_attachment_entries = 200
         self._sent_attachment_snapshot_bytes = 0
         self._max_sent_attachment_snapshot_bytes = 100 * 1024 * 1024
@@ -456,7 +456,7 @@ class SignalAdapter(BasePlatformAdapter):
         self._sent_attachment_snapshot_storage_disabled = False
         # This map is only touched by the gateway event loop. Each entry holds a
         # loop-affine Future completed by the async copy task, never its worker.
-        self._pending_sent_attachment_snapshots: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._pending_sent_attachment_snapshots: "OrderedDict[Tuple[str, str], Dict[str, Any]]" = OrderedDict()
         self._max_pending_sent_attachment_snapshots = SIGNAL_PENDING_SNAPSHOT_MAX_ENTRIES
         self._pending_sent_attachment_copy_semaphore = asyncio.Semaphore(
             SIGNAL_PENDING_SNAPSHOT_COPY_CONCURRENCY
@@ -1016,7 +1016,7 @@ class SignalAdapter(BasePlatformAdapter):
         )
         self._discard_sent_attachment_snapshots(paths)
 
-    def _expire_pending_sent_attachment_snapshot(self, key: str) -> None:
+    def _expire_pending_sent_attachment_snapshot(self, key: Tuple[str, str]) -> None:
         entry = self._pending_sent_attachment_snapshots.pop(key, None)
         if entry is None:
             return
@@ -1040,7 +1040,7 @@ class SignalAdapter(BasePlatformAdapter):
                 self._sent_attachment_snapshot_storage_disabled = True
                 logger.debug("Signal: quoted attachment snapshots unavailable")
                 return
-        key = str(timestamp)
+        key = (chat_id, str(timestamp))
         if len(self._pending_sent_attachment_snapshots) >= self._max_pending_sent_attachment_snapshots:
             logger.warning("Signal: quoted attachment snapshot capacity reached")
             return
@@ -1064,7 +1064,7 @@ class SignalAdapter(BasePlatformAdapter):
         # loop. The registered future lets the SSE quote path observe the same work.
         await asyncio.shield(entry["task"])
 
-    async def _copy_sent_attachments(self, key: str, paths: List[str], entry: Dict[str, Any]) -> None:
+    async def _copy_sent_attachments(self, key: Tuple[str, str], paths: List[str], entry: Dict[str, Any]) -> None:
         snapshots: List[str] = []
         byte_count = 0
         try:
@@ -1152,7 +1152,7 @@ class SignalAdapter(BasePlatformAdapter):
         """Return ready quoted local media without delaying a non-async caller."""
         if not quote_id or not chat_id:
             return []
-        cached = self._sent_attachment_paths.get(str(quote_id))
+        cached = self._sent_attachment_paths.get((chat_id, str(quote_id)))
         if not cached:
             return []
         cached_chat_id, paths, _ = cached
@@ -1163,7 +1163,7 @@ class SignalAdapter(BasePlatformAdapter):
         ready = self._resolve_quoted_media_paths(quote_id, chat_id)
         if ready or not quote_id or not chat_id:
             return ready
-        key = str(quote_id)
+        key = (chat_id, str(quote_id))
         entry = self._pending_sent_attachment_snapshots.get(key)
         if entry is None or entry["chat_id"] != chat_id:
             return []
