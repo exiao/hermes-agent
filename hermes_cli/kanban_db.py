@@ -2303,19 +2303,22 @@ def _repairable_index_names(messages: list[str]) -> Optional[list[str]]:
     names: list[str] = []
     saw_any = False
     for raw in messages:
-        message = (raw or "").strip()
-        if not message:
-            continue
-        for pattern in _REPAIRABLE_INDEX_ERROR_PATTERNS:
-            match = pattern.match(message)
-            if match:
-                break
-        else:
-            return None
-        saw_any = True
-        name = match.group("index").strip()
-        if name and name not in names:
-            names.append(name)
+        for message in (raw or "").splitlines():
+            message = message.strip()
+            if not message or message == "*** in database main ***":
+                continue
+            if message.lower().startswith("fragmentation of "):
+                continue
+            for pattern in _REPAIRABLE_INDEX_ERROR_PATTERNS:
+                match = pattern.match(message)
+                if match:
+                    break
+            else:
+                return None
+            saw_any = True
+            name = match.group("index").strip()
+            if name and name not in names:
+                names.append(name)
     if not saw_any or not names:
         return None
     return names
