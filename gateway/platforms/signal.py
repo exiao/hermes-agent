@@ -1037,7 +1037,7 @@ class SignalAdapter(BasePlatformAdapter):
                     raise
                 byte_count += snapshot.stat().st_size
                 snapshots.append(str(snapshot))
-            except OSError:
+            except (OSError, RuntimeError):
                 snapshot.unlink(missing_ok=True)
                 logger.debug("Signal: could not snapshot sent attachment %s", source)
 

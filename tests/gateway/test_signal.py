@@ -3121,6 +3121,24 @@ class TestQuotedAttachments:
         assert copy_in_worker.await_args.args[:2] == (signal_module.shutil.copyfile, source)
 
     @pytest.mark.asyncio
+    async def test_snapshot_executor_failure_does_not_fail_the_send(self, monkeypatch, tmp_path):
+        """Snapshotting is optional when the default executor rejects work."""
+        import gateway.platforms.signal as signal_module
+
+        adapter = _make_signal_adapter(monkeypatch)
+        source = tmp_path / "chart.png"
+        source.write_bytes(b"image bytes")
+        monkeypatch.setattr(
+            signal_module.asyncio,
+            "to_thread",
+            AsyncMock(side_effect=RuntimeError("executor shut down")),
+        )
+
+        await adapter._remember_sent_attachments(123, "+15559998888", [str(source)])
+
+        assert adapter._sent_attachment_paths == {}
+
+    @pytest.mark.asyncio
     async def test_cancelled_snapshot_copy_is_deleted_after_worker_finishes(self, monkeypatch, tmp_path):
         """A cancelled send cannot leave an untracked snapshot in the temp directory."""
         import gateway.platforms.signal as signal_module
