@@ -28,11 +28,12 @@ async def test_expired_snapshot_entries_do_not_admit_more_than_cap_copy_tasks(mo
     copy_slots_started = asyncio.Event()
     release_copies = asyncio.Event()
     copies_started = 0
+    copy_concurrency = signal_module.SIGNAL_PENDING_SNAPSHOT_COPY_CONCURRENCY
 
     async def blocked_copy(_copyfile, _source, destination):
         nonlocal copies_started
         copies_started += 1
-        if copies_started == 4:
+        if copies_started == copy_concurrency:
             copy_slots_started.set()
         await release_copies.wait()
         Path(destination).write_bytes(source.read_bytes())
@@ -56,7 +57,7 @@ async def test_expired_snapshot_entries_do_not_admit_more_than_cap_copy_tasks(mo
 
         assert len(adapter._pending_sent_attachment_snapshots) == cap
         assert adapter._snapshot_capacity_rejected_total == 1
-        assert copies_started == 4
+        assert copies_started == copy_concurrency
     finally:
         release_copies.set()
         await asyncio.gather(*copies, *([candidate] if candidate else []), return_exceptions=True)
