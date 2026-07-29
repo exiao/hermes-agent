@@ -11,7 +11,9 @@ The batched-image path (send_multiple_images) already used
 _signal_send_timeout(n); this asserts the single-attachment paths do too.
 """
 
-import inspect
+from unittest.mock import AsyncMock
+
+import pytest
 
 from gateway.platforms.signal_rate_limit import _signal_send_timeout
 
@@ -22,21 +24,35 @@ def test_signal_send_timeout_floor_beats_httpx_default():
     assert _signal_send_timeout(1) > 30.0
 
 
-def test_send_attachment_passes_scaled_timeout():
-    """_send_attachment must not fall back to the client default timeout."""
+@pytest.mark.asyncio
+async def test_send_document_passes_scaled_timeout(tmp_path):
+    """Documents must not fall back to the client default timeout."""
     from gateway.platforms.signal import SignalAdapter
 
-    src = inspect.getsource(SignalAdapter._send_attachment)
-    assert "_signal_send_timeout(" in src, (
-        "_send_attachment must pass an explicit attachment-scaled timeout to "
-        "_rpc; without it the 30s httpx default truncates slow uploads and "
-        "produces a phantom 'RPC send file failed'."
-    )
+    attachment = tmp_path / "slow-upload.txt"
+    attachment.write_text("payload")
+    adapter = object.__new__(SignalAdapter)
+    adapter.account = "+15551234567"
+    adapter._stop_typing_indicator = AsyncMock()
+    adapter._rpc = AsyncMock(return_value=None)
+
+    await adapter.send_document("group:group-id", str(attachment))
+
+    assert adapter._rpc.await_args.kwargs["timeout"] == _signal_send_timeout(1)
 
 
-def test_send_image_passes_scaled_timeout():
-    """send_image (url/file:// path) shares the same failure mode."""
+@pytest.mark.asyncio
+async def test_send_image_passes_scaled_timeout(tmp_path):
+    """file:// images must use the attachment-scaled RPC timeout too."""
     from gateway.platforms.signal import SignalAdapter
 
-    src = inspect.getsource(SignalAdapter.send_image)
-    assert "_signal_send_timeout(" in src
+    image = tmp_path / "slow-upload.png"
+    image.write_bytes(b"image")
+    adapter = object.__new__(SignalAdapter)
+    adapter.account = "+15551234567"
+    adapter._stop_typing_indicator = AsyncMock()
+    adapter._rpc = AsyncMock(return_value=None)
+
+    await adapter.send_image("group:group-id", image.as_uri())
+
+    assert adapter._rpc.await_args.kwargs["timeout"] == _signal_send_timeout(1)
