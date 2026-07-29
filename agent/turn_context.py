@@ -480,6 +480,7 @@ def build_turn_context(
                 # here, so its cooldown clear is unaffected.
                 _cooldown_snapshot = _cooldown_before_sync
                 if _ineffective_before_sync:
+                    _compressor._ineffective_compression_count = _ineffective_before_sync
                     _sess_db = getattr(_compressor, "_session_db", None)
                     _sess_id = getattr(_compressor, "_session_id", "")
                     _get_ineffective = getattr(
@@ -492,7 +493,6 @@ def build_turn_context(
                         try:
                             if not _get_ineffective(_sess_id):
                                 _set_ineffective(_sess_id, _ineffective_before_sync)
-                                _compressor._ineffective_compression_count = _ineffective_before_sync
                         except Exception:
                             pass
                 if _cooldown_snapshot:
