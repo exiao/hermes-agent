@@ -445,11 +445,9 @@ class SignalAdapter(BasePlatformAdapter):
         self._max_sent_attachment_entries = 200
         self._sent_attachment_snapshot_bytes = 0
         self._max_sent_attachment_snapshot_bytes = 100 * 1024 * 1024
-        # Snapshot caller-owned paths after a successful send. The directory is
-        # per-adapter and is removed on disconnect; eviction removes files earlier.
-        self._sent_attachment_snapshot_dir = tempfile.TemporaryDirectory(
-            prefix="hermes-signal-quote-"
-        )
+        # Snapshot storage is optional and created only after an attachment send.
+        # Text-only adapters must start even when temporary storage is unavailable.
+        self._sent_attachment_snapshot_dir = None
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
         # phone number to the corresponding UUID when signal-cli prefers it.
@@ -996,14 +994,18 @@ class SignalAdapter(BasePlatformAdapter):
         )
         self._discard_sent_attachment_snapshots(paths)
 
-    def _remember_sent_attachments(self, timestamp: Any, chat_id: str, paths: List[str]) -> None:
-        """Snapshot outbound attachments so later quotes resolve immutable bytes."""
+    async def _remember_sent_attachments(self, timestamp: Any, chat_id: str, paths: List[str]) -> None:
+        """Best-effort snapshot of outbound attachments for later quoted replies."""
         if timestamp is None or not chat_id or not paths:
             return
         if self._sent_attachment_snapshot_dir is None:
-            self._sent_attachment_snapshot_dir = tempfile.TemporaryDirectory(
-                prefix="hermes-signal-quote-"
-            )
+            try:
+                self._sent_attachment_snapshot_dir = tempfile.TemporaryDirectory(
+                    prefix="hermes-signal-quote-"
+                )
+            except OSError:
+                logger.debug("Signal: quoted attachment snapshots unavailable")
+                return
 
         snapshots: List[str] = []
         byte_count = 0
@@ -1014,7 +1016,7 @@ class SignalAdapter(BasePlatformAdapter):
                 continue
             snapshot = snapshot_root / f"{uuid.uuid4().hex}{source.suffix[:32]}"
             try:
-                shutil.copyfile(source, snapshot)
+                await asyncio.to_thread(shutil.copyfile, source, snapshot)
                 byte_count += snapshot.stat().st_size
                 snapshots.append(str(snapshot))
             except OSError:
@@ -1617,7 +1619,7 @@ class SignalAdapter(BasePlatformAdapter):
                             # Remember which local files went out under this
                             # timestamp, so quoting the image later resolves to it.
                             if isinstance(result, dict):
-                                self._remember_sent_attachments(result.get("timestamp"), chat_id, att_batch)
+                                await self._remember_sent_attachments(result.get("timestamp"), chat_id, att_batch)
                             await scheduler.report_rpc_duration(_rpc_duration, n)
                             logger.info(
                                 "Signal batch %d/%d: %d attachments sent in %.1fs "
@@ -1745,7 +1747,7 @@ class SignalAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
             if isinstance(result, dict):
-                self._remember_sent_attachments(result.get("timestamp"), chat_id, [file_path])
+                await self._remember_sent_attachments(result.get("timestamp"), chat_id, [file_path])
             return SendResult(success=True)
         return SendResult(success=False, error="RPC send with attachment failed")
 
@@ -1789,7 +1791,7 @@ class SignalAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
             if isinstance(result, dict):
-                self._remember_sent_attachments(result.get("timestamp"), chat_id, [file_path])
+                await self._remember_sent_attachments(result.get("timestamp"), chat_id, [file_path])
             return SendResult(success=True)
         return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
 

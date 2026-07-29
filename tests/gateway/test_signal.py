@@ -3011,25 +3011,27 @@ class TestQuotedAttachments:
             {"attachments": [{}]}
         ) == "a file"
 
-    def test_resolves_local_path_for_an_image_we_sent(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_resolves_local_path_for_an_image_we_sent(self, monkeypatch, tmp_path):
         """Quoting an image the bot sent resolves back to the file on disk."""
         adapter = _make_signal_adapter(monkeypatch)
         real_file = tmp_path / "chart.png"
         real_file.write_bytes(b"\x89PNG\r\n\x1a\n")
 
-        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(real_file)])
+        await adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(real_file)])
 
         quoted_paths = adapter._resolve_quoted_media_paths("1753650000000", "+15559998888")
         assert len(quoted_paths) == 1
         assert Path(quoted_paths[0]).read_bytes() == real_file.read_bytes()
 
-    def test_preserves_sent_bytes_when_caller_reuses_the_path(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_preserves_sent_bytes_when_caller_reuses_the_path(self, monkeypatch, tmp_path):
         """An older quote must not resolve to replacement bytes at the caller path."""
         adapter = _make_signal_adapter(monkeypatch)
         caller_path = tmp_path / "chart.png"
         caller_path.write_bytes(b"original chart bytes")
 
-        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(caller_path)])
+        await adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(caller_path)])
         caller_path.write_bytes(b"replacement chart bytes")
 
         resolved = adapter._resolve_quoted_media_paths("1753650000000", "+15559998888")
@@ -3044,19 +3046,21 @@ class TestQuotedAttachments:
         assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == []
         assert adapter._resolve_quoted_media_paths(None, "+15559998888") == []
 
-    def test_keeps_snapshot_when_caller_deletes_the_source_path(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_keeps_snapshot_when_caller_deletes_the_source_path(self, monkeypatch, tmp_path):
         """A quote keeps the sent bytes after the caller removes its temp file."""
         adapter = _make_signal_adapter(monkeypatch)
         gone = tmp_path / "deleted.png"
         gone.write_bytes(b"x")
-        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(gone)])
+        await adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(gone)])
         gone.unlink()
 
         quoted_paths = adapter._resolve_quoted_media_paths("1753650000000", "+15559998888")
         assert len(quoted_paths) == 1
         assert Path(quoted_paths[0]).read_bytes() == b"x"
 
-    def test_sent_attachment_cache_evicts_and_deletes_oldest_snapshot(self, monkeypatch, tmp_path):
+    @pytest.mark.asyncio
+    async def test_sent_attachment_cache_evicts_and_deletes_oldest_snapshot(self, monkeypatch, tmp_path):
         adapter = _make_signal_adapter(monkeypatch)
         adapter._max_sent_attachment_entries = 1
         first = tmp_path / "first.png"
@@ -3064,18 +3068,54 @@ class TestQuotedAttachments:
         first.write_bytes(b"first")
         second.write_bytes(b"second")
 
-        adapter._remember_sent_attachments(1, "+15559998888", [str(first)])
+        await adapter._remember_sent_attachments(1, "+15559998888", [str(first)])
         first_snapshot = adapter._sent_attachment_paths["1"][1][0]
-        adapter._remember_sent_attachments(2, "+15559998888", [str(second)])
+        await adapter._remember_sent_attachments(2, "+15559998888", [str(second)])
 
         assert list(adapter._sent_attachment_paths) == ["2"]
         assert not Path(first_snapshot).exists()
 
-    def test_remembering_is_a_noop_without_paths(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_remembering_is_a_noop_without_paths(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
-        adapter._remember_sent_attachments(123, "+15559998888", [])
-        adapter._remember_sent_attachments(None, "+15559998888", ["/tmp/x.png"])
+        await adapter._remember_sent_attachments(123, "+15559998888", [])
+        await adapter._remember_sent_attachments(None, "+15559998888", ["/tmp/x.png"])
         assert len(adapter._sent_attachment_paths) == 0
+
+    @pytest.mark.asyncio
+    async def test_unavailable_snapshot_storage_keeps_adapter_and_quote_fallback_running(self, monkeypatch, tmp_path):
+        """Attachment quoting is optional when temporary storage is unavailable."""
+        import gateway.platforms.signal as signal_module
+
+        monkeypatch.setattr(
+            signal_module.tempfile,
+            "TemporaryDirectory",
+            MagicMock(side_effect=OSError("temporary storage unavailable")),
+        )
+
+        adapter = _make_signal_adapter(monkeypatch)
+        source = tmp_path / "chart.png"
+        source.write_bytes(b"image bytes")
+        await adapter._remember_sent_attachments(123, "+15559998888", [str(source)])
+
+        assert adapter._sent_attachment_snapshot_dir is None
+        assert adapter._resolve_quoted_media_paths("123", "+15559998888") == []
+
+    @pytest.mark.asyncio
+    async def test_snapshots_copy_in_a_worker_thread(self, monkeypatch, tmp_path):
+        """Large optional snapshots must not block the gateway event loop."""
+        import gateway.platforms.signal as signal_module
+
+        adapter = _make_signal_adapter(monkeypatch)
+        source = tmp_path / "chart.png"
+        source.write_bytes(b"image bytes")
+        copy_in_worker = AsyncMock()
+        monkeypatch.setattr(signal_module.asyncio, "to_thread", copy_in_worker)
+
+        await adapter._remember_sent_attachments(123, "+15559998888", [str(source)])
+
+        copy_in_worker.assert_awaited_once()
+        assert copy_in_worker.await_args.args[:2] == (signal_module.shutil.copyfile, source)
 
 
 @pytest.mark.asyncio
@@ -3093,7 +3133,7 @@ async def test_quoted_image_envelope_end_to_end(monkeypatch, tmp_path):
 
     sent_image = tmp_path / "cc_verification_sheet.png"
     sent_image.write_bytes(b"\x89PNG\r\n\x1a\n")
-    adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(sent_image)])
+    await adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(sent_image)])
     adapter._remember_sent_message_timestamp(1753650000000)
 
     captured = {}
@@ -3180,7 +3220,7 @@ async def test_quoted_timestamp_collision_from_another_chat_has_no_local_path(mo
     adapter = _make_signal_adapter(monkeypatch)
     sent_image = tmp_path / "other-chat.png"
     sent_image.write_bytes(b"\x89PNG\r\n\x1a\n")
-    adapter._remember_sent_attachments(1753650000000, "+15558887777", [str(sent_image)])
+    await adapter._remember_sent_attachments(1753650000000, "+15558887777", [str(sent_image)])
 
     captured = {}
 
