@@ -10,7 +10,8 @@ Covers the two follow-up fixes layered on top of the salvaged contributor PRs:
 2. Inline-code-wrapped tags — a whole ``MEDIA:`` tag inside inline backticks
    (`` `MEDIA:/path.csv` ``) is a real delivery directive when the path
    validates on disk; prose examples with non-existent paths stay masked
-   (#35695), and fenced code blocks are always masked.
+   (#35695). The same validation distinguishes real directives in fenced
+   output from fenced documentation examples.
 """
 
 import os
@@ -72,11 +73,17 @@ class TestInlineCodeWrappedTags:
         assert media == []
         assert "`MEDIA:/nonexistent/example.csv`" in cleaned
 
-    def test_fenced_code_block_always_masked(self, real_file):
+    def test_real_path_in_fenced_code_block_delivers(self, real_file):
         text = f"```\nMEDIA:{real_file}\n```"
         media, cleaned = BasePlatformAdapter.extract_media(text)
+        assert [p for p, _ in media] == [real_file]
+        assert cleaned == ""
+
+    def test_nonexistent_path_in_fenced_code_block_stays_masked(self):
+        text = "```\nMEDIA:/nonexistent/example.csv\n```"
+        media, cleaned = BasePlatformAdapter.extract_media(text)
         assert media == []
-        assert real_file in cleaned
+        assert "MEDIA:/nonexistent/example.csv" in cleaned
 
     def test_inline_code_non_media_untouched(self, real_file):
         text = f"Run `ls -la` then see MEDIA:{real_file}"
