@@ -457,6 +457,11 @@ class SignalAdapter(BasePlatformAdapter):
         # This map is only touched by the gateway event loop. Each entry holds a
         # loop-affine Future completed by the async copy task, never its worker.
         self._pending_sent_attachment_snapshots: "OrderedDict[Tuple[str, str], Dict[str, Any]]" = OrderedDict()
+        # The map is also the quote lookup, so duplicate keys can replace its
+        # visible entry while an older worker is still unwinding. Keep a separate
+        # work registry for the real admission bound.
+        self._outstanding_sent_attachment_snapshot_tokens: set[object] = set()
+        self._snapshot_capacity_rejected_total = 0
         self._max_pending_sent_attachment_snapshots = SIGNAL_PENDING_SNAPSHOT_MAX_ENTRIES
         self._pending_sent_attachment_copy_semaphore = asyncio.Semaphore(
             SIGNAL_PENDING_SNAPSHOT_COPY_CONCURRENCY
@@ -1017,12 +1022,12 @@ class SignalAdapter(BasePlatformAdapter):
         self._discard_sent_attachment_snapshots(paths)
 
     def _expire_pending_sent_attachment_snapshot(self, key: Tuple[str, str]) -> None:
-        entry = self._pending_sent_attachment_snapshots.pop(key, None)
+        entry = self._pending_sent_attachment_snapshots.get(key)
         if entry is None:
             return
         entry["expired"] = True
-        # A thread-pool copy cannot be safely cancelled. Remove the entry now;
-        # its loop coroutine discards any bytes that arrive after expiry.
+        # A thread-pool copy cannot be safely cancelled. Keep the entry counted
+        # until its coroutine reaches finally, while resolving the quote waiter.
         if not entry["future"].done():
             entry["future"].set_result([])
         logger.warning("Signal: quoted attachment snapshot expired before completion")
@@ -1041,18 +1046,33 @@ class SignalAdapter(BasePlatformAdapter):
                 logger.debug("Signal: quoted attachment snapshots unavailable")
                 return
         key = (chat_id, str(timestamp))
-        if len(self._pending_sent_attachment_snapshots) >= self._max_pending_sent_attachment_snapshots:
-            logger.warning("Signal: quoted attachment snapshot capacity reached")
+        outstanding = len(self._outstanding_sent_attachment_snapshot_tokens)
+        if outstanding >= self._max_pending_sent_attachment_snapshots:
+            self._snapshot_capacity_rejected_total += 1
+            logger.warning(
+                "Signal: signal_snapshot_capacity_rejected outstanding=%d cap=%d",
+                outstanding,
+                self._max_pending_sent_attachment_snapshots,
+            )
             return
         previous = self._pending_sent_attachment_snapshots.pop(key, None)
         if previous is not None:
-            previous["task"].cancel()
+            # Cancelling an asyncio task does not stop a submitted to_thread
+            # worker. Let the old coroutine release its own work token instead.
+            previous["expired"] = True
             previous["expiry"].cancel()
             if not previous["future"].done():
                 previous["future"].set_result([])
         loop = asyncio.get_running_loop()
         future: asyncio.Future[List[str]] = loop.create_future()
-        entry: Dict[str, Any] = {"chat_id": chat_id, "future": future, "expired": False}
+        token = object()
+        entry: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "future": future,
+            "expired": False,
+            "work_token": token,
+        }
+        self._outstanding_sent_attachment_snapshot_tokens.add(token)
         self._pending_sent_attachment_snapshots[key] = entry
         entry["task"] = asyncio.create_task(self._copy_sent_attachments(key, paths, entry))
         entry["expiry"] = loop.call_later(
@@ -1068,9 +1088,15 @@ class SignalAdapter(BasePlatformAdapter):
         snapshots: List[str] = []
         byte_count = 0
         try:
+            if entry["expired"]:
+                return
             snapshot_root = Path(self._sent_attachment_snapshot_dir.name)
             async with self._pending_sent_attachment_copy_semaphore:
+                if entry["expired"]:
+                    return
                 for path in paths:
+                    if entry["expired"]:
+                        break
                     source = Path(path)
                     if not source.is_file():
                         continue
@@ -1102,6 +1128,7 @@ class SignalAdapter(BasePlatformAdapter):
             self._discard_sent_attachment_snapshots(snapshots)
             raise
         finally:
+            self._outstanding_sent_attachment_snapshot_tokens.discard(entry["work_token"])
             current = self._pending_sent_attachment_snapshots.get(key)
             if current is entry:
                 self._pending_sent_attachment_snapshots.pop(key, None)

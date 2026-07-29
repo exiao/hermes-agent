@@ -3137,6 +3137,7 @@ class TestQuotedAttachments:
         await adapter._remember_sent_attachments(123, "+15559998888", [str(source)])
 
         assert adapter._sent_attachment_paths == {}
+        assert not adapter._outstanding_sent_attachment_snapshot_tokens
 
     @pytest.mark.asyncio
     async def test_cancelled_snapshot_copy_is_deleted_after_worker_finishes(self, monkeypatch, tmp_path):

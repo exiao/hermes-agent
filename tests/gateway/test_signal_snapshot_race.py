@@ -60,8 +60,8 @@ async def test_quoted_reply_waits_for_snapshot_copy_before_building_event(monkey
 
 
 @pytest.mark.asyncio
-async def test_snapshot_wait_timeout_removes_pending_entry(monkeypatch, tmp_path):
-    """A stalled optional copy cannot retain its pending map entry."""
+async def test_snapshot_wait_timeout_keeps_copy_counted_until_worker_exits(monkeypatch, tmp_path):
+    """A timed-out quote resolves without releasing its running copy slot."""
     import gateway.platforms.signal as signal_module
 
     adapter = _make_signal_adapter(monkeypatch)
@@ -83,9 +83,10 @@ async def test_snapshot_wait_timeout_removes_pending_entry(monkeypatch, tmp_path
     original_wait = signal_module.SIGNAL_QUOTE_SNAPSHOT_WAIT_SECONDS
     monkeypatch.setattr(signal_module, "SIGNAL_QUOTE_SNAPSHOT_WAIT_SECONDS", 0.01)
     assert await adapter._await_quoted_media_paths("123", "+15559998888") == []
-    assert not adapter._pending_sent_attachment_snapshots
+    assert ("+15559998888", "123") in adapter._pending_sent_attachment_snapshots
     release.set()
     await task
+    assert not adapter._pending_sent_attachment_snapshots
     monkeypatch.setattr(signal_module, "SIGNAL_QUOTE_SNAPSHOT_WAIT_SECONDS", original_wait)
 
 
