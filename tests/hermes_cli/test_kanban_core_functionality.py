@@ -1599,6 +1599,48 @@ def test_owner_evidence_supersedes_empty_terminal_handoff(kanban_home):
         conn.close()
 
 
+def test_owner_evidence_supersession_preserves_scratch_artifact(kanban_home, tmp_path, monkeypatch):
+    """A corrected terminal handoff keeps managed scratch evidence after cleanup."""
+    workspace_root = tmp_path / "workspaces"
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspace_root))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="owner handoff artifact",
+            assignee="worker",
+            workspace_kind="scratch",
+            workspace_path=str(workspace_root / "owner-handoff-artifact"),
+        )
+        workspace = workspace_root / "owner-handoff-artifact"
+        workspace.mkdir(parents=True)
+        artifact = workspace / "proof.txt"
+        artifact.write_text("owner proof", encoding="utf-8")
+        kb.claim_task(conn, tid)
+        owner = kb.latest_run(conn, tid)
+        assert owner is not None
+        kb.create_task(conn, title="keeps parent scratch workspace", parents=[tid])
+        assert kb.complete_task(conn, tid, summary="bare completion")
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="corrected completion",
+            metadata={"commit_sha": "abc123", "artifacts": [str(artifact)]},
+            expected_run_id=owner.id,
+        )
+
+        attachments = kb.list_attachments(conn, tid)
+        assert len(attachments) == 1
+        assert attachments[0].filename == "proof.txt"
+        assert Path(attachments[0].stored_path).read_text(encoding="utf-8") == "owner proof"
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.metadata["artifacts"] == [attachments[0].stored_path]
+    finally:
+        conn.close()
+
+
 def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
     """A worker from an earlier attempt cannot close a later retry."""
     import hermes_cli.kanban_db as _kb

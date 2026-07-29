@@ -5062,6 +5062,8 @@ def _supersede_empty_terminal_handoff(
             prior_metadata = None
         if _has_push_evidence(prior_metadata):
             return False
+        if isinstance(metadata, dict):
+            _persist_completion_artifacts(conn, task_id, metadata, now=int(time.time()))
         handoff = summary if summary is not None else result
         conn.execute(
             "UPDATE tasks SET result = COALESCE(?, result) WHERE id = ?",
@@ -6446,17 +6448,7 @@ def complete_task(
                 )
             return False
         if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
-                path = Path(stored_path)
-                _insert_completion_attachment(
-                    conn,
-                    task_id,
-                    filename=path.name,
-                    stored_path=str(path),
-                    size=path.stat().st_size,
-                    created_at=now,
-                )
+            _persist_completion_artifacts(conn, task_id, metadata, now=now)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -6733,6 +6725,27 @@ def _insert_completion_attachment(
         "attached",
         {"filename": filename, "size": size, "by": "kanban_complete"},
     )
+
+
+def _persist_completion_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict,
+    *,
+    now: int,
+) -> None:
+    """Preserve scratch artifacts and record their attachment rows."""
+    _persist_scratch_completion_artifacts(conn, task_id, metadata)
+    for stored_path in metadata.pop("_staged_artifacts", []):
+        path = Path(stored_path)
+        _insert_completion_attachment(
+            conn,
+            task_id,
+            filename=path.name,
+            stored_path=str(path),
+            size=path.stat().st_size,
+            created_at=now,
+        )
 
 
 def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
