@@ -135,6 +135,14 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+# Absolute ceiling on blocked runs for a single task, independent of which
+# state machine routed it. BLOCK_RECURRENCE_LIMIT only counts consecutive
+# re-blocks of the SAME kind and is reset whenever a task leaves the blocked
+# state — so any path that launders a task through another status (the triage
+# specifier's ``triage -> todo`` flip did exactly this) resets it to 1 forever
+# and the limit never bites. Eight cards reached 76-296 blocked runs that way.
+# This cap counts total ``blocked`` run outcomes and cannot be laundered.
+BLOCKED_RUN_HARD_CAP = 10
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -5252,6 +5260,59 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _has_unresolved_block_loop(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when ``task_id`` sits in triage because the block-recurrence
+    breaker tripped and nothing has cleared it since.
+
+    ``block_task`` routes a task to ``status='triage'`` once it re-blocks for
+    the same cause ``BLOCK_RECURRENCE_LIMIT`` times, emitting
+    ``block_loop_detected``. That state means "a human must decide".
+
+    Without this predicate the triage specifier treats such a task as an
+    unspecified one-liner and flips it ``triage -> todo``; ``recompute_ready``
+    promotes it, the dispatcher respawns the same worker, it re-blocks for the
+    same cause, and the breaker routes it back to triage. Observed as a
+    ~4-minute cycle on t_4e495923 (296 blocked runs) plus seven sibling cards
+    at 76-288 runs each. ``block_recurrences`` reads 0 on all of them because
+    each lap resets the counter, which is why the existing limit never bit.
+
+    Clearing signals, any of which means an operator/worker touched it
+    deliberately after the loop was detected:
+
+    * ``unblocked`` — an explicit ``unblock_task``.
+    * ``status`` — a drag-drop / ``set_status_direct`` move (how an operator
+      actually rescues a triage card; ``unblock_task`` itself only accepts
+      ``blocked``/``scheduled``, so it cannot exit ``triage``).
+    * ``completed`` / ``archived`` — terminal, nothing left to loop.
+
+    Gating on ONLY ``unblocked`` would trap the card forever, since no verb
+    emits it from ``triage``.
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN "
+        "('block_loop_detected', 'unblocked', 'status', 'completed', 'archived') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(row) and row["kind"] == "block_loop_detected"
+
+
+def _blocked_run_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """Total ``blocked`` run outcomes ever recorded for ``task_id``.
+
+    Deliberately monotonic — unlike ``block_recurrences`` this is never reset,
+    so it holds as a ceiling across every routing path (breaker, specifier,
+    cron unblocker, operator). Backs :data:`BLOCKED_RUN_HARD_CAP`.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'blocked'",
+        (task_id,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when a ``dependency``-blocked ``todo`` task must PARK
     rather than be auto-promoted by :func:`recompute_ready` (t_e85f0abe).
@@ -5546,6 +5607,11 @@ def recompute_ready(
                         else int(failure_limit)
                     )
                     if failures >= effective_limit:
+                        continue
+                    # Hard ceiling that no status-laundering path can reset:
+                    # count total blocked runs, not consecutive same-kind
+                    # re-blocks. See BLOCKED_RUN_HARD_CAP.
+                    if _blocked_run_count(conn, task_id) >= BLOCKED_RUN_HARD_CAP:
                         continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' "
@@ -7395,6 +7461,17 @@ def specify_triage_task(
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        # A task routed to triage by the block-recurrence breaker
+        # (``block_loop_detected``) is awaiting a HUMAN decision, not a missing
+        # spec. Specifying it flips triage -> todo, recompute_ready promotes it,
+        # the dispatcher respawns the same worker, it re-blocks for the same
+        # cause, and the breaker routes it back to triage — a ~4-minute cycle
+        # that produced 296 blocked runs on one card (t_4e495923). The two
+        # guards each work alone and defeat each other: triage is where the
+        # breaker PARKS a looping task and where the specifier HARVESTS work.
+        # Refuse until an explicit ``unblock_task`` clears the loop state.
+        if _has_unresolved_block_loop(conn, task_id):
             return False
         # Re-check the spec-less guard against the *post-update* values. A
         # specifier (auxiliary LLM) can return a title-only response or omit
