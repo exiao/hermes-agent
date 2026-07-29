@@ -504,7 +504,24 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     _apply_windows_msys_bash_env_defaults(sanitized)
 
+    sanitized = _scrub_delegated_child_kanban_env(sanitized)
+
     return sanitized
+
+
+def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
+    """Strip dispatcher-owned Kanban env from delegate_task child subprocesses."""
+    try:
+        from agent.delegation_context import (
+            is_delegated_child_process_context,
+            scrub_kanban_env,
+        )
+
+        if is_delegated_child_process_context():
+            return scrub_kanban_env(env)
+    except Exception:
+        pass
+    return env
 
 
 # Tier-1 secrets: stripped from EVERY spawned subprocess unconditionally —
@@ -635,6 +652,11 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # Hermes-tools MCP kanban_complete/kanban_block. Strip it here too so the
     # mask covers every non-terminal spawn surface, not just terminal spawns.
     _strip_delegated_child_kanban_ownership(env)
+    # Upstream's complementary scrub: keyed on the delegate_task child-process
+    # lineage marker rather than the ownership mask, so a child that later
+    # imports Kanban DB code in the spawned process still loses the parent's
+    # DB mutation guard. Both run — different detection, same intent.
+    env = _scrub_delegated_child_kanban_env(env)
 
     return env
 
@@ -765,7 +787,7 @@ def _mandatory_aslr_enabled() -> "bool | None":
                 "(Get-ProcessMitigation -System).Aslr.ForceRelocateImages.ToString()",
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=10,
             creationflags=windows_hide_flags(),
         )
@@ -831,7 +853,7 @@ def _bash_starts(bash: str) -> bool:
         result = subprocess.run(
             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=15,
             creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
         )
@@ -1198,6 +1220,8 @@ def _make_run_env(env: dict) -> dict:
         run_env.pop(_marker, None)
 
     _apply_windows_msys_bash_env_defaults(run_env)
+
+    run_env = _scrub_delegated_child_kanban_env(run_env)
 
     return run_env
 

@@ -312,7 +312,8 @@ class QQAdapter(BasePlatformAdapter):
             # Tighter keepalive pool so idle CLOSE_WAIT sockets drain
             # faster behind proxies like Cloudflare Warp (#18451).
             from gateway.platforms._http_client_limits import platform_httpx_limits
-            self._http_client = httpx.AsyncClient(
+            from tools.url_safety import create_ssrf_safe_async_client
+            self._http_client = create_ssrf_safe_async_client(
                 timeout=30.0,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
@@ -1201,7 +1202,7 @@ class QQAdapter(BasePlatformAdapter):
             home = get_hermes_home()
             response_path = home / ".update_response"
             tmp = response_path.with_suffix(".tmp")
-            tmp.write_text(answer)
+            tmp.write_text(answer, encoding="utf-8")
             tmp.replace(response_path)
             logger.info(
                 "QQ update prompt answered %r by %s",
@@ -1811,16 +1812,14 @@ class QQAdapter(BasePlatformAdapter):
         fn = filename.strip().lower()
         if ct == "voice" or ct.startswith("audio/"):
             return True
+        # QQ file uploads have content_type="file".  Without this guard,
+        # any uploaded audio file (e.g. .wav, .mp3) would be misrouted into
+        # the STT pipeline and never be received as a normal file attachment.
+        if ct == "file":
+            return False
         _VOICE_EXTENSIONS = (
-            ".silk",
-            ".amr",
-            ".mp3",
-            ".wav",
-            ".ogg",
-            ".m4a",
-            ".aac",
-            ".speex",
-            ".flac",
+            ".silk", ".amr", ".mp3", ".wav", ".ogg",
+            ".m4a", ".aac", ".speex", ".flac",
         )
         if any(fn.endswith(ext) for ext in _VOICE_EXTENSIONS):
             return True
@@ -1937,15 +1936,15 @@ class QQAdapter(BasePlatformAdapter):
                     )
                     return None
 
-            # 4. Call STT API
+            # 4. Call STT API and always clean up the temp WAV afterward.
             logger.debug("[%s] STT: calling ASR on %s", self._log_tag, wav_path)
-            transcript = await self._call_stt(wav_path)
-
-            # 5. Cleanup temp file
             try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
+                transcript = await self._call_stt(wav_path)
+            finally:
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
 
             if transcript:
                 logger.debug("[%s] STT success: %r", self._log_tag, transcript[:100])
@@ -2672,6 +2671,7 @@ class QQAdapter(BasePlatformAdapter):
             description: str = "dangerous command",
             metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
+        allow_session: bool = True,
         smart_denied: bool = False,
     ) -> SendResult:
         """Send a button-based exec-approval prompt for a dangerous command.
@@ -2682,6 +2682,7 @@ class QQAdapter(BasePlatformAdapter):
         adapter's interaction callback (:meth:`_default_interaction_dispatch`).
         """
         del metadata  # QQ doesn't have thread_id / DM targeting overrides.
+        del allow_session  # QQ's 3-button keyboard has no session tier (once/always/deny).
         if smart_denied:
             description += " Owner override applies to this one operation only."
 

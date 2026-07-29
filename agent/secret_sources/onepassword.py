@@ -98,6 +98,9 @@ _OP_ENV_ALLOWLIST = (
     "OP_ACCOUNT",
     "OP_CONNECT_HOST",
     "OP_CONNECT_TOKEN",
+    # Lets a user skip op's desktop-app integration probe (which can hang with
+    # no timeout on a wedged desktop container) and go straight to token auth.
+    "OP_LOAD_DESKTOP_APP_SETTINGS",
 )
 
 
@@ -178,11 +181,12 @@ def _auth_fingerprint(
 ) -> str:
     """SHA-256 prefix over the auth material `op` would use.
 
-    Folds in the service-account token, ``OP_ACCOUNT``, and *all*
-    ``OP_SESSION_*`` vars (the names `op` actually exports for interactive
-    sessions — ``OP_SESSION_<account_shorthand>``).  Signing out and into a
-    different identity therefore changes the cache key, so a value cached under
-    a previous identity is never served under a new one.  Never logged or
+    Folds in the service-account token, ``OP_ACCOUNT``, the 1Password Connect
+    ``OP_CONNECT_HOST``/``OP_CONNECT_TOKEN``, and *all* ``OP_SESSION_*`` vars
+    (the names `op` actually exports for interactive sessions —
+    ``OP_SESSION_<account_shorthand>``).  Signing out and into a different
+    identity therefore changes the cache key, so a value cached under a
+    previous identity is never served under a new one.  Never logged or
     displayed; the raw token never leaves this hash.
     """
     resolved_token = (
@@ -194,6 +198,11 @@ def _auth_fingerprint(
     ]
     if include_process_auth:
         parts.append(f"account={os.environ.get('OP_ACCOUNT', '')}")
+        # 1Password Connect auth material (upstream): folded in only under
+        # process auth — an isolated/named-profile fetch must not key off the
+        # default profile's process env.
+        parts.append(f"connect_host={os.environ.get('OP_CONNECT_HOST', '')}")
+        parts.append(f"connect_token={os.environ.get('OP_CONNECT_TOKEN', '')}")
         for key in (
             "HOME",
             "USERPROFILE",
@@ -709,6 +718,24 @@ class OnePasswordSource(SecretSource):
         result.warnings.extend(fetch_warnings)
         return result
 
+    def remediation(self, kind, cfg: dict) -> str:
+        if kind in (ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED):
+            token_env = _DEFAULT_TOKEN_ENV
+            if isinstance(cfg, dict):
+                token_env = str(cfg.get("service_account_token_env") or token_env)
+            return (
+                "Run `hermes secrets onepassword token` to paste a fresh "
+                f"service-account token ({token_env}), or `op signin` for an "
+                "interactive session."
+            )
+        if kind == ErrorKind.BINARY_MISSING:
+            return (
+                "Install the 1Password CLI "
+                "(https://developer.1password.com/docs/cli/get-started/) or "
+                "set secrets.onepassword.binary_path."
+            )
+        return super().remediation(kind, cfg)
+
 
 def _classify_op_error(message: str) -> ErrorKind:
     """Best-effort mapping of op failure text onto the shared taxonomy."""
@@ -735,11 +762,21 @@ def _classify_op_error(message: str) -> ErrorKind:
 # ---------------------------------------------------------------------------
 
 
+def clear_caches(home_path: Optional[Path] = None) -> None:
+    """Drop in-process AND disk caches.
+
+    Used after a token rotation (`hermes secrets onepassword token`) so
+    the next startup resolves fresh with the new credential instead of
+    serving values cached under the old token's fingerprint.
+    """
+    _CACHE.clear()
+    _DISK_CACHE.clear(home_path)
+
+
 def _reset_cache_for_tests(home_path: Optional[Path] = None) -> None:
     """Clear in-process AND disk caches.
 
     Tests can pass ``home_path`` to scope the disk cleanup to a tmpdir.
     Without it we fall back to the same default resolution as the writer.
     """
-    _CACHE.clear()
-    _DISK_CACHE.clear(home_path)
+    clear_caches(home_path)

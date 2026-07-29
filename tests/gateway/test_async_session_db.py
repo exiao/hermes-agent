@@ -126,9 +126,10 @@ _GATEWAY_FILES = ("gateway/run.py", "gateway/slash_commands.py")
 #     provably off the event loop — construction (__init__ / gateway start,
 #     before the loop serves) and the run_sync closure (executed in a
 #     thread-pool executor). Four such sites today: startup prune+vacuum,
-#     startup WAL watchdog, and two run_sync reads. The hourly WAL watchdog on
-#     the expiry-watcher loop is NOT here — it goes through asyncio.to_thread.
-#     A fifth must be justified and this count bumped.
+#     startup auto-archive, startup WAL watchdog, and run_sync reads. The
+#     hourly WAL watchdog on the expiry-watcher loop is NOT here — it goes
+#     through asyncio.to_thread. A fifth must be justified and this count
+#     bumped.
 _ALLOWED_SYNC_DB_ESCAPES = 4
 
 # Sync helpers that touch SessionDB but are NEVER invoked bare on the loop:
