@@ -6231,6 +6231,29 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        if expected_run_id is not None:
+            task = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            run = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ? "
+                "AND outcome = 'completed'",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if (
+                task
+                and task["status"] == "done"
+                and run
+                and isinstance(metadata, dict)
+                and (metadata.get("commit_sha") or metadata.get("pr_url"))
+            ):
+                prior_metadata = json.loads(run["metadata"]) if run["metadata"] else {}
+                if not (prior_metadata.get("commit_sha") or prior_metadata.get("pr_url")):
+                    conn.execute(
+                        "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
+                        (summary or result, json.dumps(metadata) if metadata else None, expected_run_id),
+                    )
+                    return True
         if expected_run_id is None:
             cur = conn.execute(
                 """
