@@ -6261,14 +6261,26 @@ def complete_task(
                         else None if summary is not None
                         else task["result"]
                     )
+                    corrected_metadata = {**prior_metadata, **metadata}
                     conn.execute(
                         "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
-                        (corrected_summary, json.dumps(metadata) if metadata else None, expected_run_id),
+                        (corrected_summary, json.dumps(corrected_metadata), expected_run_id),
                     )
                     conn.execute(
                         "UPDATE tasks SET result = ? WHERE id = ?",
                         (corrected_result, task_id),
                     )
+                    scan_text = " ".join(filter(None, [corrected_summary, corrected_result]))
+                    phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+                    if phantom_refs:
+                        _append_event(
+                            conn, task_id, "suspected_hallucinated_references",
+                            {
+                                "phantom_refs": phantom_refs,
+                                "source": "completion_summary",
+                            },
+                            run_id=expected_run_id,
+                        )
                     return True
         if expected_run_id is None:
             cur = conn.execute(

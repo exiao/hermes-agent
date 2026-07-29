@@ -1631,6 +1631,46 @@ def test_owner_retry_preserves_text_for_metadata_only_handoff(kanban_home):
         conn.close()
 
 
+def test_owner_retry_merges_metadata_and_scans_corrected_handoff(kanban_home):
+    """A proof-only correction keeps prior facts and runs completion diagnostics."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="metadata handoff", assignee="worker")
+        kb.claim_task(conn, tid)
+        owner = kb.latest_run(conn, tid)
+        assert owner is not None
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="see t_abcd1234ffff",
+            metadata={"changed_files": ["one.py"], "tests_run": 1},
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            metadata={"commit_sha": "abc123", "tests_run": 2},
+            expected_run_id=owner.id,
+        )
+
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.metadata == {
+            "changed_files": ["one.py"],
+            "tests_run": 2,
+            "commit_sha": "abc123",
+        }
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'suspected_hallucinated_references'",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        assert "t_abcd1234ffff" in json.loads(event["payload"])["phantom_refs"]
+    finally:
+        conn.close()
+
+
 def test_superseded_completed_run_cannot_correct_newer_completion(kanban_home):
     """Only the latest completed run can replace a bare completion handoff."""
     conn = kb.connect()
