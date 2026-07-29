@@ -24,7 +24,13 @@ from tests.agent.test_turn_context import _FakeAgent
 
 def _make_compressor(**kwargs) -> ContextCompressor:
     defaults = dict(
-        model="test-model",
+        # Match _FakeAgent's active runtime so turn setup does not treat this
+        # isolated compressor as a provider switch and clear its block state.
+        model="test/model",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-x",
+        api_mode="chat_completions",
         threshold_percent=0.65,
         protect_first_n=2,
         protect_last_n=3,
