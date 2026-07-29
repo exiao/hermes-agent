@@ -11564,6 +11564,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                 # gateway notifier).
                 if task and getattr(task, "status", "") in {"done", "archived"}:
                     try:
+                        _kb.record_completion_delivery(conn, sub)
                         _kb.remove_notify_sub(
                             conn,
                             task_id=sub["task_id"],

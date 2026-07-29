@@ -5078,6 +5078,14 @@ def _supersede_empty_terminal_handoff(
             prior_metadata = None
         if _has_push_evidence(prior_metadata):
             return False
+        latest = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest is None or int(latest["id"]) != int(expected_run_id):
+            return False
+        _restore_completion_delivery_subs(conn, task_id)
         handoff = summary if summary is not None else result
         conn.execute(
             "UPDATE tasks SET result = COALESCE(?, result) WHERE id = ?",
@@ -12022,6 +12030,34 @@ def remove_notify_sub(
             (task_id, platform, chat_id, thread_id or ""),
         )
     return cur.rowcount > 0
+
+
+def record_completion_delivery(conn: sqlite3.Connection, sub: Mapping[str, Any]) -> None:
+    """Keep one delivered terminal target available for an owner correction."""
+    payload = {
+        key: sub.get(key)
+        for key in ("platform", "chat_id", "chat_type", "thread_id", "user_id", "notifier_profile", "delivery_metadata")
+    }
+    with write_txn(conn):
+        _append_event(conn, str(sub["task_id"]), "completion_delivery", payload)
+
+
+def _restore_completion_delivery_subs(conn: sqlite3.Connection, task_id: str) -> None:
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'completion_delivery'",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            sub = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(sub, dict) or not sub.get("platform") or not sub.get("chat_id"):
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_notify_subs (task_id, platform, chat_id, chat_type, thread_id, user_id, notifier_profile, delivery_metadata, created_at, last_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))",
+            (task_id, sub["platform"], sub["chat_id"], sub.get("chat_type"), sub.get("thread_id") or "", sub.get("user_id"), sub.get("notifier_profile"), _encode_notify_delivery_metadata(sub.get("delivery_metadata")), int(time.time()), task_id),
+        )
 
 
 def unseen_events_for_sub(

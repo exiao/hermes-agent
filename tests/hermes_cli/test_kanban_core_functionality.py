@@ -1599,6 +1599,33 @@ def test_owner_evidence_supersedes_empty_terminal_handoff(kanban_home):
         conn.close()
 
 
+def test_owner_evidence_cannot_supersede_a_newer_completed_run(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="recompleted", assignee="worker")
+        kb.claim_task(conn, tid)
+        first = kb.latest_run(conn, tid)
+        assert first is not None
+        assert kb.complete_task(conn, tid, summary="first completion")
+
+        assert kb.set_status_direct(conn, tid, "ready")
+        kb.claim_task(conn, tid)
+        second = kb.latest_run(conn, tid)
+        assert second is not None and second.id != first.id
+        assert kb.complete_task(conn, tid, result="second result", summary="second completion")
+
+        assert not kb.complete_task(
+            conn,
+            tid,
+            result="stale owner result",
+            metadata={"commit_sha": "abc123"},
+            expected_run_id=first.id,
+        )
+        assert kb.get_task(conn, tid).result == "second result"
+    finally:
+        conn.close()
+
+
 def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
     """A worker from an earlier attempt cannot close a later retry."""
     import hermes_cli.kanban_db as _kb

@@ -1260,6 +1260,7 @@ class GatewayKanbanWatchersMixin:
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
+            _kb.record_completion_delivery(conn, sub)
             _kb.remove_notify_sub(
                 conn,
                 task_id=sub["task_id"],

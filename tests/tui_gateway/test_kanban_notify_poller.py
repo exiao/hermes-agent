@@ -66,6 +66,37 @@ class TestCollectKanbanNotifications:
         # Task is at a final status -> subscription removed.
         assert _sub_rows(tid) == []
 
+    def test_delivers_owner_correction_after_original_completion_unsubscribes(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            kb.claim_task(conn, tid)
+            owner = kb.latest_run(conn, tid)
+            assert owner is not None
+            assert kb.complete_task(conn, tid, summary="review-only completion")
+        finally:
+            conn.close()
+
+        assert _collect_kanban_notifications(_session())
+        assert _sub_rows(tid) == []
+
+        conn = kb.connect()
+        try:
+            assert kb.complete_task(
+                conn,
+                tid,
+                summary="pushed owner handoff",
+                metadata={"commit_sha": "abc123"},
+                expected_run_id=owner.id,
+            )
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+        assert len(texts) == 1
+        assert "pushed owner handoff" in texts[0]
+        assert _sub_rows(tid) == []
+
     def test_claim_advances_cursor_so_second_poll_is_empty(self):
         tid = _create_subscribed_task()
         conn = kb.connect()
