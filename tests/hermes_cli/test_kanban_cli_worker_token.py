@@ -43,3 +43,23 @@ def test_cli_complete_requires_run_token_only_in_worker_context(kanban_home, mon
 
     monkeypatch.delenv("HERMES_KANBAN_TASK")
     assert "Completed" in run_slash(f"complete {task_id} --summary operator-close")
+
+
+def test_cli_worker_cannot_complete_sibling_task(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        worker_task = kb.create_task(conn, title="worker task", assignee="worker")
+        sibling_task = kb.create_task(conn, title="sibling task", assignee="worker")
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
+    assert "scoped to task" in run_slash(f"complete {sibling_task} --summary forged")
+
+    conn = kb.connect()
+    try:
+        sibling = kb.get_task(conn, sibling_task)
+        assert sibling is not None and sibling.status == "ready"
+    finally:
+        conn.close()

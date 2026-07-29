@@ -2191,8 +2191,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            worker_task_id = os.environ.get("HERMES_KANBAN_TASK")
+            if worker_task_id and worker_task_id != tid:
+                failed.append(tid)
+                print(
+                    f"cannot complete {tid}: worker is scoped to task {worker_task_id}",
+                    file=sys.stderr,
+                )
+                continue
             worker_run_id = _worker_run_id_for(tid)
-            if os.environ.get("HERMES_KANBAN_TASK") == tid and worker_run_id is None:
+            if worker_task_id and worker_run_id is None:
                 kb.record_completion_rejected(
                     conn,
                     tid,
