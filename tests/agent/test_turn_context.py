@@ -537,3 +537,28 @@ def test_runtime_sync_keeps_local_anti_thrash_breaker_when_repair_fails(tmp_path
     # write to make in this turn.
     assert db.get_compression_ineffective_count("sess-1") == 2
     assert agent.context_compressor._ineffective_compression_count == 2
+
+
+def test_runtime_sync_keeps_failed_local_anti_thrash_breaker_through_refresh(tmp_path):
+    """A failed repair keeps the local breaker authoritative at the gate."""
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    db = agent._session_db
+    agent.context_compressor._ineffective_compression_count = 2
+    agent.model = "new-runtime-model"
+
+    with patch.object(db, "set_compression_ineffective_count", side_effect=Exception("state DB locked")):
+        _build(agent)
+
+    assert db.get_compression_ineffective_count("sess-1") == 0
+    assert agent.context_compressor._automatic_compression_blocked() is True
+
+
+def test_runtime_sync_keeps_failed_local_cooldown_through_refresh(tmp_path):
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    compressor = agent.context_compressor
+    with patch.object(agent._session_db, "record_compression_failure_cooldown", side_effect=Exception("state DB locked")):
+        compressor._record_compression_failure_cooldown(60, "timeout")
+        agent.model = "new-runtime-model"
+        _build(agent)
+
+    assert compressor.get_active_compression_failure_cooldown(refresh=True) is not None

@@ -444,6 +444,9 @@ def build_turn_context(
                 _cooldown_until_before_sync = float(
                     getattr(_compressor, "_summary_failure_cooldown_until", 0.0) or 0.0
                 )
+                _cooldown_persist_failed_before_sync = bool(
+                    getattr(_compressor, "_cooldown_persist_failed", False)
+                )
                 _pre_db = getattr(_compressor, "_session_db", None)
                 _pre_id = getattr(_compressor, "_session_id", "")
                 _pre_get = getattr(_pre_db, "get_compression_failure_cooldown", None)
@@ -533,6 +536,7 @@ def build_turn_context(
                                 _rehydrate()
                 if _cooldown_until_before_sync > time.monotonic():
                     _compressor._summary_failure_cooldown_until = _cooldown_until_before_sync
+                    _compressor._cooldown_persist_failed = _cooldown_persist_failed_before_sync
     except Exception:
         logger.debug("Could not sync compressor runtime to agent model", exc_info=True)
 

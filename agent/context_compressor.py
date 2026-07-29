@@ -1245,6 +1245,7 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
+        self._ineffective_count_persist_failed = False
         self._anti_thrash_recovery_deadline = 0.0
         self._fallback_compression_streak = 0
         self._verify_compaction_cleared_threshold = False
@@ -1529,6 +1530,7 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._fallback_compression_streak = 0
         self._ineffective_compression_count = 0
+        self._ineffective_count_persist_failed = False
         self._anti_thrash_recovery_deadline = 0.0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
@@ -1638,12 +1640,14 @@ class ContextCompressor(ContextEngine):
             return
         try:
             stored_count = getter(session_id)
-            self._ineffective_compression_count = max(
+            stored_count = max(
                 0,
                 int(stored_count)
                 if isinstance(stored_count, (int, float, str))
                 else 0,
             )
+            if not (stored_count == 0 and self._ineffective_count_persist_failed):
+                self._ineffective_compression_count = stored_count
         except (TypeError, ValueError, sqlite3.Error) as exc:
             logger.debug("compression ineffective count lookup failed: %s", exc)
         except Exception as exc:
@@ -1657,9 +1661,12 @@ class ContextCompressor(ContextEngine):
             return
         try:
             setter(session_id, self._ineffective_compression_count)
+            self._ineffective_count_persist_failed = False
         except sqlite3.Error as exc:
+            self._ineffective_count_persist_failed = True
             logger.debug("compression ineffective count persist failed: %s", exc)
         except Exception as exc:
+            self._ineffective_count_persist_failed = True
             logger.debug("compression ineffective count persist failed (non-sqlite): %s", exc)
 
     def _record_ineffective_compression_verdict(self, count: int) -> None:
@@ -2153,6 +2160,9 @@ class ContextCompressor(ContextEngine):
         # Anti-thrashing: track whether last compression was effective
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
+        # True while a local anti-thrash count failed to persist. An empty
+        # durable row is then unknown rather than a confirmed clear.
+        self._ineffective_count_persist_failed: bool = False
         # Monotonic deadline after which a tripped anti-thrash guard grants
         # one probation probe (#14694). 0.0 = clock not armed. Armed lazily on
         # the first blocked evaluation; deliberately NOT durable, so a process
