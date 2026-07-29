@@ -624,6 +624,12 @@ class TestStrictUrlCredentialRedaction:
             redact_url_credentials=True,
         ) == "see a//b then https://user:***@host/x"
 
+    @pytest.mark.parametrize("text", ["///user:pw@host/x", "https:///user:pw@host/x"])
+    def test_userinfo_redacts_after_overlapping_double_slash(self, text):
+        assert redact_sensitive_text(text, redact_url_credentials=True) == text.replace(
+            "user:pw@", "user:***@"
+        )
+
     @pytest.mark.parametrize(
         ("text", "secret", "expected"),
         [

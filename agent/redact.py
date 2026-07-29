@@ -416,8 +416,9 @@ def _sub_url_userinfo(text: str, repl) -> str:
             break
         authority = _STRICT_URL_USERINFO_AUTHORITY_RE.match(text, slashes + 2)
         if authority is None:
-            # No userinfo here; keep scanning after these slashes.
-            search_from = slashes + 2
+            # Advance one character so overlapping ``//`` candidates in runs
+            # such as ``///user:password@host`` are not skipped.
+            search_from = slashes + 1
             continue
         scheme = _URL_SCHEME_SUFFIX_RE.search(text, pos, slashes)
         start = scheme.start() if scheme is not None else slashes
