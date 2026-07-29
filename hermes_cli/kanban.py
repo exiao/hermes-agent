@@ -2191,6 +2191,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            worker_run_id = _worker_run_id_for(tid)
+            if os.environ.get("HERMES_KANBAN_TASK") == tid and worker_run_id is None:
+                kb.record_completion_rejected(
+                    conn,
+                    tid,
+                    reason="missing_worker_run_id",
+                    summary=summary if summary is not None else args.result,
+                    metadata=metadata,
+                )
+                failed.append(tid)
+                print(
+                    f"cannot complete {tid}: worker has no dispatcher run token",
+                    file=sys.stderr,
+                )
+                continue
             # Goal-mode pre-completion judge gate (mirrors the gate in
             # tools/kanban_tools.py:_handle_complete — Issue #38367).
             # Without this, a goal_mode worker can call
@@ -2253,7 +2268,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=worker_run_id,
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
