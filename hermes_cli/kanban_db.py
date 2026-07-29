@@ -5085,7 +5085,9 @@ def _supersede_empty_terminal_handoff(
         ).fetchone()
         if latest is None or int(latest["id"]) != int(expected_run_id):
             return False
-        _restore_completion_delivery_subs(conn, task_id)
+        _restore_completion_delivery_subs(
+            conn, task_id, run_id=int(expected_run_id),
+        )
         handoff = summary if summary is not None else result
         conn.execute(
             "UPDATE tasks SET result = COALESCE(?, result) WHERE id = ?",
@@ -12033,19 +12035,35 @@ def remove_notify_sub(
 
 
 def record_completion_delivery(conn: sqlite3.Connection, sub: Mapping[str, Any]) -> None:
-    """Keep one delivered terminal target available for an owner correction."""
+    """Keep a delivered terminal target scoped to its completed run."""
     payload = {
         key: sub.get(key)
         for key in ("platform", "chat_id", "chat_type", "thread_id", "user_id", "notifier_profile", "delivery_metadata")
     }
     with write_txn(conn):
-        _append_event(conn, str(sub["task_id"]), "completion_delivery", payload)
+        completed = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? "
+            "AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+            (str(sub["task_id"]),),
+        ).fetchone()
+        if completed is None or completed["run_id"] is None:
+            return
+        _append_event(
+            conn,
+            str(sub["task_id"]),
+            "completion_delivery",
+            payload,
+            run_id=int(completed["run_id"]),
+        )
 
 
-def _restore_completion_delivery_subs(conn: sqlite3.Connection, task_id: str) -> None:
+def _restore_completion_delivery_subs(
+    conn: sqlite3.Connection, task_id: str, *, run_id: int,
+) -> None:
     rows = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'completion_delivery'",
-        (task_id,),
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'completion_delivery' AND run_id = ?",
+        (task_id, run_id),
     ).fetchall()
     for row in rows:
         try:

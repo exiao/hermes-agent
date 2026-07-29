@@ -1626,6 +1626,43 @@ def test_owner_evidence_cannot_supersede_a_newer_completed_run(kanban_home):
         conn.close()
 
 
+def test_owner_evidence_restores_only_corrected_run_delivery_targets(kanban_home):
+    """A corrected handoff must not revive a previous run's subscribers."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="recompleted", assignee="worker")
+        kb.claim_task(conn, tid)
+        first = kb.latest_run(conn, tid)
+        assert first is not None
+        assert kb.complete_task(conn, tid, summary="first completion")
+        kb.record_completion_delivery(
+            conn, {"task_id": tid, "platform": "telegram", "chat_id": "old-session"},
+        )
+
+        assert kb.set_status_direct(conn, tid, "ready")
+        kb.claim_task(conn, tid)
+        second = kb.latest_run(conn, tid)
+        assert second is not None and second.id != first.id
+        assert kb.complete_task(conn, tid, summary="second completion")
+        kb.record_completion_delivery(
+            conn, {"task_id": tid, "platform": "telegram", "chat_id": "new-session"},
+        )
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="corrected second completion",
+            metadata={"commit_sha": "abc123"},
+            expected_run_id=second.id,
+        )
+        subs = kb.list_notify_subs(conn, tid)
+        assert [(sub["platform"], sub["chat_id"]) for sub in subs] == [
+            ("telegram", "new-session"),
+        ]
+    finally:
+        conn.close()
+
+
 def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
     """A worker from an earlier attempt cannot close a later retry."""
     import hermes_cli.kanban_db as _kb
