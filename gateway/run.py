@@ -21425,6 +21425,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if source is None:
             return None
         platform = source.platform
+        if getattr(source, "delivered_via_upstream_relay", False):
+            return getattr(self, "adapters", {}).get(Platform.RELAY)
+        transport_ref = getattr(source, "_transport_adapter_ref", None)
+        if callable(transport_ref):
+            transport_adapter = transport_ref()
+            if transport_adapter is not None:
+                return transport_adapter
         profile = (getattr(source, "profile", None) or "").strip()
         _shared_listener = getattr(platform, "value", platform) in _PORT_BINDING_PLATFORM_VALUES
         if profile and not _shared_listener:

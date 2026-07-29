@@ -438,9 +438,12 @@ def build_turn_context(
                     ) or getattr(_compressor, "context_length", 0)
                 else:
                     _ctx_len = getattr(_compressor, "context_length", 0)
-                # Snapshot the persisted failure cooldown BEFORE update_model
-                # may clear it (see the re-record note below).
+                # Snapshot both the local breaker state and its durable mirror
+                # before update_model() clears runtime calibration state.
                 _cooldown_before_sync = None
+                _cooldown_until_before_sync = float(
+                    getattr(_compressor, "_summary_failure_cooldown_until", 0.0) or 0.0
+                )
                 _pre_db = getattr(_compressor, "_session_db", None)
                 _pre_id = getattr(_compressor, "_session_id", "")
                 _pre_get = getattr(_pre_db, "get_compression_failure_cooldown", None)
@@ -449,15 +452,19 @@ def build_turn_context(
                         _cooldown_before_sync = _pre_get(_pre_id)
                     except Exception:
                         _cooldown_before_sync = None
-                _ineffective_before_sync = 0
+                _ineffective_before_sync = int(
+                    getattr(_compressor, "_ineffective_compression_count", 0) or 0
+                )
                 _pre_get_ineffective = getattr(
                     _pre_db, "get_compression_ineffective_count", None
                 )
                 if callable(_pre_get_ineffective) and _pre_id:
                     try:
-                        _ineffective_before_sync = _pre_get_ineffective(_pre_id)
+                        _ineffective_before_sync = int(
+                            _pre_get_ineffective(_pre_id) or _ineffective_before_sync
+                        )
                     except Exception:
-                        _ineffective_before_sync = 0
+                        pass
                 _compressor.update_model(
                     _agent_model,
                     _ctx_len,
@@ -524,6 +531,8 @@ def build_turn_context(
                                 _rehydrate(refresh=True)
                             except TypeError:
                                 _rehydrate()
+                if _cooldown_until_before_sync > time.monotonic():
+                    _compressor._summary_failure_cooldown_until = _cooldown_until_before_sync
     except Exception:
         logger.debug("Could not sync compressor runtime to agent model", exc_info=True)
 
