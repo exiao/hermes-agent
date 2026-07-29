@@ -1596,7 +1596,7 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        result = await self._rpc("send", params, timeout=_signal_send_timeout(1))
+        result = await self._rpc("send", params, timeout=_signal_send_timeout(1, file_size))
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:
@@ -1638,7 +1638,7 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        result = await self._rpc("send", params, timeout=_signal_send_timeout(1))
+        result = await self._rpc("send", params, timeout=_signal_send_timeout(1, file_size))
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:

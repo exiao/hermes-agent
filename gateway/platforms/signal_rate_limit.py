@@ -144,18 +144,19 @@ def _format_wait(seconds: float) -> str:
     return f"{max(1, int(round(s / 60)))} min"
 
 
-def _signal_send_timeout(num_attachments: int) -> float:
+def _signal_send_timeout(num_attachments: int, total_attachment_bytes: int = 0) -> float:
     """HTTP timeout for a Signal ``send`` RPC.
 
     signal-cli uploads attachments serially during the call, so the
-    server-side time scales with batch size. Default 30s is fine for
-    text-only sends but truncates large attachment batches mid-upload —
-    we then log a phantom failure even though signal-cli completes the
-    send a few seconds later. Scale at 5s/attachment with a 60s floor.
+    server-side time scales with batch size and upload volume. Default 30s is
+    fine for text-only sends but truncates large attachment batches mid-upload
+    — we then log a phantom failure even though signal-cli completes the send
+    a few seconds later. Scale at 5s/attachment with a 60s floor, and allow
+    one second per 512 KiB of known attachment data beyond that floor.
     """
     if num_attachments <= 0:
         return 30.0
-    return max(60.0, 5.0 * num_attachments)
+    return max(60.0, 5.0 * num_attachments, 60.0 + total_attachment_bytes / (512 * 1024))
 
 
 # ---------------------------------------------------------------------------
