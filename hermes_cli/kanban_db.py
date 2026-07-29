@@ -11734,6 +11734,7 @@ def add_default_notify_subs(
     thread_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
     final_statuses: Iterable[str] = ("done", "archived"),
+    initial_event_cursor: Optional[int] = None,
 ) -> None:
     """Subscribe one board-wide target to every active (non-final) task in a
     single write transaction.
@@ -11743,7 +11744,10 @@ def add_default_notify_subs(
     transactions per notifier tick — the per-task loop opened a write txn for
     every active task every 5s even when the rows already existed. Idempotent
     on the (task, platform, chat, thread) PK, so existing per-task or default
-    subscriptions (and their cursors) are never disturbed.
+    subscriptions (and their cursors) are never disturbed. When a target is
+    first enabled, ``initial_event_cursor`` is the board-wide event ID observed
+    at that instant: older tasks catch up to their current cursor, while newer
+    task events remain eligible for first delivery.
     """
     finals = tuple(final_statuses)
     placeholders = ",".join("?" for _ in finals)
@@ -11755,12 +11759,19 @@ def add_default_notify_subs(
                 (task_id, platform, chat_id, thread_id, notifier_profile, created_at,
                  last_event_id)
             SELECT id, ?, ?, ?, ?, ?,
-                   COALESCE((SELECT MAX(id) FROM task_events
-                             WHERE task_id = tasks.id), 0)
+                   CASE WHEN ? IS NULL THEN
+                       COALESCE((SELECT MAX(id) FROM task_events
+                                 WHERE task_id = tasks.id), 0)
+                   ELSE MIN(COALESCE((SELECT MAX(id) FROM task_events
+                                      WHERE task_id = tasks.id), 0), ?)
+                   END
               FROM tasks
              WHERE status NOT IN ({placeholders})
             """,
-            (platform, chat_id, thread_id or "", notifier_profile, now, *finals),
+            (
+                platform, chat_id, thread_id or "", notifier_profile, now,
+                initial_event_cursor, initial_event_cursor, *finals,
+            ),
         )
 
 

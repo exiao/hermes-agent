@@ -235,6 +235,40 @@ def test_default_notify_delivers_without_manual_subscribe(tmp_path, monkeypatch)
     assert "done" in adapter.sent[0]["text"].lower()
 
 
+def test_default_notify_keeps_events_from_tasks_created_after_target_activation(tmp_path, monkeypatch):
+    """A task can block between notifier ticks without losing its first ping."""
+    db_path = tmp_path / "default-notify-first-event.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    target_chat = "group:first-event="
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda *a, **k: {"kanban": {"default_notify": [
+            {"platform": "signal", "chat_id": target_chat},
+        ]}},
+        raising=False,
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    # Establish the target baseline before the task exists.
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs a decision", assignee="worker")
+        kb.block_task(conn, tid, reason="approval needed", kind="needs_input")
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == target_chat
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+
+
 def test_default_notify_does_not_disturb_existing_per_task_sub(tmp_path, monkeypatch):
     """The per-task subscribe path is untouched: a pre-existing subscription to
     a different chat keeps delivering, and the default target is added

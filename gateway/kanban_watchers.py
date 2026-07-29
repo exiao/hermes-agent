@@ -584,6 +584,15 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
+        # Preserve events from tasks created after a default target becomes
+        # active, while avoiding a historical replay for existing tasks. Keep
+        # the baseline on the runner so a watcher restart cannot reclassify a
+        # known target as newly enabled.
+        default_notify_cursors: dict[tuple[str, str, str, str, str], int] = getattr(
+            self, "_kanban_default_notify_cursors", {}
+        )
+        self._kanban_default_notify_cursors = default_notify_cursors
+
         while self._running:
             try:
                 # Resolve board-wide auto-subscribe targets fresh each tick so
@@ -707,12 +716,27 @@ class GatewayKanbanWatchersMixin:
                                     if tgt["platform"] not in active_platforms:
                                         continue
                                     try:
+                                        cursor_key = (
+                                            resolved_db_path,
+                                            notifier_profile or "",
+                                            tgt["platform"],
+                                            tgt["chat_id"],
+                                            tgt["thread_id"],
+                                        )
+                                        initial_event_cursor = default_notify_cursors.get(cursor_key)
+                                        if initial_event_cursor is None:
+                                            row = conn.execute(
+                                                "SELECT COALESCE(MAX(id), 0) FROM task_events"
+                                            ).fetchone()
+                                            initial_event_cursor = int(row[0]) if row else 0
+                                            default_notify_cursors[cursor_key] = initial_event_cursor
                                         _kb.add_default_notify_subs(
                                             conn,
                                             platform=tgt["platform"],
                                             chat_id=tgt["chat_id"],
                                             thread_id=tgt["thread_id"],
                                             notifier_profile=notifier_profile,
+                                            initial_event_cursor=initial_event_cursor,
                                         )
                                     except Exception as exc:
                                         logger.debug(
