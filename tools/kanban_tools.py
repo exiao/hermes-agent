@@ -666,6 +666,26 @@ def _handle_complete(args: dict, **kw) -> str:
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
+    worker_run_id = _worker_run_id(tid)
+    if os.environ.get("HERMES_KANBAN_TASK") == tid and worker_run_id is None:
+        try:
+            kb, conn = _connect(board=board)
+            try:
+                kb.record_completion_rejected(
+                    conn,
+                    tid,
+                    reason="missing_worker_run_id",
+                    summary=summary if summary is not None else result,
+                    metadata=metadata,
+                )
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception("failed to record rejected kanban completion")
+        return tool_error(
+            "kanban_complete rejected: this worker has no dispatcher run token. "
+            "Use kanban_comment to hand off review findings instead."
+        )
     try:
         kb, conn = _connect(board=board)
         try:
@@ -725,7 +745,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=worker_run_id,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(

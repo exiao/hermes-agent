@@ -197,6 +197,13 @@ def worker_env(monkeypatch, tmp_path):
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    finally:
+        conn.close()
     return tid
 
 
@@ -336,6 +343,61 @@ def test_complete_happy_path(worker_env):
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
         assert run.metadata == {"files": 2}
+    finally:
+        conn.close()
+
+
+def test_complete_without_worker_run_id_is_rejected_and_preserves_owner_handoff(
+    worker_env, monkeypatch
+):
+    """A review child without the dispatcher run token cannot close its owner."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    review = json.loads(kt._handle_complete({"summary": "review-only completion"}))
+    assert review.get("ok") is not True
+    assert "kanban_comment" in review["error"]
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.status == "running"
+        owner_run_id = task.current_run_id
+        assert owner_run_id is not None
+        rejected = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "completion_rejected"
+        ]
+        assert rejected[-1].payload == {
+            "reason": "missing_worker_run_id",
+            "summary": "review-only completion",
+            "metadata": None,
+            "expected_run_id": None,
+            "current_run_id": owner_run_id,
+        }
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(owner_run_id))
+    owner = json.loads(kt._handle_complete({
+        "summary": "pushed owner handoff",
+        "metadata": {
+            "commit_sha": "abc123",
+            "pr_url": "https://github.com/exiao/hermes-agent/pull/999",
+        },
+    }))
+    assert owner.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.summary == "pushed owner handoff"
+        assert run.metadata == {
+            "commit_sha": "abc123",
+            "pr_url": "https://github.com/exiao/hermes-agent/pull/999",
+        }
     finally:
         conn.close()
 
@@ -668,9 +730,12 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
             body="Must achieve X with verified evidence.", goal_mode=True
         )
         kb.claim_task(conn, goal_task_id)
+        run = kb.latest_run(conn, goal_task_id)
+        assert run is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
@@ -726,9 +791,12 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
             body="Must achieve X with verified evidence.", goal_mode=True
         )
         kb.claim_task(conn, goal_task_id)
+        run = kb.latest_run(conn, goal_task_id)
+        assert run is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
 
     # No judge reachable. judge_goal must not even be consulted; if it were,
     # this stub would reject — so reaching "done" proves the probe short-circuit.
@@ -779,9 +847,12 @@ def test_complete_goal_mode_allows_when_judge_transport_fails(monkeypatch, tmp_p
             body="Must achieve X with verified evidence.", goal_mode=True
         )
         kb.claim_task(conn, goal_task_id)
+        run = kb.latest_run(conn, goal_task_id)
+        assert run is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
 
     # Judge is "available" at probe time, but the call transport-fails: the
     # real judge_goal returns ("continue", "judge error: AuthenticationError",
@@ -846,9 +917,12 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             body="Must achieve X.", goal_mode=True,
         )
         kb.claim_task(conn, goal_task_id)
+        run = kb.latest_run(conn, goal_task_id)
+        assert run is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
     return goal_task_id
 
 
