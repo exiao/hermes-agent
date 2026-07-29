@@ -3098,8 +3098,11 @@ class TestQuotedAttachments:
         source.write_bytes(b"image bytes")
         await adapter._remember_sent_attachments(123, "+15559998888", [str(source)])
 
-        assert adapter._sent_attachment_snapshot_dir is None
+        assert adapter._sent_attachment_snapshot_storage_disabled is True
         assert adapter._resolve_quoted_media_paths("123", "+15559998888") == []
+
+        await adapter._remember_sent_attachments(124, "+15559998888", [str(source)])
+        assert signal_module.tempfile.TemporaryDirectory.call_count == 1
 
     @pytest.mark.asyncio
     async def test_snapshots_copy_in_a_worker_thread(self, monkeypatch, tmp_path):
@@ -3116,6 +3119,38 @@ class TestQuotedAttachments:
 
         copy_in_worker.assert_awaited_once()
         assert copy_in_worker.await_args.args[:2] == (signal_module.shutil.copyfile, source)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_snapshot_copy_is_deleted_after_worker_finishes(self, monkeypatch, tmp_path):
+        """A cancelled send cannot leave an untracked snapshot in the temp directory."""
+        import gateway.platforms.signal as signal_module
+
+        adapter = _make_signal_adapter(monkeypatch)
+        source = tmp_path / "chart.png"
+        source.write_bytes(b"image bytes")
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        copied = asyncio.Event()
+
+        async def delayed_copy(_copyfile, _source, snapshot):
+            started.set()
+            await finish.wait()
+            Path(snapshot).write_bytes(b"image bytes")
+            copied.set()
+
+        monkeypatch.setattr(signal_module.asyncio, "to_thread", delayed_copy)
+        remember = asyncio.create_task(
+            adapter._remember_sent_attachments(123, "+15559998888", [str(source)])
+        )
+        await started.wait()
+        remember.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await remember
+
+        finish.set()
+        await copied.wait()
+        await asyncio.sleep(0)
+        assert list(Path(adapter._sent_attachment_snapshot_dir.name).iterdir()) == []
 
 
 @pytest.mark.asyncio

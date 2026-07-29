@@ -448,6 +448,7 @@ class SignalAdapter(BasePlatformAdapter):
         # Snapshot storage is optional and created only after an attachment send.
         # Text-only adapters must start even when temporary storage is unavailable.
         self._sent_attachment_snapshot_dir = None
+        self._sent_attachment_snapshot_storage_disabled = False
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
         # phone number to the corresponding UUID when signal-cli prefers it.
@@ -998,12 +999,15 @@ class SignalAdapter(BasePlatformAdapter):
         """Best-effort snapshot of outbound attachments for later quoted replies."""
         if timestamp is None or not chat_id or not paths:
             return
+        if self._sent_attachment_snapshot_storage_disabled:
+            return
         if self._sent_attachment_snapshot_dir is None:
             try:
                 self._sent_attachment_snapshot_dir = tempfile.TemporaryDirectory(
                     prefix="hermes-signal-quote-"
                 )
             except OSError:
+                self._sent_attachment_snapshot_storage_disabled = True
                 logger.debug("Signal: quoted attachment snapshots unavailable")
                 return
 
@@ -1016,7 +1020,14 @@ class SignalAdapter(BasePlatformAdapter):
                 continue
             snapshot = snapshot_root / f"{uuid.uuid4().hex}{source.suffix[:32]}"
             try:
-                await asyncio.to_thread(shutil.copyfile, source, snapshot)
+                copy_task = asyncio.create_task(asyncio.to_thread(shutil.copyfile, source, snapshot))
+                try:
+                    await asyncio.shield(copy_task)
+                except asyncio.CancelledError:
+                    copy_task.add_done_callback(
+                        lambda _task: self._discard_sent_attachment_snapshots([str(snapshot)])
+                    )
+                    raise
                 byte_count += snapshot.stat().st_size
                 snapshots.append(str(snapshot))
             except OSError:
