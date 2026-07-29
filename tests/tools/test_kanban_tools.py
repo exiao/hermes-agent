@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -167,7 +168,7 @@ def worker_env(monkeypatch, tmp_path):
     # real profiles on disk for their happy paths to succeed.
     profiles_root = home / "profiles"
     for _name in (
-        "test-worker", "peer", "factory", "qa", "worker", "linguist", "a", "x",
+        "test-worker", "peer", "factory", "qa", "reviewer", "worker", "linguist", "a", "x",
     ):
         _pdir = profiles_root / _name
         _pdir.mkdir(parents=True, exist_ok=True)
@@ -1276,6 +1277,7 @@ def test_create_default_child_inherits_project_without_reusing_worktree(
 
     repo = tmp_path / "repo"
     repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
     with pdb.connect_closing() as project_conn:
         project_id = pdb.create_project(
             project_conn, name="Isolated Project", folders=[str(repo)],
@@ -1332,8 +1334,14 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
     profile_b = tmp_path / "profiles" / "worker"
     profile_a.mkdir(parents=True)
     profile_b.mkdir(parents=True)
+    profiles_root = tmp_path / "profiles"
+    for profile_name in ("peer", "reviewer"):
+        profile_dir = profiles_root / profile_name
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: {}\n")
     repo = tmp_path / "repo"
     repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
     shared_db = tmp_path / "shared-kanban.db"
 
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
@@ -1374,7 +1382,7 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
     with ThreadPoolExecutor(max_workers=2) as pool:
         children = list(pool.map(create_child, range(2)))
 
-    assert all(result["ok"] is True for result in children)
+    assert all(result.get("ok") is True for result in children), children
     child_ids = [result["task_id"] for result in children]
     with kb.connect() as conn:
         child_tasks = [kb.get_task(conn, task_id) for task_id in child_ids]
