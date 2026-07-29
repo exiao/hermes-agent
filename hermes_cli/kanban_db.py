@@ -1398,6 +1398,19 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Board-wide default notification targets need a durable activation cursor:
+-- subscriptions created after a gateway restart must not skip events emitted
+-- while that runner was offline.
+CREATE TABLE IF NOT EXISTS kanban_default_notify_cursors (
+    platform               TEXT NOT NULL,
+    chat_id                TEXT NOT NULL,
+    thread_id              TEXT NOT NULL DEFAULT '',
+    notifier_profile       TEXT NOT NULL DEFAULT '',
+    initial_event_cursor   INTEGER NOT NULL,
+    created_at             INTEGER NOT NULL,
+    PRIMARY KEY (platform, chat_id, thread_id, notifier_profile)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -11734,6 +11747,7 @@ def add_default_notify_subs(
     thread_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
     final_statuses: Iterable[str] = ("done", "archived"),
+    initial_event_cursor: Optional[int] = None,
 ) -> None:
     """Subscribe one board-wide target to every active (non-final) task in a
     single write transaction.
@@ -11743,7 +11757,10 @@ def add_default_notify_subs(
     transactions per notifier tick — the per-task loop opened a write txn for
     every active task every 5s even when the rows already existed. Idempotent
     on the (task, platform, chat, thread) PK, so existing per-task or default
-    subscriptions (and their cursors) are never disturbed.
+    subscriptions (and their cursors) are never disturbed. When a target is
+    first enabled, ``initial_event_cursor`` is the board-wide event ID observed
+    at that instant: older tasks catch up to their current cursor, while newer
+    task events remain eligible for first delivery.
     """
     finals = tuple(final_statuses)
     placeholders = ",".join("?" for _ in finals)
@@ -11752,13 +11769,62 @@ def add_default_notify_subs(
         conn.execute(
             f"""
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, notifier_profile, created_at)
-            SELECT id, ?, ?, ?, ?, ?
+                (task_id, platform, chat_id, thread_id, notifier_profile, created_at,
+                 last_event_id)
+            SELECT id, ?, ?, ?, ?, ?,
+                   CASE WHEN ? IS NULL THEN
+                       COALESCE((SELECT MAX(id) FROM task_events
+                                 WHERE task_id = tasks.id), 0)
+                   ELSE MIN(COALESCE((SELECT MAX(id) FROM task_events
+                                      WHERE task_id = tasks.id), 0), ?)
+                   END
               FROM tasks
              WHERE status NOT IN ({placeholders})
             """,
-            (platform, chat_id, thread_id or "", notifier_profile, now, *finals),
+            (
+                platform, chat_id, thread_id or "", notifier_profile, now,
+                initial_event_cursor, initial_event_cursor, *finals,
+            ),
         )
+
+
+
+def get_or_create_default_notify_cursor(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+) -> int:
+    """Return a target's durable activation cursor, creating it atomically.
+
+    The cursor is per board (the connection determines the board) and per
+    delivery identity. Once created, it survives gateway restarts so task
+    events produced while a runner is down remain eligible for delivery.
+    """
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_default_notify_cursors
+                (platform, chat_id, thread_id, notifier_profile,
+                 initial_event_cursor, created_at)
+            SELECT ?, ?, ?, ?, COALESCE(MAX(id), 0), ? FROM task_events
+            """,
+            (
+                platform, chat_id, thread_id or "", notifier_profile or "",
+                int(time.time()),
+            ),
+        )
+        row = conn.execute(
+            """
+            SELECT initial_event_cursor FROM kanban_default_notify_cursors
+             WHERE platform = ? AND chat_id = ? AND thread_id = ?
+               AND notifier_profile = ?
+            """,
+            (platform, chat_id, thread_id or "", notifier_profile or ""),
+        ).fetchone()
+    return int(row["initial_event_cursor"])
 
 
 def remove_notify_sub(
