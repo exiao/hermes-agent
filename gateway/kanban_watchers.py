@@ -619,6 +619,21 @@ class GatewayKanbanWatchersMixin:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
 
+                    # Default targets belong to this gateway's active profile.
+                    # A secondary profile's adapter can deliver its own stored
+                    # subscription, but cannot carry a row auto-created for this
+                    # profile. Keep that profile's platforms out of the zero-sub
+                    # gate and insertion eligibility, otherwise the row rewinds
+                    # forever at the profile-aware delivery check below.
+                    notifier_platforms: set[str] = set()
+                    for target in default_notify_targets:
+                        try:
+                            platform = _Platform(target["platform"])
+                        except ValueError:
+                            continue
+                        if self._authorization_adapter(platform, notifier_profile) is not None:
+                            notifier_platforms.add(target["platform"])
+
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
                     # HERMES_KANBAN_DB pins the board path; without this guard
@@ -654,7 +669,7 @@ class GatewayKanbanWatchersMixin:
                             if (
                                 _kb.count_notify_subs(board=slug) == 0
                                 and not any(
-                                    tgt["platform"] in active_platforms
+                                    tgt["platform"] in notifier_platforms
                                     for tgt in default_notify_targets
                                 )
                             ):
@@ -710,7 +725,7 @@ class GatewayKanbanWatchersMixin:
                                 # existing per-task subscription (cursor /
                                 # fail-count) is never disturbed.
                                 for tgt in default_notify_targets:
-                                    if tgt["platform"] not in active_platforms:
+                                    if tgt["platform"] not in notifier_platforms:
                                         continue
                                     try:
                                         _kb.add_default_notify_subs(

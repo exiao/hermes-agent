@@ -503,6 +503,47 @@ def test_notifier_claims_platform_only_a_secondary_profile_owns(tmp_path, monkey
     )
 
 
+def test_default_notify_skips_platform_owned_only_by_secondary_profile(tmp_path, monkeypatch):
+    """Default targets must be connected for the active profile that owns them.
+
+    A secondary profile's Discord adapter may deliver a subscription stamped
+    ``beta``, but it cannot deliver a default target auto-created with this
+    standalone gateway's ``default`` profile. Opening an otherwise empty board
+    in that situation creates a row that the delivery path rewinds forever.
+    """
+    db_path = tmp_path / "default-target-secondary-only.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "default_notify": [{"platform": "discord", "chat_id": "chat-default"}],
+            },
+        },
+    )
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        kb.create_task(conn, title="pending default notify", assignee="worker")
+    finally:
+        conn.close()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: RecordingAdapter()}
+    runner._profile_adapters = {"beta": {Platform.DISCORD: RecordingAdapter()}}
+    runner._kanban_sub_fail_counts = {}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn) == []
+    finally:
+        conn.close()
+
+
 def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     db_path = tmp_path / "chat-type-wakeup.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
