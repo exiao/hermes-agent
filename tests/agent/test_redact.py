@@ -1,6 +1,7 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
 import logging
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -591,16 +592,37 @@ class TestWebUrlsNotRedacted:
 
 
 class TestStrictUrlCredentialRedaction:
-    def test_skips_userinfo_scan_without_url_delimiters(self, monkeypatch):
-        """A non-URL compaction block cannot contain URL userinfo."""
-        userinfo_re = MagicMock()
-        userinfo_re.sub.side_effect = AssertionError("userinfo regex should not run")
-        monkeypatch.setattr(redact, "_STRICT_URL_USERINFO_RE", userinfo_re)
+    def test_userinfo_scan_is_linear_on_large_non_url_text(self):
+        """Userinfo redaction must not degrade superlinearly on big text.
 
+        The scan used to be quadratic: a ``//`` followed by a long
+        delimiter-free run made the regex retry the optional scheme at every
+        offset, so a 100 KB run cost ~15s and every compaction of a large
+        conversation paid it. Assert the scaling contract (doubling the input
+        must not quadruple the time), not the mechanism.
+        """
+        base = "//" + ("x" * 50_000) + " @"
+        doubled = "//" + ("x" * 100_000) + " @"
+
+        start = time.perf_counter()
+        redact_sensitive_text(base, redact_url_credentials=True)
+        base_seconds = time.perf_counter() - start
+
+        start = time.perf_counter()
+        redact_sensitive_text(doubled, redact_url_credentials=True)
+        doubled_seconds = time.perf_counter() - start
+
+        # Generous absolute ceiling: the quadratic version took >10s here.
+        assert doubled_seconds < 1.0
+        # And the growth must stay roughly linear, not quadratic (~4x).
+        assert doubled_seconds < max(base_seconds * 3.0, 0.05)
+
+    def test_userinfo_still_redacted_after_unrelated_double_slash(self):
+        """A ``//`` with no userinfo must not stop a later real match."""
         assert redact_sensitive_text(
-            "p" * 10,
+            "see a//b then https://user:pw@host/x",
             redact_url_credentials=True,
-        ) == "p" * 10
+        ) == "see a//b then https://user:***@host/x"
 
     @pytest.mark.parametrize(
         ("text", "secret", "expected"),
