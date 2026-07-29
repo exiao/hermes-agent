@@ -19,6 +19,9 @@ outputs:
   python:
     description: Run Python tests / ruff / ty / windows-footguns.
     value: ${{ steps.classify.outputs.python }}
+  e2e:
+    description: Run Python end-to-end tests for runtime-sensitive paths.
+    value: ${{ steps.classify.outputs.e2e }}
   frontend:
     description: Run the TypeScript testing matrix + desktop build.
     value: ${{ steps.classify.outputs.frontend }}
@@ -93,13 +96,13 @@ runs:
 
         if [ -n "$COMPARE_BASE" ] && [ -n "$COMPARE_HEAD" ]; then
           # Compare pinned event SHAs rather than shallow checkout history. The
-          # API is retried, then an error deliberately becomes an empty diff so
-          # the classifier emits every lane rather than skipping validation.
+          # API is retried, then an error or GitHub's 300-file response cap
+          # deliberately becomes an empty diff so every lane runs rather than
+          # skipping validation for an omitted path.
           for i in 1 2 3; do
-            if CHANGED="$(gh api \
-              --paginate \
-              "repos/${REPO}/compare/${COMPARE_BASE}...${COMPARE_HEAD}" \
-              --jq '.files[]?.filename')"; then
+            if COMPARE="$(gh api \
+              "repos/${REPO}/compare/${COMPARE_BASE}...${COMPARE_HEAD}")"; then
+              CHANGED="$(printf '%s' "$COMPARE" | python3 -c 'import json, sys; files = json.load(sys.stdin).get("files", []); complete = isinstance(files, list) and len(files) < 300; print(*(item["filename"] for item in files if "filename" in item), sep="\n") if complete else print("::warning::compare response is incomplete or reaches the 300-file cap - failing open", file=sys.stderr)')"
               break
             fi
             if [ "$i" = 3 ]; then

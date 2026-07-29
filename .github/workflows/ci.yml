@@ -42,6 +42,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       python: ${{ steps.classify.outputs.python }}
+      e2e: ${{ steps.classify.outputs.e2e }}
       frontend: ${{ steps.classify.outputs.frontend }}
       site: ${{ steps.classify.outputs.site }}
       scan: ${{ steps.classify.outputs.scan }}
@@ -72,7 +73,7 @@ jobs:
     uses: ./.github/workflows/tests.yml
     with:
       slice_count: 8
-      run_e2e: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/live-config' && needs.detect.outputs.frontend != 'true') }}
+      run_e2e: ${{ needs.detect.outputs.e2e == 'true' }}
 
   lint:
     name: Python lints

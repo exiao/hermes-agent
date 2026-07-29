@@ -25,6 +25,7 @@ ci_review_files = _mod.ci_review_files
 
 DEFAULT = {
     "python": True,
+    "e2e": True,
     "frontend": True,
     "docker_meta": True,
     "site": True,
@@ -36,9 +37,11 @@ DEFAULT = {
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, npm_lock=False, mcp_catalog=False, docker_meta=False, ci_review=False) -> dict[str, bool]:
+def _lanes(python=False, e2e=None, frontend=False, site=False, scan=False, deps=False, npm_lock=False, mcp_catalog=False, docker_meta=False, ci_review=False) -> dict[str, bool]:
+    e2e = python if e2e is None else e2e
     return {
         "python": python,
+        "e2e": e2e,
         "frontend": frontend,
         "docker_meta": docker_meta,
         "site": site,
@@ -136,10 +139,18 @@ def test_classify(files, expected):
 
 
 LIVE_CONFIG_PUSH_CASES = {
-    "live-config python-only push narrows to Python": (
+    "live-config test-only push narrows without E2E": (
         "push", "refs/heads/live-config",
-        ["agent/tool_runtime.py", "tests/agent/test_tool_runtime.py", "uv.lock"],
-        _lanes(python=True),
+        ["tests/agent/test_tool_runtime.py"],
+        _lanes(python=True, e2e=False),
+    ),
+    "live-config runtime push retains E2E": (
+        "push", "refs/heads/live-config",
+        ["gateway/runtime.py", "tests/gateway/test_runtime.py"],
+        _lanes(python=True, e2e=True),
+    ),
+    "live-config lockfile push retains E2E": (
+        "push", "refs/heads/live-config", ["uv.lock"], _lanes(python=True, e2e=True),
     ),
     "live-config mixed code push fails open": (
         "push", "refs/heads/live-config",

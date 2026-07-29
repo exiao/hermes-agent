@@ -9,6 +9,7 @@ booleans (one per lane) to ``$GITHUB_OUTPUT`` and stdout. The
 Lanes:
 
 * ``python``      — pytest / ruff / ty / footguns.
+* ``e2e``         — Python end-to-end tests for runtime-sensitive paths.
 * ``docker_meta`` — Dockerfiles etc.
 * ``frontend``    — TS typecheck matrix + desktop build.
 * ``site``        — Docusaurus + generated skill docs.
@@ -75,6 +76,10 @@ _LIVE_CONFIG_PYTHON_FILES = {"pyproject.toml", "uv.lock"}
 _LIVE_CONFIG_PYTHON_SCRIPTS = {
     "scripts/run_tests.sh", "scripts/run_tests_parallel.py",
 }
+_LIVE_CONFIG_E2E_ROOTS = (
+    "agent/", "gateway/", "hermes_cli/", "tools/", "cron/",
+    "tui_gateway/", "acp_adapter/",
+)
 
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
@@ -112,6 +117,7 @@ def classify(files: list[str]) -> dict[str, bool]:
     files = [f.strip() for f in files if f.strip()]
     ret = {
         "python": any(not _py_irrelevant(f) for f in files),
+        "e2e": any(not _py_irrelevant(f) for f in files),
         "docker_meta":  any(f.startswith(_DOCKER_META) for f in files),
         "frontend": any(f.startswith(_FRONTEND) or f in _ROOT_NPM for f in files),
         "site": any(f.startswith(_SITE) for f in files),
@@ -123,6 +129,7 @@ def classify(files: list[str]) -> dict[str, bool]:
     }
     if not files or any(f.startswith(".github/") for f in files):
         ret["python"] = True
+        ret["e2e"] = True
         ret["docker_meta"] = True
         ret["frontend"] = True
         ret["site"] = True
@@ -145,6 +152,15 @@ def _is_live_config_python_path(path: str) -> bool:
     )
 
 
+def _is_live_config_e2e_path(path: str) -> bool:
+    """Return whether a narrow live-config push must retain Python E2E tests."""
+    return (
+        path.startswith(_LIVE_CONFIG_E2E_ROOTS)
+        or path in _LIVE_CONFIG_PYTHON_FILES
+        or ("/" not in path and path.endswith(".py"))
+    )
+
+
 def classify_live_config_push(files: list[str]) -> dict[str, bool]:
     """Classify an explicitly identified live-config push.
 
@@ -156,6 +172,7 @@ def classify_live_config_push(files: list[str]) -> dict[str, bool]:
         return classify([])
     lanes = dict.fromkeys(classify([]), False)
     lanes["python"] = True
+    lanes["e2e"] = any(_is_live_config_e2e_path(path) for path in files)
     return lanes
 
 
