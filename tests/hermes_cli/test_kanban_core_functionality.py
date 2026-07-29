@@ -1725,6 +1725,36 @@ def test_owner_retry_cannot_correct_after_runless_manual_completion(kanban_home)
         conn.close()
 
 
+def test_owner_retry_cannot_correct_after_completed_handoff_edit(kanban_home):
+    """An operator handoff edit supersedes a delayed prior-run correction."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="edited completion", assignee="worker")
+        kb.claim_task(conn, tid)
+        original = kb.latest_run(conn, tid)
+        assert original is not None
+        assert kb.complete_task(conn, tid, result="first completion")
+        assert kb.edit_completed_task_result(
+            conn, tid, result="operator handoff", metadata={"reviewed": True},
+        )
+
+        assert not kb.complete_task(
+            conn,
+            tid,
+            result="stale pushed handoff",
+            metadata={"commit_sha": "abc123"},
+            expected_run_id=original.id,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.result == "operator handoff"
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.summary == "operator handoff"
+        assert run.metadata == {"reviewed": True}
+    finally:
+        conn.close()
+
+
 def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
     """A worker from an earlier attempt cannot close a later retry."""
     import hermes_cli.kanban_db as _kb
