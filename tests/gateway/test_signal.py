@@ -3126,26 +3126,38 @@ class TestQuotedAttachments:
         import gateway.platforms.signal as signal_module
 
         adapter = _make_signal_adapter(monkeypatch)
-        source = tmp_path / "chart.png"
-        source.write_bytes(b"image bytes")
+        first_source = tmp_path / "first.png"
+        first_source.write_bytes(b"first image")
+        second_source = tmp_path / "second.png"
+        second_source.write_bytes(b"second image")
         started = asyncio.Event()
         finish = asyncio.Event()
         copied = asyncio.Event()
+        copy_count = 0
 
         async def delayed_copy(_copyfile, _source, snapshot):
+            nonlocal copy_count
+            copy_count += 1
+            if copy_count == 1:
+                Path(snapshot).write_bytes(b"first image")
+                return
             started.set()
             await finish.wait()
-            Path(snapshot).write_bytes(b"image bytes")
+            Path(snapshot).write_bytes(b"second image")
             copied.set()
 
         monkeypatch.setattr(signal_module.asyncio, "to_thread", delayed_copy)
         remember = asyncio.create_task(
-            adapter._remember_sent_attachments(123, "+15559998888", [str(source)])
+            adapter._remember_sent_attachments(
+                123, "+15559998888", [str(first_source), str(second_source)]
+            )
         )
         await started.wait()
         remember.cancel()
         with pytest.raises(asyncio.CancelledError):
             await remember
+
+        assert list(Path(adapter._sent_attachment_snapshot_dir.name).iterdir()) == []
 
         finish.set()
         await copied.wait()

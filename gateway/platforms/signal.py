@@ -1024,6 +1024,8 @@ class SignalAdapter(BasePlatformAdapter):
                 try:
                     await asyncio.shield(copy_task)
                 except asyncio.CancelledError:
+                    self._discard_sent_attachment_snapshots(snapshots)
+
                     def discard_cancelled_snapshot(task: asyncio.Task[None]) -> None:
                         try:
                             task.result()
