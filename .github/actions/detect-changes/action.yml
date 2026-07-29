@@ -10,6 +10,10 @@ inputs:
     description: Token for the GitHub API (gh CLI). Pass steps.app-token.outputs.token from the calling workflow.
     required: false
     default: ${{ github.token }}
+  classification-mode:
+    description: Standard PR classification, or the allowlisted live-config push gate.
+    required: false
+    default: standard
 
 outputs:
   python:
@@ -58,35 +62,43 @@ runs:
         GH_TOKEN: ${{ inputs.github-token || github.token }}
         REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
+        REF: ${{ github.ref }}
+        CLASSIFICATION_MODE: ${{ inputs.classification-mode }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PUSH_BASE_SHA: ${{ github.event.before }}
+        PUSH_HEAD_SHA: ${{ github.sha }}
       run: |
         set -euo pipefail
 
-        # Only pull_request events are gated. Other events (push, release,
-        # dispatch) leave CHANGED empty, so the classifier fails open and every
-        # lane runs. Post-merge / on-demand validation is never weakened.
+        # Standard classification preserves the existing PR-only compare and
+        # fail-open behavior. The live-config exception is enabled only by the
+        # exact caller-selected mode and still fails open for an unavailable or
+        # ambiguous push comparison.
+        CHANGED=""
         if [ "$EVENT_NAME" = "pull_request" ]; then
-          # Use the compare endpoint with the pinned base/head SHAs from the
-          # event payload instead of the "current PR files" endpoint. The SHAs
-          # are frozen at trigger time, so the file list is deterministic even
-          # if the PR receives a new push between trigger and detect.
-          #
-          # Retried: a rate-limit blip or eventual-consistency 404 on a
-          # freshly-pushed HEAD would otherwise silently fall open (all lanes
-          # run — safe, but wasteful and it masks the API failure).
-          #
-          # `.files[]?` (null-safe): with --paginate, a PR more than 100
-          # commits ahead of its merge-base paginates the compare, and pages
-          # after the first carry `files: null` — bare `.files[]` makes jq
-          # die with "cannot iterate over: null", which fails every retry
-          # and forces the fail-open path (seen on stacked PRs). The full
-          # file list (up to the API's 300-file cap) is on page one.
-          CHANGED=""
+          COMPARE_BASE="$BASE_SHA"
+          COMPARE_HEAD="$HEAD_SHA"
+        elif [ "$CLASSIFICATION_MODE" = "live_config_push" ] && \
+             [ "$EVENT_NAME" = "push" ] && \
+             [ "$REF" = "refs/heads/live-config" ] && \
+             [ -n "$PUSH_BASE_SHA" ] && \
+             [ "$PUSH_BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+          COMPARE_BASE="$PUSH_BASE_SHA"
+          COMPARE_HEAD="$PUSH_HEAD_SHA"
+        else
+          COMPARE_BASE=""
+          COMPARE_HEAD=""
+        fi
+
+        if [ -n "$COMPARE_BASE" ] && [ -n "$COMPARE_HEAD" ]; then
+          # Compare pinned event SHAs rather than shallow checkout history. The
+          # API is retried, then an error deliberately becomes an empty diff so
+          # the classifier emits every lane rather than skipping validation.
           for i in 1 2 3; do
             if CHANGED="$(gh api \
               --paginate \
-              "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
+              "repos/${REPO}/compare/${COMPARE_BASE}...${COMPARE_HEAD}" \
               --jq '.files[]?.filename')"; then
               break
             fi
@@ -102,4 +114,4 @@ runs:
 
         echo "Changed files:"
         printf '%s\n' "${CHANGED:-(none)}"
-        printf '%s\n' "${CHANGED:-}" | python3 scripts/ci/classify_changes.py
+        printf '%s\n' "${CHANGED:-}" | python3 scripts/ci/classify_changes.py "$CLASSIFICATION_MODE"

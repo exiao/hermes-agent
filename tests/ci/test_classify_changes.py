@@ -19,6 +19,8 @@ if _spec is None or _spec.loader is None:
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 classify = _mod.classify
+classify_for_event = _mod.classify_for_event
+classify_live_config_push = _mod.classify_live_config_push
 ci_review_files = _mod.ci_review_files
 
 DEFAULT = {
@@ -131,6 +133,38 @@ CASES = {
 @pytest.mark.parametrize("files,expected", CASES.values(), ids=CASES.keys())
 def test_classify(files, expected):
     assert classify(files) == expected
+
+
+LIVE_CONFIG_PUSH_CASES = {
+    "live-config python-only push narrows to Python": (
+        "push", "refs/heads/live-config",
+        ["agent/tool_runtime.py", "tests/agent/test_tool_runtime.py", "uv.lock"],
+        _lanes(python=True),
+    ),
+    "live-config mixed code push fails open": (
+        "push", "refs/heads/live-config",
+        ["agent/tool_runtime.py", "apps/desktop/src/app.tsx"], DEFAULT,
+    ),
+    "main push keeps full CI": (
+        "push", "refs/heads/main", ["agent/tool_runtime.py"], DEFAULT,
+    ),
+    "live-config unknown path push fails open": (
+        "push", "refs/heads/live-config", ["new-runtime-surface.yaml"], DEFAULT,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "event_name,ref,files,expected",
+    LIVE_CONFIG_PUSH_CASES.values(),
+    ids=LIVE_CONFIG_PUSH_CASES.keys(),
+)
+def test_classify_for_event(event_name, ref, files, expected):
+    assert classify_for_event(event_name, ref, files) == expected
+
+
+def test_classify_live_config_push_empty_diff_fails_open():
+    assert classify_live_config_push([]) == DEFAULT
 
 
 def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():

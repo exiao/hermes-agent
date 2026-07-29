@@ -64,6 +64,18 @@ _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
 _MCP_CATALOG_PATHS = ("optional-mcps/",)
 _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 
+# A live-config push may use the narrow Python gate only when every changed
+# path is a known Python runtime, test, or test-runner surface. Everything
+# else deliberately uses the standard fail-open classification.
+_LIVE_CONFIG_PYTHON_ROOTS = (
+    "agent/", "gateway/", "hermes_cli/", "tools/", "cron/",
+    "tui_gateway/", "acp_adapter/", "tests/",
+)
+_LIVE_CONFIG_PYTHON_FILES = {"pyproject.toml", "uv.lock"}
+_LIVE_CONFIG_PYTHON_SCRIPTS = {
+    "scripts/run_tests.sh", "scripts/run_tests_parallel.py",
+}
+
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
         return False
@@ -124,9 +136,47 @@ def classify(files: list[str]) -> dict[str, bool]:
 
 
 
+def _is_live_config_python_path(path: str) -> bool:
+    return (
+        path in _LIVE_CONFIG_PYTHON_FILES
+        or path in _LIVE_CONFIG_PYTHON_SCRIPTS
+        or path.startswith(_LIVE_CONFIG_PYTHON_ROOTS)
+        or ("/" not in path and path.endswith(".py"))
+    )
+
+
+def classify_live_config_push(files: list[str]) -> dict[str, bool]:
+    """Classify an explicitly identified live-config push.
+
+    The narrow gate is an allowlist: an empty, mixed, or unknown diff retains
+    the standard all-lanes result rather than risking skipped validation.
+    """
+    files = [f.strip() for f in files if f.strip()]
+    if not files or not all(_is_live_config_python_path(path) for path in files):
+        return classify([])
+    lanes = dict.fromkeys(classify([]), False)
+    lanes["python"] = True
+    return lanes
+
+
+def classify_for_event(event_name: str, ref: str, files: list[str]) -> dict[str, bool]:
+    """Apply the live-config exception without weakening other events."""
+    if event_name == "push" and ref == "refs/heads/live-config":
+        return classify_live_config_push(files)
+    if event_name == "pull_request":
+        return classify(files)
+    return classify([])
+
+
 def main() -> int:
     files = sys.stdin.read().splitlines()
-    lanes = classify(files)
+    mode = sys.argv[1] if len(sys.argv) == 2 else "standard"
+    if mode == "live_config_push":
+        lanes = classify_live_config_push(files)
+    elif mode == "standard":
+        lanes = classify(files)
+    else:
+        raise SystemExit(f"unknown classification mode: {mode}")
     out = "\n".join([
         *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
         f"ci_review_files={json.dumps(ci_review_files(files))}",

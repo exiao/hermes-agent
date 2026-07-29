@@ -59,6 +59,7 @@ jobs:
         uses: ./.github/actions/detect-changes
         with:
           github-token: ${{ github.token }}
+          classification-mode: ${{ github.event_name == 'push' && github.ref == 'refs/heads/live-config' && 'live_config_push' || 'standard' }}
 
   # ─────────────────────────────────────────────────────────────────────
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
@@ -71,6 +72,7 @@ jobs:
     uses: ./.github/workflows/tests.yml
     with:
       slice_count: 8
+      run_e2e: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/live-config' && needs.detect.outputs.frontend != 'true') }}
 
   lint:
     name: Python lints
@@ -89,7 +91,7 @@ jobs:
   e2e-desktop:
     name: Desktop E2E
     needs: detect
-    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true'
+    if: needs.detect.outputs.frontend == 'true' || (needs.detect.outputs.python == 'true' && !(github.event_name == 'push' && github.ref == 'refs/heads/live-config'))
     uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
@@ -167,6 +169,8 @@ jobs:
 
   osv-scanner:
     name: OSV scan
+    needs: detect
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/live-config' && needs.detect.outputs.frontend != 'true') }}
     uses: ./.github/workflows/osv-scanner.yml
 
   # ─────────────────────────────────────────────────────────────────────
