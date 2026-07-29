@@ -253,6 +253,45 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
 
 @pytest.mark.asyncio
+async def test_notifier_failure_drop_does_not_record_completion_delivery(kanban_home):
+    """A discarded failing target must not be revived by an owner correction."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="failing target", assignee="worker1")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    dropped: list[bool] = []
+
+    def _capture_unsub(sub, board=None, *, record_delivery=True):
+        dropped.append(record_delivery)
+        runner._running = False
+
+    runner._kanban_unsub = _capture_unsub
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock(side_effect=RuntimeError("delivery failed"))
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await original_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(runner._kanban_notifier_watcher(interval=1), timeout=10.0)
+
+    assert dropped == [False]
+
+
+@pytest.mark.asyncio
 async def test_notifier_second_blocked_delivers(kanban_home):
     """
     After the first blocked, should receive second blocked notification.
