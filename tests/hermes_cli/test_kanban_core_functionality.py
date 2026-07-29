@@ -1578,6 +1578,62 @@ def test_owner_retry_replaces_bare_completion_with_pushed_work_proof(kanban_home
         conn.close()
 
 
+
+def test_owner_retry_clears_legacy_result_for_summary_handoff(kanban_home):
+    """A corrected summary must not leave the prior legacy result visible."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="summary handoff", assignee="worker")
+        kb.claim_task(conn, tid)
+        owner = kb.latest_run(conn, tid)
+        assert owner is not None
+
+        assert kb.complete_task(conn, tid, result="review-only completion")
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="pushed owner handoff",
+            metadata={"commit_sha": "abc123"},
+            expected_run_id=owner.id,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.result is None
+        run = kb.latest_run(conn, tid)
+        assert run is not None and run.summary == "pushed owner handoff"
+    finally:
+        conn.close()
+
+
+def test_superseded_completed_run_cannot_correct_newer_completion(kanban_home):
+    """Only the latest completed run can replace a bare completion handoff."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="superseded handoff", assignee="worker")
+        kb.claim_task(conn, tid)
+        original = kb.latest_run(conn, tid)
+        assert original is not None
+        assert kb.complete_task(conn, tid, result="first completion")
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        kb.claim_task(conn, tid)
+        assert kb.complete_task(conn, tid, result="newer completion")
+
+        assert not kb.complete_task(
+            conn,
+            tid,
+            result="stale pushed handoff",
+            metadata={"commit_sha": "abc123"},
+            expected_run_id=original.id,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.result == "newer completion"
+        assert kb.latest_run(conn, tid).summary == "newer completion"
+    finally:
+        conn.close()
+
+
 def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
     """A worker from an earlier attempt cannot close a later retry."""
     import hermes_cli.kanban_db as _kb

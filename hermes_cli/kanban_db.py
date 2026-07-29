@@ -6237,8 +6237,10 @@ def complete_task(
             ).fetchone()
             run = conn.execute(
                 "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ? "
-                "AND outcome = 'completed'",
-                (int(expected_run_id), task_id),
+                "AND outcome = 'completed' AND id = ("
+                "SELECT MAX(id) FROM task_runs WHERE task_id = ? "
+                "AND outcome = 'completed')",
+                (int(expected_run_id), task_id, task_id),
             ).fetchone()
             if (
                 task
@@ -6253,11 +6255,10 @@ def complete_task(
                         "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
                         (summary or result, json.dumps(metadata) if metadata else None, expected_run_id),
                     )
-                    if result is not None:
-                        conn.execute(
-                            "UPDATE tasks SET result = ? WHERE id = ?",
-                            (result, task_id),
-                        )
+                    conn.execute(
+                        "UPDATE tasks SET result = ? WHERE id = ?",
+                        (result, task_id),
+                    )
                     return True
         if expected_run_id is None:
             cur = conn.execute(
