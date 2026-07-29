@@ -583,7 +583,9 @@ class TestSignalSendImageFile:
         img_path = tmp_path / "chart.png"
         img_path.write_bytes(b"\x89PNG" + b"\x00" * 100)
 
+        original_bytes = img_path.read_bytes()
         result = await adapter.send_image_file(chat_id="+155****4567", image_path=str(img_path))
+        img_path.write_bytes(b"replacement image bytes")
 
         assert result.success is True
         assert len(captured) == 1
@@ -596,8 +598,11 @@ class TestSignalSendImageFile:
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         # Timestamp must be tracked for echo-back prevention
         assert 1234567890 in adapter._recent_sent_timestamps
-        # Local-file media must also be available if the user quotes it later.
-        assert adapter._resolve_quoted_media_paths("1234567890", "+155****4567") == [str(img_path)]
+        # Local-file media must be immutable if the user quotes it later.
+        quoted_paths = adapter._resolve_quoted_media_paths("1234567890", "+155****4567")
+        assert len(quoted_paths) == 1
+        assert quoted_paths[0] != str(img_path)
+        assert Path(quoted_paths[0]).read_bytes() == original_bytes
 
     @pytest.mark.asyncio
     async def test_send_image_file_to_group(self, monkeypatch, tmp_path):
@@ -3014,7 +3019,24 @@ class TestQuotedAttachments:
 
         adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(real_file)])
 
-        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == [str(real_file)]
+        quoted_paths = adapter._resolve_quoted_media_paths("1753650000000", "+15559998888")
+        assert len(quoted_paths) == 1
+        assert Path(quoted_paths[0]).read_bytes() == real_file.read_bytes()
+
+    def test_preserves_sent_bytes_when_caller_reuses_the_path(self, monkeypatch, tmp_path):
+        """An older quote must not resolve to replacement bytes at the caller path."""
+        adapter = _make_signal_adapter(monkeypatch)
+        caller_path = tmp_path / "chart.png"
+        caller_path.write_bytes(b"original chart bytes")
+
+        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(caller_path)])
+        caller_path.write_bytes(b"replacement chart bytes")
+
+        resolved = adapter._resolve_quoted_media_paths("1753650000000", "+15559998888")
+
+        assert len(resolved) == 1
+        assert resolved[0] != str(caller_path)
+        assert Path(resolved[0]).read_bytes() == b"original chart bytes"
 
     def test_no_local_path_for_media_the_user_sent(self, monkeypatch):
         """A photo the USER took was never on this machine — no path, no lie."""
@@ -3022,26 +3044,32 @@ class TestQuotedAttachments:
         assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == []
         assert adapter._resolve_quoted_media_paths(None, "+15559998888") == []
 
-    def test_drops_paths_that_no_longer_exist(self, monkeypatch, tmp_path):
-        """A since-deleted temp file must not be advertised to the agent."""
+    def test_keeps_snapshot_when_caller_deletes_the_source_path(self, monkeypatch, tmp_path):
+        """A quote keeps the sent bytes after the caller removes its temp file."""
         adapter = _make_signal_adapter(monkeypatch)
         gone = tmp_path / "deleted.png"
         gone.write_bytes(b"x")
         adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(gone)])
         gone.unlink()
 
-        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == []
+        quoted_paths = adapter._resolve_quoted_media_paths("1753650000000", "+15559998888")
+        assert len(quoted_paths) == 1
+        assert Path(quoted_paths[0]).read_bytes() == b"x"
 
-    def test_sent_attachment_cache_is_bounded_and_fifo(self, monkeypatch):
+    def test_sent_attachment_cache_evicts_and_deletes_oldest_snapshot(self, monkeypatch, tmp_path):
         adapter = _make_signal_adapter(monkeypatch)
-        adapter._max_sent_attachment_entries = 3
-        for i in range(5):
-            adapter._remember_sent_attachments(i, "+15559998888", [f"/tmp/{i}.png"])
+        adapter._max_sent_attachment_entries = 1
+        first = tmp_path / "first.png"
+        second = tmp_path / "second.png"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
 
-        assert len(adapter._sent_attachment_paths) == 3
-        # Oldest evicted first.
-        assert "0" not in adapter._sent_attachment_paths
-        assert "4" in adapter._sent_attachment_paths
+        adapter._remember_sent_attachments(1, "+15559998888", [str(first)])
+        first_snapshot = adapter._sent_attachment_paths["1"][1][0]
+        adapter._remember_sent_attachments(2, "+15559998888", [str(second)])
+
+        assert list(adapter._sent_attachment_paths) == ["2"]
+        assert not Path(first_snapshot).exists()
 
     def test_remembering_is_a_noop_without_paths(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
@@ -3103,7 +3131,8 @@ async def test_quoted_image_envelope_end_to_end(monkeypatch, tmp_path):
     assert event is not None, "handler did not emit a MessageEvent"
     assert event.reply_to_text is None
     assert event.reply_to_media_summary == "an image (image/png, cc_verification_sheet.png)"
-    assert event.reply_to_media_paths == [str(sent_image)]
+    assert len(event.reply_to_media_paths) == 1
+    assert Path(event.reply_to_media_paths[0]).read_bytes() == sent_image.read_bytes()
 
 
 @pytest.mark.asyncio

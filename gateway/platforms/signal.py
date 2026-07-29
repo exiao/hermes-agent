@@ -441,8 +441,15 @@ class SignalAdapter(BasePlatformAdapter):
         # Local file paths of attachments this bot sent, keyed by the outbound
         # Signal timestamp. Signal timestamps are only unique within a
         # conversation, so retain the destination too before resolving a quote.
-        self._sent_attachment_paths: "OrderedDict[str, Tuple[str, List[str]]]" = OrderedDict()
+        self._sent_attachment_paths: "OrderedDict[str, Tuple[str, List[str], int]]" = OrderedDict()
         self._max_sent_attachment_entries = 200
+        self._sent_attachment_snapshot_bytes = 0
+        self._max_sent_attachment_snapshot_bytes = 100 * 1024 * 1024
+        # Snapshot caller-owned paths after a successful send. The directory is
+        # per-adapter and is removed on disconnect; eviction removes files earlier.
+        self._sent_attachment_snapshot_dir = tempfile.TemporaryDirectory(
+            prefix="hermes-signal-quote-"
+        )
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
         # phone number to the corresponding UUID when signal-cli prefers it.
@@ -524,6 +531,7 @@ class SignalAdapter(BasePlatformAdapter):
         for task in self._typing_tasks.values():
             task.cancel()
         self._typing_tasks.clear()
+        self._clear_sent_attachment_cache()
 
         if self.client:
             await self.client.aclose()
@@ -966,15 +974,70 @@ class SignalAdapter(BasePlatformAdapter):
         cached_number = self._recipient_number_by_uuid.get(author)
         return bool(cached_number and cached_number == self._account_normalized)
 
+    def _clear_sent_attachment_cache(self) -> None:
+        self._sent_attachment_paths.clear()
+        self._sent_attachment_snapshot_bytes = 0
+        if self._sent_attachment_snapshot_dir is not None:
+            self._sent_attachment_snapshot_dir.cleanup()
+            self._sent_attachment_snapshot_dir = None
+
+    @staticmethod
+    def _discard_sent_attachment_snapshots(paths: List[str]) -> None:
+        for path in paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Signal: failed to delete quoted attachment snapshot %s", path)
+
+    def _drop_oldest_sent_attachment_entry(self) -> None:
+        _, (_, paths, byte_count) = self._sent_attachment_paths.popitem(last=False)
+        self._sent_attachment_snapshot_bytes = max(
+            0, self._sent_attachment_snapshot_bytes - byte_count
+        )
+        self._discard_sent_attachment_snapshots(paths)
+
     def _remember_sent_attachments(self, timestamp: Any, chat_id: str, paths: List[str]) -> None:
-        """Map an outbound Signal timestamp and destination to local attached files."""
+        """Snapshot outbound attachments so later quotes resolve immutable bytes."""
         if timestamp is None or not chat_id or not paths:
             return
+        if self._sent_attachment_snapshot_dir is None:
+            self._sent_attachment_snapshot_dir = tempfile.TemporaryDirectory(
+                prefix="hermes-signal-quote-"
+            )
+
+        snapshots: List[str] = []
+        byte_count = 0
+        snapshot_root = Path(self._sent_attachment_snapshot_dir.name)
+        for path in paths:
+            source = Path(path)
+            if not source.is_file():
+                continue
+            snapshot = snapshot_root / f"{uuid.uuid4().hex}{source.suffix[:32]}"
+            try:
+                shutil.copyfile(source, snapshot)
+                byte_count += snapshot.stat().st_size
+                snapshots.append(str(snapshot))
+            except OSError:
+                snapshot.unlink(missing_ok=True)
+                logger.debug("Signal: could not snapshot sent attachment %s", source)
+
+        if not snapshots:
+            return
         key = str(timestamp)
-        self._sent_attachment_paths.pop(key, None)
-        self._sent_attachment_paths[key] = (chat_id, list(paths))
-        while len(self._sent_attachment_paths) > self._max_sent_attachment_entries:
-            self._sent_attachment_paths.popitem(last=False)
+        previous = self._sent_attachment_paths.pop(key, None)
+        if previous is not None:
+            _, previous_paths, previous_bytes = previous
+            self._sent_attachment_snapshot_bytes = max(
+                0, self._sent_attachment_snapshot_bytes - previous_bytes
+            )
+            self._discard_sent_attachment_snapshots(previous_paths)
+        self._sent_attachment_paths[key] = (chat_id, snapshots, byte_count)
+        self._sent_attachment_snapshot_bytes += byte_count
+        while (
+            len(self._sent_attachment_paths) > self._max_sent_attachment_entries
+            or self._sent_attachment_snapshot_bytes > self._max_sent_attachment_snapshot_bytes
+        ):
+            self._drop_oldest_sent_attachment_entry()
 
     @staticmethod
     def _describe_quoted_attachments(quote_data: Any) -> Optional[str]:
@@ -1022,7 +1085,7 @@ class SignalAdapter(BasePlatformAdapter):
         cached = self._sent_attachment_paths.get(str(quote_id))
         if not cached:
             return []
-        cached_chat_id, paths = cached
+        cached_chat_id, paths, _ = cached
         if cached_chat_id != chat_id:
             return []
         return [p for p in paths if p and Path(p).exists()]
