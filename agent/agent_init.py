@@ -1622,7 +1622,11 @@ def init_agent(
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
-            if agent._memory_enabled or agent._user_profile_enabled:
+            if (
+                agent._memory_enabled
+                or agent._user_profile_enabled
+                or _memory_toolset_requested
+            ):
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
