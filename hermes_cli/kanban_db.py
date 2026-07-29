@@ -5075,15 +5075,37 @@ def _supersede_empty_terminal_handoff(
                 int(expected_run_id),
             ),
         )
+        handoff = (summary if summary is not None else result) or ""
+        handoff_lines = handoff.strip().splitlines()
+        completed_payload: dict = {
+            "result_len": len(result) if result else 0,
+            "summary": (
+                handoff_lines[0][:_EVENT_PAYLOAD_DETAIL_MAX]
+                if handoff_lines
+                else None
+            ),
+            "owner_run_id": int(expected_run_id),
+            "superseded_summary": run["summary"],
+            "superseded_had_push_evidence": False,
+        }
+        if isinstance(metadata, dict):
+            artifacts = metadata.get("artifacts")
+            if isinstance(artifacts, (list, tuple)):
+                cleaned_artifacts = [
+                    str(path).strip()
+                    for path in artifacts
+                    if isinstance(path, str) and str(path).strip()
+                ]
+                if cleaned_artifacts:
+                    completed_payload["artifacts"] = cleaned_artifacts
+        # Re-emit this as a normal completion: all notification consumers already
+        # claim completed events and deliver their summary plus native artifacts.
+        # The audit fields retain the fact that it replaced a bare terminal handoff.
         _append_event(
             conn,
             task_id,
-            "completion_superseded",
-            {
-                "owner_run_id": int(expected_run_id),
-                "superseded_summary": run["summary"],
-                "superseded_had_push_evidence": False,
-            },
+            "completed",
+            completed_payload,
             run_id=int(expected_run_id),
         )
     return True
