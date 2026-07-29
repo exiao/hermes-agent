@@ -2214,12 +2214,27 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 continue
+            task = kb.get_task(conn, tid)
+            if worker_run_id is None and task and task.current_run_id is not None:
+                kb.record_completion_rejected(
+                    conn,
+                    tid,
+                    reason="active_task_requires_run_token",
+                    summary=summary if summary is not None else args.result,
+                    metadata=metadata,
+                )
+                failed.append(tid)
+                print(
+                    f"cannot complete {tid}: task has an active worker run; "
+                    "a dispatcher run token is required",
+                    file=sys.stderr,
+                )
+                continue
             # Goal-mode pre-completion judge gate (mirrors the gate in
             # tools/kanban_tools.py:_handle_complete — Issue #38367).
             # Without this, a goal_mode worker can call
             # `hermes kanban complete <id>` from the terminal tool and
             # bypass the auxiliary judge that the tool-call path enforces.
-            task = kb.get_task(conn, tid)
             if task and task.goal_mode:
                 judge_available = False
                 try:

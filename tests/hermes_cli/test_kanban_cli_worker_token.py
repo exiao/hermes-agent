@@ -41,8 +41,27 @@ def test_cli_complete_requires_run_token_only_in_worker_context(kanban_home, mon
     finally:
         conn.close()
 
+    # Removing worker-owned environment markers cannot turn an active worker
+    # task into an operator completion. Only the dispatcher-issued run token
+    # can close a claimed task.
     monkeypatch.delenv("HERMES_KANBAN_TASK")
-    assert "Completed" in run_slash(f"complete {task_id} --summary operator-close")
+    assert "active worker run" in run_slash(f"complete {task_id} --summary forged")
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        worker_run_id = task.current_run_id
+        operator_task = kb.create_task(conn, title="operator task", assignee="worker")
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(worker_run_id))
+    assert "Completed" in run_slash(f"complete {task_id} --summary worker-close")
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    assert "Completed" in run_slash(f"complete {operator_task} --summary operator-close")
 
 
 def test_cli_worker_cannot_complete_sibling_task(kanban_home, monkeypatch):
@@ -61,5 +80,34 @@ def test_cli_worker_cannot_complete_sibling_task(kanban_home, monkeypatch):
     try:
         sibling = kb.get_task(conn, sibling_task)
         assert sibling is not None and sibling.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_cli_worker_cannot_hide_env_to_complete_active_sibling(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        worker_task = kb.create_task(conn, title="worker task", assignee="worker")
+        sibling_task = kb.create_task(conn, title="sibling task", assignee="worker")
+        kb.claim_task(conn, worker_task)
+        kb.claim_task(conn, sibling_task)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    assert "active worker run" in run_slash(f"complete {sibling_task} --summary forged")
+
+    conn = kb.connect()
+    try:
+        sibling = kb.get_task(conn, sibling_task)
+        assert sibling is not None and sibling.status == "running"
+        rejected = [
+            event for event in kb.list_events(conn, sibling_task)
+            if event.kind == "completion_rejected"
+        ]
+        assert rejected[-1].payload["reason"] == "active_task_requires_run_token"
     finally:
         conn.close()
