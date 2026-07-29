@@ -69,6 +69,11 @@ SSE_RETRY_DELAY_INITIAL = 2.0
 SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+# Quote resolution waits at most 750 ms; optional snapshots expire after 10 minutes.
+SIGNAL_QUOTE_SNAPSHOT_WAIT_SECONDS = 0.75
+SIGNAL_PENDING_SNAPSHOT_MAX_ENTRIES = 32
+SIGNAL_PENDING_SNAPSHOT_COPY_CONCURRENCY = 4
+SIGNAL_PENDING_SNAPSHOT_TTL_SECONDS = 600.0
 
 
 class SignalRPCError(RuntimeError):
@@ -449,6 +454,14 @@ class SignalAdapter(BasePlatformAdapter):
         # Text-only adapters must start even when temporary storage is unavailable.
         self._sent_attachment_snapshot_dir = None
         self._sent_attachment_snapshot_storage_disabled = False
+        # This map is only touched by the gateway event loop. Each entry holds a
+        # loop-affine Future completed by the async copy task, never its worker.
+        self._pending_sent_attachment_snapshots: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._max_pending_sent_attachment_snapshots = SIGNAL_PENDING_SNAPSHOT_MAX_ENTRIES
+        self._pending_sent_attachment_copy_semaphore = asyncio.Semaphore(
+            SIGNAL_PENDING_SNAPSHOT_COPY_CONCURRENCY
+        )
+        self._pending_sent_attachment_snapshot_ttl_seconds = SIGNAL_PENDING_SNAPSHOT_TTL_SECONDS
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
         # phone number to the corresponding UUID when signal-cli prefers it.
@@ -808,7 +821,7 @@ class SignalAdapter(BasePlatformAdapter):
         reply_to_media_summary = self._describe_quoted_attachments(quote_data)
         # Signal timestamps are only unique within a conversation, so lookup
         # uses the current chat as well as the quoted timestamp.
-        reply_to_media_paths = self._resolve_quoted_media_paths(reply_to_id, chat_id)
+        reply_to_media_paths = await self._await_quoted_media_paths(reply_to_id, chat_id)
 
         # Process attachments
         attachments_data = data_message.get("attachments", [])
@@ -976,6 +989,12 @@ class SignalAdapter(BasePlatformAdapter):
     def _clear_sent_attachment_cache(self) -> None:
         self._sent_attachment_paths.clear()
         self._sent_attachment_snapshot_bytes = 0
+        for entry in self._pending_sent_attachment_snapshots.values():
+            entry["task"].cancel()
+            entry["expiry"].cancel()
+            if not entry["future"].done():
+                entry["future"].set_result([])
+        self._pending_sent_attachment_snapshots.clear()
         if self._sent_attachment_snapshot_dir is not None:
             self._sent_attachment_snapshot_dir.cleanup()
             self._sent_attachment_snapshot_dir = None
@@ -995,11 +1014,20 @@ class SignalAdapter(BasePlatformAdapter):
         )
         self._discard_sent_attachment_snapshots(paths)
 
-    async def _remember_sent_attachments(self, timestamp: Any, chat_id: str, paths: List[str]) -> None:
-        """Best-effort snapshot of outbound attachments for later quoted replies."""
-        if timestamp is None or not chat_id or not paths:
+    def _expire_pending_sent_attachment_snapshot(self, key: str) -> None:
+        entry = self._pending_sent_attachment_snapshots.pop(key, None)
+        if entry is None:
             return
-        if self._sent_attachment_snapshot_storage_disabled:
+        entry["expired"] = True
+        # A thread-pool copy cannot be safely cancelled. Remove the entry now;
+        # its loop coroutine discards any bytes that arrive after expiry.
+        if not entry["future"].done():
+            entry["future"].set_result([])
+        logger.warning("Signal: quoted attachment snapshot expired before completion")
+
+    async def _remember_sent_attachments(self, timestamp: Any, chat_id: str, paths: List[str]) -> None:
+        """Register a pending snapshot before scheduling its non-blocking copy."""
+        if timestamp is None or not chat_id or not paths or self._sent_attachment_snapshot_storage_disabled:
             return
         if self._sent_attachment_snapshot_dir is None:
             try:
@@ -1010,54 +1038,74 @@ class SignalAdapter(BasePlatformAdapter):
                 self._sent_attachment_snapshot_storage_disabled = True
                 logger.debug("Signal: quoted attachment snapshots unavailable")
                 return
+        key = str(timestamp)
+        if len(self._pending_sent_attachment_snapshots) >= self._max_pending_sent_attachment_snapshots:
+            logger.warning("Signal: quoted attachment snapshot capacity reached")
+            return
+        previous = self._pending_sent_attachment_snapshots.pop(key, None)
+        if previous is not None:
+            previous["task"].cancel()
+            previous["expiry"].cancel()
+            if not previous["future"].done():
+                previous["future"].set_result([])
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[List[str]] = loop.create_future()
+        entry: Dict[str, Any] = {"chat_id": chat_id, "future": future, "expired": False}
+        self._pending_sent_attachment_snapshots[key] = entry
+        entry["task"] = asyncio.create_task(self._copy_sent_attachments(key, paths, entry))
+        entry["expiry"] = loop.call_later(
+            self._pending_sent_attachment_snapshot_ttl_seconds,
+            self._expire_pending_sent_attachment_snapshot,
+            key,
+        )
+        # The copy runs in the executor, so awaiting it does not block the gateway
+        # loop. The registered future lets the SSE quote path observe the same work.
+        await asyncio.shield(entry["task"])
 
+    async def _copy_sent_attachments(self, key: str, paths: List[str], entry: Dict[str, Any]) -> None:
         snapshots: List[str] = []
         byte_count = 0
-        snapshot_root = Path(self._sent_attachment_snapshot_dir.name)
-        for path in paths:
-            source = Path(path)
-            if not source.is_file():
-                continue
-            snapshot = snapshot_root / f"{uuid.uuid4().hex}{source.suffix[:32]}"
-            try:
-                copy_task = asyncio.create_task(asyncio.to_thread(shutil.copyfile, source, snapshot))
-                try:
-                    await asyncio.shield(copy_task)
-                except asyncio.CancelledError:
-                    self._discard_sent_attachment_snapshots(snapshots)
-
-                    def discard_cancelled_snapshot(task: asyncio.Task[None]) -> None:
-                        try:
-                            task.result()
-                        except (OSError, asyncio.CancelledError):
-                            pass
-                        self._discard_sent_attachment_snapshots([str(snapshot)])
-
-                    copy_task.add_done_callback(discard_cancelled_snapshot)
-                    raise
-                byte_count += snapshot.stat().st_size
-                snapshots.append(str(snapshot))
-            except (OSError, RuntimeError):
-                snapshot.unlink(missing_ok=True)
-                logger.debug("Signal: could not snapshot sent attachment %s", source)
-
-        if not snapshots:
-            return
-        key = str(timestamp)
-        previous = self._sent_attachment_paths.pop(key, None)
-        if previous is not None:
-            _, previous_paths, previous_bytes = previous
-            self._sent_attachment_snapshot_bytes = max(
-                0, self._sent_attachment_snapshot_bytes - previous_bytes
-            )
-            self._discard_sent_attachment_snapshots(previous_paths)
-        self._sent_attachment_paths[key] = (chat_id, snapshots, byte_count)
-        self._sent_attachment_snapshot_bytes += byte_count
-        while (
-            len(self._sent_attachment_paths) > self._max_sent_attachment_entries
-            or self._sent_attachment_snapshot_bytes > self._max_sent_attachment_snapshot_bytes
-        ):
-            self._drop_oldest_sent_attachment_entry()
+        try:
+            snapshot_root = Path(self._sent_attachment_snapshot_dir.name)
+            async with self._pending_sent_attachment_copy_semaphore:
+                for path in paths:
+                    source = Path(path)
+                    if not source.is_file():
+                        continue
+                    snapshot = snapshot_root / f"{uuid.uuid4().hex}{source.suffix[:32]}"
+                    try:
+                        await asyncio.to_thread(shutil.copyfile, source, snapshot)
+                        byte_count += snapshot.stat().st_size
+                        snapshots.append(str(snapshot))
+                    except (OSError, RuntimeError):
+                        snapshot.unlink(missing_ok=True)
+                        logger.debug("Signal: could not snapshot sent attachment %s", source)
+            if entry["expired"]:
+                self._discard_sent_attachment_snapshots(snapshots)
+                return
+            if snapshots:
+                previous = self._sent_attachment_paths.pop(key, None)
+                if previous is not None:
+                    _, previous_paths, previous_bytes = previous
+                    self._sent_attachment_snapshot_bytes = max(0, self._sent_attachment_snapshot_bytes - previous_bytes)
+                    self._discard_sent_attachment_snapshots(previous_paths)
+                self._sent_attachment_paths[key] = (entry["chat_id"], snapshots, byte_count)
+                self._sent_attachment_snapshot_bytes += byte_count
+                while (len(self._sent_attachment_paths) > self._max_sent_attachment_entries
+                       or self._sent_attachment_snapshot_bytes > self._max_sent_attachment_snapshot_bytes):
+                    self._drop_oldest_sent_attachment_entry()
+            if not entry["future"].done():
+                entry["future"].set_result(snapshots)
+        except asyncio.CancelledError:
+            self._discard_sent_attachment_snapshots(snapshots)
+            raise
+        finally:
+            current = self._pending_sent_attachment_snapshots.get(key)
+            if current is entry:
+                self._pending_sent_attachment_snapshots.pop(key, None)
+                entry["expiry"].cancel()
+                if not entry["future"].done():
+                    entry["future"].set_result([])
 
     @staticmethod
     def _describe_quoted_attachments(quote_data: Any) -> Optional[str]:
@@ -1099,14 +1147,31 @@ class SignalAdapter(BasePlatformAdapter):
         return f"{len(descriptions)} attachments: " + "; ".join(descriptions)
 
     def _resolve_quoted_media_paths(self, quote_id: Optional[str], chat_id: str) -> List[str]:
-        """Return local paths for quoted media sent to this Signal conversation."""
+        """Return ready quoted local media without delaying a non-async caller."""
         if not quote_id or not chat_id:
             return []
         cached = self._sent_attachment_paths.get(str(quote_id))
         if not cached:
             return []
         cached_chat_id, paths, _ = cached
-        if cached_chat_id != chat_id:
+        return [p for p in paths if cached_chat_id == chat_id and p and Path(p).exists()]
+
+    async def _await_quoted_media_paths(self, quote_id: Optional[str], chat_id: str) -> List[str]:
+        """Wait briefly for a matching pending copy without blocking the event loop."""
+        ready = self._resolve_quoted_media_paths(quote_id, chat_id)
+        if ready or not quote_id or not chat_id:
+            return ready
+        key = str(quote_id)
+        entry = self._pending_sent_attachment_snapshots.get(key)
+        if entry is None or entry["chat_id"] != chat_id:
+            return []
+        try:
+            paths = await asyncio.wait_for(
+                asyncio.shield(entry["future"]), SIGNAL_QUOTE_SNAPSHOT_WAIT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Signal: quoted attachment snapshot resolution timed out")
+            self._expire_pending_sent_attachment_snapshot(key)
             return []
         return [p for p in paths if p and Path(p).exists()]
 

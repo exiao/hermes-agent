@@ -599,7 +599,7 @@ class TestSignalSendImageFile:
         # Timestamp must be tracked for echo-back prevention
         assert 1234567890 in adapter._recent_sent_timestamps
         # Local-file media must be immutable if the user quotes it later.
-        quoted_paths = adapter._resolve_quoted_media_paths("1234567890", "+155****4567")
+        quoted_paths = await adapter._await_quoted_media_paths("1234567890", "+155****4567")
         assert len(quoted_paths) == 1
         assert quoted_paths[0] != str(img_path)
         assert Path(quoted_paths[0]).read_bytes() == original_bytes
@@ -3020,7 +3020,7 @@ class TestQuotedAttachments:
 
         await adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(real_file)])
 
-        quoted_paths = adapter._resolve_quoted_media_paths("1753650000000", "+15559998888")
+        quoted_paths = await adapter._await_quoted_media_paths("1753650000000", "+15559998888")
         assert len(quoted_paths) == 1
         assert Path(quoted_paths[0]).read_bytes() == real_file.read_bytes()
 
@@ -3034,7 +3034,7 @@ class TestQuotedAttachments:
         await adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(caller_path)])
         caller_path.write_bytes(b"replacement chart bytes")
 
-        resolved = adapter._resolve_quoted_media_paths("1753650000000", "+15559998888")
+        resolved = await adapter._await_quoted_media_paths("1753650000000", "+15559998888")
 
         assert len(resolved) == 1
         assert resolved[0] != str(caller_path)
@@ -3055,7 +3055,7 @@ class TestQuotedAttachments:
         await adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(gone)])
         gone.unlink()
 
-        quoted_paths = adapter._resolve_quoted_media_paths("1753650000000", "+15559998888")
+        quoted_paths = await adapter._await_quoted_media_paths("1753650000000", "+15559998888")
         assert len(quoted_paths) == 1
         assert Path(quoted_paths[0]).read_bytes() == b"x"
 
@@ -3099,7 +3099,7 @@ class TestQuotedAttachments:
         await adapter._remember_sent_attachments(123, "+15559998888", [str(source)])
 
         assert adapter._sent_attachment_snapshot_storage_disabled is True
-        assert adapter._resolve_quoted_media_paths("123", "+15559998888") == []
+        assert await adapter._await_quoted_media_paths("123", "+15559998888") == []
 
         await adapter._remember_sent_attachments(124, "+15559998888", [str(source)])
         assert signal_module.tempfile.TemporaryDirectory.call_count == 1
@@ -3175,12 +3175,11 @@ class TestQuotedAttachments:
         with pytest.raises(asyncio.CancelledError):
             await remember
 
-        assert list(Path(adapter._sent_attachment_snapshot_dir.name).iterdir()) == []
-
+        assert adapter._pending_sent_attachment_snapshots
         finish.set()
         await copied.wait()
         await asyncio.sleep(0)
-        assert list(Path(adapter._sent_attachment_snapshot_dir.name).iterdir()) == []
+        assert adapter._sent_attachment_paths["123"][1]
 
 
 @pytest.mark.asyncio
