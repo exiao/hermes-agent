@@ -1,9 +1,11 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
 import logging
+from unittest.mock import MagicMock
 
 import pytest
 
+import agent.redact as redact
 from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
 
 
@@ -589,6 +591,17 @@ class TestWebUrlsNotRedacted:
 
 
 class TestStrictUrlCredentialRedaction:
+    def test_skips_userinfo_scan_without_url_delimiters(self, monkeypatch):
+        """A non-URL compaction block cannot contain URL userinfo."""
+        userinfo_re = MagicMock()
+        userinfo_re.sub.side_effect = AssertionError("userinfo regex should not run")
+        monkeypatch.setattr(redact, "_STRICT_URL_USERINFO_RE", userinfo_re)
+
+        assert redact_sensitive_text(
+            "p" * 10,
+            redact_url_credentials=True,
+        ) == "p" * 10
+
     @pytest.mark.parametrize(
         ("text", "secret", "expected"),
         [

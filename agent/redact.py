@@ -539,7 +539,11 @@ def _redact_strict_url_credentials(text: str) -> str:
         return f"{match.group(1)}***@"
 
     text = _STRICT_URL_PARAM_RE.sub(_redact_param, text)
-    return _STRICT_URL_USERINFO_RE.sub(_redact_userinfo, text)
+    # URL userinfo requires both delimiters; skipping the regex otherwise
+    # avoids its superlinear scan on large non-URL compaction text.
+    if "//" in text and "@" in text:
+        text = _STRICT_URL_USERINFO_RE.sub(_redact_userinfo, text)
+    return text
 
 
 def redact_cdp_url(value: object) -> str:
