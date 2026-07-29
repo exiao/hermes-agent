@@ -50,7 +50,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 
 
-def is_excluded_skill_path(path) -> bool:
+def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     """True if *path* should be skipped by active skill scanners.
 
     Use this on every ``SKILL.md`` path produced by direct ``rglob`` scans to
@@ -66,11 +66,11 @@ def is_excluded_skill_path(path) -> bool:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
     return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
-        path
+        path, root=root
     )
 
 
-def is_skill_support_path(path) -> bool:
+def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
     """True if *path* is under a support dir of an actual skill root.
 
     ``references/``, ``templates/``, ``assets/``, and ``scripts/`` are
@@ -92,6 +92,8 @@ def is_skill_support_path(path) -> bool:
         if part not in SKILL_SUPPORT_DIRS or idx == 0:
             continue
         skill_root = Path(*parts[:idx])
+        if root is not None and not path_obj.is_absolute():
+            skill_root = root / skill_root
         if (skill_root / "SKILL.md").exists():
             return True
     return False
@@ -800,13 +802,31 @@ def resolve_skill_config_values(
 
 # ── Description extraction ────────────────────────────────────────────────
 
+SKILL_PROMPT_DESC_LIMIT = 60
+
+
+def _normalize_skill_description(frontmatter: Dict[str, Any]) -> str:
+    """Normalize a skill's description field for comparison/truncation."""
+    raw_desc = frontmatter.get("description", "")
+    return str(raw_desc).strip().strip("'\"") if raw_desc else ""
+
 
 def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
-    """Extract full description from parsed frontmatter."""
-    raw_desc = frontmatter.get("description", "")
-    if not raw_desc:
-        return ""
-    return str(raw_desc).strip().strip("'\"")
+    """Extract the full description from parsed frontmatter.
+
+    Fork patch (two-tier skill loading, #83): NOT truncated to
+    ``SKILL_PROMPT_DESC_LIMIT`` — preloaded skills show their full description
+    in the system prompt. The limit constant and
+    ``is_skill_description_truncated_for_prompt`` remain upstream's authoring
+    guard (skill_manager warns/rejects on over-limit descriptions).
+    """
+    return _normalize_skill_description(frontmatter)
+
+
+def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bool:
+    """True when the description will be truncated in the system prompt skill index."""
+    desc = _normalize_skill_description(frontmatter)
+    return len(desc) > SKILL_PROMPT_DESC_LIMIT
 
 
 # ── File iteration ────────────────────────────────────────────────────────

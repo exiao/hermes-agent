@@ -841,6 +841,9 @@ def resolve_display_context_length(
     model_info: Optional[ModelInfo] = None,
     custom_providers: list | None = None,
     config_context_length: int | None = None,
+    configured_model: str | None = None,
+    configured_provider: str | None = None,
+    configured_base_url: str | None = None,
 ) -> Optional[int]:
     """Resolve the context length to show in /model output.
 
@@ -859,6 +862,24 @@ def resolve_display_context_length(
     Prefer the provider-aware value; fall back to ``model_info.context_window``
     only if the resolver returns nothing.
     """
+    if config_context_length is not None and (
+        configured_model or configured_provider or configured_base_url
+    ):
+        try:
+            from hermes_cli.route_identity import should_clear_context_pin
+
+            if should_clear_context_pin(
+                configured_model,
+                model,
+                configured_base_url,
+                base_url,
+                configured_provider,
+                provider,
+            ):
+                config_context_length = None
+        except Exception:
+            config_context_length = None
+
     try:
         from agent.model_metadata import get_model_context_length
         ctx = get_model_context_length(
@@ -945,6 +966,38 @@ def _configured_provider_matches(
                     break
 
     return matches
+
+
+def _resolve_named_custom_model_id(
+    model_name: str,
+    target_provider: str,
+    custom_providers: Optional[list],
+) -> str:
+    """Map a picker-prefixed custom model selection to its configured ID."""
+    provider = str(target_provider or "").strip().lower()
+    if not provider.startswith("custom:") or "/" not in model_name:
+        return model_name
+
+    prefix, candidate = model_name.split("/", 1)
+    prefix = prefix.strip().lower()
+    candidate = candidate.strip()
+    if not prefix or not candidate:
+        return model_name
+
+    for entry in custom_providers or []:
+        if not isinstance(entry, dict):
+            continue
+        entry_slugs = {
+            custom_provider_slug(str(entry.get(key) or "")).lower()
+            for key in ("name", "provider_key")
+            if str(entry.get(key) or "").strip()
+        }
+        if provider not in entry_slugs or f"custom:{prefix}" not in entry_slugs:
+            continue
+        for model_id in _declared_model_ids(entry.get("models")):
+            if model_id.lower() == candidate.lower():
+                return model_id
+    return model_name
 
 
 # ---------------------------------------------------------------------------
@@ -1457,6 +1510,9 @@ def switch_model(
         api_mode = determine_api_mode(target_provider, base_url)
 
     # --- Normalize model name for target provider ---
+    new_model = _resolve_named_custom_model_id(
+        new_model, target_provider, custom_providers
+    )
     new_model = normalize_model_for_provider(new_model, target_provider)
 
     # --- Validate ---
@@ -1535,9 +1591,21 @@ def switch_model(
     if target_provider in {"opencode-zen", "opencode-go", "opencode"}:
         api_mode = opencode_model_api_mode(target_provider, new_model)
 
+    # --- Nous Portal dual-wire override ---
+    # Portal serves anthropic/* on /v1/messages and everything else on
+    # /chat/completions. resolve_runtime_provider already sets this when it
+    # succeeds; always re-derive from the *final* (post-normalize) model so
+    # alias clears / empty fallbacks cannot leave Claude on the OpenAI wire.
+    if target_provider in {"nous", "nous-portal", "nousresearch"}:
+        from hermes_cli.providers import nous_api_mode
+
+        api_mode = nous_api_mode(new_model)
+
     # --- Determine api_mode if not already set ---
     if not api_mode:
-        api_mode = determine_api_mode(target_provider, base_url)
+        api_mode = determine_api_mode(
+            target_provider, base_url, model=new_model
+        )
 
     # OpenCode base URLs end with /v1 for OpenAI-compatible models, but the
     # Anthropic SDK prepends its own /v1/messages to the base_url.  Normalize
@@ -1794,7 +1862,6 @@ def list_authenticated_providers(
 
     results: List[dict] = []
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
-    seen_mdev_ids: set = set()  # prevent duplicate entries for aliases (e.g. kimi-coding + kimi-coding-cn)
     _current_provider_norm = str(current_provider or "").strip().lower()
     _current_base_url_norm = str(current_base_url or "").strip().rstrip("/").lower()
 
@@ -1934,6 +2001,7 @@ def list_authenticated_providers(
 
     # --- 1. Check Hermes-mapped providers ---
     from hermes_cli.models import _AGGREGATOR_PROVIDERS as _AGG_PROVIDERS
+    from hermes_cli.models import _PROVIDER_ALIASES as _CANON_ALIASES
     from hermes_cli.providers import ALIASES as _PROVIDER_ALIAS_TABLE
     for hermes_id, mdev_id in PROVIDER_TO_MODELS_DEV.items():
         # Skip vendor names that are merely aliases routing through an
@@ -1951,10 +2019,30 @@ def list_authenticated_providers(
             and _alias_target in _AGG_PROVIDERS
         ):
             continue
-        # Skip aliases that map to the same models.dev provider (e.g.
-        # kimi-coding and kimi-coding-cn both → kimi-for-coding).
-        # The first one with valid credentials wins (#10526).
-        if mdev_id in seen_mdev_ids:
+        # Resolve the canonical provider profile name.  Skip hermes_ids
+        # that are mere aliases resolving to a different canonical profile
+        # (e.g. "kimi" and "moonshot" both → "kimi-coding").  Only process
+        # entries whose hermes_id matches the canonical profile name so
+        # distinct profiles (e.g. kimi-coding, kimi-coding-cn) each get
+        # their own picker row.
+        _canonical = hermes_id
+        try:
+            from providers import get_provider_profile as _gpp
+            _prof = _gpp(hermes_id)
+            if _prof is not None:
+                _canonical = _prof.name
+        except Exception:
+            pass
+        if _canonical != hermes_id:
+            continue
+
+        # Skip duplicates: another entry with the same slug was already
+        # emitted (e.g. two PROVIDER_TO_MODELS_DEV entries routing to the
+        # same hermes_id).  Distinct canonical profiles that share a
+        # models.dev ID (e.g. kimi-coding and kimi-coding-cn → kimi-for-coding)
+        # are both allowed through since they have different slugs.
+        slug = hermes_id
+        if slug.lower() in seen_slugs:
             continue
         if hermes_id.lower() in _excluded or mdev_id.lower() in _excluded:
             continue
@@ -2025,21 +2113,23 @@ def list_authenticated_providers(
         else:
             top = model_ids[:max_models] if max_models is not None else model_ids
 
-        slug = hermes_id
         pinfo = _mdev_pinfo(mdev_id)
-        display_name = pinfo.name if pinfo else mdev_id
+        display_name = pconfig.name if pconfig and pconfig.name else (pinfo.name if pinfo else mdev_id)
 
         results.append({
             "slug": slug,
             "name": display_name,
-            "is_current": slug == current_provider or mdev_id == current_provider,
+            "is_current": (
+                slug == current_provider
+                or hermes_id == current_provider
+                or mdev_id == current_provider
+            ),
             "is_user_defined": False,
             "models": top,
             "total_models": total,
             "source": "built-in",
         })
         seen_slugs.add(slug.lower())
-        seen_mdev_ids.add(mdev_id)
         _record_builtin_endpoint(slug)
 
     # --- 2. Check Hermes-only providers (nous, openai-codex, copilot, opencode-go) ---
@@ -2066,6 +2156,16 @@ def list_authenticated_providers(
         has_creds = False
         if overlay.auth_type == "aws_sdk":
             has_creds = _has_aws_sdk_creds_for_listing(hermes_slug)
+        elif overlay.auth_type == "vertex":
+            # Vertex authenticates via OAuth2 (service-account JSON / ADC),
+            # not an API key — mirror the aws_sdk gate above, otherwise the
+            # provider is silently hidden from the /model picker even when
+            # fully configured.
+            try:
+                from agent.vertex_adapter import has_vertex_credentials
+                has_creds = has_vertex_credentials()
+            except Exception as exc:
+                logger.debug("Vertex credential check failed: %s", exc)
         elif overlay.extra_env_vars:
             has_creds = any(_get_secret(ev) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
@@ -2377,7 +2477,8 @@ def list_authenticated_providers(
             entry_models: list = []
             if default_model:
                 entry_models.append(default_model)
-            for model_id in _declared_model_ids(ep_cfg.get("models", [])):
+            entry_declared_models = _declared_model_ids(ep_cfg.get("models", []))
+            for model_id in entry_declared_models:
                 if model_id not in entry_models:
                     entry_models.append(model_id)
 
@@ -2411,6 +2512,7 @@ def list_authenticated_providers(
                     "name": grp_display or display_name,
                     "api_url": api_url,
                     "models": [],
+                    "has_explicit_models": False,
                     "ep_cfg": ep_cfg,  # used below for discover_models / api_key
                     "raw_names": [],
                 }
@@ -2418,6 +2520,13 @@ def list_authenticated_providers(
             for _m in entry_models:
                 if _m and _m not in ep_groups[group_key]["models"]:
                     ep_groups[group_key]["models"].append(_m)
+            # Track explicit ``models:`` declarations separately from the
+            # merged list: a singular ``default_model``/``model`` is only the
+            # active selection and must not be mistaken for the user narrowing
+            # the endpoint to a curated subset (mirrors section 4's
+            # declaration-tracking; see #40542 / PR #61928).
+            if entry_declared_models:
+                ep_groups[group_key]["has_explicit_models"] = True
             ep_groups[group_key]["raw_names"].append(display_name)
 
         for grp in ep_groups.values():
@@ -2440,8 +2549,11 @@ def list_authenticated_providers(
             # unless the provider explicitly opts out via discover_models: false.
             # Policy mirrors Section 4's should_probe logic:
             # - With an api_key: always probe (user opted into the endpoint).
-            # - Without an api_key but with explicit models: skip — the user
-            #   is narrowing a public endpoint to a specific subset.
+            # - Without an api_key but with an explicit ``models:`` list:
+            #   skip — the user is narrowing a public endpoint to a specific
+            #   subset. A singular ``default_model``/``model`` does NOT count
+            #   as narrowing (it's just the active selection) and must not
+            #   suppress discovery — mirrors section 4 / #40542.
             # - Without an api_key AND no explicit models: probe anyway so
             #   bare-endpoint providers (local llama.cpp / Ollama servers)
             #   still show their full model catalog.
@@ -2452,7 +2564,7 @@ def list_authenticated_providers(
             discover = ep_cfg.get("discover_models", True)
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
-            has_explicit_models = bool(models_list)
+            has_explicit_models = bool(grp.get("has_explicit_models"))
             _ep_url_norm = str(api_url).strip().rstrip("/").lower()
             _ep_slug_norm = str(ep_name).strip().lower()
             _ep_custom_slug_norm = custom_provider_slug(display_name).lower()
