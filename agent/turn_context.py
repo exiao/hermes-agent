@@ -504,7 +504,7 @@ def build_turn_context(
                             if not _get_ineffective(_sess_id):
                                 _set_ineffective(_sess_id, _ineffective_before_sync)
                         except Exception:
-                            pass
+                            _compressor._ineffective_count_persist_failed = True
                 if _cooldown_snapshot:
                     _sess_db = getattr(_compressor, "_session_db", None)
                     _sess_id = getattr(_compressor, "_session_id", "")
