@@ -6233,10 +6233,10 @@ def complete_task(
     with write_txn(conn):
         if expected_run_id is not None:
             task = conn.execute(
-                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+                "SELECT status, result FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
             run = conn.execute(
-                "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ? "
+                "SELECT summary, metadata FROM task_runs WHERE id = ? AND task_id = ? "
                 "AND outcome = 'completed' AND id = ("
                 "SELECT MAX(id) FROM task_runs WHERE task_id = ? "
                 "AND outcome = 'completed')",
@@ -6251,13 +6251,23 @@ def complete_task(
             ):
                 prior_metadata = json.loads(run["metadata"]) if run["metadata"] else {}
                 if not (prior_metadata.get("commit_sha") or prior_metadata.get("pr_url")):
+                    corrected_summary = (
+                        summary if summary is not None
+                        else result if result is not None
+                        else run["summary"]
+                    )
+                    corrected_result = (
+                        result if result is not None
+                        else None if summary is not None
+                        else task["result"]
+                    )
                     conn.execute(
                         "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
-                        (summary or result, json.dumps(metadata) if metadata else None, expected_run_id),
+                        (corrected_summary, json.dumps(metadata) if metadata else None, expected_run_id),
                     )
                     conn.execute(
                         "UPDATE tasks SET result = ? WHERE id = ?",
-                        (result, task_id),
+                        (corrected_result, task_id),
                     )
                     return True
         if expected_run_id is None:

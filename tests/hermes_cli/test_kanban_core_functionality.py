@@ -1605,6 +1605,32 @@ def test_owner_retry_clears_legacy_result_for_summary_handoff(kanban_home):
         conn.close()
 
 
+def test_owner_retry_preserves_text_for_metadata_only_handoff(kanban_home):
+    """Proof metadata must not erase a bare completion's visible handoff."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="metadata handoff", assignee="worker")
+        kb.claim_task(conn, tid)
+        owner = kb.latest_run(conn, tid)
+        assert owner is not None
+
+        assert kb.complete_task(conn, tid, result="review-only completion")
+        assert kb.complete_task(
+            conn,
+            tid,
+            metadata={"commit_sha": "abc123"},
+            expected_run_id=owner.id,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.result == "review-only completion"
+        run = kb.latest_run(conn, tid)
+        assert run is not None and run.summary == "review-only completion"
+        assert run.metadata == {"commit_sha": "abc123"}
+    finally:
+        conn.close()
+
+
 def test_superseded_completed_run_cannot_correct_newer_completion(kanban_home):
     """Only the latest completed run can replace a bare completion handoff."""
     conn = kb.connect()
