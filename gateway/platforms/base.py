@@ -4220,13 +4220,10 @@ class BasePlatformAdapter(ABC):
         def _inside_fence(start: int, end: int) -> bool:
             return any(fs <= start and end <= fe for fs, fe in fence_ranges)
 
-        # Fenced code blocks: ```...``` (scanned first; they own their range).
+        # Fenced code blocks are documentation, never delivery directives.
         for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
             fence_ranges.append((m.start(), m.end()))
-            if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
-                delivered.append((m.start(), m.end()))
-            else:
-                masked.append((m.start(), m.end()))
+            masked.append((m.start(), m.end()))
 
         # Inline code: `...` but NOT backtick-quoted paths in MEDIA: tags, and
         # NOT spans nested inside a fenced block already classified above.
