@@ -186,15 +186,23 @@ context, budget, credential pool, etc.). The subset you'll usually touch (full l
 ```python
 class AIAgent:
     def __init__(self,
-        base_url=None, api_key=None, provider=None,
-        api_mode=None, # "chat_completions" | "codex_responses" | ...
-        model="", # empty → resolved from config/provider later
-        max_iterations=90, # tool-calling iterations (shared with subagents)
-        enabled_toolsets=None, disabled_toolsets=None,
-        quiet_mode=False, save_trajectories=False, platform=None, # "cli", "telegram", ...
-        session_id=None, skip_context_files=False, skip_memory=False, credential_pool=None,
- # ... plus callbacks, thread/user/chat IDs, iteration_budget, fallback_model,
- # checkpoints, prefill_messages, service_tier, reasoning_config, etc.
+        base_url: str = None,
+        api_key: str = None,
+        provider: str = None,
+        api_mode: str = None,              # "chat_completions" | "codex_responses" | ...
+        model: str = "",                   # empty → resolved from config/provider later
+        max_iterations: int = 500,         # tool-calling iterations (shared with subagents)
+        enabled_toolsets: list = None,
+        disabled_toolsets: list = None,
+        quiet_mode: bool = False,
+        save_trajectories: bool = False,
+        platform: str = None,              # "cli", "telegram", etc.
+        session_id: str = None,
+        skip_context_files: bool = False,
+        skip_memory: bool = False,
+        credential_pool=None,
+        # ... plus callbacks, thread/user/chat IDs, iteration_budget, fallback_model,
+        # checkpoints config, prefill_messages, service_tier, reasoning_config, etc.
     ): ...
 
     def chat(self, message) -> str: ... # final response string
@@ -667,9 +675,21 @@ Knobs (`delegation:` in `config.yaml`): `max_concurrent_children`, `max_spawn_de
 `child_timeout_seconds`, `orchestrator_enabled`, `subagent_auto_approve`,
 `inherit_mcp_toolsets`, `max_iterations`.
 
-Durability: background `delegate_task` is detached from the turn but still
-process-local. For work that must survive process restart, use `cronjob` or
-`terminal(background=True, notify_on_complete=True)`.
+- `role="leaf"` (default) — focused worker. Cannot call `delegate_task`,
+  `clarify`, `memory`, `send_message`, `cronjob`. Retains `execute_code`
+  (programmatic tool calling).
+- `role="orchestrator"` — retains `delegate_task` so it can spawn its
+  own workers. Gated by `delegation.orchestrator_enabled` (default true)
+  and bounded by `delegation.max_spawn_depth` (default 2).
+
+Key config knobs (under `delegation:` in `config.yaml`):
+`max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
+`orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
+`max_iterations`.
+
+Durability rule: background `delegate_task` is detached from the current
+turn but still process-local. For work that must survive process restart, use
+`cronjob` or `terminal(background=True, notify_on_complete=True)` instead.
 
 ---
 

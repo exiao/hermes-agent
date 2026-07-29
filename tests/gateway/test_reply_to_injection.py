@@ -241,6 +241,35 @@ async def test_no_text_reply_includes_local_path_when_we_have_the_file():
 
 
 @pytest.mark.asyncio
+async def test_no_text_reply_translates_local_path_for_active_backend(monkeypatch):
+    """Quoted media paths use the backend-visible cache mount, like inbound media."""
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="this one",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=None,
+        reply_to_media_summary="an image (image/png, sheet.png)",
+        reply_to_media_paths=["/host/.hermes/cache/sheet.png"],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.to_agent_visible_cache_path",
+        lambda path: path.replace("/host/.hermes", "/root/.hermes"),
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result is not None
+    assert "local copy: /root/.hermes/cache/sheet.png" in result
+    assert "/host/.hermes/cache/sheet.png" not in result
+
+
+@pytest.mark.asyncio
 async def test_no_text_reply_falls_back_when_media_unknown():
     """Platforms that expose no quoted-media metadata keep the old pointer."""
     runner = _make_runner()

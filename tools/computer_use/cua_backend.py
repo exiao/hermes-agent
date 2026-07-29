@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import functools
 import json
 import logging
 import os
@@ -137,7 +138,8 @@ def _action_result_from(
 # only have *looked* like it pinned. For a reproducible version, point
 # `HERMES_CUA_DRIVER_CMD` at a specific binary instead.
 
-_CUA_DRIVER_CMD = os.environ.get("HERMES_CUA_DRIVER_CMD", "cua-driver")
+_CUA_DRIVER_CMD_ENV = "HERMES_CUA_DRIVER_CMD"
+_CUA_DRIVER_DEFAULT_CMD = "cua-driver"
 _CUA_DRIVER_ARGS = ["mcp"]  # stdio MCP transport (fallback when the
                             # driver doesn't expose `manifest` — see
                             # `_resolve_mcp_invocation` below)
@@ -164,6 +166,17 @@ _DESKTOP_WINDOW_NAMES = (
     "finder", "desktop", "dock",              # macOS desktop / shell
 )
 
+# Linux/X11 can surface GNOME Shell / desktop backdrop windows before real app
+# windows and cua-driver 0.6.x currently does not assign a useful z-order for
+# them. These windows are targetable X11 windows but do not produce screenshots
+# through get_window_state, so default app capture must skip them.
+_NON_APP_WINDOW_TITLE_PREFIXES = (
+    "@!",          # GNOME Shell background/monitor helper windows
+    "Desktop",
+    "gnome-shell",
+    "GNOME Shell",
+)
+
 
 # Env var cua-driver reads to gate its anonymous usage telemetry (PostHog).
 # Setting it to "0" disables telemetry; absence => the binary's own default
@@ -171,23 +184,67 @@ _DESKTOP_WINDOW_NAMES = (
 _CUA_TELEMETRY_ENV_VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
 
 
-def _cua_telemetry_disabled() -> bool:
-    """True when Hermes should disable cua-driver telemetry for this user.
-
-    Reads ``computer_use.cua_telemetry`` from config.yaml. Default is False
-    (telemetry off). Any failure to read config fails SAFE — toward the
-    privacy-preserving default of telemetry disabled.
-    """
+def _computer_use_cfg() -> Dict[str, Any]:
+    """The ``computer_use`` config block, or ``{}`` when config is unreadable."""
     try:
         from hermes_cli.config import load_config
 
-        cfg = load_config() or {}
-        cu = cfg.get("computer_use") or {}
-        # opt-in flag: True => user wants telemetry => do NOT disable.
-        return not bool(cu.get("cua_telemetry", False))
+        return (load_config() or {}).get("computer_use") or {}
     except Exception:
-        # Config unreadable — default to disabling telemetry (fail safe).
+        return {}
+
+
+def _cua_no_overlay() -> bool:
+    """True when Hermes should pass ``--no-overlay`` to cua-driver.
+
+    Reads ``computer_use.no_overlay``. Default ``None`` (auto-detect):
+    disable the overlay where idle CPU burn is a known failure mode —
+    macOS (cursor-overlay vImage redraw loop, #28152/#47032), headless
+    Linux / WSL2 / containers — and keep it on Windows / desktop Linux
+    with a display. Explicit ``True`` / ``False`` overrides auto-detection.
+    """
+    val = _computer_use_cfg().get("no_overlay")
+    if val is not None:
+        return bool(val)
+    # Auto-detect: macOS overlay can peg a core indefinitely after a
+    # computer_use session (#47032). Prefer off until the driver teardown
+    # is solid; set computer_use.no_overlay: false to keep the cursor.
+    if sys.platform == "darwin":
         return True
+    if sys.platform != "linux":
+        return False
+    if not os.environ.get("DISPLAY"):
+        return True
+    try:
+        with open("/proc/version", encoding="utf-8") as f:
+            if "microsoft" in f.read().lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _cua_telemetry_disabled() -> bool:
+    """True when Hermes should disable cua-driver telemetry for this user.
+
+    Reads ``computer_use.cua_telemetry`` (default False → telemetry off).
+    Unreadable config falls SAFE toward disabling telemetry.
+    """
+    # opt-in flag: True => user wants telemetry => do NOT disable.
+    return not bool(_computer_use_cfg().get("cua_telemetry", False))
+
+
+def _computer_use_max_image_dimension() -> Optional[int]:
+    """Longest-edge cap for cua-driver screenshots, or None to leave unset.
+
+    Reads ``computer_use.max_image_dimension`` (default 1456, matching the
+    aux-vision downscale). ``0`` / negative / non-numeric → None.
+    """
+    try:
+        dim = int(_computer_use_cfg().get("max_image_dimension", 1456))
+    except (TypeError, ValueError):
+        return 1456
+    return dim if dim > 0 else None
 
 
 def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -203,6 +260,94 @@ def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str,
     if _cua_telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
     return env
+
+
+def _z_index_uninformative(windows: List[Dict[str, Any]]) -> bool:
+    """True when every window shares the same z_index (common on Linux/X11)."""
+    if not windows:
+        return True
+    return len({w.get("z_index", 0) for w in windows}) <= 1
+
+
+def _parse_xprop_net_active_window(stdout: str) -> Optional[int]:
+    """Parse ``xprop -root _NET_ACTIVE_WINDOW`` stdout into a window id.
+
+    Accepts the common ``window id # 0x...`` form and falls back to the first
+    hex token. Returns None for empty/unparseable output.
+    """
+    text = stdout or ""
+    match = re.search(r"window id # (0x[0-9a-fA-F]+)", text)
+    if not match:
+        match = re.search(r"(0x[0-9a-fA-F]+)", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1), 16)
+    except ValueError:
+        return None
+
+
+def _linux_x11_active_window_id() -> Optional[int]:
+    """Best-effort read of ``_NET_ACTIVE_WINDOW`` via xprop. Never raises."""
+    if sys.platform != "linux" or not os.environ.get("DISPLAY"):
+        return None
+    try:
+        proc = subprocess.run(
+            ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return _parse_xprop_net_active_window(proc.stdout or "")
+
+
+def _is_real_app_window(w: Dict[str, Any]) -> bool:
+    """Return False for desktop/shell helper windows that capture as empty."""
+    title = w.get("title", "")
+    return not any(
+        title.startswith(p) or title.lower().startswith(p.lower())
+        for p in _NON_APP_WINDOW_TITLE_PREFIXES
+    )
+
+
+def _select_capture_target(
+    windows: List[Dict[str, Any]],
+    *,
+    app_requested: bool,
+    exact_target: bool = False,
+) -> Dict[str, Any]:
+    """Select the best window for capture from normalized list_windows output.
+
+    Callers pass windows already sorted by ``z_index`` descending (higher =
+    frontmost). When ordering is informative, keep that frontmost contract.
+    For unqualified default captures (no app filter and no exact
+    pid/window_id) on Linux, desktop/shell helper windows (GNOME ``ding``
+    "Desktop Icons", ``@!x,y;BDHF`` backdrop helpers) are skipped first —
+    they are targetable X11 windows but capture as empty. Then, when every
+    remaining candidate shares the same ``z_index`` (tied or unknown, the
+    common Linux/X11 case), prefer ``_NET_ACTIVE_WINDOW`` over list order
+    (#58026). Exact-target captures must not pay for an ``xprop`` probe.
+    """
+    candidates = [w for w in windows if not w["off_screen"]]
+    pool = candidates
+    if not exact_target and not app_requested and sys.platform == "linux":
+        real_apps = [w for w in candidates if _is_real_app_window(w)]
+        if real_apps:
+            pool = real_apps
+        if pool and _z_index_uninformative(pool):
+            active_id = _linux_x11_active_window_id()
+            if active_id is not None:
+                for w in pool:
+                    if w.get("window_id") == active_id:
+                        return w
+    if pool:
+        return pool[0]
+    return windows[0]
 
 
 def _resolve_mcp_invocation(
@@ -222,12 +367,19 @@ def _resolve_mcp_invocation(
     Falls back to ``(driver_cmd, ["mcp"])`` for older drivers that don't
     expose ``manifest``, or any indeterminate failure — the wrapper must
     not refuse to start just because the discovery hop failed.
+
+    When ``computer_use.no_overlay`` is enabled (or auto-detected on
+    Linux), ``--no-overlay`` is appended to suppress the cursor overlay
+    rendering loop that can consume CPU indefinitely when idle
+    (#28152, #47032).  Older drivers that don't recognise the flag will
+    reject it; callers should fall back to the no-overlay invocation on
+    spawn failure.
     """
     try:
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [driver_cmd, "manifest"],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             stdin=subprocess.DEVNULL,
             # cua-driver is a third-party binary — never hand it provider
             # API keys via inherited env (same policy as the MCP and CLI
@@ -235,28 +387,72 @@ def _resolve_mcp_invocation(
             env=_sanitize_subprocess_env(cua_driver_child_env()),
         )
     except Exception:
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     out = (proc.stdout or "").strip()
     if proc.returncode != 0 or not out:
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     try:
         manifest = json.loads(out)
     except (ValueError, TypeError):
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     if not isinstance(manifest, dict):
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     invocation = manifest.get("mcp_invocation")
     if not isinstance(invocation, dict):
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     args = invocation.get("args")
     command = invocation.get("command")
     if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     if not isinstance(command, str) or not command:
         # The driver knows the subcommand but didn't surface its own path.
         # Keep our resolved driver_cmd; the args are still authoritative.
-        return driver_cmd, args
-    return command, args
+        return driver_cmd, _mcp_args_with_overlay_flag(args, driver_cmd=driver_cmd)
+    if not _has_path_separator(command):
+        # A manifest may legitimately retain the generic ``cua-driver`` name.
+        # Under a GUI's thin PATH that would lose the resolved user-local path
+        # and fail at MCP spawn, so preserve the concrete command we verified.
+        return driver_cmd, _mcp_args_with_overlay_flag(args, driver_cmd=driver_cmd)
+    # Manifest surfaced a relocated executable — probe THAT binary for
+    # `--no-overlay` support rather than the system-resolved one, so a
+    # wrapper/relocation with a different feature set doesn't crash on
+    # an unknown flag (or silently keep an unwanted overlay).
+    return command, _mcp_args_with_overlay_flag(args, driver_cmd=command)
+
+
+def _mcp_args_with_overlay_flag(
+    args: List[str],
+    driver_cmd: str = _CUA_DRIVER_DEFAULT_CMD,
+) -> List[str]:
+    """Return *args* with ``--no-overlay`` appended when configured and supported."""
+    if _cua_no_overlay() and _cua_driver_supports_no_overlay(driver_cmd):
+        return [*args, "--no-overlay"]
+    return list(args)
+
+
+@functools.lru_cache(maxsize=1)
+def _cua_driver_supports_no_overlay(driver_cmd: str) -> bool:
+    """True if the installed cua-driver recognises ``--no-overlay``.
+
+    Probes ``<driver> --help`` once and caches the result.  Older
+    drivers (< 0.6.x) reject unknown flags, so passing ``--no-overlay``
+    would crash the MCP spawn.
+    """
+    try:
+        # cua-driver is a third-party binary — never hand it provider
+        # API keys via inherited env (same policy as the manifest probe
+        # and MCP spawn; #53503/#55709/#58889 lineage).
+        from tools.environments.local import _sanitize_subprocess_env
+        proc = subprocess.run(
+            [driver_cmd, "--help"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3.0,
+            stdin=subprocess.DEVNULL,
+            env=_sanitize_subprocess_env(cua_driver_child_env()),
+        )
+        help_text = (proc.stdout or "") + (proc.stderr or "")
+        return "--no-overlay" in help_text
+    except Exception:
+        return False
 
 # Regex to parse element lines from get_window_state AX tree markdown.
 #
@@ -297,16 +493,81 @@ def _is_macos() -> bool:
     return sys.platform == "darwin"
 
 
+def _has_path_separator(value: str) -> bool:
+    return os.sep in value or (os.altsep is not None and os.altsep in value)
+
+
+def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
+    """Return candidate cua-driver commands in resolution order.
+
+    ``override`` is authoritative when supplied. Otherwise a non-empty
+    ``HERMES_CUA_DRIVER_CMD`` is authoritative; only when neither is set do we
+    use PATH and canonical install locations.
+
+    Desktop apps launched from Finder/Dock often inherit a narrow PATH that
+    omits user-local install directories. The upstream cua-driver installer
+    commonly places the binary under ``~/.local/bin`` on POSIX systems, so a
+    Hermes Desktop/TUI session can otherwise filter out the `computer_use`
+    tool even though `hermes computer-use doctor` succeeds from a login shell.
+    """
+    configured = (override if override is not None else os.environ.get(_CUA_DRIVER_CMD_ENV, "")).strip()
+    if configured:
+        # An explicit override is authoritative: if it is wrong, report the
+        # driver missing instead of silently picking a different binary.
+        return [configured]
+
+    candidates = [_CUA_DRIVER_DEFAULT_CMD]
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        candidates.extend([
+            os.path.join(home, ".local", "bin", "cua-driver.exe"),
+            os.path.join(home, ".local", "bin", "cua-driver"),
+        ])
+    else:
+        candidates.extend([
+            os.path.join(home, ".local", "bin", "cua-driver"),
+            os.path.join(home, ".cargo", "bin", "cua-driver"),
+            "/opt/homebrew/bin/cua-driver",
+            "/usr/local/bin/cua-driver",
+        ])
+    return candidates
+
+
+def resolve_cua_driver_cmd(override: Optional[str] = None) -> Optional[str]:
+    """Resolve the cua-driver executable for every runtime/status surface.
+
+    A supplied override (or ``HERMES_CUA_DRIVER_CMD``) is never silently
+    replaced by another binary. Otherwise resolve PATH first, then canonical
+    user-local installation locations used by the official installer.
+    """
+    for candidate in _candidate_cua_driver_commands(override):
+        expanded = os.path.expanduser(candidate)
+        if _has_path_separator(expanded):
+            if shutil.which(expanded):
+                return expanded
+        else:
+            resolved = shutil.which(expanded)
+            if resolved:
+                return resolved
+    return None
+
+
 def cua_driver_binary_available() -> bool:
-    """True if `cua-driver` is on $PATH or HERMES_CUA_DRIVER_CMD resolves."""
-    return bool(shutil.which(_CUA_DRIVER_CMD))
+    """True if `cua-driver` resolves via env, PATH, or known install paths."""
+    return resolve_cua_driver_cmd() is not None
 
 
-def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]:
+def cua_driver_update_check(*, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """Run ``cua-driver check-update --json`` and return its parsed state.
 
     The payload mirrors the ``check_for_update`` MCP tool:
     ``{current_version, latest_version, update_available, ...}``.
+
+    ``timeout`` defaults to 8s on POSIX and 25s on Windows — first-spawn of
+    the exe there routinely eats several seconds in Defender/SmartScreen
+    scanning, and a false timeout is expensive: callers treat ``None`` as
+    indeterminate, and the ``install_cua_driver(upgrade=True)`` path used to
+    fall through to a full multi-minute reinstall on it.
 
     Returns ``None`` (callers should stay quiet) when the result is
     indeterminate: the binary is missing, the driver is too old to support
@@ -314,11 +575,16 @@ def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]
     ``error`` field is set), or the output didn't parse. Best-effort; never
     raises.
     """
+    if timeout is None:
+        timeout = 25.0 if sys.platform == "win32" else 8.0
+    driver_cmd = resolve_cua_driver_cmd()
+    if not driver_cmd:
+        return None
     try:
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
-            [_CUA_DRIVER_CMD, "check-update", "--json"],
-            capture_output=True, text=True, timeout=timeout,
+            [driver_cmd, "check-update", "--json"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             # Some older drivers don't have the verb and fall through to a
             # stdin-reading mode rather than erroring — DEVNULL gives them EOF
             # so they exit fast instead of blocking until the timeout.
@@ -643,6 +909,10 @@ class _CuaDriverSession:
         self._shutdown_event: Optional[asyncio.Event] = None  # created on bridge loop
         self._lifecycle_future = None  # concurrent.futures.Future
         self._setup_error: Optional[BaseException] = None
+        # Stable driver-side identity declared through start_session.
+        # Used to revive a logical ended-session rejection without
+        # recursive call_tool re-entry or backend-owned state (#71166).
+        self._declared_session_id: Optional[str] = None
 
     def _require_started(self) -> None:
         if not self._started:
@@ -671,14 +941,15 @@ class _CuaDriverSession:
         self._startup_phase = "binary-check"
 
         try:
-            if not cua_driver_binary_available():
+            driver_cmd = resolve_cua_driver_cmd()
+            if not driver_cmd:
                 raise RuntimeError(cua_driver_install_hint())
 
             # Surface 8: ask cua-driver itself which subcommand spawns
             # the MCP server, instead of hardcoding ["mcp"]. Falls back
             # transparently for older drivers / any discovery failure.
             self._startup_phase = "manifest-discovery"
-            command, args = _resolve_mcp_invocation(_CUA_DRIVER_CMD)
+            command, args = _resolve_mcp_invocation(driver_cmd)
             _t_manifest = _time.monotonic()
             params = StdioServerParameters(
                 command=command,
@@ -903,6 +1174,67 @@ class _CuaDriverSession:
         return self._capability_version
 
     @staticmethod
+    def _logical_error_text(result: Dict[str, Any]) -> str:
+        """Flatten a logical MCP error into text for narrow classification."""
+        chunks: List[str] = []
+        for value in (result.get("data"), result.get("structuredContent")):
+            if isinstance(value, str):
+                chunks.append(value)
+            elif value is not None:
+                try:
+                    chunks.append(json.dumps(value, sort_keys=True))
+                except (TypeError, ValueError):
+                    chunks.append(str(value))
+        return "\n".join(chunks)
+
+    @classmethod
+    def _is_ended_session_result(cls, result: Any) -> bool:
+        """Recognise cua-driver's explicit recoverable ended-session result."""
+        if not isinstance(result, dict) or result.get("isError") is not True:
+            return False
+        message = cls._logical_error_text(result).lower()
+        return (
+            "session" in message
+            and ("has ended" in message or "session ended" in message)
+            and "start_session" in message
+        )
+
+    def _revive_declared_session_once(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        first_result: Dict[str, Any],
+        timeout: float,
+    ) -> Dict[str, Any]:
+        """Revive the stable session and replay one rejected tool call once."""
+        session_id = self._declared_session_id
+        if not session_id or name in self._LIFECYCLE_CALLS:
+            return first_result
+
+        logger.warning(
+            "cua-driver session %s ended during %s; reviving and retrying once",
+            session_id,
+            name,
+        )
+        revive_result = self._bridge.run(
+            self._call_tool_async("start_session", {"session": session_id}),
+            timeout=timeout,
+        )
+        if revive_result.get("isError") is True:
+            logger.warning(
+                "cua-driver session %s could not be revived: %s",
+                session_id,
+                self._logical_error_text(revive_result),
+            )
+            return first_result
+
+        # Return the second result as-is. A second rejection is surfaced; no loop.
+        return self._bridge.run(
+            self._call_tool_async(name, args),
+            timeout=timeout,
+        )
+
+    @staticmethod
     def _is_closed_session_error(exc: Exception) -> bool:
         """Return True for MCP/stdio failures that are recoverable by reconnecting."""
         name = exc.__class__.__name__
@@ -985,7 +1317,10 @@ class _CuaDriverSession:
             os.close(fd)
             call_args["screenshot_out_file"] = shot_file
 
-        cmd = [_CUA_DRIVER_CMD, "call", name, json.dumps(call_args)]
+        driver_cmd = resolve_cua_driver_cmd()
+        if not driver_cmd:
+            raise RuntimeError(cua_driver_install_hint())
+        cmd = [driver_cmd, "call", name, json.dumps(call_args)]
         attempts = 4
         backoff = 0.5
         parsed: Any = None
@@ -994,7 +1329,7 @@ class _CuaDriverSession:
             for attempt in range(attempts):
                 try:
                     proc = _subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=max(15.0, timeout),
+                        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(15.0, timeout),
                         env=_sanitize_subprocess_env(cua_driver_child_env()),
                     )
                 except Exception as e:  # pragma: no cover - subprocess spawn failure
@@ -1077,28 +1412,19 @@ class _CuaDriverSession:
 
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         # A prior session may have died (MCP drop / driver crash): its
-        # lifecycle coro reset _started to False in its finally (#55048
-        # Bug 1). Re-enter start() so we rebuild the session instead of
-        # calling _require_started() straight into a "not started" raise or
-        # a None session. start() is idempotent when already started. Skip
-        # this for the start_session/end_session handshake, which start()/
-        # stop() drive directly while _started is still in flux.
+        # lifecycle coro reset _started to False in its finally (#55048).
         if not self._started and name not in self._LIFECYCLE_CALLS:
             logger.warning(
                 "cua-driver session not active on %s; (re)starting before call", name
             )
             self.start()
         self._require_started()
-        # The cua-driver daemon proxy returns POSIX EAGAIN ("Resource
-        # temporarily unavailable") for heavier calls like get_window_state when
-        # its non-blocking socket buffer is full. On some machines/builds this
-        # is persistent for get_window_state over the MCP stdio bridge, while
-        # the direct CLI transport keeps working. So: try the MCP path ONCE,
-        # and on the transient/transport error fall straight through to the CLI
-        # transport (which has its own retry + screenshot-to-file mitigation)
-        # rather than burning a long backoff chain on a path that won't recover.
+
         try:
-            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            result = self._bridge.run(
+                self._call_tool_async(name, args),
+                timeout=timeout,
+            )
         except Exception as e:
             if self._is_transient_daemon_error(e):
                 logger.warning(
@@ -1108,13 +1434,31 @@ class _CuaDriverSession:
                 return self._call_tool_via_cli(name, args, timeout)
             if not self._is_closed_session_error(e):
                 raise
-            # Daemon restart closes the cached stdio channel. Reconnect once and
-            # retry exactly one more time — never loop, to avoid hammering a
-            # genuinely dead daemon.
             logger.warning("cua-driver MCP session closed during %s; reconnecting once", name)
             with self._lock:
                 self._restart_session_locked()
-            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            result = self._bridge.run(
+                self._call_tool_async(name, args),
+                timeout=timeout,
+            )
+
+        # Remember only a successfully declared stable identity. Failed
+        # start_session calls must not leave stale recovery state behind.
+        if name == "start_session" and result.get("isError") is not True:
+            declared_id = args.get("session")
+            if isinstance(declared_id, str) and declared_id:
+                self._declared_session_id = declared_id
+
+        if self._is_ended_session_result(result):
+            result = self._revive_declared_session_once(name, args, result, timeout)
+
+        if (
+            name == "end_session"
+            and result.get("isError") is not True
+            and args.get("session") == self._declared_session_id
+        ):
+            self._declared_session_id = None
+        return result
 
 
 def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
@@ -1256,7 +1600,9 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "app_name": w.get("app_name", ""),
             "pid": pid_int,
             "window_id": window_id_int,
-            "off_screen": not w.get("is_on_screen", True),
+            # cua-driver 0.6.x on Linux may return JSON null here.
+            # Only explicit False means off-screen; null means unknown.
+            "off_screen": w.get("is_on_screen") is False,
             "title": w.get("title", ""),
             "z_index": z_index,
         })
@@ -1339,6 +1685,27 @@ class CuaDriverBackend(ComputerUseBackend):
             self._session.call_tool("start_session", {"session": self._session_id})
         except Exception as e:
             logger.debug("cua-driver start_session failed (continuing anonymous): %s", e)
+
+        # Post-handshake session tuning. Both guard on `_started`: before the
+        # handshake flips it, call_tool would re-enter session.start() (see
+        # _LIFECYCLE_CALLS) and tests that stub start() would recurse.
+        if self._session._started:
+            # Cap screenshot size so every later get_window_state / SOM
+            # capture pays less over the daemon socket and in the model turn.
+            max_dim = _computer_use_max_image_dimension()
+            if max_dim:
+                try:
+                    self.set_config(max_image_dimension=max_dim)
+                except Exception as e:
+                    logger.debug("cua-driver set_config(max_image_dimension) failed: %s", e)
+            # Belt-and-suspenders when --no-overlay is unsupported or ignored:
+            # hide the agent cursor overlay via the session API so macOS idle
+            # redraw loops cannot keep burning CPU after the first action.
+            if _cua_no_overlay():
+                try:
+                    self.set_agent_cursor_enabled(False, cursor_id=self._session_id)
+                except Exception as e:
+                    logger.debug("cua-driver set_agent_cursor_enabled failed: %s", e)
 
     def stop(self) -> None:
         # Tear the cua-driver session down before disconnecting so the
@@ -1631,7 +1998,14 @@ class CuaDriverBackend(ComputerUseBackend):
             windows = filtered
 
         # Pick first on-screen window (sorted by z_index / z-order above).
-        target = next((w for w in windows if not w["off_screen"]), windows[0])
+        # On Linux, unqualified default captures skip desktop/shell helper
+        # windows and, with tied/unknown z_index, may additionally consult
+        # _NET_ACTIVE_WINDOW (#58026).
+        target = _select_capture_target(
+            windows,
+            app_requested=bool(app),
+            exact_target=pid is not None or window_id is not None,
+        )
         self._active_pid = target["pid"]
         self._active_window_id = target["window_id"]
         # Tokens belong to the prior window snapshot. Disarm them before any
@@ -1641,7 +2015,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # Record the resolved app name so capture_after= follow-ups can re-target
         # the same app rather than falling back to the frontmost window.
         if app or not self._last_app:
-            self._last_app = app_name
+            self._last_app = app_name or app or ""
         self._last_target = {
             "pid": self._active_pid,
             "window_id": self._active_window_id,
@@ -2155,7 +2529,7 @@ class CuaDriverBackend(ComputerUseBackend):
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
             self._snapshot_tokens = {}
-            self._last_app = target["app_name"]  # retained for back-compat diagnostics
+            self._last_app = target["app_name"] or app  # retained for back-compat diagnostics
             self._last_target = {
                 "pid": self._active_pid,
                 "window_id": self._active_window_id,
