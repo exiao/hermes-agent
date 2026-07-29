@@ -1566,6 +1566,7 @@ def test_owner_evidence_supersedes_empty_terminal_handoff(kanban_home):
             metadata={
                 "commit_sha": "abc123",
                 "pr_url": "https://github.com/exiao/hermes-agent/pull/999",
+                "artifacts": ["/tmp/owner-proof.txt"],
             },
             expected_run_id=owner.id,
         )
@@ -1579,13 +1580,21 @@ def test_owner_evidence_supersedes_empty_terminal_handoff(kanban_home):
         assert run.metadata == {
             "commit_sha": "abc123",
             "pr_url": "https://github.com/exiao/hermes-agent/pull/999",
+            "artifacts": ["/tmp/owner-proof.txt"],
         }
-        superseded = [
+        completed = [
             event for event in kb.list_events(conn, tid)
-            if event.kind == "completion_superseded"
+            if event.kind == "completed"
         ]
-        assert superseded[-1].payload["superseded_summary"] == "review-only completion"
-        assert superseded[-1].payload["owner_run_id"] == owner.id
+        assert len(completed) == 2
+        assert completed[-1].payload == {
+            "result_len": len("owner result"),
+            "summary": "pushed owner handoff",
+            "owner_run_id": owner.id,
+            "superseded_summary": "review-only completion",
+            "superseded_had_push_evidence": False,
+            "artifacts": ["/tmp/owner-proof.txt"],
+        }
     finally:
         conn.close()
 
