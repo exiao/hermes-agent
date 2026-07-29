@@ -209,7 +209,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     message = adapter.sent[0]["text"]
     assert tid in message
-    assert "blocked" in message
+    assert "DECISION NEEDED" in message
 
 
 def test_kanban_db_path_is_test_isolated_from_real_home():

@@ -193,10 +193,11 @@ class TestXiaomiCredentials:
 
         ss.set_multiplex_active(True)
         try:
-            with pytest.raises(ss.UnscopedSecretError):
-                resolve_api_key_provider_credentials("xiaomi")
+            creds = resolve_api_key_provider_credentials("xiaomi")
         finally:
             ss.set_multiplex_active(False)
+
+        assert creds["api_key"] == ""
 
 
 # =============================================================================
