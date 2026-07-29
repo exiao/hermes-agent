@@ -6253,6 +6253,11 @@ def complete_task(
                         "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
                         (summary or result, json.dumps(metadata) if metadata else None, expected_run_id),
                     )
+                    if result is not None:
+                        conn.execute(
+                            "UPDATE tasks SET result = ? WHERE id = ?",
+                            (result, task_id),
+                        )
                     return True
         if expected_run_id is None:
             cur = conn.execute(

@@ -1552,11 +1552,11 @@ def test_owner_retry_replaces_bare_completion_with_pushed_work_proof(kanban_home
         owner = kb.latest_run(conn, tid)
         assert owner is not None
 
-        assert kb.complete_task(conn, tid, summary="review-only completion")
+        assert kb.complete_task(conn, tid, result="review-only completion")
         assert kb.complete_task(
             conn,
             tid,
-            summary="pushed owner handoff",
+            result="pushed owner handoff",
             metadata={
                 "commit_sha": "abc123",
                 "pr_url": "https://github.com/exiao/hermes-agent/pull/999",
@@ -1566,6 +1566,7 @@ def test_owner_retry_replaces_bare_completion_with_pushed_work_proof(kanban_home
 
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "done"
+        assert task.result == "pushed owner handoff"
         run = kb.latest_run(conn, tid)
         assert run is not None
         assert run.summary == "pushed owner handoff"
