@@ -364,6 +364,7 @@ class ModalEnvironment(BaseEnvironment):
                 get_credential_file_mounts,
                 iter_skills_files,
                 iter_cache_files,
+                iter_plans_files,
             )
 
             for mount_entry in get_credential_file_mounts():
@@ -374,6 +375,13 @@ class ModalEnvironment(BaseEnvironment):
                     )
                 )
             for entry in iter_skills_files():
+                cred_mounts.append(
+                    _modal.Mount.from_local_file(
+                        entry["host_path"],
+                        remote_path=entry["container_path"],
+                    )
+                )
+            for entry in iter_plans_files():
                 cred_mounts.append(
                     _modal.Mount.from_local_file(
                         entry["host_path"],
