@@ -1393,6 +1393,7 @@ class SignalAdapter(BasePlatformAdapter):
         await self._stop_typing_indicator(chat_id)
 
         attachments: List[str] = []
+        attachment_sizes: Dict[str, int] = {}
         skipped_download = 0
         skipped_missing = 0
         skipped_oversize = 0
@@ -1421,6 +1422,7 @@ class SignalAdapter(BasePlatformAdapter):
                 continue
 
             attachments.append(file_path)
+            attachment_sizes[file_path] = file_size
 
         if not attachments:
             logger.error(
@@ -1462,7 +1464,9 @@ class SignalAdapter(BasePlatformAdapter):
                 )
 
             params = dict(base_params, attachments=att_batch)
-            send_timeout = _signal_send_timeout(n)
+            send_timeout = _signal_send_timeout(
+                n, sum(attachment_sizes[path] for path in att_batch)
+            )
 
             for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
                 await scheduler.acquire(n)

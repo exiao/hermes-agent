@@ -64,3 +64,27 @@ async def test_send_document_scales_timeout_with_large_attachment(tmp_path):
     await adapter.send_document("group:group-id", str(attachment))
 
     assert adapter._rpc.await_args.kwargs["timeout"] > _signal_send_timeout(1)
+
+
+@pytest.mark.asyncio
+async def test_send_multiple_images_passes_batch_byte_total(tmp_path):
+    """Large image batches must not fall back to the attachment-count floor."""
+    from gateway.platforms.signal import SIGNAL_MAX_ATTACHMENT_SIZE, SignalAdapter
+
+    images = []
+    for index in range(2):
+        image = tmp_path / f"slow-upload-{index}.png"
+        with image.open("wb") as file:
+            file.truncate(SIGNAL_MAX_ATTACHMENT_SIZE)
+        images.append((image.as_uri(), ""))
+
+    adapter = object.__new__(SignalAdapter)
+    adapter.account = "+15551234567"
+    adapter._stop_typing_indicator = AsyncMock()
+    adapter._rpc = AsyncMock(return_value=None)
+
+    await adapter.send_multiple_images("group:group-id", images)
+
+    assert adapter._rpc.await_args.kwargs["timeout"] == _signal_send_timeout(
+        2, 2 * SIGNAL_MAX_ATTACHMENT_SIZE
+    )
