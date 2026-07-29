@@ -926,6 +926,11 @@ class SignalAdapter(BasePlatformAdapter):
         """Cache any number↔UUID mapping observed from Signal envelopes."""
         if not number or not service_id or not _is_signal_service_id(service_id):
             return
+        # A UUID-only envelope reports the same value for ``sender`` and
+        # ``sourceUuid``. Do not replace a canonical UUID→number mapping
+        # learned from an earlier envelope with that self-reference.
+        if number == service_id and self._recipient_number_by_uuid.get(service_id):
+            return
         self._recipient_uuid_by_number[number] = service_id
         self._recipient_number_by_uuid[service_id] = number
 

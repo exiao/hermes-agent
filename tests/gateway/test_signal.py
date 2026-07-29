@@ -3088,7 +3088,10 @@ async def test_quoted_image_envelope_end_to_end(monkeypatch, tmp_path):
 
     sent_image = tmp_path / "cc_verification_sheet.png"
     sent_image.write_bytes(b"\x89PNG\r\n\x1a\n")
-    adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(sent_image)])
+    recipient_number = "+15559998888"
+    recipient_uuid = "68680952-6d86-45bc-85e0-1a4d186d53ee"
+    adapter._remember_recipient_identifiers(recipient_number, recipient_uuid)
+    adapter._remember_sent_attachments(1753650000000, recipient_number, [str(sent_image)])
     adapter._remember_sent_message_timestamp(1753650000000)
 
     captured = {}
@@ -3100,9 +3103,8 @@ async def test_quoted_image_envelope_end_to_end(monkeypatch, tmp_path):
 
     envelope = {
         "envelope": {
-            "source": "+15559998888",
+            "sourceUuid": recipient_uuid,
             "sourceName": "E X",
-            "sourceNumber": "+15559998888",
             "timestamp": 1753650500000,
             "dataMessage": {
                 "message": "what about this part?",
