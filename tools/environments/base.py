@@ -417,8 +417,21 @@ def _cwd_marker(session_id: str) -> str:
 # with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
+#
+# HERMES_DELEGATED_CHILD_CONTEXT is per-COMMAND, not per-session, and belongs
+# in the same exclusion set for the same reason. It is stamped into a spawned
+# subprocess's env by tools/environments/local._scrub_delegated_child_kanban_env
+# only while a genuine delegate_task child is running. Because the snapshot is
+# shared by every command on the backend, a child's ``export -p`` persisted the
+# marker into the snapshot file, and the NEXT top-level command sourced it back
+# in — making a non-delegated gateway turn look like a delegate_task child
+# forever after the first delegation. Symptom: ``hermes kanban`` refusing every
+# write with "delegate_task child contexts cannot mutate Kanban tasks". Like the
+# session vars, dropping it from the snapshot is safe: genuine children get the
+# marker re-injected on every command from the Python side.
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_"
+    "|HERMES_DELEGATED_CHILD_CONTEXT)"
 )
 
 
@@ -448,7 +461,7 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "HERMES_UI_SESSION_ID 2>/dev/null; "
+        "HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
