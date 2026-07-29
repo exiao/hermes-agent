@@ -1024,7 +1024,10 @@ class SignalAdapter(BasePlatformAdapter):
             return []
         cached_chat_id, paths = cached
         if cached_chat_id != chat_id:
-            return []
+            cached_chat_id = self._recipient_number_by_uuid.get(cached_chat_id, cached_chat_id)
+            chat_id = self._recipient_number_by_uuid.get(chat_id, chat_id)
+            if cached_chat_id != chat_id:
+                return []
         return [p for p in paths if p and Path(p).exists()]
 
     def _remember_sent_message_timestamp(self, timestamp: Any) -> None:

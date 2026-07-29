@@ -3016,6 +3016,29 @@ class TestQuotedAttachments:
 
         assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == [str(real_file)]
 
+    def test_resolves_sent_media_when_quote_uses_mapped_uuid(self, monkeypatch, tmp_path):
+        """A UUID inbound identity refers to the same direct chat as its E.164 cache key."""
+        adapter = _make_signal_adapter(monkeypatch)
+        real_file = tmp_path / "chart.png"
+        real_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+        recipient_number = "+15559998888"
+        recipient_uuid = "68680952-6d86-45bc-85e0-1a4d186d53ee"
+        adapter._remember_recipient_identifiers(recipient_number, recipient_uuid)
+        adapter._remember_sent_attachments(1753650000000, recipient_number, [str(real_file)])
+
+        assert adapter._resolve_quoted_media_paths("1753650000000", recipient_uuid) == [str(real_file)]
+
+    def test_keeps_mapped_quoted_media_isolated_to_its_recipient(self, monkeypatch, tmp_path):
+        """A known UUID for another direct chat cannot reuse this chats local media."""
+        adapter = _make_signal_adapter(monkeypatch)
+        real_file = tmp_path / "chart.png"
+        real_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+        adapter._remember_recipient_identifiers("+15559998888", "68680952-6d86-45bc-85e0-1a4d186d53ee")
+        adapter._remember_recipient_identifiers("+15557776666", "68680952-6d86-45bc-85e0-1a4d186d53ff")
+        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(real_file)])
+
+        assert adapter._resolve_quoted_media_paths("1753650000000", "68680952-6d86-45bc-85e0-1a4d186d53ff") == []
+
     def test_no_local_path_for_media_the_user_sent(self, monkeypatch):
         """A photo the USER took was never on this machine — no path, no lie."""
         adapter = _make_signal_adapter(monkeypatch)
