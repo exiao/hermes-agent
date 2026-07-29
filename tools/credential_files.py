@@ -381,6 +381,48 @@ def iter_skills_files(
     return result
 
 
+def iter_plans_files(
+    container_base: str = "/root/.hermes",
+) -> List[Dict[str, str]]:
+    """Yield individual (host_path, container_path) entries for plan files.
+
+    Kanban card briefs routinely link a plan by host path
+    (``~/.hermes/plans/<task>.md``) — constitution rule 2f makes a plan file
+    path mandatory on every dev card.  Remote backends (Modal, Daytona) do not
+    see the host filesystem, so a worker on those lanes could not read the plan
+    it was told to follow and blocked instead.  Mirroring the plans dir keeps
+    that contract satisfiable everywhere.  Skips symlinks; markdown/text only,
+    so a stray artifact in plans/ can't bloat every sandbox.
+    """
+    result: List[Dict[str, str]] = []
+
+    hermes_home = _resolve_hermes_home()
+    plans_dir = hermes_home / "plans"
+    if not plans_dir.is_dir():
+        return result
+
+    container_root = f"{container_base.rstrip('/')}/plans"
+    allowed_suffixes = {".md", ".txt", ".json", ".yaml", ".yml", ".svg"}
+    # Subtrees a worker never needs: archived/superseded plans and rescued run
+    # artifacts.  Without this the mount is ~4.5k files / 44MB uploaded on every
+    # sandbox start, most of it dead weight.
+    skip_roots = {"archive", "wt-reaper-rescued", "shelved", "babysit-split-backup"}
+    for item in plans_dir.rglob("*"):
+        if item.is_symlink() or not item.is_file():
+            continue
+        if item.suffix.lower() not in allowed_suffixes:
+            continue
+        rel = item.relative_to(plans_dir)
+        if rel.parts and rel.parts[0] in skip_roots:
+            continue
+        result.append({
+            "host_path": str(item),
+            "container_path": f"{container_root}/{rel}",
+        })
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Cache directory mounts (documents, images, audio, videos, screenshots)
 # ---------------------------------------------------------------------------
