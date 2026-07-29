@@ -219,6 +219,10 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
             protect_first_n=2,
             protect_last_n=2,
             quiet_mode=True,
+            base_url=agent.base_url,
+            api_key=agent.api_key,
+            provider=agent.provider,
+            api_mode=agent.api_mode,
         )
     compressor.bind_session_state(db, sid)
     # Trip the breaker durably (#54923: the strike counter now round-trips
