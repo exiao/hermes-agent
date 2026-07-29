@@ -417,7 +417,7 @@ def iter_plans_files(
             continue
         result.append({
             "host_path": str(item),
-            "container_path": f"{container_root}/{rel}",
+            "container_path": f"{container_root}/{rel.as_posix()}",
         })
 
     return result

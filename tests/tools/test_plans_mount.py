@@ -12,8 +12,11 @@ mocking, per AGENTS.md ("E2E validation, not just green unit mocks").
 
 from __future__ import annotations
 
+import asyncio
 import importlib
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,9 +32,13 @@ def plans_home(tmp_path, monkeypatch):
 
     (plans / "t_live.md").write_text("# live plan\n", encoding="utf-8")
     (plans / "diagram.svg").write_text("<svg/>", encoding="utf-8")
-    (plans / "hermes-patches" / "some-patch.md").write_text("# patch note\n", encoding="utf-8")
+    (plans / "hermes-patches" / "some-patch.md").write_text(
+        "# patch note\n", encoding="utf-8"
+    )
     (plans / "archive" / "t_old.md").write_text("# superseded\n", encoding="utf-8")
-    (plans / "wt-reaper-rescued" / "t_dead" / "raw" / "corpus.md").write_text("junk\n", encoding="utf-8")
+    (plans / "wt-reaper-rescued" / "t_dead" / "raw" / "corpus.md").write_text(
+        "junk\n", encoding="utf-8"
+    )
     (plans / "binary.bin").write_bytes(b"\x00\x01\x02")
 
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -105,11 +112,73 @@ class TestIterPlansFiles:
 
 
 class TestModalWiring:
-    def test_modal_backend_mounts_plans(self):
-        """The Modal sandbox path must actually call iter_plans_files()."""
-        source = Path(__file__).resolve().parents[2] / "tools/environments/modal.py"
-        text = source.read_text(encoding="utf-8")
-        assert "iter_plans_files" in text, (
-            "modal.py must import and iterate iter_plans_files(); without the "
-            "wiring the helper exists but no plan reaches the sandbox."
+    def test_modal_backend_mounts_plan_files(self, monkeypatch):
+        """Plans are passed through to Modal's sandbox mounts at creation."""
+        import tools.credential_files as cf
+        from tools.environments import modal as modal_env
+
+        mounts = []
+        create_calls = []
+
+        class FakeMount:
+            @staticmethod
+            def from_local_file(host_path, *, remote_path):
+                mounts.append((host_path, remote_path))
+                return (host_path, remote_path)
+
+        async def lookup_app(*_args, **_kwargs):
+            return object()
+
+        async def create_sandbox(*args, **kwargs):
+            create_calls.append((args, kwargs))
+            return object()
+
+        fake_modal = SimpleNamespace(
+            App=SimpleNamespace(lookup=SimpleNamespace(aio=lookup_app)),
+            Mount=FakeMount,
+            Sandbox=SimpleNamespace(create=SimpleNamespace(aio=create_sandbox)),
         )
+
+        class ImmediateWorker:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def run_coroutine(self, coro, timeout=600):
+                return asyncio.run(coro)
+
+        class NoopSyncManager:
+            def __init__(self, **_kwargs):
+                pass
+
+            def sync(self, force=False):
+                pass
+
+        monkeypatch.setitem(sys.modules, "modal", fake_modal)
+        monkeypatch.setattr(modal_env, "_ensure_modal_sdk", lambda: None)
+        monkeypatch.setattr(modal_env, "_resolve_modal_image", lambda image: image)
+        monkeypatch.setattr(modal_env, "_AsyncWorker", ImmediateWorker)
+        monkeypatch.setattr(modal_env, "FileSyncManager", NoopSyncManager)
+        monkeypatch.setattr(
+            modal_env.ModalEnvironment, "init_session", lambda self: None
+        )
+        monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
+        monkeypatch.setattr(cf, "iter_skills_files", lambda: [])
+        monkeypatch.setattr(cf, "iter_cache_files", lambda: [])
+        monkeypatch.setattr(
+            cf,
+            "iter_plans_files",
+            lambda: [
+                {
+                    "host_path": "/host/plan.md",
+                    "container_path": "/root/.hermes/plans/plan.md",
+                }
+            ],
+        )
+
+        modal_env.ModalEnvironment("test-image", persistent_filesystem=False)
+
+        assert mounts == [("/host/plan.md", "/root/.hermes/plans/plan.md")]
+        assert create_calls[0][1]["mounts"] == mounts
