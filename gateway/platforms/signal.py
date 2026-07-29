@@ -990,7 +990,9 @@ class SignalAdapter(BasePlatformAdapter):
         self._sent_attachment_paths.clear()
         self._sent_attachment_snapshot_bytes = 0
         for entry in self._pending_sent_attachment_snapshots.values():
-            entry["task"].cancel()
+            # Do not cancel executor-backed work: a thread may still be writing.
+            # Mark it expired so its loop continuation discards late bytes.
+            entry["expired"] = True
             entry["expiry"].cancel()
             if not entry["future"].done():
                 entry["future"].set_result([])
