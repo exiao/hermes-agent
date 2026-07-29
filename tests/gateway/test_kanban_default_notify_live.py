@@ -269,6 +269,41 @@ def test_default_notify_keeps_events_from_tasks_created_after_target_activation(
     assert "DECISION NEEDED" in adapter.sent[0]["text"]
 
 
+
+def test_default_notify_keeps_events_created_while_runner_is_restarted(tmp_path, monkeypatch):
+    """A persisted target baseline survives the gap between gateway runners."""
+    db_path = tmp_path / "default-notify-restart.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    target_chat = "group:restart="
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda *a, **k: {"kanban": {"default_notify": [
+            {"platform": "signal", "chat_id": target_chat},
+        ]}},
+        raising=False,
+    )
+
+    # The first runner records the configured target's activation cursor.
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(RecordingAdapter())))
+
+    # A task blocks while no runner is alive. Its event must still be unseen
+    # when the restarted gateway subscribes the target.
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs a restart decision", assignee="worker")
+        kb.block_task(conn, tid, reason="approval needed", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == target_chat
+    assert tid in adapter.sent[0]["text"]
+
+
 def test_default_notify_does_not_disturb_existing_per_task_sub(tmp_path, monkeypatch):
     """The per-task subscribe path is untouched: a pre-existing subscription to
     a different chat keeps delivering, and the default target is added
