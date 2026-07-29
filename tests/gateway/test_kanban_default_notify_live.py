@@ -235,6 +235,31 @@ def test_default_notify_delivers_without_manual_subscribe(tmp_path, monkeypatch)
     assert "done" in adapter.sent[0]["text"].lower()
 
 
+def test_default_notify_does_not_subscribe_through_secondary_profile(tmp_path, monkeypatch):
+    """A default-owned row must not be created through another profile bot."""
+    db_path = tmp_path / 'default-profile-eligibility.db'
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(db_path))
+    kb.init_db()
+    monkeypatch.setattr(
+        'hermes_cli.config.load_config',
+        lambda *a, **k: {'kanban': {'default_notify': [{'platform': 'discord', 'chat_id': 'beta-chat'}]}},
+        raising=False,
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title='default-owned target', assignee='worker')
+    finally:
+        conn.close()
+    runner = _make_runner(RecordingAdapter())
+    runner._profile_adapters = {'beta': {Platform.DISCORD: RecordingAdapter()}}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
 def test_default_notify_does_not_disturb_existing_per_task_sub(tmp_path, monkeypatch):
     """The per-task subscribe path is untouched: a pre-existing subscription to
     a different chat keeps delivering, and the default target is added

@@ -615,6 +615,14 @@ class GatewayKanbanWatchersMixin:
                             getattr(platform, "value", str(platform)).lower()
                             for platform in _profile_adapter_map.keys()
                         )
+                    eligible_default_notify_targets = []
+                    for target in default_notify_targets:
+                        try:
+                            platform = _Platform(target["platform"])
+                        except ValueError:
+                            continue
+                        if self._authorization_adapter(platform, notifier_profile) is not None:
+                            eligible_default_notify_targets.append(target)
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
@@ -653,10 +661,7 @@ class GatewayKanbanWatchersMixin:
                         try:
                             if (
                                 _kb.count_notify_subs(board=slug) == 0
-                                and not any(
-                                    tgt["platform"] in active_platforms
-                                    for tgt in default_notify_targets
-                                )
+                                and not eligible_default_notify_targets
                             ):
                                 logger.debug(
                                     "kanban notifier: board %s has no subscriptions; skipping open",
@@ -709,9 +714,7 @@ class GatewayKanbanWatchersMixin:
                                 # single transaction. Idempotent on the PK, so an
                                 # existing per-task subscription (cursor /
                                 # fail-count) is never disturbed.
-                                for tgt in default_notify_targets:
-                                    if tgt["platform"] not in active_platforms:
-                                        continue
+                                for tgt in eligible_default_notify_targets:
                                     try:
                                         _kb.add_default_notify_subs(
                                             conn,
