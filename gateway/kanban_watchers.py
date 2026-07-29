@@ -651,7 +651,7 @@ class GatewayKanbanWatchersMixin:
                         # checkpoint traffic) is exactly the per-tick cost
                         # this skip avoids.
                         try:
-                            if _kb.count_notify_subs(board=slug) == 0:
+                            if not default_notify_targets and _kb.count_notify_subs(board=slug) == 0:
                                 logger.debug(
                                     "kanban notifier: board %s has no subscriptions; skipping open",
                                     slug,

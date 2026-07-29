@@ -4442,8 +4442,9 @@ class BasePlatformAdapter(ABC):
             path = _normalize_media_tag_path(match.group("path"))
             if not path or not _path_lacks_deliverable_extension(path):
                 continue
-            if validate_media_delivery_path(path):
-                tag_spans.append(match.span())
+            resolved = _match_extensionless_path(masked, match)
+            if resolved is not None:
+                tag_spans.append((match.start(), resolved[1]))
         if not tag_spans:
             return text
         wrapper_spans = [
