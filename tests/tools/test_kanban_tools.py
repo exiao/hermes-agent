@@ -16,6 +16,19 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+def _init_worktree_ready_repo(path):
+    """Create a repository that can supply HEAD to ``git worktree add``."""
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(path),
+            "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-qm", "Initial commit",
+        ],
+        check=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -1277,7 +1290,7 @@ def test_create_default_child_inherits_project_without_reusing_worktree(
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _init_worktree_ready_repo(repo)
     with pdb.connect_closing() as project_conn:
         project_id = pdb.create_project(
             project_conn, name="Isolated Project", folders=[str(repo)],
@@ -1341,7 +1354,7 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
         (profile_dir / "config.yaml").write_text("model: {}\n")
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _init_worktree_ready_repo(repo)
     shared_db = tmp_path / "shared-kanban.db"
 
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
