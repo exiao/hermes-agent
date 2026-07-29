@@ -4969,6 +4969,126 @@ def _append_event(
     )
 
 
+def _append_completion_rejected_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    summary: Optional[str],
+    metadata: Optional[dict],
+    expected_run_id: Optional[int],
+) -> bool:
+    """Record a rejected completion handoff without changing task state."""
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    current_run_id = (
+        int(row["current_run_id"]) if row["current_run_id"] is not None else None
+    )
+    _append_event(
+        conn,
+        task_id,
+        "completion_rejected",
+        {
+            "reason": reason,
+            "summary": summary,
+            "metadata": metadata,
+            "expected_run_id": expected_run_id,
+            "current_run_id": current_run_id,
+        },
+        run_id=expected_run_id if expected_run_id is not None else current_run_id,
+    )
+    return True
+
+
+def record_completion_rejected(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Persist a rejected worker handoff before returning a tool error."""
+    with write_txn(conn):
+        return _append_completion_rejected_event(
+            conn,
+            task_id,
+            reason=reason,
+            summary=summary,
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
+
+
+def _has_push_evidence(metadata: Optional[dict]) -> bool:
+    """True when a handoff identifies pushed work that must not be lost."""
+    return isinstance(metadata, dict) and bool(
+        metadata.get("commit_sha") or metadata.get("pr_url")
+    )
+
+
+def _supersede_empty_terminal_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+    expected_run_id: Optional[int],
+) -> bool:
+    """Let the original owner replace a bare terminal handoff with push evidence."""
+    if expected_run_id is None or not _has_push_evidence(metadata):
+        return False
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None or task["status"] != "done":
+            return False
+        run = conn.execute(
+            "SELECT summary, metadata FROM task_runs WHERE id = ? AND task_id = ? "
+            "AND outcome = 'completed'",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if run is None:
+            return False
+        try:
+            prior_metadata = json.loads(run["metadata"]) if run["metadata"] else None
+        except (TypeError, ValueError):
+            prior_metadata = None
+        if _has_push_evidence(prior_metadata):
+            return False
+        handoff = summary if summary is not None else result
+        conn.execute(
+            "UPDATE tasks SET result = COALESCE(?, result) WHERE id = ?",
+            (result, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
+            (
+                handoff,
+                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                int(expected_run_id),
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "completion_superseded",
+            {
+                "owner_run_id": int(expected_run_id),
+                "superseded_summary": run["summary"],
+                "superseded_had_push_evidence": False,
+            },
+            run_id=int(expected_run_id),
+        )
+    return True
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6223,6 +6343,14 @@ def complete_task(
                         ),
                     },
                 )
+                _append_completion_rejected_event(
+                    conn,
+                    task_id,
+                    reason="invalid_created_cards",
+                    summary=summary if summary is not None else result,
+                    metadata=metadata,
+                    expected_run_id=expected_run_id,
+                )
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
@@ -6230,7 +6358,19 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    if _supersede_empty_terminal_handoff(
+        conn,
+        task_id,
+        result=result,
+        summary=summary,
+        metadata=metadata,
+        expected_run_id=expected_run_id,
+    ):
+        return True
     with write_txn(conn):
+        state = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -6267,6 +6407,21 @@ def complete_task(
                 (result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
+            if state is not None:
+                if expected_run_id is not None and state["current_run_id"] != int(expected_run_id):
+                    reason = "not_claim_holder"
+                elif state["status"] in ("done", "archived"):
+                    reason = "already_terminal"
+                else:
+                    reason = "invalid_status"
+                _append_completion_rejected_event(
+                    conn,
+                    task_id,
+                    reason=reason,
+                    summary=summary if summary is not None else result,
+                    metadata=metadata,
+                    expected_run_id=expected_run_id,
+                )
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)

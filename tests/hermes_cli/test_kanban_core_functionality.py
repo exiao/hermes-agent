@@ -1543,6 +1543,53 @@ def test_multiple_attempts_preserved_as_runs(kanban_home):
         conn.close()
 
 
+def test_owner_evidence_supersedes_empty_terminal_handoff(kanban_home):
+    """A late owner handoff recovers pushed-work evidence from a bare close."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owner handoff", assignee="worker")
+        kb.claim_task(conn, tid)
+        owner = kb.latest_run(conn, tid)
+        assert owner is not None
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="review result",
+            summary="review-only completion",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="owner result",
+            summary="pushed owner handoff",
+            metadata={
+                "commit_sha": "abc123",
+                "pr_url": "https://github.com/exiao/hermes-agent/pull/999",
+            },
+            expected_run_id=owner.id,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "done"
+        assert task.result == "owner result"
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.summary == "pushed owner handoff"
+        assert run.metadata == {
+            "commit_sha": "abc123",
+            "pr_url": "https://github.com/exiao/hermes-agent/pull/999",
+        }
+        superseded = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "completion_superseded"
+        ]
+        assert superseded[-1].payload["superseded_summary"] == "review-only completion"
+        assert superseded[-1].payload["owner_run_id"] == owner.id
+    finally:
+        conn.close()
+
+
 def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
     """A worker from an earlier attempt cannot close a later retry."""
     import hermes_cli.kanban_db as _kb
@@ -1570,6 +1617,14 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
         task = kb.get_task(conn, tid)
         assert task.status == "running"
         assert task.current_run_id == run2.id
+        rejected = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "completion_rejected"
+        ]
+        assert rejected[-1].payload["reason"] == "not_claim_holder"
+        assert rejected[-1].payload["summary"] == "late stale completion"
+        assert rejected[-1].payload["expected_run_id"] == run1.id
+        assert rejected[-1].payload["current_run_id"] == run2.id
 
         assert kb.complete_task(
             conn,
