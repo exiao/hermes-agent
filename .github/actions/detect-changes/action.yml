@@ -1,15 +1,26 @@
 name: Detect affected areas
 description: >-
-  Classify a PR's changed files into CI work lanes (python, frontend, site,
-  scan, deps, mcp_catalog) so the orchestrator can conditionally call only
-  the sub-workflows a PR can affect. Outputs are always "true" on push/dispatch
-  events and fail open (everything "true") when the diff cannot be computed.
+  Classify changed files into CI work lanes (python, frontend, site, scan,
+  deps, mcp_catalog). Ordinary pushes fail open; the exact live-config push
+  path may use a narrow Python-only gate only for a proven allowlisted diff.
 
 inputs:
   github-token:
     description: Token for the GitHub API (gh CLI). Pass steps.app-token.outputs.token from the calling workflow.
     required: false
     default: ${{ github.token }}
+  classification_mode:
+    description: Use live_config_push only for the exact live-config push gate.
+    required: false
+    default: standard
+  push_before:
+    description: Previous SHA from the push event, used by live_config_push.
+    required: false
+    default: ""
+  push_after:
+    description: New SHA from the push event, used by live_config_push.
+    required: false
+    default: ""
 
 outputs:
   python:
@@ -42,6 +53,9 @@ outputs:
   ci_review_files:
     description: JSON list of CI-sensitive files changed by the pull request.
     value: ${{ steps.classify.outputs.ci_review_files }}
+  live_config_python_only:
+    description: True only for a nonempty, fully allowlisted live-config Python diff.
+    value: ${{ steps.classify.outputs.live_config_python_only }}
 
 runs:
   using: composite
@@ -60,39 +74,55 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        CLASSIFICATION_MODE: ${{ inputs.classification_mode }}
+        PUSH_BEFORE: ${{ inputs.push_before }}
+        PUSH_AFTER: ${{ inputs.push_after }}
       run: |
         set -euo pipefail
 
-        # Only pull_request events are gated. Other events (push, release,
-        # dispatch) leave CHANGED empty, so the classifier fails open and every
-        # lane runs. Post-merge / on-demand validation is never weakened.
-        if [ "$EVENT_NAME" = "pull_request" ]; then
-          # Use the compare endpoint with the pinned base/head SHAs from the
-          # event payload instead of the "current PR files" endpoint. The SHAs
-          # are frozen at trigger time, so the file list is deterministic even
-          # if the PR receives a new push between trigger and detect.
-          #
-          # Retried: a rate-limit blip or eventual-consistency 404 on a
-          # freshly-pushed HEAD would otherwise silently fall open (all lanes
-          # run — safe, but wasteful and it masks the API failure).
-          #
-          # `.files[]?` (null-safe): with --paginate, a PR more than 100
-          # commits ahead of its merge-base paginates the compare, and pages
-          # after the first carry `files: null` — bare `.files[]` makes jq
-          # die with "cannot iterate over: null", which fails every retry
-          # and forces the fail-open path (seen on stacked PRs). The full
-          # file list (up to the API's 300-file cap) is on page one.
+        # Pull requests retain the existing compare-based classification.
+        # The exact live-config push path also compares its before/after SHAs;
+        # every other push/dispatch leaves CHANGED empty and therefore retains
+        # the ordinary fail-open behavior.
+        COMPARE_BASE=""
+        COMPARE_HEAD=""
+        if [ "$CLASSIFICATION_MODE" = "live_config_push" ]; then
+          sha_pattern='^[0-9a-fA-F]{40}$'
+          if [[ ! "$PUSH_BEFORE" =~ $sha_pattern ]] || \
+             [[ ! "$PUSH_AFTER" =~ $sha_pattern ]] || \
+             [[ "$PUSH_BEFORE" =~ ^0+$ ]] || [[ "$PUSH_AFTER" =~ ^0+$ ]]; then
+            echo "::warning::live-config push has no usable before/after SHAs — failing open"
+            CHANGED="__ambiguous_live_config_push__"
+          else
+            COMPARE_BASE="$PUSH_BEFORE"
+            COMPARE_HEAD="$PUSH_AFTER"
+          fi
+        elif [ "$EVENT_NAME" = "pull_request" ]; then
+          COMPARE_BASE="$BASE_SHA"
+          COMPARE_HEAD="$HEAD_SHA"
+        else
+          CHANGED=""
+        fi
+
+        if [ -n "$COMPARE_BASE" ]; then
           CHANGED=""
           for i in 1 2 3; do
             if CHANGED="$(gh api \
               --paginate \
-              "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
+              "repos/${REPO}/compare/${COMPARE_BASE}...${COMPARE_HEAD}" \
               --jq '.files[]?.filename')"; then
+              # GitHub caps compare responses at 300 files. Treat the cap as
+              # ambiguous rather than risking a narrow gate on a partial diff.
+              file_count="$(printf '%s\n' "$CHANGED" | sed '/^$/d' | wc -l)"
+              if [ "$file_count" -ge 300 ]; then
+                echo "::warning::compare returned the file cap — failing open"
+                CHANGED="__truncated_compare__"
+              fi
               break
             fi
             if [ "$i" = 3 ]; then
               echo "::warning::compare API failed after 3 attempts — failing open (all lanes run)"
-              CHANGED=""
+              CHANGED="__compare_failed__"
               break
             fi
             echo "::warning::compare API failed (attempt $i); retrying in 10s"

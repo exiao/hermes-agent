@@ -19,6 +19,7 @@ if _spec is None or _spec.loader is None:
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 classify = _mod.classify
+classify_live_config_push = _mod.classify_live_config_push
 ci_review_files = _mod.ci_review_files
 
 DEFAULT = {
@@ -128,9 +129,38 @@ CASES = {
 }
 
 
+LIVE_CONFIG_CASES = {
+    "runtime Python file → Python checks": (["agent/runner.py"], _lanes(python=True)),
+    "test file → Python checks": (["tests/agent/test_runner.py"], _lanes(python=True)),
+    "Python manifests → full validation": (["pyproject.toml", "uv.lock"], DEFAULT),
+    "Python file plus test → Python checks": (["gateway/run.py", "tests/gateway/test_run.py"], _lanes(python=True)),
+    "docs → full validation": (["README.md"], DEFAULT),
+    "frontend → full validation": (["ui-tui/src/app.tsx"], DEFAULT),
+    "skills → full validation": (["skills/example/SKILL.md"], DEFAULT),
+    "workflow → full validation": ([".github/workflows/ci.yml"], DEFAULT),
+    "shell script → full validation": (["scripts/run_tests.sh"], DEFAULT),
+    "test runner → full validation": (["scripts/run_tests_parallel.py"], DEFAULT),
+    "CI classifier → full validation": (["scripts/ci/classify_changes.py"], DEFAULT),
+    "packaging setup.py → full validation": (["setup.py"], DEFAULT),
+    "MCP catalog → full validation": (["hermes_cli/mcp_catalog.py"], DEFAULT),
+    "dedicated e2e suite → full validation": (["tests/e2e/test_smoke.py"], DEFAULT),
+    "dedicated Docker suite → full validation": (["tests/docker/test_smoke.py"], DEFAULT),
+    "dedicated integration suite → full validation": (["tests/integration/test_smoke.py"], DEFAULT),
+    "mixed Python and docs → full validation": (["agent/runner.py", "README.md"], DEFAULT),
+    "unknown path → full validation": (["Makefile"], DEFAULT),
+    "compare failure sentinel → full validation": (["__compare_failed__"], DEFAULT),
+    "empty diff → full validation": ([], DEFAULT),
+}
+
+
 @pytest.mark.parametrize("files,expected", CASES.values(), ids=CASES.keys())
 def test_classify(files, expected):
     assert classify(files) == expected
+
+
+@pytest.mark.parametrize("files,expected", LIVE_CONFIG_CASES.values(), ids=LIVE_CONFIG_CASES.keys())
+def test_classify_live_config_push(files, expected):
+    assert classify_live_config_push(files) == expected
 
 
 def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():

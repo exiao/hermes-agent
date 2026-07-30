@@ -64,6 +64,25 @@ _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
 _MCP_CATALOG_PATHS = ("optional-mcps/",)
 _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 
+# A live-config push may use the narrow Python gate only when every changed
+# path is known to be consumed by the Python suite. Keep this allowlist
+# separate from the PR classifier: the ordinary classifier must retain its
+# existing fail-open behavior.
+_LIVE_CONFIG_PYTHON_DIRS = (
+    "acp_adapter/",
+    "agent/",
+    "cron/",
+    "gateway/",
+    "hermes_cli/",
+    "plugins/",
+    "providers/",
+    "tests/",
+    "tools/",
+    "tui_gateway/",
+)
+_LIVE_CONFIG_FULL_TEST_DIRS = ("tests/docker/", "tests/e2e/", "tests/integration/")
+_LIVE_CONFIG_FULL_FILES = {"hermes_cli/mcp_catalog.py"}
+
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
         return False
@@ -93,6 +112,38 @@ def _is_ci_review(p: str) -> bool:
 def ci_review_files(files: list[str]) -> list[str]:
     """Return the CI-sensitive paths that need maintainer review."""
     return sorted({f.strip() for f in files if f.strip() and _is_ci_review(f.strip())})
+
+
+def _live_config_python_path(path: str) -> bool:
+    if path in _LIVE_CONFIG_FULL_FILES or path.startswith(_LIVE_CONFIG_FULL_TEST_DIRS):
+        return False
+    if path.startswith("tests/"):
+        return True
+    if "/" not in path and path.endswith(".py"):
+        return path != "setup.py"
+    return path.endswith(".py") and path.startswith(_LIVE_CONFIG_PYTHON_DIRS)
+
+
+def _is_live_config_python_only(files: list[str]) -> bool:
+    paths = [f.strip() for f in files if f.strip()]
+    return bool(paths) and all(_live_config_python_path(path) for path in paths)
+
+
+def classify_live_config_push(files: list[str]) -> dict[str, bool]:
+    """Return the narrow live-config lanes, or all lanes when uncertain."""
+    if not _is_live_config_python_only(files):
+        return classify([])
+    return {
+        "python": True,
+        "frontend": False,
+        "docker_meta": False,
+        "site": False,
+        "scan": False,
+        "deps": False,
+        "npm_lock": False,
+        "mcp_catalog": False,
+        "ci_review": False,
+    }
 
 
 def classify(files: list[str]) -> dict[str, bool]:
@@ -126,10 +177,12 @@ def classify(files: list[str]) -> dict[str, bool]:
 
 def main() -> int:
     files = sys.stdin.read().splitlines()
-    lanes = classify(files)
+    live_config_mode = os.environ.get("CLASSIFICATION_MODE") == "live_config_push"
+    lanes = classify_live_config_push(files) if live_config_mode else classify(files)
     out = "\n".join([
         *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
         f"ci_review_files={json.dumps(ci_review_files(files))}",
+        f"live_config_python_only={str(live_config_mode and _is_live_config_python_only(files)).lower()}",
     ])
     if dest := os.environ.get("GITHUB_OUTPUT"):
         with open(dest, "a", encoding="utf-8") as fh:

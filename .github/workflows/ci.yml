@@ -51,6 +51,7 @@ jobs:
       mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
       ci_review: ${{ steps.classify.outputs.ci_review }}
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
+      live_config_python_only: ${{ steps.classify.outputs.live_config_python_only }}
       event_name: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -59,6 +60,9 @@ jobs:
         uses: ./.github/actions/detect-changes
         with:
           github-token: ${{ github.token }}
+          classification_mode: ${{ github.event_name == 'push' && github.ref == 'refs/heads/live-config' && 'live_config_push' || 'standard' }}
+          push_before: ${{ github.event.before }}
+          push_after: ${{ github.event.after }}
 
   # ─────────────────────────────────────────────────────────────────────
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
@@ -71,6 +75,7 @@ jobs:
     uses: ./.github/workflows/tests.yml
     with:
       slice_count: 8
+      run_e2e: ${{ needs.detect.outputs.live_config_python_only != 'true' }}
 
   lint:
     name: Python lints
@@ -121,6 +126,7 @@ jobs:
   infographic-check:
     name: Check no committed infographics
     needs: detect
+    if: needs.detect.outputs.live_config_python_only != 'true'
     uses: ./.github/workflows/infographic-check.yml
 
   lockfile-diff:
@@ -167,6 +173,8 @@ jobs:
 
   osv-scanner:
     name: OSV scan
+    needs: detect
+    if: needs.detect.outputs.live_config_python_only != 'true'
     uses: ./.github/workflows/osv-scanner.yml
 
   # ─────────────────────────────────────────────────────────────────────
@@ -317,8 +325,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   ci-timings:
     name: CI timing report
-    needs: [all-checks-pass, docker]
-    if: always()
+    needs: [detect, all-checks-pass, docker]
+    if: always() && needs.detect.outputs.live_config_python_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
