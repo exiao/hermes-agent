@@ -168,11 +168,14 @@ def _signal_send_timeout(num_attachments: int, total_attachment_bytes: int = 0) 
         return 30.0
     try:
         import httpx
-    except ImportError:  # pragma: no cover — httpx is a hard dependency
+
+        # connect/write/pool bounded: a dead daemon or a stuck local write still
+        # fails fast. read=None: only the remote upload leg is open-ended.
+        return httpx.Timeout(60.0, read=None)
+    except (ImportError, AttributeError):
+        # httpx is a hard dependency, but never let timeout CONSTRUCTION be the
+        # thing that fails a send: fall back to a bounded scalar deadline.
         return max(60.0, 5.0 * num_attachments)
-    # connect/write/pool bounded: a dead daemon or a stuck local write still
-    # fails fast. read=None: only the remote upload leg is open-ended.
-    return httpx.Timeout(60.0, read=None)
 
 
 # ---------------------------------------------------------------------------
