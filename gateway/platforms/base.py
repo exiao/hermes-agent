@@ -3396,7 +3396,37 @@ class BasePlatformAdapter(ABC):
             None,
         )
         if last_user_idx is not None:
-            history = history[:last_user_idx]
+            # A redirect can append a second non-observed user row after the
+            # media-producing part of the same turn. Walk past that correction
+            # and its provider checkpoint so the boundary remains before the
+            # original user message.
+            while last_user_idx is not None:
+                correction_api_content = history[last_user_idx].get("api_content")
+                is_redirect_correction = (
+                    isinstance(correction_api_content, str)
+                    and "[Context from the interrupted assistant response]" in correction_api_content
+                )
+                checkpoint_idx = last_user_idx - 1
+                checkpoint_api_content = (
+                    history[checkpoint_idx].get("api_content")
+                    if checkpoint_idx >= 0
+                    else None
+                )
+                is_redirect_checkpoint = (
+                    checkpoint_idx >= 0
+                    and history[checkpoint_idx].get("role") == "assistant"
+                    and isinstance(checkpoint_api_content, str)
+                    and "[This response was interrupted by a user correction.]" in checkpoint_api_content
+                )
+                if not (is_redirect_correction or is_redirect_checkpoint):
+                    break
+                last_user_idx = next(
+                    (i for i in range(last_user_idx - 1, -1, -1)
+                     if history[i].get("role") == "user" and not history[i].get("observed")),
+                    None,
+                )
+            if last_user_idx is not None:
+                history = history[:last_user_idx]
         else:
             for msg in reversed(history):
                 if msg.get("role") == "assistant":
