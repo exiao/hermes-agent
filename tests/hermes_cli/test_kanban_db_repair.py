@@ -210,6 +210,7 @@ def test_corrupt_backup_retention_cap_prunes_oldest(tmp_path, monkeypatch):
     mutation. The cap keeps only the newest ``_CORRUPT_BACKUP_RETENTION``.
     """
     monkeypatch.setattr(kb, "_CORRUPT_BACKUP_RETENTION", 3)
+    monkeypatch.setattr(kb, "_MAX_CORRUPT_CLONES", 3)
     db_path = tmp_path / "kanban.db"
     _write_page_corrupt_db(db_path)
 

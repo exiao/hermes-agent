@@ -261,10 +261,11 @@ def test_external_secret_values_are_isolated_between_homes(tmp_path, monkeypatch
     )
     from agent.secret_sources import registry as reg_module
 
-    home_a = tmp_path / "profile-a"
-    home_b = tmp_path / "profile-b"
+    profiles = tmp_path / "profiles"
+    home_a = profiles / "profile-a"
+    home_b = profiles / "profile-b"
     for home in (home_a, home_b):
-        home.mkdir()
+        home.mkdir(parents=True)
         (home / "config.yaml").write_text(
             "secrets:\n  test-source:\n    enabled: true\n",
             encoding="utf-8",

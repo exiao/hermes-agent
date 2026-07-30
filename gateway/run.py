@@ -21446,6 +21446,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if source is None:
             return None
         platform = source.platform
+        # Both fields are internal, explicitly stamped SessionSource state.
+        # Partial/mock sources can fabricate truthy attributes through getattr,
+        # which must not divert normal platform delivery.
+        if getattr(source, "delivered_via_upstream_relay", False) is True:
+            return getattr(self, "adapters", {}).get(Platform.RELAY)
+        # A weak ref can outlive an adapter that a reconnect replaced. Only
+        # return it when it remains registered on this runner.
+        transport_adapter = self._registered_transport_adapter(source)
+        if transport_adapter is not None:
+            return transport_adapter
         profile = (getattr(source, "profile", None) or "").strip()
         _shared_listener = getattr(platform, "value", platform) in _PORT_BINDING_PLATFORM_VALUES
         if profile and not _shared_listener:

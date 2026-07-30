@@ -41,10 +41,10 @@ def test_under_limit_writes_to_file():
     s, _ = _store(2000)
     r = s.add("memory", "[2026-06-17][fact] small entry one")
     check("under-limit add succeeds", r.get("success"))
-    txt = (home / "memories" / "MEMORY.md").read_text()
+    txt = (home / "memories" / "MEMORY.md").read_text(encoding="utf-8")
     check("under-limit add lands in MEMORY.md", "small entry one" in txt)
     pend = home / "episodes" / ".pending.md"
-    check("under-limit add does NOT spill", not pend.exists() or pend.read_text().strip() == "")
+    check("under-limit add does NOT spill", not pend.exists() or pend.read_text(encoding="utf-8").strip() == "")
 
 
 def test_over_limit_spills():
@@ -55,7 +55,7 @@ def test_over_limit_spills():
     r = s.add("memory", big)
     check("over-limit add returns success (no drop)", r.get("success"))
     check("over-limit add reports spilled_to_pending", r.get("spilled_to_pending") is True)
-    pend = (home / "episodes" / ".pending.md").read_text()
+    pend = (home / "episodes" / ".pending.md").read_text(encoding="utf-8")
     check("over-limit entry is in pending", "pushes past the configured limit" in pend)
     check("pending line is TARGET-tab prefixed", pend.startswith("memory\t"))
 
@@ -69,7 +69,7 @@ def test_over_limit_dedups():
     r2 = s.add("memory", big)
     check("repeated overflow still returns success", r2.get("success"))
     check("repeated overflow is deduped (not spilled twice)", r2.get("spilled_to_pending") is False)
-    pend = (home / "episodes" / ".pending.md").read_text()
+    pend = (home / "episodes" / ".pending.md").read_text(encoding="utf-8")
     check("pending contains the fact exactly once", pend.count("duplicate overflow fact") == 1)
 
 
@@ -81,7 +81,7 @@ def test_cross_target_does_not_false_dedup():
     mt._spill_to_pending("memory", "[2026-06-17][fact] shared sentence about pipelines")
     status = mt._spill_to_pending("user", "[2026-06-17][fact] shared sentence about pipelines")
     check("user spill not suppressed by memory line", status == "written")
-    pend = (home / "episodes" / ".pending.md").read_text()
+    pend = (home / "episodes" / ".pending.md").read_text(encoding="utf-8")
     check("pending has both target rows", pend.count("shared sentence about pipelines") == 2)
 
 
@@ -109,7 +109,7 @@ def test_multiline_entry_flattened():
     s, mt = _store(120)
     status = mt._spill_to_pending("memory", "[2026-06-17][fact] line one\nline two\nline three")
     check("multiline entry written", status == "written")
-    pend = (home / "episodes" / ".pending.md").read_text()
+    pend = (home / "episodes" / ".pending.md").read_text(encoding="utf-8")
     body_lines = [ln for ln in pend.splitlines() if ln.strip()]
     check("multiline collapsed to one physical record", len(body_lines) == 1)
     check("single record is target-prefixed", body_lines[0].startswith("memory\t"))

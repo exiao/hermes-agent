@@ -584,6 +584,11 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
+        # Preserve events from tasks created after a default target becomes
+        # active, while avoiding a historical replay for existing tasks. The
+        # baseline belongs in the board DB, not this runner, because a restart
+        # can happen between task creation and the notifier's next tick.
+
         while self._running:
             try:
                 # Resolve board-wide auto-subscribe targets fresh each tick so
@@ -651,7 +656,7 @@ class GatewayKanbanWatchersMixin:
                         # checkpoint traffic) is exactly the per-tick cost
                         # this skip avoids.
                         try:
-                            if _kb.count_notify_subs(board=slug) == 0:
+                            if not default_notify_targets and _kb.count_notify_subs(board=slug) == 0:
                                 logger.debug(
                                     "kanban notifier: board %s has no subscriptions; skipping open",
                                     slug,
@@ -707,12 +712,20 @@ class GatewayKanbanWatchersMixin:
                                     if tgt["platform"] not in active_platforms:
                                         continue
                                     try:
+                                        initial_event_cursor = _kb.get_or_create_default_notify_cursor(
+                                            conn,
+                                            platform=tgt["platform"],
+                                            chat_id=tgt["chat_id"],
+                                            thread_id=tgt["thread_id"],
+                                            notifier_profile=notifier_profile,
+                                        )
                                         _kb.add_default_notify_subs(
                                             conn,
                                             platform=tgt["platform"],
                                             chat_id=tgt["chat_id"],
                                             thread_id=tgt["thread_id"],
                                             notifier_profile=notifier_profile,
+                                            initial_event_cursor=initial_event_cursor,
                                         )
                                     except Exception as exc:
                                         logger.debug(
