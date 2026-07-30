@@ -42,6 +42,7 @@ def test_current_turn_media_is_not_treated_as_history():
         {"role": "assistant", "tool_calls": [{"id": "t1", "function": {"name": "image_generate"}}]},
         {"role": "tool", "tool_call_id": "t1", "content": f"MEDIA:{path}"},
         {"role": "assistant", "content": f"MEDIA:{path}"},
+        {"role": "user", "content": "[alice|u2]\nunrelated group message", "observed": True},
     ])
     paths = adapter._history_media_paths_for_session("session-key")
     assert not paths or path not in paths

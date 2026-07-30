@@ -3392,7 +3392,7 @@ class BasePlatformAdapter(ABC):
         history = list(transcript)
         last_user_idx = next(
             (i for i in range(len(history) - 1, -1, -1)
-             if history[i].get("role") == "user"),
+             if history[i].get("role") == "user" and not history[i].get("observed")),
             None,
         )
         if last_user_idx is not None:
