@@ -441,7 +441,7 @@ class SignalAdapter(BasePlatformAdapter):
         # Local file paths of attachments this bot sent, keyed by the outbound
         # Signal timestamp. Signal timestamps are only unique within a
         # conversation, so retain the destination too before resolving a quote.
-        self._sent_attachment_paths: "OrderedDict[str, Tuple[str, List[str]]]" = OrderedDict()
+        self._sent_attachment_paths: "OrderedDict[Tuple[str, str], List[str]]" = OrderedDict()
         self._max_sent_attachment_entries = 200
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
@@ -970,9 +970,12 @@ class SignalAdapter(BasePlatformAdapter):
         """Map an outbound Signal timestamp and destination to local attached files."""
         if timestamp is None or not chat_id or not paths:
             return
-        key = str(timestamp)
+        # Key on (conversation, timestamp): two conversations can receive the
+        # same millisecond timestamp, and a timestamp-only key would let the
+        # second send evict a still-quotable attachment from the first.
+        key = (str(chat_id), str(timestamp))
         self._sent_attachment_paths.pop(key, None)
-        self._sent_attachment_paths[key] = (chat_id, list(paths))
+        self._sent_attachment_paths[key] = list(paths)
         while len(self._sent_attachment_paths) > self._max_sent_attachment_entries:
             self._sent_attachment_paths.popitem(last=False)
 
@@ -1019,13 +1022,10 @@ class SignalAdapter(BasePlatformAdapter):
         """Return local paths for quoted media sent to this Signal conversation."""
         if not quote_id or not chat_id:
             return []
-        cached = self._sent_attachment_paths.get(str(quote_id))
+        cached = self._sent_attachment_paths.get((str(chat_id), str(quote_id)))
         if not cached:
             return []
-        cached_chat_id, paths = cached
-        if cached_chat_id != chat_id:
-            return []
-        return [p for p in paths if p and Path(p).exists()]
+        return [p for p in cached if p and Path(p).exists()]
 
     def _remember_sent_message_timestamp(self, timestamp: Any) -> None:
         """Keep a bounded cache of outbound Signal timestamps for quote matching."""

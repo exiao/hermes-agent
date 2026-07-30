@@ -3040,8 +3040,22 @@ class TestQuotedAttachments:
 
         assert len(adapter._sent_attachment_paths) == 3
         # Oldest evicted first.
-        assert "0" not in adapter._sent_attachment_paths
-        assert "4" in adapter._sent_attachment_paths
+        assert ("+15559998888", "0") not in adapter._sent_attachment_paths
+        assert ("+15559998888", "4") in adapter._sent_attachment_paths
+
+    def test_same_timestamp_in_two_conversations_both_survive(self, monkeypatch, tmp_path):
+        """Concurrent sends sharing a millisecond must not evict each other."""
+        adapter = _make_signal_adapter(monkeypatch)
+        first = tmp_path / "a.png"
+        second = tmp_path / "b.png"
+        first.write_bytes(b"a")
+        second.write_bytes(b"b")
+
+        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(first)])
+        adapter._remember_sent_attachments(1753650000000, "+15551112222", [str(second)])
+
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == [str(first)]
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15551112222") == [str(second)]
 
     def test_remembering_is_a_noop_without_paths(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
