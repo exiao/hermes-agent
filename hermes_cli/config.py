@@ -3100,17 +3100,6 @@ DEFAULT_CONFIG = {
         # to disable the preflight. Bridged by HERMES_KANBAN_FD_HEADROOM (env
         # override wins) for worker subprocesses / tests.
         "fd_headroom": 64,
-        # Board-wide auto-subscribe. Each entry fans EVERY ticket's terminal
-        # events (completed / blocked / gave_up / crashed / timed_out, plus
-        # completion artifacts) out to a chat with zero manual
-        # ``hermes kanban notify-subscribe``. The gateway notifier applies
-        # these to every active task each tick (idempotent INSERT-OR-IGNORE,
-        # so per-task subscriptions are never disturbed). Read fresh each
-        # tick — editing this list takes effect on the next tick, no restart.
-        # Entries are dicts: {platform, chat_id, thread_id?}. ``chat_id`` is
-        # the adapter's send-format id (e.g. Signal group: "group:<base64>").
-        # Empty list = feature off (default).
-        "default_notify": [],
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
