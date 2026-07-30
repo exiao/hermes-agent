@@ -689,6 +689,10 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     try:
         tid = kb.create_task(conn, title="render q3 chart", assignee="worker1")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        # The completion path requires a dispatcher run token; claim the task so
+        # a real run exists to scope this worker's completion to.
+        kb.claim_task(conn, tid)
+        _run = kb.latest_run(conn, tid)
     finally:
         conn.close()
 
@@ -696,6 +700,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     # → metadata.artifacts → event payload promotion.
     import os
     os.environ["HERMES_KANBAN_TASK"] = tid
+    os.environ["HERMES_KANBAN_RUN_ID"] = str(_run.id)
     try:
         out = kt._handle_complete({
             "summary": "rendered the chart",
@@ -703,6 +708,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
         })
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
+        os.environ.pop("HERMES_KANBAN_RUN_ID", None)
     import json as _json
     assert _json.loads(out)["ok"] is True
 
@@ -777,11 +783,16 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     try:
         tid = kb.create_task(conn, title="t", assignee="worker1")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        # The completion path requires a dispatcher run token; claim the task so
+        # a real run exists to scope this worker's completion to.
+        kb.claim_task(conn, tid)
+        _run = kb.latest_run(conn, tid)
     finally:
         conn.close()
 
     import os
     os.environ["HERMES_KANBAN_TASK"] = tid
+    os.environ["HERMES_KANBAN_RUN_ID"] = str(_run.id)
     try:
         kt._handle_complete({
             "summary": "one real, one ghost",
@@ -789,6 +800,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
         })
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
+        os.environ.pop("HERMES_KANBAN_RUN_ID", None)
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
