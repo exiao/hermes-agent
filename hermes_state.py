@@ -7174,10 +7174,17 @@ class SessionDB:
             )
             msg_id = cursor.lastrowid
 
-            # Session metadata is persisted for gateway bookkeeping, not as a
-            # model-visible turn. Keep it out of transcript counters so adding
-            # a delivery receipt cannot evict a cached agent on the next turn.
-            if role == "session_meta":
+            # Delivery receipts are persisted for gateway bookkeeping, not as
+            # model-visible turns. Keep only those metadata rows out of
+            # transcript counters so adding a receipt cannot evict a cached
+            # agent on the next turn. Other session_meta rows, such as the
+            # first-turn tool-definition marker, remain counted for the
+            # existing transcript invariant.
+            if (
+                role == "session_meta"
+                and isinstance(display_metadata, dict)
+                and "media_delivered" in display_metadata
+            ):
                 return msg_id
 
             # Update counters
