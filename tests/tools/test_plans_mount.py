@@ -254,3 +254,74 @@ def test_plans_are_in_the_recurring_sync_path(monkeypatch):
     assert ("/host/plan.md", "/root/.hermes/plans/plan.md") in iter_sync_files(
         "/root/.hermes"
     )
+
+
+def test_managed_modal_transports_plans_over_exec(monkeypatch, tmp_path):
+    """Managed sandboxes must carry plans themselves, not reroute the backend.
+
+    The gateway exposes no mount or upload primitive, so plans travel as a
+    base64 payload on an exec. Rerouting auto-mode to direct instead would
+    silently move ordinary sessions onto the user's own Modal credentials.
+    """
+    import base64
+    import tools.credential_files as cf
+    from tools.environments import managed_modal as mm
+
+    plan = tmp_path / "task.md"
+    plan.write_text("# the plan\nstep one\n")
+
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
+    monkeypatch.setattr(
+        cf,
+        "iter_plans_files",
+        lambda *a, **k: [
+            {
+                "host_path": str(plan),
+                "container_path": "/root/.hermes/plans/task.md",
+            }
+        ],
+    )
+
+    calls = []
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"id": "sb-1"}
+
+    def fake_request(self, method, path, **kwargs):
+        calls.append((method, path, kwargs.get("json")))
+        return _Resp()
+
+    monkeypatch.setattr(mm.ManagedModalEnvironment, "_request", fake_request)
+    monkeypatch.setattr(
+        mm,
+        "resolve_managed_tool_gateway",
+        lambda _n: type("G", (), {"gateway_origin": "https://gw", "nous_user_token": "t"})(),
+    )
+
+    mm.ManagedModalEnvironment(image="img")
+
+    exec_calls = [c for c in calls if c[1].endswith("/execs")]
+    assert exec_calls, "no exec issued to transport plans"
+    command = exec_calls[0][2]["command"]
+    script = command[-1]
+    assert "/root/.hermes/plans/task.md" in script
+    # The plan's real bytes must be in the payload, not just its path.
+    encoded = base64.b64encode(plan.read_bytes()).decode("ascii")
+    assert encoded in script
+
+
+def test_plans_do_not_reroute_auto_modal_selection(monkeypatch, tmp_path):
+    """Unrelated plans must not flip an auto-mode session onto direct Modal.
+
+    Doing so would spend the user's own Modal credentials and change execution
+    behavior for sessions that reference no plan at all.
+    """
+    from tools.tool_backend_helpers import resolve_modal_backend_state
+
+    state = resolve_modal_backend_state(
+        "auto", has_direct=True, managed_ready=True, managed_enabled=True
+    )
+    assert state["selected_backend"] == "managed"

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import requests
+import shlex
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -68,6 +69,70 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         self._sandbox_kwargs = dict(modal_sandbox_kwargs or {})
         self._create_idempotency_key = str(uuid.uuid4())
         self._sandbox_id = self._create_sandbox()
+        self._plans_synced: set[str] = set()
+        self._sync_plan_files()
+
+    def _sync_plan_files(self) -> None:
+        """Push host plan files into the sandbox over the exec channel.
+
+        Managed Modal has no mount or file-upload primitive — the gateway only
+        exposes exec — so plans travel as a base64 payload on stdin and are
+        decoded inside the sandbox. Constitution rule 2f makes a plan path
+        mandatory in dev card bodies, and a worker that cannot read the plan it
+        was told to follow blocks; carrying them here means managed sandboxes
+        satisfy that contract without rerouting the user's backend selection
+        (which would silently move ordinary sessions onto their own direct
+        Modal credentials and change billing).
+
+        Best-effort by design: a plan that fails to transfer degrades to the
+        pre-existing "no plan visible" behaviour rather than failing the
+        sandbox.
+        """
+        try:
+            from tools.credential_files import iter_plans_files
+
+            entries = iter_plans_files()
+        except Exception:
+            return
+        if not entries:
+            return
+
+        import base64
+
+        script_lines = []
+        for entry in entries:
+            host_path = entry.get("host_path")
+            container_path = entry.get("container_path")
+            if not host_path or not container_path:
+                continue
+            if container_path in self._plans_synced:
+                continue
+            try:
+                with open(host_path, "rb") as handle:
+                    blob = base64.b64encode(handle.read()).decode("ascii")
+            except OSError:
+                continue
+            quoted = shlex.quote(container_path)
+            script_lines.append(f"mkdir -p \"$(dirname {quoted})\"")
+            script_lines.append(f"printf %s {shlex.quote(blob)} | base64 -d > {quoted}")
+            self._plans_synced.add(container_path)
+
+        if not script_lines:
+            return
+        try:
+            self._request(
+                "POST",
+                f"/v1/sandboxes/{self._sandbox_id}/execs",
+                json={
+                    "execId": str(uuid.uuid4()),
+                    "command": ["bash", "-lc", "\n".join(script_lines)],
+                    "cwd": self.cwd,
+                    "timeoutMs": 120_000,
+                },
+                timeout=60,
+            )
+        except Exception as exc:
+            logger.warning("Managed Modal plan sync failed: %s", exc)
 
     def _start_modal_exec(self, prepared: PreparedModalExec) -> ModalExecStart:
         exec_id = str(uuid.uuid4())
