@@ -212,9 +212,12 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         return sandbox_id
 
     def _guard_unsupported_credential_passthrough(self) -> None:
-        """Managed Modal does not sync or mount host credential files."""
+        """Managed Modal does not sync or mount host credential or plan files."""
         try:
-            from tools.credential_files import get_credential_file_mounts
+            from tools.credential_files import (
+                get_credential_file_mounts,
+                iter_plans_files,
+            )
         except Exception:
             return
 
@@ -224,6 +227,20 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
                 "Managed Modal does not support host credential-file passthrough. "
                 "Use TERMINAL_MODAL_MODE=direct when skills or config require "
                 "credential files inside the sandbox."
+            )
+
+        # Plan files are mounted only on the direct Modal route. Failing loudly
+        # here beats a worker silently finding no plan at the /root/.hermes/plans
+        # path its card told it to read.
+        try:
+            plans = iter_plans_files()
+        except Exception:
+            plans = []
+        if plans:
+            raise ValueError(
+                "Managed Modal does not support host plan-file passthrough. "
+                "Use TERMINAL_MODAL_MODE=direct when a card links a plan file "
+                "under ~/.hermes/plans that the worker must read."
             )
 
     def _request(self, method: str, path: str, *,

@@ -182,3 +182,37 @@ class TestModalWiring:
 
         assert mounts == [("/host/plan.md", "/root/.hermes/plans/plan.md")]
         assert create_calls[0][1]["mounts"] == mounts
+
+
+def test_managed_modal_refuses_plan_passthrough(monkeypatch):
+    """Managed Modal cannot mount plans, so it must fail loudly, not silently."""
+    import tools.credential_files as cf
+    from tools.environments.managed_modal import ManagedModalEnvironment
+
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
+    monkeypatch.setattr(
+        cf,
+        "iter_plans_files",
+        lambda: [
+            {
+                "host_path": "/host/plan.md",
+                "container_path": "/root/.hermes/plans/plan.md",
+            }
+        ],
+    )
+
+    env = object.__new__(ManagedModalEnvironment)
+    with pytest.raises(ValueError, match="plan-file passthrough"):
+        env._guard_unsupported_credential_passthrough()
+
+
+def test_managed_modal_allows_sandbox_without_plans(monkeypatch):
+    """No plans on the host means the managed route stays usable."""
+    import tools.credential_files as cf
+    from tools.environments.managed_modal import ManagedModalEnvironment
+
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
+    monkeypatch.setattr(cf, "iter_plans_files", lambda: [])
+
+    env = object.__new__(ManagedModalEnvironment)
+    env._guard_unsupported_credential_passthrough()
