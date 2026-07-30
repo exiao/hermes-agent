@@ -78,8 +78,9 @@ _LIVE_CONFIG_PYTHON_SCRIPTS = {
 }
 _LIVE_CONFIG_E2E_ROOTS = (
     "agent/", "gateway/", "hermes_cli/", "tools/", "cron/",
-    "tui_gateway/", "acp_adapter/",
+    "tui_gateway/", "acp_adapter/", "tests/e2e/",
 )
+_LIVE_CONFIG_E2E_FILES = {"tests/conftest.py"}
 
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
@@ -156,6 +157,7 @@ def _is_live_config_e2e_path(path: str) -> bool:
     """Return whether a narrow live-config push must retain Python E2E tests."""
     return (
         path.startswith(_LIVE_CONFIG_E2E_ROOTS)
+        or path in _LIVE_CONFIG_E2E_FILES
         or path in _LIVE_CONFIG_PYTHON_FILES
         or ("/" not in path and path.endswith(".py"))
     )

@@ -149,6 +149,14 @@ LIVE_CONFIG_PUSH_CASES = {
         ["gateway/runtime.py", "tests/gateway/test_runtime.py"],
         _lanes(python=True, e2e=True),
     ),
+    "live-config E2E test push retains E2E": (
+        "push", "refs/heads/live-config", ["tests/e2e/test_cli.py"],
+        _lanes(python=True, e2e=True),
+    ),
+    "live-config shared test fixture push retains E2E": (
+        "push", "refs/heads/live-config", ["tests/conftest.py"],
+        _lanes(python=True, e2e=True),
+    ),
     "live-config lockfile push retains E2E": (
         "push", "refs/heads/live-config", ["uv.lock"], _lanes(python=True, e2e=True),
     ),
