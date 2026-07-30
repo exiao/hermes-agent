@@ -8966,8 +8966,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if persist_global:
             HermesCLI._clear_persisted_context_for_model_switch(self, result)
             save_config_value("model.default", result.new_model)
-            if result.provider_changed:
-                save_config_value("model.provider", result.target_provider)
+            save_config_value("model.provider", result.target_provider)
             # Preserve provider-scoped proxy provenance; copying its URL into
             # model.base_url would turn it into an untrusted raw override.
             # base_url/api_mode were previously never persisted here, so a
@@ -9325,8 +9324,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if persist_global:
             HermesCLI._clear_persisted_context_for_model_switch(self, result)
             save_config_value("model.default", result.new_model)
-            if result.provider_changed:
-                save_config_value("model.provider", result.target_provider)
+            save_config_value("model.provider", result.target_provider)
             # Keep provider-scoped proxy URLs out of the global model block.
             # See _apply_model_switch_result above for why base_url/api_mode
             # must be synced on every global switch (#25106).

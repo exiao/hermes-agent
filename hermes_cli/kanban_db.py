@@ -1398,6 +1398,19 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Board-wide default notification targets need a durable activation cursor:
+-- subscriptions created after a gateway restart must not skip events emitted
+-- while that runner was offline.
+CREATE TABLE IF NOT EXISTS kanban_default_notify_cursors (
+    platform               TEXT NOT NULL,
+    chat_id                TEXT NOT NULL,
+    thread_id              TEXT NOT NULL DEFAULT '',
+    notifier_profile       TEXT NOT NULL DEFAULT '',
+    initial_event_cursor   INTEGER NOT NULL,
+    created_at             INTEGER NOT NULL,
+    PRIMARY KEY (platform, chat_id, thread_id, notifier_profile)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2303,19 +2316,22 @@ def _repairable_index_names(messages: list[str]) -> Optional[list[str]]:
     names: list[str] = []
     saw_any = False
     for raw in messages:
-        message = (raw or "").strip()
-        if not message:
-            continue
-        for pattern in _REPAIRABLE_INDEX_ERROR_PATTERNS:
-            match = pattern.match(message)
-            if match:
-                break
-        else:
-            return None
-        saw_any = True
-        name = match.group("index").strip()
-        if name and name not in names:
-            names.append(name)
+        for message in (raw or "").splitlines():
+            message = message.strip()
+            if not message or message == "*** in database main ***":
+                continue
+            if message.lower().startswith("fragmentation of "):
+                continue
+            for pattern in _REPAIRABLE_INDEX_ERROR_PATTERNS:
+                match = pattern.match(message)
+                if match:
+                    break
+            else:
+                return None
+            saw_any = True
+            name = match.group("index").strip()
+            if name and name not in names:
+                names.append(name)
     if not saw_any or not names:
         return None
     return names
@@ -11724,41 +11740,6 @@ def count_notify_subs(
         return int(row[0]) if row else 0
     finally:
         conn.close()
-
-
-def add_default_notify_subs(
-    conn: sqlite3.Connection,
-    *,
-    platform: str,
-    chat_id: str,
-    thread_id: Optional[str] = None,
-    notifier_profile: Optional[str] = None,
-    final_statuses: Iterable[str] = ("done", "archived"),
-) -> None:
-    """Subscribe one board-wide target to every active (non-final) task in a
-    single write transaction.
-
-    Equivalent to calling :func:`add_notify_sub` once per active task, but
-    issues one ``INSERT OR IGNORE ... SELECT`` instead of N IMMEDIATE write
-    transactions per notifier tick — the per-task loop opened a write txn for
-    every active task every 5s even when the rows already existed. Idempotent
-    on the (task, platform, chat, thread) PK, so existing per-task or default
-    subscriptions (and their cursors) are never disturbed.
-    """
-    finals = tuple(final_statuses)
-    placeholders = ",".join("?" for _ in finals)
-    now = int(time.time())
-    with write_txn(conn):
-        conn.execute(
-            f"""
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, notifier_profile, created_at)
-            SELECT id, ?, ?, ?, ?, ?
-              FROM tasks
-             WHERE status NOT IN ({placeholders})
-            """,
-            (platform, chat_id, thread_id or "", notifier_profile, now, *finals),
-        )
 
 
 def remove_notify_sub(
