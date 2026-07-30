@@ -132,6 +132,7 @@ CASES = {
 LIVE_CONFIG_CASES = {
     "runtime Python file → Python checks": (["agent/runner.py"], _lanes(python=True)),
     "test file → Python checks": (["tests/agent/test_runner.py"], _lanes(python=True)),
+    "non-Python test file → full validation": (["tests/README.md"], DEFAULT),
     "Python manifests → full validation": (["pyproject.toml", "uv.lock"], DEFAULT),
     "Python file plus test → Python checks": (["gateway/run.py", "tests/gateway/test_run.py"], _lanes(python=True)),
     "docs → full validation": (["README.md"], DEFAULT),

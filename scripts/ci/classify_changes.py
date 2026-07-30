@@ -118,7 +118,7 @@ def _live_config_python_path(path: str) -> bool:
     if path in _LIVE_CONFIG_FULL_FILES or path.startswith(_LIVE_CONFIG_FULL_TEST_DIRS):
         return False
     if path.startswith("tests/"):
-        return True
+        return path.endswith(".py")
     if "/" not in path and path.endswith(".py"):
         return path != "setup.py"
     return path.endswith(".py") and path.startswith(_LIVE_CONFIG_PYTHON_DIRS)
