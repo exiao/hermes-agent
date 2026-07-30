@@ -390,7 +390,42 @@ _STRICT_URL_USERINFO_AUTHORITY_RE = re.compile(r"([^/\s?#@]+)@")
 
 # Trailing ``scheme:`` immediately before a ``//`` (``https://``), so an
 # absolute reference is redacted from the scheme rather than from the slashes.
-_URL_SCHEME_SUFFIX_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:$")
+# Matched by ``_scheme_start`` walking BACKWARD from the slashes rather than
+# by a regex ``search`` over the emitted prefix: an unanchored ``$``-anchored
+# pattern retries from every one of N prefix positions, which is quadratic on
+# a long non-URL run (``"p" * 32000 + " //user:pw@host/x"`` cost 1.6s).
+_SCHEME_TAIL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
+)
+_SCHEME_HEAD_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
+
+
+def _scheme_start(text: str, slashes: int, floor: int) -> int:
+    """Start index of a ``scheme:`` ending at ``slashes``, else ``slashes``.
+
+    Implements ``[A-Za-z][A-Za-z0-9+.-]*:$`` as a bounded backward walk over
+    the characters immediately preceding ``//``. Work is proportional to the
+    scheme run actually present (a handful of characters for real URLs), not
+    to the length of the text before it, so unrelated prose ahead of a match
+    costs nothing. ``floor`` is the last emitted position — never look behind
+    already-consumed text.
+    """
+    if slashes - 1 < floor or text[slashes - 1] != ":":
+        return slashes
+    index = slashes - 1
+    while index - 1 >= floor and text[index - 1] in _SCHEME_TAIL_CHARS:
+        index -= 1
+    # The regex took the LEFTMOST match, so a run that starts with non-letter
+    # scheme characters (``99abc://``) still matched from the first letter.
+    # Advance to it rather than rejecting the whole run.
+    while index < slashes - 1 and text[index] not in _SCHEME_HEAD_CHARS:
+        index += 1
+    # A scheme must lead with a letter and be non-empty; ``123://`` is not one.
+    if index == slashes - 1 or text[index] not in _SCHEME_HEAD_CHARS:
+        return slashes
+    return index
 
 
 def _sub_url_userinfo(text: str, repl) -> str:
@@ -420,8 +455,7 @@ def _sub_url_userinfo(text: str, repl) -> str:
             # such as ``///user:password@host`` are not skipped.
             search_from = slashes + 1
             continue
-        scheme = _URL_SCHEME_SUFFIX_RE.search(text, pos, slashes)
-        start = scheme.start() if scheme is not None else slashes
+        start = _scheme_start(text, slashes, pos)
         prefix = text[start:slashes + 2]
         out.append(text[pos:start])
         out.append(repl(_UserinfoMatch(prefix, authority.group(1))))
