@@ -1446,8 +1446,10 @@ class SignalAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> set[str]:
         """Send a batch of images via chunked Signal RPC calls.
+
+        Returns the local paths included in batches acknowledged by Signal.
 
         Per-image alt texts are dropped — Signal's send RPC only carries
         one shared message body. Bad images (download failure, missing
@@ -1456,9 +1458,10 @@ class SignalAdapter(BasePlatformAdapter):
         the rate-limit scheduler handles inter-batch pacing.
         """
         if not images:
-            return
+            return set()
 
         scheduler = get_scheduler()
+        delivered_paths: set[str] = set()
         logger.info(
             "Signal send_multiple_images: received %d image(s) for %s — "
             "scheduler state: %s",
@@ -1505,7 +1508,7 @@ class SignalAdapter(BasePlatformAdapter):
                 "(download=%d missing=%d oversize=%d)",
                 len(images), skipped_download, skipped_missing, skipped_oversize,
             )
-            return
+            return set()
 
         logger.info(
             "Signal send_multiple_images: %d/%d images valid, sending in chunks",
@@ -1559,6 +1562,7 @@ class SignalAdapter(BasePlatformAdapter):
                             # timestamp, so quoting the image later resolves to it.
                             if isinstance(result, dict):
                                 self._remember_sent_attachments(result.get("timestamp"), chat_id, att_batch)
+                            delivered_paths.update(att_batch)
                             await scheduler.report_rpc_duration(_rpc_duration, n)
                             logger.info(
                                 "Signal batch %d/%d: %d attachments sent in %.1fs "
@@ -1620,6 +1624,8 @@ class SignalAdapter(BasePlatformAdapter):
                         attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                         f"{e.retry_after:.0f}s" if e.retry_after else "unknown",
                     )
+
+        return delivered_paths
 
     async def _notify_batch_pacing(
         self,

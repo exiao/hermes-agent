@@ -39,6 +39,7 @@ class _DummyAdapter(BasePlatformAdapter):
     def __init__(self, platform: Platform):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), platform)
         self.sent: list[dict] = []
+        self.sent_documents: list[str] = []
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
@@ -49,6 +50,13 @@ class _DummyAdapter(BasePlatformAdapter):
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
         self.sent.append({"chat_id": chat_id, "content": content})
         return SendResult(success=True, message_id="msg-1")
+
+    async def send_document(
+        self, chat_id, file_path, caption=None, file_name=None,
+        reply_to=None, metadata=None, **kwargs,
+    ) -> SendResult:
+        self.sent_documents.append(file_path)
+        return SendResult(success=True, message_id="doc-1")
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None
@@ -72,6 +80,21 @@ async def _hold_typing(_chat_id, interval=2.0, metadata=None, stop_event=None):
         await asyncio.Event().wait()
 
 
+class _TranscriptStore:
+    def __init__(self, transcript):
+        self.transcript = transcript
+        self.appended = []
+
+    def peek_session_id(self, _session_key):
+        return "session-1"
+
+    def load_transcript(self, _session_id):
+        return list(self.transcript)
+
+    def append_to_transcript(self, session_id, message):
+        self.appended.append((session_id, message))
+
+
 def _strip_everything(adapter, monkeypatch):
     """Force the extract pipeline to reduce text_content to "" with no
     attachments — the exact failure mode that made the drop invisible."""
@@ -84,6 +107,71 @@ def _strip_everything(adapter, monkeypatch):
     monkeypatch.setattr(
         type(adapter), "extract_local_files", staticmethod(lambda content: ([], ""))
     )
+
+
+class TestHistoryMediaDedupUsesDeliveryOutcome:
+    @pytest.mark.asyncio
+    async def test_history_path_with_unknown_delivery_is_retried(self, tmp_path):
+        path = tmp_path / "retry.pdf"
+        path.write_bytes(b"pdf")
+        adapter = _DummyAdapter(Platform.DISCORD)
+        adapter._keep_typing = _hold_typing
+        adapter.set_session_store(_TranscriptStore([
+            {"role": "assistant", "content": f"MEDIA:{path}"},
+            {"role": "user", "content": "retry this"},
+            {"role": "assistant", "content": f"MEDIA:{path}"},
+        ]))
+
+        async def handler(_event):
+            return f"MEDIA:{path}"
+
+        adapter.set_message_handler(handler)
+        event = _make_event(Platform.DISCORD)
+
+        await adapter._process_message_background(
+            event, build_session_key(event.source)
+        )
+
+        assert adapter.sent_documents == [str(path)]
+
+    @pytest.mark.asyncio
+    async def test_history_path_that_delivered_is_still_suppressed(self, tmp_path):
+        path = tmp_path / "already-sent.pdf"
+        path.write_bytes(b"pdf")
+        adapter = _DummyAdapter(Platform.DISCORD)
+        adapter._keep_typing = _hold_typing
+        store = _TranscriptStore([
+            {"role": "user", "content": "send this"},
+            {"role": "assistant", "content": "MEDIA: old.pdf"},
+        ])
+        adapter.set_session_store(store)
+
+        async def handler(_event):
+            return f"MEDIA:{path}"
+
+        adapter.set_message_handler(handler)
+        event = _make_event(Platform.DISCORD)
+        session_key = build_session_key(event.source)
+        await adapter._process_message_background(event, session_key)
+        assert adapter.sent_documents == [str(path)]
+        assert store.appended == [(
+            "session-1",
+            {"role": "session_meta", "media_delivered": [str(path)]},
+        )]
+
+        store.transcript = [
+            {"role": "assistant", "content": f"MEDIA:{path}"},
+            {"role": "user", "content": "echo it"},
+            {"role": "assistant", "content": f"MEDIA:{path}"},
+            {"role": "session_meta", "media_delivered": [str(path)]},
+        ]
+        retry_adapter = _DummyAdapter(Platform.DISCORD)
+        retry_adapter._keep_typing = _hold_typing
+        retry_adapter.set_session_store(store)
+        retry_adapter.set_message_handler(handler)
+        await retry_adapter._process_message_background(event, session_key)
+
+        assert retry_adapter.sent_documents == []
 
 
 @pytest.mark.parametrize("platform", [Platform.DISCORD, Platform.TELEGRAM])

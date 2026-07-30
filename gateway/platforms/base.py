@@ -2750,6 +2750,10 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        # Transcript MEDIA tags record what the model mentioned, not what the
+        # platform accepted. Keep successful attachment deliveries separate so
+        # a failed send remains eligible for a later retry.
+        self._delivered_media_paths_by_session: Dict[str, set[str]] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
         # construction (gateway/run.py). Default to "interrupt" so a stray
@@ -3361,12 +3365,11 @@ class BasePlatformAdapter(ABC):
         self._session_store = session_store
     
     def _history_media_paths_for_session(self, session_key: str) -> Optional[set]:
-        """Return media paths already delivered in prior turns of this session.
+        """Return prior transcript paths that this adapter delivered successfully.
 
-        Loads the persisted transcript, drops the most recent assistant entry
-        (which belongs to the current response), and scans the remaining history
-        for MEDIA: tags and image_generate JSON payloads.  Used to prevent the
-        model from re-delivering the same file when it echoes an old MEDIA tag.
+        Transcript MEDIA tags are intent, not delivery receipts: a failed or
+        dropped upload still leaves the tag in history. Only the intersection
+        with this adapter's successful-delivery ledger is safe to suppress.
         """
         store = getattr(self, "_session_store", None)
         if not store:
@@ -3396,7 +3399,41 @@ class BasePlatformAdapter(ABC):
             return None
         # Avoid circular import: gateway.run already imports this module.
         from gateway.run import _collect_history_media_paths
-        return _collect_history_media_paths(history)
+        history_paths = _collect_history_media_paths(history)
+        delivered_paths = set(
+            getattr(self, "_delivered_media_paths_by_session", {}).get(session_key, set())
+        )
+        for msg in history:
+            if msg.get("role") == "session_meta":
+                delivered_paths.update(
+                    str(path) for path in msg.get("media_delivered", []) if path
+                )
+        return history_paths & delivered_paths or None
+
+    def _record_media_delivery(self, session_key: str, path: str) -> None:
+        """Remember and persist a path only after its send was acknowledged."""
+        delivered_paths = self._delivered_media_paths_by_session.setdefault(
+            session_key, set()
+        )
+        if path in delivered_paths:
+            return
+        delivered_paths.add(path)
+
+        # ``session_meta`` rows are excluded from the LLM transcript but keep
+        # delivery receipts across gateway restarts. A missing/partial store is
+        # fine: the in-memory ledger still protects retries in this process.
+        store = getattr(self, "_session_store", None)
+        try:
+            peek = getattr(store, "peek_session_id", None)
+            session_id = peek(session_key) if callable(peek) else None
+            append = getattr(store, "append_to_transcript", None)
+            if session_id and callable(append):
+                append(
+                    session_id,
+                    {"role": "session_meta", "media_delivered": [path]},
+                )
+        except Exception:
+            logger.debug("failed to persist media delivery receipt", exc_info=True)
 
     @abstractmethod
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -3764,8 +3801,8 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
-        """Send a batch of images.
+    ) -> set[str]:
+        """Send a batch of images and return paths sent successfully.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
         element.
@@ -3779,6 +3816,7 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        delivered_paths: set[str] = set()
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -3810,10 +3848,15 @@ class BasePlatformAdapter(ABC):
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
-                if not img_result.success:
+                if img_result.success:
+                    if image_url.startswith("file://"):
+                        delivered_paths.add(_unquote(image_url[7:]))
+                else:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+
+        return delivered_paths
 
     async def send_image(
         self,
@@ -6052,12 +6095,20 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        delivered_image_paths = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        # Legacy platform overrides return None after a
+                        # completed batch. Preserve their established
+                        # successful-echo suppression until they adopt the
+                        # receipt-returning contract used by Signal.
+                        if delivered_image_paths is None:
+                            delivered_image_paths = _image_paths
+                        for delivered_path in delivered_image_paths:
+                            self._record_media_delivery(session_key, delivered_path)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
@@ -6097,7 +6148,9 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
-                        if not media_result.success:
+                        if media_result.success:
+                            self._record_media_delivery(session_key, media_path)
+                        else:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             await self._notify_media_delivery_failure(
                                 event.source.chat_id,
@@ -6126,7 +6179,9 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
-                        if not file_result.success:
+                        if file_result.success:
+                            self._record_media_delivery(session_key, file_path)
+                        else:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
                                 self.name,
