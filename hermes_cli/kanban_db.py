@@ -5129,8 +5129,29 @@ def _supersede_empty_terminal_handoff(
         _restore_completion_delivery_subs(
             conn, task_id, run_id=int(expected_run_id),
         )
+        # The correction supplies the MISSING push evidence; it is not a full
+        # restatement of the run. Overwriting metadata wholesale would discard
+        # structured evidence the original completion already recorded
+        # (changed_files, artifacts, created_cards) whenever the worker didn't
+        # happen to repeat it. Merge instead: correction keys win, prior keys
+        # survive.
+        prior_run_metadata = None
+        if run["metadata"]:
+            try:
+                decoded = json.loads(run["metadata"])
+                if isinstance(decoded, dict):
+                    prior_run_metadata = decoded
+            except (TypeError, ValueError):
+                prior_run_metadata = None
         if isinstance(metadata, dict):
-            _persist_completion_artifacts(conn, task_id, metadata, now=int(time.time()))
+            merged_metadata: Optional[dict] = dict(prior_run_metadata or {})
+            merged_metadata.update(metadata)
+        else:
+            merged_metadata = prior_run_metadata
+        if isinstance(merged_metadata, dict):
+            _persist_completion_artifacts(
+                conn, task_id, merged_metadata, now=int(time.time())
+            )
         handoff = summary if summary is not None else result
         conn.execute(
             "UPDATE tasks SET result = COALESCE(?, result) WHERE id = ?",
@@ -5140,7 +5161,9 @@ def _supersede_empty_terminal_handoff(
             "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
             (
                 handoff,
-                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                json.dumps(merged_metadata, ensure_ascii=False)
+                if merged_metadata
+                else None,
                 int(expected_run_id),
             ),
         )
@@ -5162,8 +5185,26 @@ def _supersede_empty_terminal_handoff(
             # only completion record downstream consumers see, so it must
             # carry the verified child-card manifest too.
             completed_payload["verified_cards"] = list(verified_cards)
-        if isinstance(metadata, dict):
-            artifacts = metadata.get("artifacts")
+        else:
+            # ...and when the correction doesn't repeat them, fall back to the
+            # manifest the ORIGINAL completion event recorded. Otherwise the
+            # only surviving completion record silently loses the child cards.
+            prior_completed = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'completed' AND run_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id, int(expected_run_id)),
+            ).fetchone()
+            if prior_completed is not None and prior_completed["payload"]:
+                try:
+                    prior_payload = json.loads(prior_completed["payload"])
+                except (TypeError, ValueError):
+                    prior_payload = None
+                if isinstance(prior_payload, dict):
+                    prior_cards = prior_payload.get("verified_cards")
+                    if isinstance(prior_cards, (list, tuple)) and prior_cards:
+                        completed_payload["verified_cards"] = list(prior_cards)
+        if isinstance(merged_metadata, dict):
+            artifacts = merged_metadata.get("artifacts")
             if isinstance(artifacts, (list, tuple)):
                 cleaned_artifacts = [
                     str(path).strip()

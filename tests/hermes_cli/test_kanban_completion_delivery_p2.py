@@ -466,3 +466,43 @@ def test_correction_still_accepted_without_any_newer_lifecycle(kanban_home):
         assert kb.get_task(conn, tid).result == "real result"
     finally:
         conn.close()
+
+
+def test_correction_preserves_original_completion_evidence(kanban_home):
+    """A correction adds the missing push field; it must not erase prior evidence.
+
+    The owner's first completion can already carry changed_files/artifacts/
+    created_cards but lack commit_sha. A later correction supplying ONLY the
+    push field previously replaced the run's whole metadata object and rebuilt
+    the event from correction args alone, silently dropping everything the
+    original recorded unless the worker happened to repeat it.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="evidence merge", assignee="worker")
+        kb.claim_task(conn, tid)
+        owner = kb.latest_run(conn, tid)
+        assert owner is not None
+        assert kb.complete_task(
+            conn, tid,
+            summary="did the work",
+            metadata={"changed_files": ["a.py", "b.py"], "artifacts": ["/tmp/report.md"]},
+        )
+
+        # Correction supplies ONLY the push evidence that was missing.
+        assert kb.complete_task(
+            conn, tid,
+            summary="did the work",
+            metadata={"commit_sha": "abc123", "pr_url": "https://example/pr/1"},
+            expected_run_id=owner.id,
+        )
+
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (owner.id,)
+        ).fetchone()
+        merged = json.loads(row["metadata"])
+        assert merged["commit_sha"] == "abc123"
+        assert merged["changed_files"] == ["a.py", "b.py"], "prior evidence erased"
+        assert merged["artifacts"] == ["/tmp/report.md"], "prior artifacts erased"
+    finally:
+        conn.close()
