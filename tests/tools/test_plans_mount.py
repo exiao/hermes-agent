@@ -325,3 +325,52 @@ def test_plans_do_not_reroute_auto_modal_selection(monkeypatch, tmp_path):
         "auto", has_direct=True, managed_ready=True, managed_enabled=True
     )
     assert state["selected_backend"] == "managed"
+
+
+def test_plans_are_upload_only_and_never_synced_back(monkeypatch, tmp_path):
+    """A cloud worker must not be able to overwrite the host's authoritative plans.
+
+    Plans are read-only card context. If they were sync-back eligible, a worker
+    editing /root/.hermes/plans/foo.md would copy it back over the host file.
+    """
+    import tools.credential_files as cf
+    from tools.environments import file_sync
+
+    plan = tmp_path / "task.md"
+    plan.write_text("# authoritative")
+
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
+    monkeypatch.setattr(
+        cf,
+        "iter_plans_files",
+        lambda *a, **k: [
+            {"host_path": str(plan), "container_path": "/root/.hermes/plans/task.md"}
+        ],
+    )
+
+    assert str(plan.resolve()) in file_sync._plan_host_paths()
+
+
+def test_plan_enumeration_failure_does_not_break_sibling_syncs(monkeypatch):
+    """Credentials, skills and cache must still sync when plans blow up.
+
+    iter_sync_files is called before FileSyncManager.sync()'s transactional
+    try, so an unhandled error here would abort the whole command prep.
+    """
+    import tools.credential_files as cf
+    from tools.environments.file_sync import iter_sync_files
+
+    def _boom(**kwargs):
+        raise OSError("unreadable plans subtree")
+
+    monkeypatch.setattr(
+        cf,
+        "get_credential_file_mounts",
+        lambda: [{"host_path": "/host/cred", "container_path": "/root/.hermes/cred"}],
+    )
+    monkeypatch.setattr(cf, "iter_skills_files", lambda **k: [])
+    monkeypatch.setattr(cf, "iter_cache_files", lambda **k: [])
+    monkeypatch.setattr(cf, "iter_plans_files", _boom)
+
+    files = iter_sync_files("/root/.hermes")
+    assert ("/host/cred", "/root/.hermes/cred") in files

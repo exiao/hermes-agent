@@ -88,8 +88,16 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     # lifetime. Backends that mount at construction still get them here on the
     # next command, which is what makes an edited plan visible.
     if iter_plans_files is not None:
-        for entry in iter_plans_files(container_base=container_base):
-            files.append((entry["host_path"], entry["container_path"]))
+        # Wrapped, not just import-guarded: FileSyncManager.sync() calls this
+        # file-source callback BEFORE entering its transactional try, so an
+        # exception here (unreadable or transiently failing plans subtree)
+        # would abort command preparation and lose credential, skill and cache
+        # syncing too. Plans are the enhancement; they degrade alone.
+        try:
+            for entry in iter_plans_files(container_base=container_base):
+                files.append((entry["host_path"], entry["container_path"]))
+        except Exception:
+            logger.warning("plan enumeration failed; syncing without plans", exc_info=True)
     for entry in iter_cache_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))
     return files
@@ -108,6 +116,36 @@ def _credential_host_paths() -> set[str]:
     except Exception:
         return set()
     for entry in mounts:
+        host_path = entry.get("host_path") if isinstance(entry, dict) else None
+        if not host_path:
+            continue
+        try:
+            paths.add(str(Path(host_path).expanduser().resolve()))
+        except OSError:
+            paths.add(str(Path(host_path).expanduser()))
+    return paths
+
+
+def _plan_host_paths() -> set[str]:
+    """Return plan files, which are upload-only like credentials.
+
+    Plans are mirrored into sandboxes as READ-ONLY card context. Without this,
+    sync_back() resolves a remote ``/root/.hermes/plans/foo.md`` back to the
+    host and copies it over, so a cloud worker editing (or creating a sibling
+    of) its own plan could overwrite the authoritative plan and patch-note
+    files on Eric's machine. Push down, never pull back.
+    """
+    try:
+        from tools.credential_files import iter_plans_files
+    except ImportError:
+        return set()
+
+    paths: set[str] = set()
+    try:
+        entries = iter_plans_files()
+    except Exception:
+        return set()
+    for entry in entries:
         host_path = entry.get("host_path") if isinstance(entry, dict) else None
         if not host_path:
             continue
@@ -194,6 +232,7 @@ class FileSyncManager:
 
         current_files = self._get_files_fn()
         self._upload_only_host_paths.update(_credential_host_paths())
+        self._upload_only_host_paths.update(_plan_host_paths())
         current_remote_paths = {remote for _, remote in current_files}
 
         # --- Uploads: new or changed files ---
@@ -388,7 +427,9 @@ class FileSyncManager:
 
                 applied = 0
                 upload_only_host_paths = (
-                    self._upload_only_host_paths | _credential_host_paths()
+                    self._upload_only_host_paths
+                    | _credential_host_paths()
+                    | _plan_host_paths()
                 )
                 for dirpath, _dirnames, filenames in os.walk(staging):
                     for fname in filenames:
