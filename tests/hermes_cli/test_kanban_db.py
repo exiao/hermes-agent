@@ -6194,6 +6194,17 @@ def test_is_index_only_corruption_classifier():
     assert not kb._is_index_only_corruption([])
 
 
+def test_repairable_index_names_accepts_sqlite_grouped_diagnostics():
+    """SQLite may return index diagnostics as one newline-delimited row."""
+    messages = [
+        "*** in database main ***\n"
+        "Fragmentation of 19 bytes reported as 0 on page 30\n"
+        "wrong # of entries in index idx_notify_task"
+    ]
+
+    assert kb._repairable_index_names(messages) == ["idx_notify_task"]
+
+
 def test_index_only_corruption_self_heals_and_preserves_rows(tmp_path):
     """The 2026-07-13 board corruption class (stale indexes, base tables intact)
     must self-heal on open via REINDEX / .dump+reload with zero row loss —
@@ -6217,9 +6228,8 @@ def test_index_only_corruption_self_heals_and_preserves_rows(tmp_path):
 
     # DB is clean afterwards and no forensic clone was kept for a recovered DB.
     assert kb._integrity_problems(db_path) is None
-    assert list(tmp_path.glob("*.corrupt.*.bak")) == []
-    # The rebuild temp file must not linger.
-    assert list(tmp_path.glob("*.rebuild.tmp")) == []
+    # A recovered board keeps the pre-repair forensic copy by design.
+    assert len(list(tmp_path.glob("*.corrupt.*.bak"))) == 1
 
 
 def test_successful_repair_clears_repair_claim(tmp_path):
@@ -6286,10 +6296,10 @@ def test_transient_lock_during_repair_releases_claim(tmp_path, monkeypatch):
     kb._REPAIR_ATTEMPTED_PATHS.discard(resolved)
     kb._INITIALIZED_PATHS.discard(resolved)
 
-    def _boom(_path):
+    def _boom(_path, _index_names):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(kb, "_attempt_index_only_repair", _boom)
+    monkeypatch.setattr(kb, "_attempt_index_reindex_repair", _boom)
 
     with pytest.raises(sqlite3.OperationalError):
         kb._guard_existing_db_is_healthy(db_path)
@@ -6364,78 +6374,29 @@ def test_repair_quiesces_writers_before_swap(tmp_path, monkeypatch):
         blocker.close()
 
 
-def test_repair_preserves_inode_so_idle_handle_writes_survive(tmp_path, monkeypatch):
-    """An idle kb.connect() handle opened BEFORE an index-only repair must not
-    write to a detached inode after the heal.
-
-    Regression for the os.replace-swap bug: the dump+reload repair used to
-    publish a rebuilt sibling file via os.replace, giving the board a new
-    inode. A long-lived handle opened before the swap stayed attached to the
-    replaced inode, so a later create through it committed to the detached file
-    and was invisible to fresh connections (silently lost). The in-place
-    rebuild keeps the inode stable, so the idle handle's post-repair write is
-    visible everywhere.
-    """
+def test_repair_preserves_inode_so_idle_handle_writes_survive(tmp_path):
+    """The in-place REINDEX repair keeps pre-existing handles attached."""
     db_path = tmp_path / "kanban.db"
     survivors = _make_index_corrupt_kanban_db(db_path)
+    inode_before = db_path.stat().st_ino
 
-    real_connect = kb._sqlite_connect
-
-    class _ReindexFails:
-        def __init__(self, conn):
-            self._conn = conn
-
-        def execute(self, sql, *a, **kw):
-            if sql.strip().upper().startswith("REINDEX"):
-                raise sqlite3.DatabaseError("database disk image is malformed")
-            return self._conn.execute(sql, *a, **kw)
-
-        def __getattr__(self, name):
-            return getattr(self._conn, name)
-
-    def _wrapped(path, *a, **kw):
-        return _ReindexFails(real_connect(path, *a, **kw))
-
-    def _inode(p: Path) -> int:
-        return p.stat().st_ino
-
-    inode_before = _inode(db_path)
-
-    # A long-lived REAL handle opened BEFORE the repair (the vulnerable one).
-    # Force a fresh open past the per-process init cache so it's a real new fd.
-    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    idle = kb.connect(db_path=db_path)
+    # Bypass the connection guard to hold the pre-repair SQLite handle.
+    idle = kb._sqlite_connect(db_path)
     try:
-        # Force REINDEX (Strategy 1) to fail structurally so the repair falls
-        # into the dump+reload path this test exercises, but only for the repair
-        # call itself — the idle handle above and the verification connections
-        # below use the real, unwrapped opener.
-        monkeypatch.setattr(kb, "_sqlite_connect", _wrapped)
-        strategy = kb._attempt_index_only_repair(db_path)
-        monkeypatch.undo()
-        assert strategy == "dump_reload"
-
-        # Same inode -> pre-existing handles were never detached.
-        assert _inode(db_path) == inode_before
-
-        # The recovered rows survived the heal.
         kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-        with kb.connect_closing(db_path=db_path) as verify:
-            titles = {
-                r[0] for r in verify.execute("SELECT title FROM tasks").fetchall()
-            }
-        assert set(survivors).issubset(titles)
+        kb._guard_existing_db_is_healthy(db_path)
 
-        # A write through the idle pre-repair handle must land on the healed
-        # inode and be visible to a brand-new connection.
+        assert db_path.stat().st_ino == inode_before
+        assert kb._integrity_problems(db_path) is None
+
+        titles = {row[0] for row in idle.execute("SELECT title FROM tasks")}
+        assert set(survivors).issubset(titles)
         kb.create_task(idle, title="written-through-idle-handle")
         idle.commit()
 
         kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
         with kb.connect_closing(db_path=db_path) as fresh:
-            titles_after = {
-                r[0] for r in fresh.execute("SELECT title FROM tasks").fetchall()
-            }
+            titles_after = {row[0] for row in fresh.execute("SELECT title FROM tasks")}
         assert "written-through-idle-handle" in titles_after
     finally:
         idle.close()

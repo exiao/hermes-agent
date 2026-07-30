@@ -1717,7 +1717,7 @@ def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tup
         return None
     safe = validate_media_delivery_path(path)
     if safe:
-        return safe, match.end("path")
+        return safe, match.end()
     start = match.start("path")
     nl = scan_text.find("\n", start)
     limit = nl if nl != -1 else len(scan_text)
@@ -4230,7 +4230,9 @@ class BasePlatformAdapter(ABC):
         def _inside_fence(start: int, end: int) -> bool:
             return any(fs <= start and end <= fe for fs, fe in fence_ranges)
 
-        # Fenced code blocks: ```...``` (scanned first; they own their range).
+        # Fenced blocks normally document examples, but models also wrap actual
+        # send_file output in fences. Keep the latter deliverable only after the
+        # all-tags existence/allowlist validation used by other protected spans.
         for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
             fence_ranges.append((m.start(), m.end()))
             if BasePlatformAdapter._span_is_only_real_media_tag(m.group(0)):
@@ -4455,8 +4457,9 @@ class BasePlatformAdapter(ABC):
             path = _normalize_media_tag_path(match.group("path"))
             if not path or not _path_lacks_deliverable_extension(path):
                 continue
-            if validate_media_delivery_path(path):
-                tag_spans.append(match.span())
+            resolved = _match_extensionless_path(masked, match)
+            if resolved is not None:
+                tag_spans.append((match.start(), resolved[1]))
         if not tag_spans:
             return text
         wrapper_spans = [
