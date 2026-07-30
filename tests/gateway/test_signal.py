@@ -3289,3 +3289,39 @@ class TestQuotedMediaConversationIdentity:
 
         assert a._resolve_quoted_media_paths("1700000000000", "+15559999999") == []
         assert a._resolve_quoted_media_paths("1700000000000", "group:other") == []
+
+
+class TestUuidOnlyEnvelopePreservesNumberAlias:
+    """A UUID-only envelope must not erase a learned number<->UUID alias."""
+
+    def _adapter(self):
+        from gateway.platforms.signal import SignalAdapter
+        from collections import OrderedDict
+        a = object.__new__(SignalAdapter)
+        a._sent_attachment_paths = OrderedDict()
+        a._max_sent_attachment_entries = 200
+        a._recipient_uuid_by_number = {}
+        a._recipient_number_by_uuid = {}
+        return a
+
+    def test_self_mapping_does_not_clobber_the_real_alias(self, tmp_path):
+        """sender == sourceUuid (UUID-only envelope) must be a no-op.
+
+        _handle_envelope passes sender as `number`, which IS the uuid when the
+        envelope carries no E.164. Storing uuid->uuid destroyed the alias that
+        quote resolution depends on.
+        """
+        f = tmp_path / "chart.png"
+        f.write_bytes(b"x")
+        a = self._adapter()
+        uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        # Learned from an earlier envelope that carried both identifiers.
+        a._remember_recipient_identifiers("+15551234567", uid)
+        a._remember_sent_attachments("1700000000000", "+15551234567", [str(f)])
+
+        # Now a UUID-only envelope arrives: sender and sourceUuid are the same.
+        a._remember_recipient_identifiers(uid, uid)
+
+        assert a._recipient_number_by_uuid[uid] == "+15551234567"
+        assert a._resolve_quoted_media_paths("1700000000000", uid) == [str(f)]

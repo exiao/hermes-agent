@@ -923,7 +923,15 @@ class SignalAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     def _remember_recipient_identifiers(self, number: Optional[str], service_id: Optional[str]) -> None:
-        """Cache any number↔UUID mapping observed from Signal envelopes."""
+        """Cache any number↔UUID mapping observed from Signal envelopes.
+
+        ``number`` is whatever the envelope offered as the sender, which on a
+        UUID-only envelope is the service id ITSELF. Storing that would
+        overwrite a previously learned ``uuid -> +E.164`` alias with
+        ``uuid -> uuid``, destroying the mapping precisely when a quote-reply
+        needs it to find the E.164 cache key. A self-mapping carries no
+        information, so skip it and keep what we already know.
+        """
         if not number or not service_id or not _is_signal_service_id(service_id):
             return
         # UUID-only envelopes use the service ID for both fields. Do not let

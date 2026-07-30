@@ -3434,6 +3434,33 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+def _quoted_media_path_valid_on_backend(host_path: str) -> bool:
+    """Is an untranslated host path actually openable by the agent?
+
+    ``to_agent_visible_cache_path`` only rewrites paths for Docker; every other
+    backend gets the input back unchanged. That does NOT automatically mean the
+    path is dead: Modal/SSH/Daytona upload cache files via ``iter_sync_files``,
+    and when the remote base equals the host path (the common Modal case,
+    ``/root/.hermes``), the untranslated path is exactly right. Only claim a
+    "local copy" when the file is reachable, so the agent is never sent to a
+    path that isn't there.
+    """
+    backend = os.environ.get("TERMINAL_ENV", "local")
+    if backend in ("local", "docker"):
+        return True
+    try:
+        from tools.environments.file_sync import iter_sync_files
+    except Exception:
+        return False
+    try:
+        for host, remote in iter_sync_files():
+            if host == host_path:
+                return remote == host_path
+    except Exception:
+        return False
+    return False
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -13263,19 +13290,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 media_summary = getattr(event, "reply_to_media_summary", None)
                 from tools.credential_files import to_agent_visible_cache_path
 
-                # Only advertise a path the agent can actually open. Cache-path
-                # translation is implemented for Docker; on Modal/Daytona/SSH/
-                # Singularity the host path is returned unchanged and names a
-                # file that does not exist inside the sandbox. Claiming a "local
-                # copy" there sends the agent to a dead path, so fall back to
-                # naming the media only.
-                _backend = os.environ.get("TERMINAL_ENV", "local")
-                _paths_are_agent_visible = _backend in ("local", "docker")
-                media_paths = [
-                    to_agent_visible_cache_path(p)
-                    for p in (getattr(event, "reply_to_media_paths", None) or [])
-                    if p
-                ] if _paths_are_agent_visible else []
+                # Only advertise a path the agent can actually open. Docker gets
+                # a translated container path; other remote backends (Modal,
+                # SSH, Daytona) upload cache files to a remote base that often
+                # EQUALS the host path, in which case the untranslated path is
+                # genuinely valid there. So test the individual path rather than
+                # discarding everything because the backend is remote.
+                media_paths = []
+                for p in (getattr(event, "reply_to_media_paths", None) or []):
+                    if not p:
+                        continue
+                    visible = to_agent_visible_cache_path(p)
+                    if visible != p:
+                        # Translated: the backend told us where it really lives.
+                        media_paths.append(visible)
+                    elif _quoted_media_path_valid_on_backend(p):
+                        media_paths.append(visible)
                 if media_summary:
                     pointer = f"[Replying to {media_summary}"
                     if media_paths:
