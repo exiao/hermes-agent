@@ -6107,12 +6107,12 @@ class BasePlatformAdapter(ABC):
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
-                        # Legacy platform overrides return None after a
-                        # completed batch. Preserve their established
-                        # successful-echo suppression until they adopt the
-                        # receipt-returning contract used by Signal.
+                        # Legacy platform overrides return None when they do
+                        # not expose per-path acknowledgements. Treat that as
+                        # unknown, not success, so failed uploads remain
+                        # eligible for retry.
                         if delivered_image_paths is None:
-                            delivered_image_paths = _image_paths
+                            delivered_image_paths = set()
                         for delivered_path in delivered_image_paths:
                             self._record_media_delivery(session_key, delivered_path)
                     except Exception as batch_err:

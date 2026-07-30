@@ -81,6 +81,11 @@ async def _hold_typing(_chat_id, interval=2.0, metadata=None, stop_event=None):
         await asyncio.Event().wait()
 
 
+class _LegacyBatchAdapter(_DummyAdapter):
+    async def send_multiple_images(self, *args, **kwargs):
+        return None
+
+
 class _TranscriptStore:
     def __init__(self, transcript):
         self.transcript = transcript
@@ -180,6 +185,25 @@ class TestHistoryMediaDedupUsesDeliveryOutcome:
         await retry_adapter._process_message_background(event, session_key)
 
         assert retry_adapter.sent_documents == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_batch_receipt_does_not_suppress_retry(self, tmp_path):
+        path = tmp_path / "unknown-batch.png"
+        path.write_bytes(b"png")
+        adapter = _LegacyBatchAdapter(Platform.DISCORD)
+        adapter._keep_typing = _hold_typing
+        adapter.set_session_store(_TranscriptStore([]))
+
+        async def handler(_event):
+            return f"MEDIA:{path}"
+
+        adapter.set_message_handler(handler)
+        await adapter._process_message_background(
+            _make_event(Platform.DISCORD),
+            build_session_key(_make_event(Platform.DISCORD).source),
+        )
+
+        assert adapter._delivered_media_paths_by_session == {}
 
     def test_delivery_ledger_is_scoped_to_resolved_session(self, tmp_path):
         path = tmp_path / "session-scoped.pdf"
