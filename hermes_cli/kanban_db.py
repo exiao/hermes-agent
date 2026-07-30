@@ -1398,6 +1398,27 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Delivered terminal notification targets, kept so an owner correction can
+-- restore the subscribers that were unsubscribed when the (premature)
+-- completion was delivered. This is INTERNAL routing state — chat ids, user
+-- ids, thread ids, profile names, adapter routing metadata — and therefore
+-- deliberately lives OUTSIDE ``task_events``: the event log is a public audit
+-- stream returned verbatim by kanban_show, the dashboard task-detail endpoint
+-- and its live-event WebSocket, so messaging identifiers must never enter it.
+CREATE TABLE IF NOT EXISTS kanban_completion_deliveries (
+    task_id           TEXT NOT NULL,
+    run_id            INTEGER NOT NULL,
+    platform          TEXT NOT NULL,
+    chat_id           TEXT NOT NULL,
+    chat_type         TEXT,
+    thread_id         TEXT NOT NULL DEFAULT '',
+    user_id           TEXT,
+    notifier_profile  TEXT,
+    delivery_metadata TEXT,
+    created_at        INTEGER NOT NULL,
+    PRIMARY KEY (task_id, run_id, platform, chat_id, thread_id)
+);
+
 -- Board-wide default notification targets need a durable activation cursor:
 -- subscriptions created after a gateway restart must not skip events emitted
 -- while that runner was offline.
@@ -1421,6 +1442,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_completion_deliveries_task ON kanban_completion_deliveries(task_id, run_id);
 """
 
 
@@ -5055,6 +5077,7 @@ def _supersede_empty_terminal_handoff(
     summary: Optional[str],
     metadata: Optional[dict],
     expected_run_id: Optional[int],
+    verified_cards: Optional[list] = None,
 ) -> bool:
     """Let the original owner replace a bare terminal handoff with push evidence."""
     if expected_run_id is None or not _has_push_evidence(metadata):
@@ -5066,7 +5089,7 @@ def _supersede_empty_terminal_handoff(
         if task is None or task["status"] != "done":
             return False
         run = conn.execute(
-            "SELECT summary, metadata FROM task_runs WHERE id = ? AND task_id = ? "
+            "SELECT summary, metadata, ended_at FROM task_runs WHERE id = ? AND task_id = ? "
             "AND outcome = 'completed'",
             (int(expected_run_id), task_id),
         ).fetchone()
@@ -5078,13 +5101,31 @@ def _supersede_empty_terminal_handoff(
             prior_metadata = None
         if _has_push_evidence(prior_metadata):
             return False
-        latest = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
-            "ORDER BY ended_at DESC, id DESC LIMIT 1",
-            (task_id,),
+        # The owner's run must still be the task's LAST word. Checking only for
+        # a newer run whose outcome is 'completed' is not enough: a task can be
+        # reopened, re-claimed, and dragged straight to done — that newer run
+        # ends as 'reclaimed', yet it supersedes the owner's run just as
+        # thoroughly. Reject on ANY newer run (whatever its outcome) and on any
+        # reopening/status lifecycle event recorded after the owner completed.
+        newer_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND id > ? LIMIT 1",
+            (task_id, int(expected_run_id)),
         ).fetchone()
-        if latest is None or int(latest["id"]) != int(expected_run_id):
+        if newer_run is not None:
             return False
+        completed_event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'completed' "
+            "AND run_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id, int(expected_run_id)),
+        ).fetchone()
+        if completed_event is not None:
+            reopened = conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? AND id > ? "
+                "AND kind IN ('status', 'reopened', 'unblocked', 'claimed') LIMIT 1",
+                (task_id, int(completed_event["id"])),
+            ).fetchone()
+            if reopened is not None:
+                return False
         _restore_completion_delivery_subs(
             conn, task_id, run_id=int(expected_run_id),
         )
@@ -5116,6 +5157,11 @@ def _supersede_empty_terminal_handoff(
             "superseded_summary": run["summary"],
             "superseded_had_push_evidence": False,
         }
+        if verified_cards:
+            # Mirror the normal completion path: the corrected event is the
+            # only completion record downstream consumers see, so it must
+            # carry the verified child-card manifest too.
+            completed_payload["verified_cards"] = list(verified_cards)
         if isinstance(metadata, dict):
             artifacts = metadata.get("artifacts")
             if isinstance(artifacts, (list, tuple)):
@@ -6415,6 +6461,7 @@ def complete_task(
         summary=summary,
         metadata=metadata,
         expected_run_id=expected_run_id,
+        verified_cards=verified_cards,
     ):
         return True
     with write_txn(conn):
@@ -8049,6 +8096,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_completion_deliveries WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         deleted = cur.rowcount == 1
     if deleted:
@@ -8088,6 +8136,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_completion_deliveries WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -12047,47 +12096,114 @@ def remove_notify_sub(
     return cur.rowcount > 0
 
 
-def record_completion_delivery(conn: sqlite3.Connection, sub: Mapping[str, Any]) -> None:
-    """Keep a delivered terminal target scoped to its completed run."""
-    payload = {
-        key: sub.get(key)
-        for key in ("platform", "chat_id", "chat_type", "thread_id", "user_id", "notifier_profile", "delivery_metadata")
-    }
-    with write_txn(conn):
-        completed = conn.execute(
-            "SELECT run_id FROM task_events WHERE task_id = ? "
-            "AND kind = 'completed' ORDER BY id DESC LIMIT 1",
-            (str(sub["task_id"]),),
-        ).fetchone()
-        if completed is None or completed["run_id"] is None:
-            return
-        _append_event(
-            conn,
+def _record_completion_delivery_row(
+    conn: sqlite3.Connection, sub: Mapping[str, Any], run_id: int,
+) -> None:
+    """Insert one delivered terminal target. Caller owns the txn."""
+    conn.execute(
+        "INSERT OR REPLACE INTO kanban_completion_deliveries "
+        "(task_id, run_id, platform, chat_id, chat_type, thread_id, user_id, "
+        " notifier_profile, delivery_metadata, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
             str(sub["task_id"]),
-            "completion_delivery",
-            payload,
-            run_id=int(completed["run_id"]),
+            int(run_id),
+            str(sub["platform"]),
+            str(sub["chat_id"]),
+            sub.get("chat_type"),
+            str(sub.get("thread_id") or ""),
+            sub.get("user_id"),
+            sub.get("notifier_profile"),
+            _encode_notify_delivery_metadata(sub.get("delivery_metadata")),
+            int(time.time()),
+        ),
+    )
+
+
+def _latest_completed_run_id(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[int]:
+    row = conn.execute(
+        "SELECT run_id FROM task_events WHERE task_id = ? "
+        "AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["run_id"] is None:
+        return None
+    return int(row["run_id"])
+
+
+def record_completion_delivery(conn: sqlite3.Connection, sub: Mapping[str, Any]) -> None:
+    """Keep a delivered terminal target scoped to its completed run.
+
+    The routing identifiers land in ``kanban_completion_deliveries`` — a
+    private table — never in ``task_events`` (see the schema comment).
+    """
+    with write_txn(conn):
+        run_id = _latest_completed_run_id(conn, str(sub["task_id"]))
+        if run_id is None:
+            return
+        _record_completion_delivery_row(conn, sub, run_id)
+
+
+def finalize_terminal_delivery(
+    conn: sqlite3.Connection,
+    sub: Mapping[str, Any],
+    *,
+    delivered_through_event_id: int,
+    record_delivery: bool = True,
+) -> bool:
+    """Atomically record a delivered terminal target and drop its subscription.
+
+    Returns ``True`` when the subscription was removed.
+
+    The record + remove pair MUST be one transaction: a notifier that recorded
+    first and removed second (or vice versa) leaves a window in which an owner
+    correction sees neither the durable record nor a live subscription.
+
+    ``delivered_through_event_id`` is the notifier's post-claim cursor — the id
+    of the last event it actually sent. If a NEWER ``completed`` event was
+    appended after that (an owner correction that committed while the original
+    send was in flight), the subscription is deliberately KEPT so the corrected
+    completion still has a subscriber; the delivery record is not written
+    either, because the live subscription already routes it.
+    """
+    task_id = str(sub["task_id"])
+    with write_txn(conn):
+        newer = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'completed' "
+            "AND id > ? LIMIT 1",
+            (task_id, int(delivered_through_event_id)),
+        ).fetchone()
+        if newer is not None:
+            return False
+        if record_delivery:
+            run_id = _latest_completed_run_id(conn, task_id)
+            if run_id is not None:
+                _record_completion_delivery_row(conn, sub, run_id)
+        cur = conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, sub["platform"], sub["chat_id"], sub.get("thread_id") or ""),
         )
+        return cur.rowcount > 0
 
 
 def _restore_completion_delivery_subs(
     conn: sqlite3.Connection, task_id: str, *, run_id: int,
 ) -> None:
     rows = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'completion_delivery' AND run_id = ?",
-        (task_id, run_id),
+        "SELECT platform, chat_id, chat_type, thread_id, user_id, "
+        "       notifier_profile, delivery_metadata "
+        "  FROM kanban_completion_deliveries WHERE task_id = ? AND run_id = ?",
+        (task_id, int(run_id)),
     ).fetchall()
     for row in rows:
-        try:
-            sub = json.loads(row["payload"]) if row["payload"] else {}
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(sub, dict) or not sub.get("platform") or not sub.get("chat_id"):
+        if not row["platform"] or not row["chat_id"]:
             continue
         conn.execute(
             "INSERT OR IGNORE INTO kanban_notify_subs (task_id, platform, chat_id, chat_type, thread_id, user_id, notifier_profile, delivery_metadata, created_at, last_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))",
-            (task_id, sub["platform"], sub["chat_id"], sub.get("chat_type"), sub.get("thread_id") or "", sub.get("user_id"), sub.get("notifier_profile"), _encode_notify_delivery_metadata(sub.get("delivery_metadata")), int(time.time()), task_id),
+            (task_id, row["platform"], row["chat_id"], row["chat_type"], row["thread_id"] or "", row["user_id"], row["notifier_profile"], row["delivery_metadata"], int(time.time()), task_id),
         )
 
 

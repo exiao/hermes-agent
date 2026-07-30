@@ -11564,13 +11564,12 @@ def _collect_kanban_notifications(session: dict) -> list:
                 # gateway notifier).
                 if task and getattr(task, "status", "") in {"done", "archived"}:
                     try:
-                        _kb.record_completion_delivery(conn, sub)
-                        _kb.remove_notify_sub(
-                            conn,
-                            task_id=sub["task_id"],
-                            platform=sub["platform"],
-                            chat_id=sub["chat_id"],
-                            thread_id=sub.get("thread_id") or "",
+                        # Atomic record + remove, skipped when a newer
+                        # completed event (an owner correction) landed while
+                        # we were formatting/delivering — that correction
+                        # then keeps this live subscriber.
+                        _kb.finalize_terminal_delivery(
+                            conn, sub, delivered_through_event_id=_new,
                         )
                     except Exception:
                         pass

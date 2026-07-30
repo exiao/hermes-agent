@@ -1231,6 +1231,7 @@ class GatewayKanbanWatchersMixin:
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
+                                delivered_through_event_id=d["cursor"],
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
@@ -1268,10 +1269,25 @@ class GatewayKanbanWatchersMixin:
         board: Optional[str] = None,
         *,
         record_delivery: bool = True,
+        delivered_through_event_id: Optional[int] = None,
     ) -> None:
+        """Terminal unsubscribe, recording the delivered target atomically.
+
+        ``delivered_through_event_id`` is the cursor this tick actually
+        delivered. When supplied, the record+remove pair runs in one txn and
+        is skipped entirely if a NEWER completed event landed mid-send (an
+        owner correction) — that correction then still has a live subscriber.
+        """
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
+            if delivered_through_event_id is not None:
+                _kb.finalize_terminal_delivery(
+                    conn, sub,
+                    delivered_through_event_id=int(delivered_through_event_id),
+                    record_delivery=record_delivery,
+                )
+                return
             if record_delivery:
                 _kb.record_completion_delivery(conn, sub)
             _kb.remove_notify_sub(
