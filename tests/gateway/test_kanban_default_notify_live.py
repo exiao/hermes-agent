@@ -235,6 +235,75 @@ def test_default_notify_delivers_without_manual_subscribe(tmp_path, monkeypatch)
     assert "done" in adapter.sent[0]["text"].lower()
 
 
+def test_default_notify_keeps_events_from_tasks_created_after_target_activation(tmp_path, monkeypatch):
+    """A task can block between notifier ticks without losing its first ping."""
+    db_path = tmp_path / "default-notify-first-event.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    target_chat = "group:first-event="
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda *a, **k: {"kanban": {"default_notify": [
+            {"platform": "signal", "chat_id": target_chat},
+        ]}},
+        raising=False,
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    # Establish the target baseline before the task exists.
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs a decision", assignee="worker")
+        kb.block_task(conn, tid, reason="approval needed", kind="needs_input")
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == target_chat
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+
+
+
+def test_default_notify_keeps_events_created_while_runner_is_restarted(tmp_path, monkeypatch):
+    """A persisted target baseline survives the gap between gateway runners."""
+    db_path = tmp_path / "default-notify-restart.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    target_chat = "group:restart="
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda *a, **k: {"kanban": {"default_notify": [
+            {"platform": "signal", "chat_id": target_chat},
+        ]}},
+        raising=False,
+    )
+
+    # The first runner records the configured target's activation cursor.
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(RecordingAdapter())))
+
+    # A task blocks while no runner is alive. Its event must still be unseen
+    # when the restarted gateway subscribes the target.
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs a restart decision", assignee="worker")
+        kb.block_task(conn, tid, reason="approval needed", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == target_chat
+    assert tid in adapter.sent[0]["text"]
+
+
 def test_default_notify_does_not_disturb_existing_per_task_sub(tmp_path, monkeypatch):
     """The per-task subscribe path is untouched: a pre-existing subscription to
     a different chat keeps delivering, and the default target is added
@@ -306,10 +375,19 @@ def test_add_default_notify_subs_bulk_active_only(tmp_path, monkeypatch):
         kb.complete_task(conn, done, summary="ok")
 
         kb.add_default_notify_subs(conn, platform="signal", chat_id=chat)
-        subscribed = {s["task_id"] for s in kb.list_notify_subs(conn)}
+        subscriptions = kb.list_notify_subs(conn)
+        subscribed = {s["task_id"] for s in subscriptions}
         assert subscribed == {active1, active2}, (
             f"only active tasks should be subscribed; got {subscribed}"
         )
+        # Default subscriptions begin caught up, just like an explicit
+        # subscribe, so enabling them never replays an active task's history.
+        for sub in subscriptions:
+            latest = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+                (sub["task_id"],),
+            ).fetchone()[0]
+            assert sub["last_event_id"] == latest
 
         # Idempotent: a second call adds no duplicate rows.
         kb.add_default_notify_subs(conn, platform="signal", chat_id=chat)

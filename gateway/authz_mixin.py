@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from gateway.config import Platform
+from gateway.config import PORT_BINDING_PLATFORM_VALUES, Platform
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
@@ -118,12 +118,29 @@ class GatewayAuthorizationMixin:
             # fail and suppress streamed delivery for those profiles.
             adapters = getattr(self, "adapters", None) or {}
             return adapters.get(Platform.RELAY)
-        # ``getattr`` guards test fixtures that build a bare source via
-        # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
-        return self._authorization_adapter(
-            getattr(source, "platform", None),
-            getattr(source, "profile", None),
+        platform = getattr(source, "platform", None)
+        profile = (getattr(source, "profile", None) or "").strip()
+        shared_listener = (
+            getattr(platform, "value", platform) in PORT_BINDING_PLATFORM_VALUES
         )
+        if profile and not shared_listener:
+            profile_map = getattr(self, "_profile_adapters", None)
+            if profile_map and profile in profile_map:
+                # Served secondary profile: use ITS adapter for this platform,
+                # never the default one (return None if it has none).
+                return profile_map[profile].get(platform)
+            # A stamped source can still belong to the gateway's owner profile,
+            # whose adapters live in self.adapters. Compare against the startup
+            # owner rather than a live active-profile lookup: the latter may be
+            # temporarily scoped to a removed profile while handling a message.
+            owner = getattr(self, "_owner_profile_name", None)
+            if owner is None:
+                active = getattr(self, "_active_profile_name", None)
+                owner = active() if callable(active) else "default"
+            if profile != owner:
+                return None
+        adapters = getattr(self, "adapters", None) or {}
+        return adapters.get(platform)
 
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
