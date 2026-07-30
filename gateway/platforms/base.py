@@ -3384,14 +3384,24 @@ class BasePlatformAdapter(ABC):
             return None
         if not transcript:
             return None
-        # Exclude the current turn's assistant message, which has already been
-        # persisted by the time we reach delivery but must not be treated as
-        # "history" for dedup purposes.
+        # Exclude the CURRENT TURN entirely: the agent persists tool results and
+        # the final assistant row before this delivery-time dedup runs. Everything
+        # from the last user message onward is current-turn state, not a prior
+        # attachment delivery. Keep the old trailing-assistant fallback only for
+        # unusual transcripts with no user row.
         history = list(transcript)
-        for msg in reversed(history):
-            if msg.get("role") == "assistant":
-                history.remove(msg)
-                break
+        last_user_idx = next(
+            (i for i in range(len(history) - 1, -1, -1)
+             if history[i].get("role") == "user"),
+            None,
+        )
+        if last_user_idx is not None:
+            history = history[:last_user_idx]
+        else:
+            for msg in reversed(history):
+                if msg.get("role") == "assistant":
+                    history.remove(msg)
+                    break
         if not history:
             return None
         # Avoid circular import: gateway.run already imports this module.
