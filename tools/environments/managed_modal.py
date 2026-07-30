@@ -214,10 +214,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
     def _guard_unsupported_credential_passthrough(self) -> None:
         """Managed Modal does not sync or mount host credential or plan files."""
         try:
-            from tools.credential_files import (
-                get_credential_file_mounts,
-                iter_plans_files,
-            )
+            from tools.credential_files import get_credential_file_mounts
         except Exception:
             return
 
@@ -231,8 +228,11 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
 
         # Plan files are mounted only on the direct Modal route. Failing loudly
         # here beats a worker silently finding no plan at the /root/.hermes/plans
-        # path its card told it to read.
+        # path its card told it to read. Imported separately from the credential
+        # lookup above so a missing symbol can never disable that check.
         try:
+            from tools.credential_files import iter_plans_files
+
             plans = iter_plans_files()
         except Exception:
             plans = []
