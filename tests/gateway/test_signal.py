@@ -3160,6 +3160,54 @@ async def test_quoted_image_from_user_has_summary_but_no_path(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_uuid_only_quote_envelope_preserves_number_alias(monkeypatch, tmp_path):
+    """A UUID-only reply must retain the number learned from an earlier envelope."""
+    adapter = _make_signal_adapter(monkeypatch)
+    peer_number = "+15559998888"
+    peer_uuid = "aaaaaaaa-0000-0000-0000-000000000002"
+    sent_image = tmp_path / "quoted.png"
+    sent_image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    quoted_timestamp = 1753650000000
+    adapter._remember_sent_attachments(quoted_timestamp, peer_number, [str(sent_image)])
+    adapter._remember_sent_message_timestamp(quoted_timestamp)
+
+    captured = []
+
+    async def _capture(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", _capture)
+
+    await adapter._handle_envelope({
+        "envelope": {
+            "sourceNumber": peer_number,
+            "sourceUuid": peer_uuid,
+            "timestamp": 1753650100000,
+            "dataMessage": {"message": "sent earlier", "timestamp": 1753650100000},
+        }
+    })
+    await adapter._handle_envelope({
+        "envelope": {
+            "sourceUuid": peer_uuid,
+            "timestamp": 1753650200000,
+            "dataMessage": {
+                "message": "what about this image?",
+                "timestamp": 1753650200000,
+                "quote": {
+                    "id": quoted_timestamp,
+                    "author": adapter._account_normalized,
+                    "attachments": [{"contentType": "image/png"}],
+                },
+            },
+        }
+    })
+
+    assert len(captured) == 2
+    assert adapter._recipient_number_by_uuid[peer_uuid] == peer_number
+    assert captured[-1].reply_to_media_paths == [str(sent_image)]
+
+
+@pytest.mark.asyncio
 async def test_quoted_timestamp_collision_from_another_chat_has_no_local_path(monkeypatch, tmp_path):
     """A user quote cannot retrieve media solely by colliding with a cached timestamp."""
     adapter = _make_signal_adapter(monkeypatch)
