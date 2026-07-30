@@ -512,3 +512,79 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
+
+
+def test_runtime_sync_keeps_local_anti_thrash_breaker_when_repair_fails(tmp_path):
+    """A sync recalibration cannot disarm a durable breaker on a DB write error."""
+    db_path = tmp_path / "state.db"
+    agent = _make_agent_with_cooldown(db_path, "sess-1")
+    db = agent._session_db
+    db.set_compression_ineffective_count("sess-1", 2)
+    agent.context_compressor._ineffective_compression_count = 2
+    # Force the per-turn runtime calibration through update_model(), which
+    # clears its local count before the turn-context code rehydrates it.
+    agent.model = "new-runtime-model"
+
+    with patch.object(
+        db,
+        "set_compression_ineffective_count",
+        side_effect=Exception("state DB locked"),
+    ):
+        _build(agent)
+
+    # update_model's reset write failed, so the durable row survives. The
+    # local gate must immediately mirror it even though there is no repair
+    # write to make in this turn.
+    assert db.get_compression_ineffective_count("sess-1") == 2
+    assert agent.context_compressor._ineffective_compression_count == 2
+
+
+def test_runtime_sync_keeps_failed_local_anti_thrash_breaker_through_refresh(tmp_path):
+    """A failed repair keeps the local breaker authoritative at the gate."""
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    db = agent._session_db
+    agent.context_compressor._ineffective_compression_count = 2
+    agent.model = "new-runtime-model"
+
+    with patch.object(db, "set_compression_ineffective_count", side_effect=Exception("state DB locked")):
+        _build(agent)
+
+    assert db.get_compression_ineffective_count("sess-1") == 0
+    assert agent.context_compressor._automatic_compression_blocked() is True
+
+
+def test_runtime_sync_blocks_after_strike_repair_write_fails(tmp_path):
+    """A successful reset cannot disarm a local strike whose repair did not persist."""
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    db = agent._session_db
+    db.set_compression_ineffective_count("sess-1", 2)
+    agent.context_compressor._ineffective_compression_count = 2
+    agent.model = "new-runtime-model"
+
+    original_set = db.set_compression_ineffective_count
+    writes = 0
+
+    def persist_count(session_id, count):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise Exception("state DB locked")
+        original_set(session_id, count)
+
+    with patch.object(db, "set_compression_ineffective_count", side_effect=persist_count):
+        _build(agent)
+
+    assert writes == 2
+    assert db.get_compression_ineffective_count("sess-1") == 0
+    assert agent.context_compressor._automatic_compression_blocked() is True
+
+
+def test_runtime_sync_keeps_failed_local_cooldown_through_refresh(tmp_path):
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    compressor = agent.context_compressor
+    with patch.object(agent._session_db, "record_compression_failure_cooldown", side_effect=Exception("state DB locked")):
+        compressor._record_compression_failure_cooldown(60, "timeout")
+        agent.model = "new-runtime-model"
+        _build(agent)
+
+    assert compressor.get_active_compression_failure_cooldown(refresh=True) is not None

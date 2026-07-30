@@ -85,12 +85,13 @@ class TestStreamingDisplayStripCodeBlocks:
     def test_fenced_code_example_preserved(self, tmp_path):
         p = tmp_path / "real.pdf"
         p.write_text("x")
-        text = f"Example:\n```\nMEDIA:{p}\n```\ndone MEDIA:{p}"
+        example = tmp_path / "example.pdf"
+        text = f"Example:\n```\nMEDIA:{example}\n```\ndone MEDIA:{p}"
         out = BasePlatformAdapter.strip_media_directives_for_display(text)
         # The example inside the fence survives verbatim; the real tag outside
         # is stripped.
-        assert f"MEDIA:{p}" in out
-        assert out.count(f"MEDIA:{p}") == 1
+        assert f"MEDIA:{example}" in out
+        assert out.count(f"MEDIA:{example}") == 1
         assert "```" in out
 
     def test_inline_code_example_preserved(self):

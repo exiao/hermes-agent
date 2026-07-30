@@ -66,13 +66,15 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     return target
 
 
-def test_decompose_worktree_children_get_own_workspace(kanban_home):
+def test_decompose_worktree_children_get_own_workspace(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    kb.write_board_metadata("default", default_workdir=str(repo))
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
         conn.execute(
             "UPDATE tasks SET workspace_kind='worktree', "
-            "workspace_path='/repo/.worktrees/root' WHERE id = ?",
-            (root,),
+            "workspace_path=? WHERE id = ?",
+            (str(repo / ".worktrees" / "root"), root),
         )
         conn.commit()
 
@@ -152,6 +154,7 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
 
 def test_resolve_worktree_same_branch_still_reuses(kanban_home, tmp_path):
     repo = _make_repo(tmp_path)
+    kb.write_board_metadata("default", default_workdir=str(repo))
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -176,6 +179,7 @@ def test_resolve_worktree_own_path_on_foreign_branch_keeps_legacy_reuse(
     kanban_home, tmp_path
 ):
     repo = _make_repo(tmp_path)
+    kb.write_board_metadata("default", default_workdir=str(repo))
 
     with kb.connect() as conn:
         tid = kb.create_task(
