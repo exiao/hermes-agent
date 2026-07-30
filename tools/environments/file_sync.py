@@ -63,6 +63,7 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     from tools.credential_files import (
         get_credential_file_mounts,
         iter_cache_files,
+        iter_plans_files,
         iter_skills_files,
     )
 
@@ -73,6 +74,13 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
         )
         files.append((entry["host_path"], remote))
     for entry in iter_skills_files(container_base=container_base):
+        files.append((entry["host_path"], entry["container_path"]))
+    # Plans join the RECURRING sync, not just sandbox construction: a card can
+    # link a plan that is written or edited after its environment was cached,
+    # and a creation-time-only mount would stay stale for that sandbox's whole
+    # lifetime. Backends that mount at construction still get them here on the
+    # next command, which is what makes an edited plan visible.
+    for entry in iter_plans_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))
     for entry in iter_cache_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))

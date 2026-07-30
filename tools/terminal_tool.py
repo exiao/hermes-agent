@@ -1563,6 +1563,27 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
         modal_state = _get_modal_backend_state(cc.get("modal_mode"))
 
+        # Under `auto` the managed backend wins by default, but managed sandboxes
+        # cannot mount host plan files. Constitution rule 2f makes a plan path
+        # mandatory in dev card bodies, so a plan-dependent worker on managed
+        # Modal reads nothing at /root/.hermes/plans and blocks. When plans exist
+        # AND direct is actually usable, prefer direct so the mount is available.
+        # Only `auto` is re-steered: an explicit `managed` stays managed (the user
+        # asked for it), and `direct` is already direct.
+        if (
+            modal_state["selected_backend"] == "managed"
+            and modal_state["mode"] == "auto"
+            and modal_state["has_direct"]
+        ):
+            try:
+                from tools.credential_files import iter_plans_files
+
+                if iter_plans_files():
+                    modal_state = dict(modal_state, selected_backend="direct")
+            except Exception:
+                # A plan-enumeration failure must never cost a working backend.
+                pass
+
         if modal_state["selected_backend"] == "managed":
             return _ManagedModalEnvironment(
                 image=image, cwd=cwd, timeout=timeout,

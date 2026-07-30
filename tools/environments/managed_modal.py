@@ -212,7 +212,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         return sandbox_id
 
     def _guard_unsupported_credential_passthrough(self) -> None:
-        """Managed Modal does not sync or mount host credential or plan files."""
+        """Managed Modal does not sync or mount host credential files."""
         try:
             from tools.credential_files import get_credential_file_mounts
         except Exception:
@@ -226,22 +226,18 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
                 "credential files inside the sandbox."
             )
 
-        # Plan files are mounted only on the direct Modal route. Failing loudly
-        # here beats a worker silently finding no plan at the /root/.hermes/plans
-        # path its card told it to read. Imported separately from the credential
-        # lookup above so a missing symbol can never disable that check.
-        try:
-            from tools.credential_files import iter_plans_files
-
-            plans = iter_plans_files()
-        except Exception:
-            plans = []
-        if plans:
-            raise ValueError(
-                "Managed Modal does not support host plan-file passthrough. "
-                "Use TERMINAL_MODAL_MODE=direct when a card links a plan file "
-                "under ~/.hermes/plans that the worker must read."
-            )
+        # NOTE: plan files deliberately do NOT raise here, unlike credentials.
+        # Credential mounts are opt-in — a user configured terminal.credential_files,
+        # so a hard failure tells them their explicit request cannot be honored.
+        # Plans merely EXIST: ~/.hermes/plans accumulates files as a side effect of
+        # normal work. Raising on their presence would make every managed-Modal
+        # sandbox unconstructible for anyone who has ever written a plan, including
+        # ordinary sessions and cards that reference no plan at all — and under the
+        # default modal_mode=auto, users without direct Modal credentials would be
+        # left with no working backend. Absence of a plan is degraded, not unsafe.
+        # Callers steer around it instead: under the default modal_mode=auto,
+        # _create_modal_environment prefers the direct backend when plans exist
+        # and direct Modal is usable, so the mount is available where it matters.
 
     def _request(self, method: str, path: str, *,
                  json: Dict[str, Any] | None = None,

@@ -184,8 +184,15 @@ class TestModalWiring:
         assert create_calls[0][1]["mounts"] == mounts
 
 
-def test_managed_modal_refuses_plan_passthrough(monkeypatch):
-    """Managed Modal cannot mount plans, so it must fail loudly, not silently."""
+def test_managed_modal_stays_usable_when_plans_exist(monkeypatch):
+    """Plans existing on the host must NOT make managed Modal unconstructible.
+
+    Plans accumulate as a side effect of normal work, unlike credential mounts
+    which a user explicitly opts into. Raising on their mere presence bricked
+    every managed sandbox -- including ordinary sessions and cards referencing
+    no plan -- and left auto-mode users without direct Modal credentials with
+    no working backend at all.
+    """
     import tools.credential_files as cf
     from tools.environments.managed_modal import ManagedModalEnvironment
 
@@ -193,7 +200,7 @@ def test_managed_modal_refuses_plan_passthrough(monkeypatch):
     monkeypatch.setattr(
         cf,
         "iter_plans_files",
-        lambda: [
+        lambda *a, **k: [
             {
                 "host_path": "/host/plan.md",
                 "container_path": "/root/.hermes/plans/plan.md",
@@ -202,17 +209,48 @@ def test_managed_modal_refuses_plan_passthrough(monkeypatch):
     )
 
     env = object.__new__(ManagedModalEnvironment)
-    with pytest.raises(ValueError, match="plan-file passthrough"):
-        env._guard_unsupported_credential_passthrough()
+    env._guard_unsupported_credential_passthrough()
 
 
-def test_managed_modal_allows_sandbox_without_plans(monkeypatch):
-    """No plans on the host means the managed route stays usable."""
+def test_managed_modal_still_refuses_credential_passthrough(monkeypatch):
+    """The credential guard is opt-in and must keep failing loudly."""
     import tools.credential_files as cf
     from tools.environments.managed_modal import ManagedModalEnvironment
 
-    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
-    monkeypatch.setattr(cf, "iter_plans_files", lambda: [])
+    monkeypatch.setattr(
+        cf,
+        "get_credential_file_mounts",
+        lambda: [{"host_path": "/host/tok", "container_path": "/root/.hermes/tok"}],
+    )
 
     env = object.__new__(ManagedModalEnvironment)
-    env._guard_unsupported_credential_passthrough()
+    with pytest.raises(ValueError, match="credential-file passthrough"):
+        env._guard_unsupported_credential_passthrough()
+
+
+def test_plans_are_in_the_recurring_sync_path(monkeypatch):
+    """A plan edited after sandbox construction must still reach the worker.
+
+    Creation-time mounts alone go stale for the life of a cached environment.
+    """
+    import tools.credential_files as cf
+
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
+    monkeypatch.setattr(cf, "iter_skills_files", lambda **k: [])
+    monkeypatch.setattr(cf, "iter_cache_files", lambda **k: [])
+    monkeypatch.setattr(
+        cf,
+        "iter_plans_files",
+        lambda **k: [
+            {
+                "host_path": "/host/plan.md",
+                "container_path": "/root/.hermes/plans/plan.md",
+            }
+        ],
+    )
+
+    from tools.environments.file_sync import iter_sync_files
+
+    assert ("/host/plan.md", "/root/.hermes/plans/plan.md") in iter_sync_files(
+        "/root/.hermes"
+    )
