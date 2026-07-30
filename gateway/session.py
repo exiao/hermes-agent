@@ -3080,6 +3080,7 @@ class SessionStore:
             platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
             observed=bool(message.get("observed")),
             timestamp=message.get("timestamp"),
+            display_metadata=message.get("display_metadata"),
             # api_content sidecar: the exact bytes sent to the API for
             # this message (prompt-cache-stable replay). Must survive
             # any gateway-side persistence path or the next turn's

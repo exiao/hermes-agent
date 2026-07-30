@@ -31,6 +31,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.session import SessionSource, build_session_key
+from hermes_state import SessionDB
 
 
 class _DummyAdapter(BasePlatformAdapter):
@@ -83,10 +84,11 @@ async def _hold_typing(_chat_id, interval=2.0, metadata=None, stop_event=None):
 class _TranscriptStore:
     def __init__(self, transcript):
         self.transcript = transcript
+        self.session_id = "session-1"
         self.appended = []
 
     def peek_session_id(self, _session_key):
-        return "session-1"
+        return self.session_id
 
     def load_transcript(self, _session_id):
         return list(self.transcript)
@@ -156,14 +158,20 @@ class TestHistoryMediaDedupUsesDeliveryOutcome:
         assert adapter.sent_documents == [str(path)]
         assert store.appended == [(
             "session-1",
-            {"role": "session_meta", "media_delivered": [str(path)]},
+            {
+                "role": "session_meta",
+                "display_metadata": {"media_delivered": [str(path)]},
+            },
         )]
 
         store.transcript = [
             {"role": "assistant", "content": f"MEDIA:{path}"},
             {"role": "user", "content": "echo it"},
             {"role": "assistant", "content": f"MEDIA:{path}"},
-            {"role": "session_meta", "media_delivered": [str(path)]},
+            {
+                "role": "session_meta",
+                "display_metadata": {"media_delivered": [str(path)]},
+            },
         ]
         retry_adapter = _DummyAdapter(Platform.DISCORD)
         retry_adapter._keep_typing = _hold_typing
@@ -172,6 +180,43 @@ class TestHistoryMediaDedupUsesDeliveryOutcome:
         await retry_adapter._process_message_background(event, session_key)
 
         assert retry_adapter.sent_documents == []
+
+    def test_delivery_ledger_is_scoped_to_resolved_session(self, tmp_path):
+        path = tmp_path / "session-scoped.pdf"
+        path.write_bytes(b"pdf")
+        adapter = _DummyAdapter(Platform.DISCORD)
+        store = _TranscriptStore([
+            {"role": "assistant", "content": f"MEDIA:{path}"},
+            {"role": "user", "content": "later"},
+            {"role": "assistant", "content": "current response"},
+        ])
+        adapter.set_session_store(store)
+        session_key = build_session_key(_make_event(Platform.DISCORD).source)
+
+        adapter._record_media_delivery(session_key, str(path))
+        assert adapter._history_media_paths_for_session(session_key) == {str(path)}
+
+        store.session_id = "session-2"
+        assert adapter._history_media_paths_for_session(session_key) is None
+
+    def test_session_metadata_receipt_round_trips_without_counting_as_turn(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("session-1", "discord")
+
+        db.append_message(
+            "session-1",
+            "session_meta",
+            display_metadata={"media_delivered": ["/tmp/delivered.pdf"]},
+        )
+
+        assert db.get_session("session-1")["message_count"] == 0
+        rows = db.get_messages_as_conversation("session-1")
+        assert len(rows) == 1
+        assert rows[0]["role"] == "session_meta"
+        assert rows[0]["content"] is None
+        assert rows[0]["display_metadata"] == {
+            "media_delivered": ["/tmp/delivered.pdf"]
+        }
 
 
 @pytest.mark.parametrize("platform", [Platform.DISCORD, Platform.TELEGRAM])

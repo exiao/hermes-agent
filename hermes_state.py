@@ -7174,6 +7174,12 @@ class SessionDB:
             )
             msg_id = cursor.lastrowid
 
+            # Session metadata is persisted for gateway bookkeeping, not as a
+            # model-visible turn. Keep it out of transcript counters so adding
+            # a delivery receipt cannot evict a cached agent on the next turn.
+            if role == "session_meta":
+                return msg_id
+
             # Update counters
             if num_tool_calls > 0:
                 conn.execute(

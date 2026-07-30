@@ -3400,20 +3400,26 @@ class BasePlatformAdapter(ABC):
         # Avoid circular import: gateway.run already imports this module.
         from gateway.run import _collect_history_media_paths
         history_paths = _collect_history_media_paths(history)
+        ledger_key = session_id or session_key
         delivered_paths = set(
-            getattr(self, "_delivered_media_paths_by_session", {}).get(session_key, set())
+            getattr(self, "_delivered_media_paths_by_session", {}).get(ledger_key, set())
         )
         for msg in history:
             if msg.get("role") == "session_meta":
+                metadata = msg.get("display_metadata") or {}
                 delivered_paths.update(
-                    str(path) for path in msg.get("media_delivered", []) if path
+                    str(path) for path in metadata.get("media_delivered", []) if path
                 )
         return history_paths & delivered_paths or None
 
     def _record_media_delivery(self, session_key: str, path: str) -> None:
         """Remember and persist a path only after its send was acknowledged."""
+        store = getattr(self, "_session_store", None)
+        peek = getattr(store, "peek_session_id", None)
+        session_id = peek(session_key) if callable(peek) else None
+        ledger_key = session_id or session_key
         delivered_paths = self._delivered_media_paths_by_session.setdefault(
-            session_key, set()
+            ledger_key, set()
         )
         if path in delivered_paths:
             return
@@ -3422,15 +3428,15 @@ class BasePlatformAdapter(ABC):
         # ``session_meta`` rows are excluded from the LLM transcript but keep
         # delivery receipts across gateway restarts. A missing/partial store is
         # fine: the in-memory ledger still protects retries in this process.
-        store = getattr(self, "_session_store", None)
         try:
-            peek = getattr(store, "peek_session_id", None)
-            session_id = peek(session_key) if callable(peek) else None
             append = getattr(store, "append_to_transcript", None)
             if session_id and callable(append):
                 append(
                     session_id,
-                    {"role": "session_meta", "media_delivered": [path]},
+                    {
+                        "role": "session_meta",
+                        "display_metadata": {"media_delivered": [path]},
+                    },
                 )
         except Exception:
             logger.debug("failed to persist media delivery receipt", exc_info=True)
