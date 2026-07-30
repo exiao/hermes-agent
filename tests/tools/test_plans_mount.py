@@ -27,11 +27,11 @@ def plans_home(tmp_path, monkeypatch):
     (plans / "archive").mkdir()
     (plans / "wt-reaper-rescued" / "t_dead" / "raw").mkdir(parents=True)
 
-    (plans / "t_live.md").write_text("# live plan\n")
-    (plans / "diagram.svg").write_text("<svg/>")
-    (plans / "hermes-patches" / "some-patch.md").write_text("# patch note\n")
-    (plans / "archive" / "t_old.md").write_text("# superseded\n")
-    (plans / "wt-reaper-rescued" / "t_dead" / "raw" / "corpus.md").write_text("junk\n")
+    (plans / "t_live.md").write_text("# live plan\n", encoding="utf-8")
+    (plans / "diagram.svg").write_text("<svg/>", encoding="utf-8")
+    (plans / "hermes-patches" / "some-patch.md").write_text("# patch note\n", encoding="utf-8")
+    (plans / "archive" / "t_old.md").write_text("# superseded\n", encoding="utf-8")
+    (plans / "wt-reaper-rescued" / "t_dead" / "raw" / "corpus.md").write_text("junk\n", encoding="utf-8")
     (plans / "binary.bin").write_bytes(b"\x00\x01\x02")
 
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -108,7 +108,7 @@ class TestModalWiring:
     def test_modal_backend_mounts_plans(self):
         """The Modal sandbox path must actually call iter_plans_files()."""
         source = Path(__file__).resolve().parents[2] / "tools/environments/modal.py"
-        text = source.read_text()
+        text = source.read_text(encoding="utf-8")
         assert "iter_plans_files" in text, (
             "modal.py must import and iterate iter_plans_files(); without the "
             "wiring the helper exists but no plan reaches the sandbox."
