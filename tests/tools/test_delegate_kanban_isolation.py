@@ -622,3 +622,39 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert task.status == "running"
     assert run.status == "running"
     assert workspace.is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash session snapshot is POSIX-only")
+def test_child_marker_does_not_persist_into_shared_bash_snapshot(monkeypatch, tmp_path):
+    """A delegate_task child must not leave its marker in the shared snapshot.
+
+    Regression: ``LocalEnvironment`` keeps one bash session snapshot per
+    backend, shared by every command. A genuine child's subprocess env carries
+    HERMES_DELEGATED_CHILD_CONTEXT=1, so ``export -p`` persisted it into the
+    snapshot file; the NEXT top-level command sourced the snapshot and inherited
+    the marker, making a non-delegated gateway turn fail every ``hermes kanban``
+    write with "delegate_task child contexts cannot mutate Kanban tasks".
+
+    Cron lineage is present in env to match the reported production session.
+    """
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=60)
+    try:
+        probe = "echo MARKER=[${HERMES_DELEGATED_CHILD_CONTEXT:-unset}]"
+
+        # 1. A genuine delegate_task child still receives the marker.
+        with delegated_child_context():
+            child = env.execute(probe)
+        assert "MARKER=[1]" in child["output"], child
+
+        # 2. The very next top-level command must NOT inherit it via the
+        #    snapshot the child just wrote.
+        parent = env.execute(probe)
+        assert "MARKER=[unset]" in parent["output"], parent
+    finally:
+        env.cleanup()
