@@ -13263,11 +13263,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 media_summary = getattr(event, "reply_to_media_summary", None)
                 from tools.credential_files import to_agent_visible_cache_path
 
+                # Only advertise a path the agent can actually open. Cache-path
+                # translation is implemented for Docker; on Modal/Daytona/SSH/
+                # Singularity the host path is returned unchanged and names a
+                # file that does not exist inside the sandbox. Claiming a "local
+                # copy" there sends the agent to a dead path, so fall back to
+                # naming the media only.
+                _backend = os.environ.get("TERMINAL_ENV", "local")
+                _paths_are_agent_visible = _backend in ("local", "docker")
                 media_paths = [
                     to_agent_visible_cache_path(p)
                     for p in (getattr(event, "reply_to_media_paths", None) or [])
                     if p
-                ]
+                ] if _paths_are_agent_visible else []
                 if media_summary:
                     pointer = f"[Replying to {media_summary}"
                     if media_paths:

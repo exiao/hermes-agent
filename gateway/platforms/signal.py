@@ -1018,11 +1018,37 @@ class SignalAdapter(BasePlatformAdapter):
             return descriptions[0]
         return f"{len(descriptions)} attachments: " + "; ".join(descriptions)
 
+    def _conversation_key_aliases(self, chat_id: str) -> List[str]:
+        """Return every identifier that names this same Signal conversation.
+
+        Signal exposes a 1:1 peer as an E.164 number on one envelope and as an
+        ACI/PNI UUID on the next, so an attachment cached under the number is
+        invisible to a reply whose envelope carries only ``sourceUuid`` (and
+        vice versa). The adapter already learns both sides in
+        ``_remember_recipient_identifiers``; consult that mapping so identity
+        is compared canonically while keeping cross-conversation isolation —
+        we widen to the SAME peer's other name, never to a different chat.
+        """
+        aliases = [str(chat_id)]
+        if str(chat_id).startswith("group:"):
+            return aliases
+        mapped_uuid = self._recipient_uuid_by_number.get(str(chat_id))
+        if mapped_uuid and mapped_uuid not in aliases:
+            aliases.append(mapped_uuid)
+        mapped_number = self._recipient_number_by_uuid.get(str(chat_id))
+        if mapped_number and mapped_number not in aliases:
+            aliases.append(mapped_number)
+        return aliases
+
     def _resolve_quoted_media_paths(self, quote_id: Optional[str], chat_id: str) -> List[str]:
         """Return local paths for quoted media sent to this Signal conversation."""
         if not quote_id or not chat_id:
             return []
-        cached = self._sent_attachment_paths.get((str(chat_id), str(quote_id)))
+        cached = None
+        for alias in self._conversation_key_aliases(chat_id):
+            cached = self._sent_attachment_paths.get((alias, str(quote_id)))
+            if cached:
+                break
         if not cached:
             return []
         return [p for p in cached if p and Path(p).exists()]
