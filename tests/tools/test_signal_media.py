@@ -19,6 +19,16 @@ def _make_httpx_mock():
     class Proxy:
         pass
 
+    class _Timeout:
+        """Mirror of httpx.Timeout's shape for the fields callers read."""
+
+        def __init__(self, default=None, *, connect=None, read=None,
+                     write=None, pool=None):
+            self.connect = default if connect is None else connect
+            self.read = read
+            self.write = default if write is None else write
+            self.pool = default if pool is None else pool
+
     class MockResp:
         status_code = 200
         def json(self):
@@ -38,6 +48,10 @@ def _make_httpx_mock():
     httpx_mock.AsyncClient = lambda timeout=None: MockClient()
     httpx_mock.AsyncBaseTransport = AsyncBaseTransport  # Needed by Telegram adapter
     httpx_mock.Proxy = Proxy  # Needed by telegram-bot library
+    # Real httpx exposes Timeout, and the Signal send path builds one to leave
+    # the attachment upload leg undeadlined. A stand-in without it made every
+    # attachment send fail with AttributeError.
+    httpx_mock.Timeout = _Timeout
     return httpx_mock
 
 

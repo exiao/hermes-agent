@@ -1468,6 +1468,7 @@ class SignalAdapter(BasePlatformAdapter):
         await self._stop_typing_indicator(chat_id)
 
         attachments: List[str] = []
+        attachment_sizes: Dict[str, int] = {}
         skipped_download = 0
         skipped_missing = 0
         skipped_oversize = 0
@@ -1496,6 +1497,7 @@ class SignalAdapter(BasePlatformAdapter):
                 continue
 
             attachments.append(file_path)
+            attachment_sizes[file_path] = file_size
 
         if not attachments:
             logger.error(
@@ -1537,7 +1539,9 @@ class SignalAdapter(BasePlatformAdapter):
                 )
 
             params = dict(base_params, attachments=att_batch)
-            send_timeout = _signal_send_timeout(n)
+            send_timeout = _signal_send_timeout(
+                n, sum(attachment_sizes[path] for path in att_batch)
+            )
 
             for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
                 await scheduler.acquire(n)
@@ -1675,7 +1679,7 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        result = await self._rpc("send", params)
+        result = await self._rpc("send", params, timeout=_signal_send_timeout(1, file_size))
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:
@@ -1719,7 +1723,7 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        result = await self._rpc("send", params)
+        result = await self._rpc("send", params, timeout=_signal_send_timeout(1, file_size))
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:

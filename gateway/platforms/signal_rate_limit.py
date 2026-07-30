@@ -144,18 +144,38 @@ def _format_wait(seconds: float) -> str:
     return f"{max(1, int(round(s / 60)))} min"
 
 
-def _signal_send_timeout(num_attachments: int) -> float:
+def _signal_send_timeout(num_attachments: int, total_attachment_bytes: int = 0) -> Any:
     """HTTP timeout for a Signal ``send`` RPC.
 
-    signal-cli uploads attachments serially during the call, so the
-    server-side time scales with batch size. Default 30s is fine for
-    text-only sends but truncates large attachment batches mid-upload —
-    we then log a phantom failure even though signal-cli completes the
-    send a few seconds later. Scale at 5s/attachment with a 60s floor.
+    Text-only sends keep a flat 30s deadline: the whole exchange is local to
+    the signal-cli daemon and a hang there is a real failure worth surfacing.
+
+    Attachment sends are different. The JSON-RPC body carries file *paths*,
+    not bytes, so the local POST completes immediately and signal-cli then
+    uploads to Signal's servers serially before replying. The client is
+    waiting on someone else's uplink, and ANY read deadline is really a
+    hard-coded minimum bandwidth assumption: a 100 MiB attachment needs
+    ~400s at 2 Mbit/s but ~35s at 25 Mbit/s. Picking a number here means
+    picking which users get phantom failures, so we don't pick one —
+    ``read`` is disabled for attachment sends while connect/write/pool stay
+    bounded, so a genuinely unreachable daemon still fails fast.
+
+    ``num_attachments``/``total_attachment_bytes`` are retained because
+    callers pass them and they document intent at the call site, but the
+    upload leg is no longer deadlined on a guessed rate.
     """
     if num_attachments <= 0:
         return 30.0
-    return max(60.0, 5.0 * num_attachments)
+    try:
+        import httpx
+
+        # connect/write/pool bounded: a dead daemon or a stuck local write still
+        # fails fast. read=None: only the remote upload leg is open-ended.
+        return httpx.Timeout(60.0, read=None)
+    except (ImportError, AttributeError):
+        # httpx is a hard dependency, but never let timeout CONSTRUCTION be the
+        # thing that fails a send: fall back to a bounded scalar deadline.
+        return max(60.0, 5.0 * num_attachments)
 
 
 # ---------------------------------------------------------------------------

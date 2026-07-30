@@ -2546,23 +2546,27 @@ class TestSignalRateLimitDetection:
 
 
 class TestSignalSendTimeout:
-    """Timeout scaling for batched attachment sends."""
+    """Deadline policy for Signal send RPCs."""
 
     def test_zero_attachments_uses_default(self):
         from gateway.platforms.signal import _signal_send_timeout
+        # Text-only sends never leave the local daemon, so a hang is a real
+        # failure and stays bounded.
         assert _signal_send_timeout(0) == 30.0
 
-    def test_floor_at_60s(self):
+    def test_attachment_sends_leave_the_upload_leg_open(self):
         from gateway.platforms.signal import _signal_send_timeout
-        # Few attachments (would be 5×N=5s) should still get 60s floor.
-        assert _signal_send_timeout(1) == 60.0
-        assert _signal_send_timeout(5) == 60.0
+        # signal-cli receives paths and uploads to Signal's servers itself,
+        # so the client is waiting on a remote uplink of unknown speed. Any
+        # read deadline here is a hidden minimum-bandwidth assumption.
+        for count in (1, 5, 32):
+            assert _signal_send_timeout(count).read is None
 
-    def test_scales_with_batch_size(self):
+    def test_attachment_sends_still_bound_connect(self):
         from gateway.platforms.signal import _signal_send_timeout
-        # 32 attachments × 5s = 160s; ought to comfortably outlast a
-        # serial upload of an attachment-heavy batch.
-        assert _signal_send_timeout(32) == 160.0
+        # An unreachable or dead daemon must still fail fast rather than
+        # hanging the send forever.
+        assert _signal_send_timeout(1).connect == 60.0
 
 
 # ---------------------------------------------------------------------------
