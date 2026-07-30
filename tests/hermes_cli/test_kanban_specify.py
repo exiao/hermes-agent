@@ -142,6 +142,19 @@ def test_specify_task_rejects_non_triage_task(kanban_home):
     assert client.chat.completions.create.call_count == 0
 
 
+def test_specify_task_skips_aux_llm_for_block_loop(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    with (
+        patch("hermes_cli.kanban_specify.kb.has_unresolved_block_loop", return_value=True),
+        patch("agent.auxiliary_client.call_llm") as call_llm,
+    ):
+        outcome = spec.specify_task(tid)
+    assert outcome.ok is False
+    assert "loop review" in outcome.reason
+    call_llm.assert_not_called()
+
+
 def test_specify_task_unknown_id(kanban_home):
     p, client = _patch_aux_client("unused")
     with p:

@@ -5260,7 +5260,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
-def _has_unresolved_block_loop(conn: sqlite3.Connection, task_id: str) -> bool:
+def has_unresolved_block_loop(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` sits in triage because the block-recurrence
     breaker tripped and nothing has cleared it since.
 
@@ -7471,7 +7471,7 @@ def specify_triage_task(
         # guards each work alone and defeat each other: triage is where the
         # breaker PARKS a looping task and where the specifier HARVESTS work.
         # Refuse until an explicit ``unblock_task`` clears the loop state.
-        if _has_unresolved_block_loop(conn, task_id):
+        if has_unresolved_block_loop(conn, task_id):
             return False
         # Re-check the spec-less guard against the *post-update* values. A
         # specifier (auxiliary LLM) can return a title-only response or omit
@@ -7645,6 +7645,10 @@ def decompose_triage_task(
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        # Triage is also the circuit breaker's parking state. Never let the
+        # fan-out path bypass the corresponding specify_triage_task guard.
+        if has_unresolved_block_loop(conn, task_id):
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out

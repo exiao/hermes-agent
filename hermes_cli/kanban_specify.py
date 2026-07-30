@@ -161,6 +161,10 @@ def specify_task(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
 
+    with kb.connect_closing() as conn:
+        if kb.has_unresolved_block_loop(conn, task_id):
+            return SpecifyOutcome(task_id, False, "task is parked for human loop review")
+
     try:
         from agent.auxiliary_client import call_llm
     except Exception as exc:  # pragma: no cover — import smoke test

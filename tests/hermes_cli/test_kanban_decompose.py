@@ -113,6 +113,19 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_skips_aux_llm_for_block_loop(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    with (
+        patch("hermes_cli.kanban_decompose.kb.has_unresolved_block_loop", return_value=True),
+        patch("agent.auxiliary_client.call_llm") as call_llm,
+    ):
+        outcome = decomp.decompose_task(tid)
+    assert outcome.ok is False
+    assert "loop review" in outcome.reason
+    call_llm.assert_not_called()
+
+
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="just one thing", triage=True)

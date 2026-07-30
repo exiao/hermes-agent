@@ -109,16 +109,34 @@ def test_operator_status_move_clears_the_loop(tmp_path, monkeypatch):
             conn, title="babysit a PR whose base is broken", assignee="pr-babysitter",
         )
         _drive_into_block_loop(conn, tid)
-        assert kb._has_unresolved_block_loop(conn, tid) is True
+        assert kb.has_unresolved_block_loop(conn, tid) is True
         assert kb.unblock_task(conn, tid) is False, (
             "precondition: unblock_task cannot exit triage"
         )
 
         kb.set_status_direct(conn, tid, "todo")
 
-        assert kb._has_unresolved_block_loop(conn, tid) is False, (
+        assert kb.has_unresolved_block_loop(conn, tid) is False, (
             "an operator status move must release the guard"
         )
+    finally:
+        conn.close()
+
+
+def test_decomposer_refuses_a_block_loop_task(tmp_path, monkeypatch):
+    """Fan-out must not create children from a breaker-parked root."""
+    conn = _fresh_board(tmp_path, monkeypatch)
+    try:
+        tid = kb.create_task(conn, title="looping task", assignee="worker")
+        _drive_into_block_loop(conn, tid)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "child", "body": "real spec", "assignee": "worker"}],
+        )
+        assert child_ids is None
+        assert kb.get_task(conn, tid).status == "triage"
     finally:
         conn.close()
 
