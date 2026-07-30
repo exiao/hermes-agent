@@ -63,9 +63,16 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     from tools.credential_files import (
         get_credential_file_mounts,
         iter_cache_files,
-        iter_plans_files,
         iter_skills_files,
     )
+
+    # Imported separately and defensively: plan syncing is an enhancement, and
+    # a partial/stubbed credential_files module must not take down credential,
+    # skill and cache syncing with it.
+    try:
+        from tools.credential_files import iter_plans_files
+    except ImportError:
+        iter_plans_files = None
 
     files: list[tuple[str, str]] = []
     for entry in get_credential_file_mounts():
@@ -80,8 +87,9 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     # and a creation-time-only mount would stay stale for that sandbox's whole
     # lifetime. Backends that mount at construction still get them here on the
     # next command, which is what makes an edited plan visible.
-    for entry in iter_plans_files(container_base=container_base):
-        files.append((entry["host_path"], entry["container_path"]))
+    if iter_plans_files is not None:
+        for entry in iter_plans_files(container_base=container_base):
+            files.append((entry["host_path"], entry["container_path"]))
     for entry in iter_cache_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))
     return files

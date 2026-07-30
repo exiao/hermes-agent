@@ -126,6 +126,7 @@ def _install_modal_test_modules(
         get_credential_file_mounts=lambda: [],
         iter_skills_files=lambda **kw: [],
         iter_cache_files=lambda **kw: [],
+        iter_plans_files=lambda **kw: [],
     )
 
     from_id_calls: list[str] = []
