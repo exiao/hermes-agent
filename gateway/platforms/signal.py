@@ -438,6 +438,11 @@ class SignalAdapter(BasePlatformAdapter):
         # drop a still-recent timestamp and miss a genuine reply-to-own-message.
         self._sent_message_timestamps: "OrderedDict[str, None]" = OrderedDict()
         self._max_sent_message_timestamps = 500
+        # Local file paths of attachments this bot sent, keyed by the outbound
+        # Signal timestamp. Signal timestamps are only unique within a
+        # conversation, so retain the destination too before resolving a quote.
+        self._sent_attachment_paths: "OrderedDict[Tuple[str, str], List[str]]" = OrderedDict()
+        self._max_sent_attachment_entries = 200
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
         # phone number to the corresponding UUID when signal-cli prefers it.
@@ -790,6 +795,13 @@ class SignalAdapter(BasePlatformAdapter):
         reply_to_author = self._extract_quote_author(quote_data)
         reply_to_author_name = quote_data.get("authorName") or quote_data.get("authorProfileName")
         reply_to_is_own = self._quote_references_own_message(reply_to_id, reply_to_author)
+        # When the quoted message had no text, signal-cli still tells us what media
+        # it carried. Parse it so the agent knows WHICH image was quoted, and hand
+        # back a local path when we sent that image ourselves.
+        reply_to_media_summary = self._describe_quoted_attachments(quote_data)
+        # Signal timestamps are only unique within a conversation, so lookup
+        # uses the current chat as well as the quoted timestamp.
+        reply_to_media_paths = self._resolve_quoted_media_paths(reply_to_id, chat_id)
 
         # Process attachments
         attachments_data = data_message.get("attachments", [])
@@ -885,6 +897,8 @@ class SignalAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_to_author,
             reply_to_author_name=reply_to_author_name,
             reply_to_is_own_message=reply_to_is_own,
+            reply_to_media_summary=reply_to_media_summary,
+            reply_to_media_paths=reply_to_media_paths,
         )
 
         logger.debug("Signal: message from %s in %s: %s",
@@ -951,6 +965,67 @@ class SignalAdapter(BasePlatformAdapter):
             return True
         cached_number = self._recipient_number_by_uuid.get(author)
         return bool(cached_number and cached_number == self._account_normalized)
+
+    def _remember_sent_attachments(self, timestamp: Any, chat_id: str, paths: List[str]) -> None:
+        """Map an outbound Signal timestamp and destination to local attached files."""
+        if timestamp is None or not chat_id or not paths:
+            return
+        # Key on (conversation, timestamp): two conversations can receive the
+        # same millisecond timestamp, and a timestamp-only key would let the
+        # second send evict a still-quotable attachment from the first.
+        key = (str(chat_id), str(timestamp))
+        self._sent_attachment_paths.pop(key, None)
+        self._sent_attachment_paths[key] = list(paths)
+        while len(self._sent_attachment_paths) > self._max_sent_attachment_entries:
+            self._sent_attachment_paths.popitem(last=False)
+
+    @staticmethod
+    def _describe_quoted_attachments(quote_data: Any) -> Optional[str]:
+        """Summarize the media on a quoted message, e.g. "an image (image/png, chart.png)".
+
+        signal-cli exposes ``quote.attachments[]`` with ``contentType`` and
+        ``filename``. Without this the gateway can only say "may have been an
+        image or file", which forces the agent to guess which message is meant.
+        """
+        if not isinstance(quote_data, dict):
+            return None
+        attachments = quote_data.get("attachments")
+        if not isinstance(attachments, list) or not attachments:
+            return None
+
+        descriptions: List[str] = []
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            content_type = (att.get("contentType") or "").strip()
+            filename = (att.get("filename") or att.get("fileName") or "").strip()
+
+            if content_type.startswith("image/"):
+                noun = "an image"
+            elif content_type.startswith("video/"):
+                noun = "a video"
+            elif content_type.startswith("audio/"):
+                noun = "an audio file"
+            else:
+                noun = "a file"
+
+            details = [d for d in (content_type, filename) if d]
+            descriptions.append(f"{noun} ({', '.join(details)})" if details else noun)
+
+        if not descriptions:
+            return None
+        if len(descriptions) == 1:
+            return descriptions[0]
+        return f"{len(descriptions)} attachments: " + "; ".join(descriptions)
+
+    def _resolve_quoted_media_paths(self, quote_id: Optional[str], chat_id: str) -> List[str]:
+        """Return local paths for quoted media sent to this Signal conversation."""
+        if not quote_id or not chat_id:
+            return []
+        cached = self._sent_attachment_paths.get((str(chat_id), str(quote_id)))
+        if not cached:
+            return []
+        return [p for p in cached if p and Path(p).exists()]
 
     def _remember_sent_message_timestamp(self, timestamp: Any) -> None:
         """Keep a bounded cache of outbound Signal timestamps for quote matching."""
@@ -1476,6 +1551,10 @@ class SignalAdapter(BasePlatformAdapter):
                         success, err_msg = self._validate_send_result(result)
                         if success:
                             self._track_sent_timestamp(result)
+                            # Remember which local files went out under this
+                            # timestamp, so quoting the image later resolves to it.
+                            if isinstance(result, dict):
+                                self._remember_sent_attachments(result.get("timestamp"), chat_id, att_batch)
                             await scheduler.report_rpc_duration(_rpc_duration, n)
                             logger.info(
                                 "Signal batch %d/%d: %d attachments sent in %.1fs "
@@ -1602,6 +1681,8 @@ class SignalAdapter(BasePlatformAdapter):
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
+            if isinstance(result, dict):
+                self._remember_sent_attachments(result.get("timestamp"), chat_id, [file_path])
             return SendResult(success=True)
         return SendResult(success=False, error="RPC send with attachment failed")
 
@@ -1644,6 +1725,8 @@ class SignalAdapter(BasePlatformAdapter):
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
+            if isinstance(result, dict):
+                self._remember_sent_attachments(result.get("timestamp"), chat_id, [file_path])
             return SendResult(success=True)
         return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
 

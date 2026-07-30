@@ -183,3 +183,133 @@ async def test_reply_snippet_truncated_to_2000_chars():
     assert result is not None
     assert result.startswith('[Replying to: "' + "x" * 2000 + '"]')
     assert "x" * 2001 not in result
+
+
+@pytest.mark.asyncio
+async def test_no_text_reply_names_the_quoted_media():
+    """A quoted image is NAMED, not guessed at.
+
+    Regression: the gateway used to emit "may have been an image or file" for
+    every text-less quote, even though signal-cli reports contentType/filename
+    in quote.attachments[]. That forced the agent to ask which image was meant.
+    """
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="what about this part?",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=None,
+        reply_to_media_summary="an image (image/png, coach_cards.png)",
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result is not None
+    assert result.startswith("[Replying to an image (image/png, coach_cards.png)]")
+    assert "may have been" not in result
+    assert result.endswith("what about this part?")
+
+
+@pytest.mark.asyncio
+async def test_no_text_reply_includes_local_path_when_we_have_the_file():
+    """When the bot sent the quoted image, hand over the on-disk path too."""
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="this one",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=None,
+        reply_to_media_summary="an image (image/png, sheet.png)",
+        reply_to_media_paths=["/tmp/sheet.png"],
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result is not None
+    assert "local copy: /tmp/sheet.png" in result
+    assert result.startswith("[Replying to an image (image/png, sheet.png)")
+
+
+@pytest.mark.asyncio
+async def test_no_text_reply_translates_local_path_for_active_backend(monkeypatch):
+    """Quoted media paths use the backend-visible cache mount, like inbound media."""
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="this one",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=None,
+        reply_to_media_summary="an image (image/png, sheet.png)",
+        reply_to_media_paths=["/host/.hermes/cache/sheet.png"],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.to_agent_visible_cache_path",
+        lambda path: path.replace("/host/.hermes", "/root/.hermes"),
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result is not None
+    assert "local copy: /root/.hermes/cache/sheet.png" in result
+    assert "/host/.hermes/cache/sheet.png" not in result
+
+
+@pytest.mark.asyncio
+async def test_no_text_reply_falls_back_when_media_unknown():
+    """Platforms that expose no quoted-media metadata keep the old pointer."""
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="hi",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=None,
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result is not None
+    assert result.startswith("[Replying to a previous message (no text")
+
+
+@pytest.mark.asyncio
+async def test_quoted_text_still_wins_over_media_summary():
+    """A quote WITH text keeps quoting the text; media summary is the no-text path."""
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="follow-up",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text="the original message",
+        reply_to_media_summary="an image (image/png, ignored.png)",
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result is not None
+    assert result.startswith('[Replying to: "the original message"]')
+    assert "ignored.png" not in result
