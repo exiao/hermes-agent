@@ -161,11 +161,15 @@ class TestHistoryMediaDedupUsesDeliveryOutcome:
         session_key = build_session_key(event.source)
         await adapter._process_message_background(event, session_key)
         assert adapter.sent_documents == [str(path)]
+        route_key = "('discord', None, 'dm', '111', None)"
         assert store.appended == [(
             "session-1",
             {
                 "role": "session_meta",
-                "display_metadata": {"media_delivered": [str(path)]},
+                "display_metadata": {
+                    "media_delivered": [str(path)],
+                    "media_delivery_route": route_key,
+                },
             },
         )]
 
@@ -175,7 +179,10 @@ class TestHistoryMediaDedupUsesDeliveryOutcome:
             {"role": "assistant", "content": f"MEDIA:{path}"},
             {
                 "role": "session_meta",
-                "display_metadata": {"media_delivered": [str(path)]},
+                "display_metadata": {
+                    "media_delivered": [str(path)],
+                    "media_delivery_route": route_key,
+                },
             },
         ]
         retry_adapter = _DummyAdapter(Platform.DISCORD)
@@ -222,6 +229,24 @@ class TestHistoryMediaDedupUsesDeliveryOutcome:
 
         store.session_id = "session-2"
         assert adapter._history_media_paths_for_session(session_key) is None
+
+    def test_delivery_receipt_is_scoped_to_route(self, tmp_path):
+        path = tmp_path / "route-scoped.pdf"
+        path.write_bytes(b"pdf")
+        adapter = _DummyAdapter(Platform.DISCORD)
+        store = _TranscriptStore([
+            {"role": "assistant", "content": f"MEDIA:{path}"},
+            {"role": "user", "content": "later"},
+            {"role": "assistant", "content": "current response"},
+        ])
+        adapter.set_session_store(store)
+        session_key = build_session_key(_make_event(Platform.DISCORD).source)
+
+        adapter._record_media_delivery(session_key, str(path), "route-a")
+        store.transcript.append(store.appended[-1][1])
+
+        assert adapter._history_media_paths_for_session(session_key, "route-a") == {str(path)}
+        assert adapter._history_media_paths_for_session(session_key, "route-b") is None
 
     def test_session_metadata_receipt_round_trips_without_counting_as_turn(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")

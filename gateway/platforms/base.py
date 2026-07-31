@@ -53,6 +53,19 @@ def _platform_name(platform) -> str:
     return str(value or "").lower()
 
 
+def _media_delivery_route_key(source) -> str:
+    """Return the concrete destination used to scope media receipts."""
+    return repr(
+        (
+            _platform_name(getattr(source, "platform", None)),
+            getattr(source, "scope_id", None),
+            getattr(source, "chat_type", None),
+            getattr(source, "chat_id", None),
+            getattr(source, "thread_id", None),
+        )
+    )
+
+
 def _float_env(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -2753,7 +2766,7 @@ class BasePlatformAdapter(ABC):
         # Transcript MEDIA tags record what the model mentioned, not what the
         # platform accepted. Keep successful attachment deliveries separate so
         # a failed send remains eligible for a later retry.
-        self._delivered_media_paths_by_session: Dict[str, set[str]] = {}
+        self._delivered_media_paths_by_session: Dict[tuple[str, Optional[str]], set[str]] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
         # construction (gateway/run.py). Default to "interrupt" so a stray
@@ -3364,7 +3377,9 @@ class BasePlatformAdapter(ABC):
         """
         self._session_store = session_store
     
-    def _history_media_paths_for_session(self, session_key: str) -> Optional[set]:
+    def _history_media_paths_for_session(
+        self, session_key: str, route_key: Optional[str] = None
+    ) -> Optional[set]:
         """Return prior transcript paths that this adapter delivered successfully.
 
         Transcript MEDIA tags are intent, not delivery receipts: a failed or
@@ -3400,24 +3415,28 @@ class BasePlatformAdapter(ABC):
         # Avoid circular import: gateway.run already imports this module.
         from gateway.run import _collect_history_media_paths
         history_paths = _collect_history_media_paths(history)
-        ledger_key = session_id or session_key
+        ledger_key = (session_id or session_key, route_key)
         delivered_paths = set(
             getattr(self, "_delivered_media_paths_by_session", {}).get(ledger_key, set())
         )
         for msg in history:
             if msg.get("role") == "session_meta":
                 metadata = msg.get("display_metadata") or {}
+                if route_key is not None and metadata.get("media_delivery_route") != route_key:
+                    continue
                 delivered_paths.update(
                     str(path) for path in metadata.get("media_delivered", []) if path
                 )
         return history_paths & delivered_paths or None
 
-    def _record_media_delivery(self, session_key: str, path: str) -> None:
+    def _record_media_delivery(
+        self, session_key: str, path: str, route_key: Optional[str] = None
+    ) -> None:
         """Remember and persist a path only after its send was acknowledged."""
         store = getattr(self, "_session_store", None)
         peek = getattr(store, "peek_session_id", None)
         session_id = peek(session_key) if callable(peek) else None
-        ledger_key = session_id or session_key
+        ledger_key = (session_id or session_key, route_key)
         delivered_paths = self._delivered_media_paths_by_session.setdefault(
             ledger_key, set()
         )
@@ -3431,12 +3450,12 @@ class BasePlatformAdapter(ABC):
         try:
             append = getattr(store, "append_to_transcript", None)
             if session_id and callable(append):
+                display_metadata = {"media_delivered": [path]}
+                if route_key is not None:
+                    display_metadata["media_delivery_route"] = route_key
                 append(
                     session_id,
-                    {
-                        "role": "session_meta",
-                        "display_metadata": {"media_delivered": [path]},
-                    },
+                    {"role": "session_meta", "display_metadata": display_metadata},
                 )
         except Exception:
             logger.debug("failed to persist media delivery receipt", exc_info=True)
@@ -5724,6 +5743,7 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        delivery_route_key = _media_delivery_route_key(event.source)
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -5826,7 +5846,9 @@ class BasePlatformAdapter(ABC):
                 # The model may echo a previous MEDIA: tag or bare file path in
                 # a later response; without this guard the same file is sent
                 # repeatedly.
-                _history_media_paths = self._history_media_paths_for_session(session_key)
+                _history_media_paths = self._history_media_paths_for_session(
+                    session_key, delivery_route_key
+                )
                 if _history_media_paths:
                     media_files = [
                         (path, is_voice)
@@ -6114,7 +6136,9 @@ class BasePlatformAdapter(ABC):
                         if delivered_image_paths is None:
                             delivered_image_paths = set()
                         for delivered_path in delivered_image_paths:
-                            self._record_media_delivery(session_key, delivered_path)
+                            self._record_media_delivery(
+                                session_key, delivered_path, delivery_route_key
+                            )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
@@ -6155,7 +6179,9 @@ class BasePlatformAdapter(ABC):
                             )
 
                         if media_result.success:
-                            self._record_media_delivery(session_key, media_path)
+                            self._record_media_delivery(
+                                session_key, media_path, delivery_route_key
+                            )
                         else:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             await self._notify_media_delivery_failure(
@@ -6186,7 +6212,9 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
                         if file_result.success:
-                            self._record_media_delivery(session_key, file_path)
+                            self._record_media_delivery(
+                                session_key, file_path, delivery_route_key
+                            )
                         else:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
