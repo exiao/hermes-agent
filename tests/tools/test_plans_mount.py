@@ -357,8 +357,11 @@ def test_managed_modal_transports_plans_over_exec(monkeypatch, tmp_path):
     exec_calls = [c for c in calls if c[1].endswith("/execs")]
     assert len(exec_calls) == 3, "changed plans should resync in a reused sandbox"
     payload = exec_calls[0][2]
+    # Persistent sandboxes sweep the restored plans tree in the same exec that
+    # extracts the fresh copy (see the reconciliation test below).
     assert payload["command"] == (
         "mkdir -p /root/.hermes && "
+        "rm -rf -- /root/.hermes/plans && mkdir -p /root/.hermes/plans && "
         "base64 -d | tar -xf - -C /root/.hermes"
     )
     # The plan's real bytes travel through stdinData, not the command argument.
@@ -459,3 +462,213 @@ def test_plan_enumeration_failure_does_not_break_sibling_syncs(monkeypatch):
 
     files = iter_sync_files("/root/.hermes")
     assert ("/host/cred", "/root/.hermes/cred") in files
+
+
+def test_restored_persistent_sandbox_reconciles_stale_plans(monkeypatch, tmp_path):
+    """A plan deleted between environment instances must not survive a restore.
+
+    The gateway rebuilds a managed environment for the same task via
+    logicalKey/snapshotBeforeTerminate, so the filesystem can already hold
+    plans mirrored by an EARLIER instance while the new instance's manifest
+    starts empty. Nothing in the manifest can name those copies, so the
+    same-instance stale_paths cleanup cannot reach them and the worker would
+    keep reading obsolete instructions. The first sync of a persistent sandbox
+    therefore sweeps the remote plans tree in the same exec that extracts the
+    fresh copy.
+    """
+    import tools.credential_files as cf
+    from tools.environments import managed_modal as mm
+
+    plan = tmp_path / "current.md"
+    plan.write_text("# current plan\n")
+
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
+    monkeypatch.setattr(
+        cf,
+        "iter_plans_files",
+        lambda *a, **k: [
+            {
+                "host_path": str(plan),
+                "container_path": "/root/.hermes/plans/current.md",
+            }
+        ],
+    )
+
+    calls = []
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_request(self, method, path, **kwargs):
+        payload = kwargs.get("json") or {}
+        calls.append((method, path, payload))
+        if path.endswith("/v1/sandboxes"):
+            return _Resp({"id": "sb-1"})
+        if path.endswith("/execs"):
+            return _Resp({"execId": payload["execId"], "status": "running"})
+        if "/execs/" in path:
+            return _Resp({
+                "execId": path.rsplit("/", 1)[-1],
+                "status": "completed",
+                "output": "",
+                "returncode": 0,
+            })
+        raise AssertionError(f"unexpected managed request: {method} {path}")
+
+    monkeypatch.setattr(mm.ManagedModalEnvironment, "_request", fake_request)
+    monkeypatch.setattr(
+        mm,
+        "resolve_managed_tool_gateway",
+        lambda _n: type("G", (), {"gateway_origin": "https://gw", "nous_user_token": "t"})(),
+    )
+
+    env = mm.ManagedModalEnvironment(image="img", persistent_filesystem=True)
+    exec_calls = [c for c in calls if c[1].endswith("/execs")]
+    first = exec_calls[0][2]["command"]
+    assert "rm -rf -- /root/.hermes/plans" in first, (
+        "a restored persistent sandbox must clear plans it did not mirror"
+    )
+    # One exec, not two: the wipe rides on the extract, so the tree is never
+    # left empty between round trips and the attach costs no extra call.
+    assert len(exec_calls) == 1
+    assert first.index("rm -rf") < first.index("tar -xf")
+
+    # The sweep is once per instance, not once per sync: a later edit must not
+    # wipe plans this instance already mirrored.
+    plan.write_text("# edited plan\n")
+    env._sync_plan_files()
+    exec_calls = [c for c in calls if c[1].endswith("/execs")]
+    assert len(exec_calls) == 2
+    assert "rm -rf" not in exec_calls[1][2]["command"]
+
+
+def test_ephemeral_sandbox_does_not_sweep_plans(monkeypatch, tmp_path):
+    """A fresh non-persistent sandbox has no restored state to reconcile."""
+    import tools.credential_files as cf
+    from tools.environments import managed_modal as mm
+
+    plan = tmp_path / "current.md"
+    plan.write_text("# current plan\n")
+
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
+    monkeypatch.setattr(
+        cf,
+        "iter_plans_files",
+        lambda *a, **k: [
+            {
+                "host_path": str(plan),
+                "container_path": "/root/.hermes/plans/current.md",
+            }
+        ],
+    )
+
+    calls = []
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_request(self, method, path, **kwargs):
+        payload = kwargs.get("json") or {}
+        calls.append((method, path, payload))
+        if path.endswith("/v1/sandboxes"):
+            return _Resp({"id": "sb-1"})
+        if path.endswith("/execs"):
+            return _Resp({"execId": payload["execId"], "status": "running"})
+        if "/execs/" in path:
+            return _Resp({
+                "execId": path.rsplit("/", 1)[-1],
+                "status": "completed",
+                "output": "",
+                "returncode": 0,
+            })
+        raise AssertionError(f"unexpected managed request: {method} {path}")
+
+    monkeypatch.setattr(mm.ManagedModalEnvironment, "_request", fake_request)
+    monkeypatch.setattr(
+        mm,
+        "resolve_managed_tool_gateway",
+        lambda _n: type("G", (), {"gateway_origin": "https://gw", "nous_user_token": "t"})(),
+    )
+
+    mm.ManagedModalEnvironment(image="img", persistent_filesystem=False)
+    exec_calls = [c for c in calls if c[1].endswith("/execs")]
+    assert len(exec_calls) == 1
+    assert "rm -rf" not in exec_calls[0][2]["command"]
+
+
+def test_failed_sweep_stays_armed_for_the_next_sync(monkeypatch, tmp_path):
+    """A failed sweep exec must not be recorded as a completed reconciliation."""
+    import tools.credential_files as cf
+    from tools.environments import managed_modal as mm
+
+    plan = tmp_path / "current.md"
+    plan.write_text("# current plan\n")
+
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda: [])
+    monkeypatch.setattr(
+        cf,
+        "iter_plans_files",
+        lambda *a, **k: [
+            {
+                "host_path": str(plan),
+                "container_path": "/root/.hermes/plans/current.md",
+            }
+        ],
+    )
+
+    calls = []
+    fail_first = {"value": True}
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_request(self, method, path, **kwargs):
+        payload = kwargs.get("json") or {}
+        calls.append((method, path, payload))
+        if path.endswith("/v1/sandboxes"):
+            return _Resp({"id": "sb-1"})
+        if path.endswith("/execs"):
+            return _Resp({"execId": payload["execId"], "status": "running"})
+        if "/execs/" in path:
+            rc = 1 if fail_first["value"] else 0
+            fail_first["value"] = False
+            return _Resp({
+                "execId": path.rsplit("/", 1)[-1],
+                "status": "completed",
+                "output": "boom" if rc else "",
+                "returncode": rc,
+            })
+        raise AssertionError(f"unexpected managed request: {method} {path}")
+
+    monkeypatch.setattr(mm.ManagedModalEnvironment, "_request", fake_request)
+    monkeypatch.setattr(
+        mm,
+        "resolve_managed_tool_gateway",
+        lambda _n: type("G", (), {"gateway_origin": "https://gw", "nous_user_token": "t"})(),
+    )
+
+    env = mm.ManagedModalEnvironment(image="img", persistent_filesystem=True)
+    env._sync_plan_files()
+    exec_calls = [c for c in calls if c[1].endswith("/execs")]
+    assert len(exec_calls) == 2
+    assert "rm -rf" in exec_calls[1][2]["command"], (
+        "a failed sweep must retry, or restored plans survive forever"
+    )

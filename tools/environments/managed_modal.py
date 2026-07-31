@@ -78,6 +78,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         self._sandbox_id = self._create_sandbox()
         self._plans_synced: dict[str, str] = {}
         self._plan_file_metadata: dict[str, tuple[int, int]] = {}
+        self._plans_reconciled = False
         self._sync_plan_files()
 
     def _sync_plan_files(self) -> None:
@@ -133,7 +134,17 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
 
         stale_paths = sorted(set(self._plans_synced) - enumerated_paths)
 
-        if pending:
+        # First sync of a persistent sandbox: the local manifest starts empty,
+        # but the filesystem may hold plans mirrored by an EARLIER environment
+        # instance (restored via logicalKey/snapshotBeforeTerminate). Those
+        # copies are invisible to the manifest, so a plan deleted on the host
+        # between instances would survive and the worker would keep reading
+        # obsolete instructions. Sweep the remote plans tree down to exactly
+        # what we are about to push. This rides along on the sync exec that
+        # already runs, so it costs no extra round trip.
+        sweep_remote_plans = self._persistent and not self._plans_reconciled
+
+        if pending or sweep_remote_plans:
             archive = io.BytesIO()
             with tarfile.open(fileobj=archive, mode="w") as tar:
                 for relative_path, _digest, content, _metadata in pending:
@@ -142,11 +153,18 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
                     info.mode = 0o600
                     tar.addfile(info, io.BytesIO(content))
 
+            # The wipe and the extract are one exec: the tree is never left
+            # empty between two round trips, and a failed exec leaves the last
+            # known remote plan state intact.
+            command = "mkdir -p /root/.hermes && "
+            if sweep_remote_plans:
+                command += (
+                    "rm -rf -- /root/.hermes/plans && mkdir -p /root/.hermes/plans && "
+                )
+            command += "base64 -d | tar -xf - -C /root/.hermes"
+
             prepared = PreparedModalExec(
-                command=(
-                    "mkdir -p /root/.hermes && "
-                    "base64 -d | tar -xf - -C /root/.hermes"
-                ),
+                command=command,
                 cwd=self.cwd,
                 timeout=self._PLAN_SYNC_TIMEOUT_SECONDS,
                 stdin_data=base64.b64encode(archive.getvalue()).decode("ascii"),
@@ -167,6 +185,11 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
                 remote_path = container_root + relative_path
                 self._plans_synced[remote_path] = digest
                 self._plan_file_metadata[remote_path] = metadata
+            # Only a successful exec proves the remote tree matches the
+            # manifest; a failed one returns above and leaves the sweep armed
+            # for the next sync.
+            if sweep_remote_plans:
+                self._plans_reconciled = True
 
         if stale_paths:
             prepared = PreparedModalExec(
