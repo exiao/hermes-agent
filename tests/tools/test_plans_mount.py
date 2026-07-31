@@ -13,8 +13,11 @@ mocking, per AGENTS.md ("E2E validation, not just green unit mocks").
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
+import io
 import sys
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -91,6 +94,25 @@ class TestIterPlansFiles:
             pytest.skip("symlinks unavailable on this platform")
         container = {e["container_path"] for e in cf.iter_plans_files()}
         assert "/root/.hermes/plans/t_link.md" not in container
+
+    def test_symlinked_plans_root_is_rejected(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes_home"
+        home.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_text("not plan context", encoding="utf-8")
+        try:
+            (home / "plans").symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable on this platform")
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        import tools.credential_files as cf
+        importlib.reload(cf)
+        try:
+            assert cf.iter_plans_files() == []
+        finally:
+            importlib.reload(cf)
 
     def test_host_paths_exist_and_are_absolute(self, plans_home):
         _, cf = plans_home
@@ -287,12 +309,27 @@ def test_managed_modal_transports_plans_over_exec(monkeypatch, tmp_path):
     class _Resp:
         status_code = 200
 
+        def __init__(self, payload):
+            self._payload = payload
+
         def json(self):
-            return {"id": "sb-1"}
+            return self._payload
 
     def fake_request(self, method, path, **kwargs):
-        calls.append((method, path, kwargs.get("json")))
-        return _Resp()
+        payload = kwargs.get("json") or {}
+        calls.append((method, path, payload))
+        if path.endswith("/v1/sandboxes"):
+            return _Resp({"id": "sb-1"})
+        if path.endswith("/execs"):
+            return _Resp({"execId": payload["execId"], "status": "running"})
+        if "/execs/" in path:
+            return _Resp({
+                "execId": path.rsplit("/", 1)[-1],
+                "status": "completed",
+                "output": "",
+                "returncode": 0,
+            })
+        raise AssertionError(f"unexpected managed request: {method} {path}")
 
     monkeypatch.setattr(mm.ManagedModalEnvironment, "_request", fake_request)
     monkeypatch.setattr(
@@ -301,16 +338,25 @@ def test_managed_modal_transports_plans_over_exec(monkeypatch, tmp_path):
         lambda _n: type("G", (), {"gateway_origin": "https://gw", "nous_user_token": "t"})(),
     )
 
-    mm.ManagedModalEnvironment(image="img")
+    env = mm.ManagedModalEnvironment(image="img")
+    plan.write_text("# changed plan\n", encoding="utf-8")
+    env._sync_plan_files()
 
     exec_calls = [c for c in calls if c[1].endswith("/execs")]
-    assert exec_calls, "no exec issued to transport plans"
-    command = exec_calls[0][2]["command"]
-    script = command[-1]
-    assert "/root/.hermes/plans/task.md" in script
-    # The plan's real bytes must be in the payload, not just its path.
-    encoded = base64.b64encode(plan.read_bytes()).decode("ascii")
-    assert encoded in script
+    assert len(exec_calls) == 2, "changed plans should resync in a reused sandbox"
+    payload = exec_calls[0][2]
+    assert payload["command"] == (
+        "mkdir -p /root/.hermes && "
+        "base64 -d | tar -xf - -C /root/.hermes"
+    )
+    # The plan's real bytes travel through stdinData, not the command argument.
+    encoded = base64.b64decode(payload["stdinData"])
+    with tarfile.open(fileobj=io.BytesIO(encoded)) as archive:
+        assert archive.extractfile("plans/task.md").read() == b"# the plan\nstep one\n"
+    changed_encoded = base64.b64decode(exec_calls[1][2]["stdinData"])
+    with tarfile.open(fileobj=io.BytesIO(changed_encoded)) as archive:
+        assert archive.extractfile("plans/task.md").read() == b"# changed plan\n"
+    assert [c[0] for c in calls if "/execs" in c[1]] == ["POST", "GET", "POST", "GET"]
 
 
 def test_plans_do_not_reroute_auto_modal_selection(monkeypatch, tmp_path):
@@ -349,6 +395,29 @@ def test_plans_are_upload_only_and_never_synced_back(monkeypatch, tmp_path):
     )
 
     assert str(plan.resolve()) in file_sync._plan_host_paths()
+
+
+def test_plan_enumeration_failure_does_not_delete_last_synced_plan(tmp_path):
+    from tools.environments.file_sync import FileSyncManager, SyncFileList
+
+    plan = tmp_path / "task.md"
+    plan.write_text("# plan", encoding="utf-8")
+    remote = "/root/.hermes/plans/task.md"
+    current = SyncFileList([(str(plan), remote)])
+    delete_calls = []
+    manager = FileSyncManager(
+        get_files_fn=lambda: current,
+        upload_fn=lambda _host, _remote: None,
+        delete_fn=lambda paths: delete_calls.append(paths),
+    )
+
+    manager.sync(force=True)
+    current = SyncFileList([], plan_enumeration_failed=True)
+    manager._get_files_fn = lambda: current
+    manager.sync(force=True)
+
+    assert delete_calls == []
+    assert remote in manager._synced_files
 
 
 def test_plan_enumeration_failure_does_not_break_sibling_syncs(monkeypatch):

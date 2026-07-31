@@ -398,7 +398,10 @@ def iter_plans_files(
 
     hermes_home = _resolve_hermes_home()
     plans_dir = hermes_home / "plans"
-    if not plans_dir.is_dir():
+    # Do not follow a symlinked plans root. The per-file symlink filter below
+    # cannot protect the tree once rglob() has already followed the root out
+    # of HERMES_HOME.
+    if plans_dir.is_symlink() or not plans_dir.is_dir():
         return result
 
     container_root = f"{container_base.rstrip('/')}/plans"

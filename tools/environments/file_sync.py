@@ -50,7 +50,20 @@ DeleteFn = Callable[[list[str]], None]  # (remote_paths) -> raises on failure
 GetFilesFn = Callable[[], list[tuple[str, str]]]  # () -> [(host_path, remote_path), ...]
 
 
-def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, str]]:
+class SyncFileList(list[tuple[str, str]]):
+    """File mappings with transient source-enumeration state."""
+
+    def __init__(
+        self,
+        entries: list[tuple[str, str]] | None = None,
+        *,
+        plan_enumeration_failed: bool = False,
+    ):
+        super().__init__(entries or [])
+        self.plan_enumeration_failed = plan_enumeration_failed
+
+
+def iter_sync_files(container_base: str = "/root/.hermes") -> SyncFileList:
     """Enumerate all files that should be synced to a remote environment.
 
     Combines credentials, skills, and cache into a single flat list of
@@ -74,7 +87,7 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     except ImportError:
         iter_plans_files = None
 
-    files: list[tuple[str, str]] = []
+    files = SyncFileList()
     for entry in get_credential_file_mounts():
         remote = entry["container_path"].replace(
             "/root/.hermes", container_base, 1
@@ -97,6 +110,7 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
             for entry in iter_plans_files(container_base=container_base):
                 files.append((entry["host_path"], entry["container_path"]))
         except Exception:
+            files.plan_enumeration_failed = True
             logger.warning("plan enumeration failed; syncing without plans", exc_info=True)
     for entry in iter_cache_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))
@@ -234,6 +248,15 @@ class FileSyncManager:
         self._upload_only_host_paths.update(_credential_host_paths())
         self._upload_only_host_paths.update(_plan_host_paths())
         current_remote_paths = {remote for _, remote in current_files}
+        if getattr(current_files, "plan_enumeration_failed", False):
+            # An unavailable plans subtree is not evidence that the previously
+            # mirrored plans were deleted. Preserve those paths until a later
+            # successful enumeration can authoritatively report their removal.
+            current_remote_paths.update(
+                remote
+                for remote in self._synced_files
+                if "/.hermes/plans/" in remote
+            )
 
         # --- Uploads: new or changed files ---
         to_upload: list[tuple[str, str]] = []

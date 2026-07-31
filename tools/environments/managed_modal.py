@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import json
 import logging
 import os
 import requests
 import shlex
+import tarfile
+import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tools.environments.modal_utils import (
@@ -41,6 +47,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
     _POLL_READ_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_POLL_READ_TIMEOUT_SECONDS", 5.0)
     _CANCEL_READ_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_CANCEL_READ_TIMEOUT_SECONDS", 5.0)
     _client_timeout_grace_seconds = 10.0
+    _PLAN_SYNC_TIMEOUT_SECONDS = 120
     _interrupt_output = "[Command interrupted - Modal sandbox exec cancelled]"
     _unexpected_error_prefix = "Managed Modal exec failed"
 
@@ -69,24 +76,19 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         self._sandbox_kwargs = dict(modal_sandbox_kwargs or {})
         self._create_idempotency_key = str(uuid.uuid4())
         self._sandbox_id = self._create_sandbox()
-        self._plans_synced: set[str] = set()
+        self._plans_synced: dict[str, str] = {}
         self._sync_plan_files()
 
     def _sync_plan_files(self) -> None:
-        """Push host plan files into the sandbox over the exec channel.
+        """Push new or changed host plans into the sandbox over exec stdin.
 
-        Managed Modal has no mount or file-upload primitive — the gateway only
-        exposes exec — so plans travel as a base64 payload on stdin and are
-        decoded inside the sandbox. Constitution rule 2f makes a plan path
-        mandatory in dev card bodies, and a worker that cannot read the plan it
-        was told to follow blocks; carrying them here means managed sandboxes
-        satisfy that contract without rerouting the user's backend selection
-        (which would silently move ordinary sessions onto their own direct
-        Modal credentials and change billing).
-
-        Best-effort by design: a plan that fails to transfer degrades to the
-        pre-existing "no plan visible" behaviour rather than failing the
-        sandbox.
+        Managed Modal has no mount or file-upload primitive. Plans are packed
+        into a tar stream and sent through the gateway's stdinData field, which
+        keeps large plan trees out of the exec command argument. The copy exec
+        is validated and polled to completion before this method returns, so a
+        newly created sandbox is not exposed while its plan context is still
+        in flight. A failed transfer remains best-effort and leaves the
+        pre-existing "no plan visible" behavior intact.
         """
         try:
             from tools.credential_files import iter_plans_files
@@ -97,42 +99,79 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         if not entries:
             return
 
-        import base64
-
-        script_lines = []
+        pending: list[tuple[str, str, bytes]] = []
+        container_root = "/root/.hermes/"
         for entry in entries:
             host_path = entry.get("host_path")
             container_path = entry.get("container_path")
             if not host_path or not container_path:
                 continue
-            if container_path in self._plans_synced:
+            if not container_path.startswith(container_root + "plans/"):
                 continue
             try:
-                with open(host_path, "rb") as handle:
-                    blob = base64.b64encode(handle.read()).decode("ascii")
+                content = Path(host_path).read_bytes()
             except OSError:
                 continue
-            quoted = shlex.quote(container_path)
-            script_lines.append(f"mkdir -p \"$(dirname {quoted})\"")
-            script_lines.append(f"printf %s {shlex.quote(blob)} | base64 -d > {quoted}")
-            self._plans_synced.add(container_path)
+            digest = hashlib.sha256(content).hexdigest()
+            if self._plans_synced.get(container_path) == digest:
+                continue
+            pending.append((container_path[len(container_root):], digest, content))
 
-        if not script_lines:
+        if not pending:
             return
+
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            for relative_path, _digest, content in pending:
+                info = tarfile.TarInfo(relative_path)
+                info.size = len(content)
+                info.mode = 0o600
+                tar.addfile(info, io.BytesIO(content))
+
+        prepared = PreparedModalExec(
+            command=(
+                "mkdir -p /root/.hermes && "
+                "base64 -d | tar -xf - -C /root/.hermes"
+            ),
+            cwd=self.cwd,
+            timeout=self._PLAN_SYNC_TIMEOUT_SECONDS,
+            stdin_data=base64.b64encode(archive.getvalue()).decode("ascii"),
+        )
         try:
-            self._request(
-                "POST",
-                f"/v1/sandboxes/{self._sandbox_id}/execs",
-                json={
-                    "execId": str(uuid.uuid4()),
-                    "command": ["bash", "-lc", "\n".join(script_lines)],
-                    "cwd": self.cwd,
-                    "timeoutMs": 120_000,
-                },
-                timeout=60,
-            )
+            start = self._start_modal_exec(prepared)
+            result = self._wait_for_plan_sync(start)
         except Exception as exc:
             logger.warning("Managed Modal plan sync failed: %s", exc)
+            return
+        if result.get("returncode") != 0:
+            logger.warning("Managed Modal plan sync failed: %s", result.get("output", "unknown error"))
+            return
+        for relative_path, digest, _content in pending:
+            self._plans_synced[container_root + relative_path] = digest
+
+    def _wait_for_plan_sync(self, start: ModalExecStart) -> dict:
+        """Wait for the plan-copy exec so callers never race its writes."""
+        if start.immediate_result is not None:
+            return start.immediate_result
+        if start.handle is None:
+            return self._error_result("Managed Modal plan sync returned no exec handle")
+
+        deadline = time.monotonic() + self._PLAN_SYNC_TIMEOUT_SECONDS
+        while True:
+            result = self._poll_modal_exec(start.handle)
+            if result is not None:
+                return result
+            if time.monotonic() >= deadline:
+                try:
+                    self._cancel_modal_exec(start.handle)
+                except Exception:
+                    pass
+                return self._timeout_result_for_modal(self._PLAN_SYNC_TIMEOUT_SECONDS)
+            time.sleep(self._poll_interval_seconds)
+
+    def _before_execute(self) -> None:
+        """Refresh plan files before commands in reused managed sandboxes."""
+        self._sync_plan_files()
 
     def _start_modal_exec(self, prepared: PreparedModalExec) -> ModalExecStart:
         exec_id = str(uuid.uuid4())
