@@ -3164,6 +3164,54 @@ async def test_quoted_image_from_user_has_summary_but_no_path(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_uuid_only_quote_envelope_preserves_number_alias(monkeypatch, tmp_path):
+    """A UUID-only reply must retain the number learned from an earlier envelope."""
+    adapter = _make_signal_adapter(monkeypatch)
+    peer_number = "+15559998888"
+    peer_uuid = "aaaaaaaa-0000-0000-0000-000000000002"
+    sent_image = tmp_path / "quoted.png"
+    sent_image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    quoted_timestamp = 1753650000000
+    adapter._remember_sent_attachments(quoted_timestamp, peer_number, [str(sent_image)])
+    adapter._remember_sent_message_timestamp(quoted_timestamp)
+
+    captured = []
+
+    async def _capture(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", _capture)
+
+    await adapter._handle_envelope({
+        "envelope": {
+            "sourceNumber": peer_number,
+            "sourceUuid": peer_uuid,
+            "timestamp": 1753650100000,
+            "dataMessage": {"message": "sent earlier", "timestamp": 1753650100000},
+        }
+    })
+    await adapter._handle_envelope({
+        "envelope": {
+            "sourceUuid": peer_uuid,
+            "timestamp": 1753650200000,
+            "dataMessage": {
+                "message": "what about this image?",
+                "timestamp": 1753650200000,
+                "quote": {
+                    "id": quoted_timestamp,
+                    "author": adapter._account_normalized,
+                    "attachments": [{"contentType": "image/png"}],
+                },
+            },
+        }
+    })
+
+    assert len(captured) == 2
+    assert adapter._recipient_number_by_uuid[peer_uuid] == peer_number
+    assert captured[-1].reply_to_media_paths == [str(sent_image)]
+
+
+@pytest.mark.asyncio
 async def test_quoted_timestamp_collision_from_another_chat_has_no_local_path(monkeypatch, tmp_path):
     """A user quote cannot retrieve media solely by colliding with a cached timestamp."""
     adapter = _make_signal_adapter(monkeypatch)
@@ -3198,3 +3246,86 @@ async def test_quoted_timestamp_collision_from_another_chat_has_no_local_path(mo
     await adapter._handle_envelope(envelope)
 
     assert captured["event"].reply_to_media_paths == []
+
+
+class TestQuotedMediaConversationIdentity:
+    """A quote must resolve across Signal's number<->UUID identifier swap."""
+
+    def _adapter(self):
+        from gateway.platforms.signal import SignalAdapter
+        a = object.__new__(SignalAdapter)
+        from collections import OrderedDict
+        a._sent_attachment_paths = OrderedDict()
+        a._max_sent_attachment_entries = 200
+        a._recipient_uuid_by_number = {}
+        a._recipient_number_by_uuid = {}
+        return a
+
+    def test_quote_resolves_when_reply_arrives_under_the_peer_uuid(self, tmp_path):
+        """Sent under E.164, quoted under sourceUuid: same peer, must resolve."""
+        f = tmp_path / "chart.png"
+        f.write_bytes(b"x")
+        a = self._adapter()
+        uuid_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        a._remember_recipient_identifiers("+15551234567", uuid_id)
+        a._remember_sent_attachments("1700000000000", "+15551234567", [str(f)])
+
+        assert a._resolve_quoted_media_paths("1700000000000", uuid_id) == [str(f)]
+
+    def test_quote_resolves_when_reply_arrives_under_the_peer_number(self, tmp_path):
+        """The inverse direction must work too."""
+        f = tmp_path / "chart.png"
+        f.write_bytes(b"x")
+        a = self._adapter()
+        uuid_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        a._remember_recipient_identifiers("+15551234567", uuid_id)
+        a._remember_sent_attachments("1700000000000", uuid_id, [str(f)])
+
+        assert a._resolve_quoted_media_paths("1700000000000", "+15551234567") == [str(f)]
+
+    def test_unrelated_conversation_still_isolated(self, tmp_path):
+        """Widening to a peer alias must not leak across different chats."""
+        f = tmp_path / "chart.png"
+        f.write_bytes(b"x")
+        a = self._adapter()
+        a._remember_recipient_identifiers("+15551234567", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        a._remember_sent_attachments("1700000000000", "+15551234567", [str(f)])
+
+        assert a._resolve_quoted_media_paths("1700000000000", "+15559999999") == []
+        assert a._resolve_quoted_media_paths("1700000000000", "group:other") == []
+
+
+class TestUuidOnlyEnvelopePreservesNumberAlias:
+    """A UUID-only envelope must not erase a learned number<->UUID alias."""
+
+    def _adapter(self):
+        from gateway.platforms.signal import SignalAdapter
+        from collections import OrderedDict
+        a = object.__new__(SignalAdapter)
+        a._sent_attachment_paths = OrderedDict()
+        a._max_sent_attachment_entries = 200
+        a._recipient_uuid_by_number = {}
+        a._recipient_number_by_uuid = {}
+        return a
+
+    def test_self_mapping_does_not_clobber_the_real_alias(self, tmp_path):
+        """sender == sourceUuid (UUID-only envelope) must be a no-op.
+
+        _handle_envelope passes sender as `number`, which IS the uuid when the
+        envelope carries no E.164. Storing uuid->uuid destroyed the alias that
+        quote resolution depends on.
+        """
+        f = tmp_path / "chart.png"
+        f.write_bytes(b"x")
+        a = self._adapter()
+        uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        # Learned from an earlier envelope that carried both identifiers.
+        a._remember_recipient_identifiers("+15551234567", uid)
+        a._remember_sent_attachments("1700000000000", "+15551234567", [str(f)])
+
+        # Now a UUID-only envelope arrives: sender and sourceUuid are the same.
+        a._remember_recipient_identifiers(uid, uid)
+
+        assert a._recipient_number_by_uuid[uid] == "+15551234567"
+        assert a._resolve_quoted_media_paths("1700000000000", uid) == [str(f)]
