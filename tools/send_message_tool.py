@@ -1662,7 +1662,19 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                 "params": params,
                 "id": f"send_{int(time.time() * 1000)}",
             }
-            timeout = _signal_send_timeout(len(batch_attachments) if batch_attachments else 0)
+            # Same scaling as SignalAdapter: this path sends real user media
+            # (agent MEDIA: replies) and was previously capped at the flat
+            # count-derived value, so a large attachment hit the same phantom
+            # timeout the adapter paths were fixed for.
+            batch_bytes = 0
+            for _path in batch_attachments or []:
+                try:
+                    batch_bytes += os.path.getsize(_path)
+                except OSError:
+                    pass
+            timeout = _signal_send_timeout(
+                len(batch_attachments) if batch_attachments else 0, batch_bytes
+            )
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(f"{http_url}/api/v1/rpc", json=payload)
                 resp.raise_for_status()

@@ -2043,6 +2043,16 @@ class MessageEvent:
     reply_to_author_id: Optional[str] = None
     reply_to_author_name: Optional[str] = None
     reply_to_is_own_message: bool = False  # True when the user replied to this bot/assistant's message
+    # Human-readable description of media on the quoted message when that message
+    # carried no text (e.g. "an image (image/png, chart.png)"). Platforms that
+    # expose quoted-attachment metadata populate this so the agent knows WHICH
+    # image was quoted instead of a generic "may have been an image" guess.
+    reply_to_media_summary: Optional[str] = None
+    # Local paths to quoted media the adapter could resolve (already on disk from
+    # a prior send, or fetched via the platform API). Lets the agent actually look
+    # at what was quoted rather than only naming it.
+    reply_to_media_paths: List[str] = field(default_factory=list)
+
 
     # Structured interactive-prompt reply (relay Phase 3). Present when this
     # event is the user answering a native interactive prompt rendered by the

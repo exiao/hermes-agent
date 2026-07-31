@@ -11802,6 +11802,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         reply_to_author_id=event.reply_to_author_id,
                         reply_to_author_name=event.reply_to_author_name,
                         reply_to_is_own_message=event.reply_to_is_own_message,
+                        reply_to_media_summary=event.reply_to_media_summary,
+                        reply_to_media_paths=list(event.reply_to_media_paths),
                         auto_skill=event.auto_skill,
                         channel_prompt=event.channel_prompt,
                         channel_context=event.channel_context,
@@ -13255,8 +13257,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
             else:
                 # The quoted message had no text (e.g. image-only, voice-only).
-                # Still inject a pointer so the agent knows this is a reply.
-                message_text = f'[Replying to a previous message (no text — may have been an image or file)]\n\n{message_text}'
+                # Prefer a concrete description of the quoted media when the adapter
+                # could parse it — "an image (image/png, chart.png)" tells the agent
+                # WHICH message is meant, where the generic fallback forces a guess.
+                media_summary = getattr(event, "reply_to_media_summary", None)
+                from tools.credential_files import to_agent_visible_cache_path
+
+                media_paths = [
+                    to_agent_visible_cache_path(p)
+                    for p in (getattr(event, "reply_to_media_paths", None) or [])
+                    if p
+                ]
+                if media_summary:
+                    pointer = f"[Replying to {media_summary}"
+                    if media_paths:
+                        # We still have the file (we sent it): hand over the path so
+                        # the agent can look at it instead of only naming it.
+                        pointer += f" — local copy: {', '.join(media_paths[:4])}"
+                    pointer += "]"
+                    message_text = f"{pointer}\n\n{message_text}"
+                else:
+                    message_text = f'[Replying to a previous message (no text — may have been an image or file)]\n\n{message_text}'
 
         if "@" in message_text:
             try:

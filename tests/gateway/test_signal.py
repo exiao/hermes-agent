@@ -596,6 +596,8 @@ class TestSignalSendImageFile:
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         # Timestamp must be tracked for echo-back prevention
         assert 1234567890 in adapter._recent_sent_timestamps
+        # Local-file media must also be available if the user quotes it later.
+        assert adapter._resolve_quoted_media_paths("1234567890", "+155****4567") == [str(img_path)]
 
     @pytest.mark.asyncio
     async def test_send_image_file_to_group(self, monkeypatch, tmp_path):
@@ -2544,23 +2546,27 @@ class TestSignalRateLimitDetection:
 
 
 class TestSignalSendTimeout:
-    """Timeout scaling for batched attachment sends."""
+    """Deadline policy for Signal send RPCs."""
 
     def test_zero_attachments_uses_default(self):
         from gateway.platforms.signal import _signal_send_timeout
+        # Text-only sends never leave the local daemon, so a hang is a real
+        # failure and stays bounded.
         assert _signal_send_timeout(0) == 30.0
 
-    def test_floor_at_60s(self):
+    def test_attachment_sends_leave_the_upload_leg_open(self):
         from gateway.platforms.signal import _signal_send_timeout
-        # Few attachments (would be 5×N=5s) should still get 60s floor.
-        assert _signal_send_timeout(1) == 60.0
-        assert _signal_send_timeout(5) == 60.0
+        # signal-cli receives paths and uploads to Signal's servers itself,
+        # so the client is waiting on a remote uplink of unknown speed. Any
+        # read deadline here is a hidden minimum-bandwidth assumption.
+        for count in (1, 5, 32):
+            assert _signal_send_timeout(count).read is None
 
-    def test_scales_with_batch_size(self):
+    def test_attachment_sends_still_bound_connect(self):
         from gateway.platforms.signal import _signal_send_timeout
-        # 32 attachments × 5s = 160s; ought to comfortably outlast a
-        # serial upload of an attachment-heavy batch.
-        assert _signal_send_timeout(32) == 160.0
+        # An unreachable or dead daemon must still fail fast rather than
+        # hanging the send forever.
+        assert _signal_send_timeout(1).connect == 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -2936,3 +2942,259 @@ class TestRecentSentTimestampRing:
         adapter._track_sent_timestamp({"timestamp": 3})
         # Both 1 and 2 should be evicted on TTL, only 3 remains
         assert list(adapter._recent_sent_timestamps.keys()) == [3]
+
+
+# ---------------------------------------------------------------------------
+# Quoted attachment metadata (reply-to an image)
+# ---------------------------------------------------------------------------
+
+class TestQuotedAttachments:
+    """signal-cli reports quote.attachments[] with contentType + filename.
+
+    The adapter used to ignore it, so quoting an image produced a generic
+    "may have been an image or file" pointer and the agent had to ask which
+    one was meant.
+    """
+
+    def test_describes_a_quoted_image(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        summary = adapter._describe_quoted_attachments({
+            "id": 1753650000000,
+            "attachments": [{"contentType": "image/png", "filename": "sheet.png"}],
+        })
+        assert summary == "an image (image/png, sheet.png)"
+
+    def test_describes_video_audio_and_generic_files(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter._describe_quoted_attachments(
+            {"attachments": [{"contentType": "video/mp4"}]}
+        ) == "a video (video/mp4)"
+        assert adapter._describe_quoted_attachments(
+            {"attachments": [{"contentType": "audio/ogg"}]}
+        ) == "an audio file (audio/ogg)"
+        assert adapter._describe_quoted_attachments(
+            {"attachments": [{"contentType": "application/pdf", "filename": "memo.pdf"}]}
+        ) == "a file (application/pdf, memo.pdf)"
+
+    def test_handles_missing_filename(self, monkeypatch):
+        """iOS often sends no filename; still say it was an image."""
+        adapter = _make_signal_adapter(monkeypatch)
+        summary = adapter._describe_quoted_attachments({
+            "attachments": [{"contentType": "image/jpeg"}],
+        })
+        assert summary == "an image (image/jpeg)"
+
+    def test_handles_multiple_attachments(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        summary = adapter._describe_quoted_attachments({
+            "attachments": [
+                {"contentType": "image/png", "filename": "a.png"},
+                {"contentType": "image/png", "filename": "b.png"},
+            ],
+        })
+        assert summary.startswith("2 attachments:")
+        assert "a.png" in summary and "b.png" in summary
+
+    def test_returns_none_when_quote_has_no_attachments(self, monkeypatch):
+        """A text-only quote must not be described as media."""
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter._describe_quoted_attachments({"id": 1, "text": "hi"}) is None
+        assert adapter._describe_quoted_attachments({"attachments": []}) is None
+        assert adapter._describe_quoted_attachments({}) is None
+        assert adapter._describe_quoted_attachments(None) is None
+
+    def test_survives_malformed_attachment_entries(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter._describe_quoted_attachments({"attachments": ["nonsense", 42]}) is None
+        assert adapter._describe_quoted_attachments(
+            {"attachments": [{}]}
+        ) == "a file"
+
+    def test_resolves_local_path_for_an_image_we_sent(self, monkeypatch, tmp_path):
+        """Quoting an image the bot sent resolves back to the file on disk."""
+        adapter = _make_signal_adapter(monkeypatch)
+        real_file = tmp_path / "chart.png"
+        real_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(real_file)])
+
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == [str(real_file)]
+
+    def test_no_local_path_for_media_the_user_sent(self, monkeypatch):
+        """A photo the USER took was never on this machine — no path, no lie."""
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == []
+        assert adapter._resolve_quoted_media_paths(None, "+15559998888") == []
+
+    def test_drops_paths_that_no_longer_exist(self, monkeypatch, tmp_path):
+        """A since-deleted temp file must not be advertised to the agent."""
+        adapter = _make_signal_adapter(monkeypatch)
+        gone = tmp_path / "deleted.png"
+        gone.write_bytes(b"x")
+        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(gone)])
+        gone.unlink()
+
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == []
+
+    def test_sent_attachment_cache_is_bounded_and_fifo(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._max_sent_attachment_entries = 3
+        for i in range(5):
+            adapter._remember_sent_attachments(i, "+15559998888", [f"/tmp/{i}.png"])
+
+        assert len(adapter._sent_attachment_paths) == 3
+        # Oldest evicted first.
+        assert ("+15559998888", "0") not in adapter._sent_attachment_paths
+        assert ("+15559998888", "4") in adapter._sent_attachment_paths
+
+    def test_same_timestamp_in_two_conversations_both_survive(self, monkeypatch, tmp_path):
+        """Concurrent sends sharing a millisecond must not evict each other."""
+        adapter = _make_signal_adapter(monkeypatch)
+        first = tmp_path / "a.png"
+        second = tmp_path / "b.png"
+        first.write_bytes(b"a")
+        second.write_bytes(b"b")
+
+        adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(first)])
+        adapter._remember_sent_attachments(1753650000000, "+15551112222", [str(second)])
+
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15559998888") == [str(first)]
+        assert adapter._resolve_quoted_media_paths("1753650000000", "+15551112222") == [str(second)]
+
+    def test_remembering_is_a_noop_without_paths(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._remember_sent_attachments(123, "+15559998888", [])
+        adapter._remember_sent_attachments(None, "+15559998888", ["/tmp/x.png"])
+        assert len(adapter._sent_attachment_paths) == 0
+
+
+@pytest.mark.asyncio
+async def test_quoted_image_envelope_end_to_end(monkeypatch, tmp_path):
+    """Drive a realistic signal-cli quote envelope through the real handler.
+
+    Envelope shape mirrors signal-cli's JsonQuote/JsonQuotedAttachment records:
+    quote.attachments[] carries contentType + filename, and quote.id is the
+    timestamp of the quoted (bot-sent) message.
+
+    handle_message() dispatches onto a background task, so we capture the event
+    at that seam rather than racing the task.
+    """
+    adapter = _make_signal_adapter(monkeypatch)
+
+    sent_image = tmp_path / "cc_verification_sheet.png"
+    sent_image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    adapter._remember_sent_attachments(1753650000000, "+15559998888", [str(sent_image)])
+    adapter._remember_sent_message_timestamp(1753650000000)
+
+    captured = {}
+
+    async def _capture(event):
+        captured["event"] = event
+
+    monkeypatch.setattr(adapter, "handle_message", _capture)
+
+    envelope = {
+        "envelope": {
+            "source": "+15559998888",
+            "sourceName": "E X",
+            "sourceNumber": "+15559998888",
+            "timestamp": 1753650500000,
+            "dataMessage": {
+                "message": "what about this part?",
+                "timestamp": 1753650500000,
+                "quote": {
+                    "id": 1753650000000,
+                    "author": "+15201234567",
+                    "text": None,
+                    "attachments": [
+                        {"contentType": "image/png", "filename": "cc_verification_sheet.png"}
+                    ],
+                },
+                "attachments": [],
+            },
+        }
+    }
+
+    await adapter._handle_envelope(envelope)
+
+    event = captured.get("event")
+    assert event is not None, "handler did not emit a MessageEvent"
+    assert event.reply_to_text is None
+    assert event.reply_to_media_summary == "an image (image/png, cc_verification_sheet.png)"
+    assert event.reply_to_media_paths == [str(sent_image)]
+
+
+@pytest.mark.asyncio
+async def test_quoted_image_from_user_has_summary_but_no_path(monkeypatch):
+    """A photo the USER sent is described but has no local copy to offer."""
+    adapter = _make_signal_adapter(monkeypatch)
+
+    captured = {}
+
+    async def _capture(event):
+        captured["event"] = event
+
+    monkeypatch.setattr(adapter, "handle_message", _capture)
+
+    envelope = {
+        "envelope": {
+            "source": "+15559998888",
+            "sourceName": "E X",
+            "timestamp": 1753650500000,
+            "dataMessage": {
+                "message": "this photo",
+                "timestamp": 1753650500000,
+                "quote": {
+                    "id": 1753649000000,
+                    "author": "+15559998888",
+                    "text": None,
+                    "attachments": [{"contentType": "image/jpeg"}],
+                },
+                "attachments": [],
+            },
+        }
+    }
+
+    await adapter._handle_envelope(envelope)
+
+    event = captured.get("event")
+    assert event is not None
+    assert event.reply_to_media_summary == "an image (image/jpeg)"
+    assert event.reply_to_media_paths == []
+
+
+@pytest.mark.asyncio
+async def test_quoted_timestamp_collision_from_another_chat_has_no_local_path(monkeypatch, tmp_path):
+    """A user quote cannot retrieve media solely by colliding with a cached timestamp."""
+    adapter = _make_signal_adapter(monkeypatch)
+    sent_image = tmp_path / "other-chat.png"
+    sent_image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    adapter._remember_sent_attachments(1753650000000, "+15558887777", [str(sent_image)])
+
+    captured = {}
+
+    async def _capture(event):
+        captured["event"] = event
+
+    monkeypatch.setattr(adapter, "handle_message", _capture)
+    envelope = {
+        "envelope": {
+            "source": "+15559998888",
+            "sourceName": "E X",
+            "timestamp": 1753650500000,
+            "dataMessage": {
+                "message": "what is this?",
+                "timestamp": 1753650500000,
+                "quote": {
+                    "id": 1753650000000,
+                    "author": "+15559998888",
+                    "attachments": [{"contentType": "image/png", "filename": "other-chat.png"}],
+                },
+                "attachments": [],
+            },
+        }
+    }
+
+    await adapter._handle_envelope(envelope)
+
+    assert captured["event"].reply_to_media_paths == []
