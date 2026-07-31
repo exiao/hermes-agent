@@ -279,6 +279,44 @@ class TestDiscordMultiImage:
         adapter._client = MagicMock()
         _run(adapter.send_multiple_images("67890", []))
 
+    def test_forum_batch_without_attachments_is_not_acknowledged(self, adapter, tmp_path):
+        """A forum starter created with no attachments must stay retryable."""
+        from gateway.platforms.base import SendResult
+
+        p = tmp_path / "img.png"
+        p.write_bytes(b"\x89PNG" + b"\x00" * 20)
+
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(return_value=MagicMock(id=1))
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=True)
+        adapter._forum_post_file = AsyncMock(
+            return_value=SendResult(
+                success=False, error="Discord created the forum thread but attached no files"
+            )
+        )
+
+        delivered = _run(adapter.send_multiple_images("67890", [(f"file://{p}", "")]))
+
+        assert delivered == set()
+
+    def test_forum_batch_with_attachments_is_acknowledged(self, adapter, tmp_path):
+        from gateway.platforms.base import SendResult
+
+        p = tmp_path / "img.png"
+        p.write_bytes(b"\x89PNG" + b"\x00" * 20)
+
+        mock_channel = MagicMock()
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=True)
+        adapter._forum_post_file = AsyncMock(
+            return_value=SendResult(success=True, message_id="1")
+        )
+
+        delivered = _run(adapter.send_multiple_images("67890", [(f"file://{p}", "")]))
+
+        assert delivered == {str(p)}
+
     def test_url_batch_blocks_private_redirect_before_send(self, adapter, monkeypatch):
         """A public image URL must not redirect into private metadata and then upload."""
         import plugins.platforms.discord.adapter as discord_adapter

@@ -2359,6 +2359,34 @@ class TestMatrixUploadAndSend:
             assert sent["m.relates_to"]["event_id"] == "$root"
             assert sent["m.relates_to"]["m.in_reply_to"] == {"event_id": "$root"}
 
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_skips_failed_attachment_notice(self, tmp_path):
+        """A successful 'couldn't deliver' notice must not be acknowledged as delivery."""
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        missing = tmp_path / "gone.png"
+        delivered_file = tmp_path / "ok.png"
+        delivered_file.write_bytes(b"ok")
+
+        from gateway.platforms.base import SendResult
+
+        async def fake_send_image_file(
+            chat_id, image_path, caption=None, reply_to=None, metadata=None
+        ):
+            if image_path == str(missing):
+                # Notice sent fine, but the attachment itself never went out.
+                return SendResult(success=True, message_id="$notice", attachment_delivered=False)
+            return SendResult(success=True, message_id="$img")
+
+        adapter.send_image_file = fake_send_image_file
+
+        delivered = await adapter.send_multiple_images(
+            "!room:example.org",
+            [(f"file://{missing}", "gone"), (f"file://{delivered_file}", "ok")],
+        )
+
+        assert delivered == {str(delivered_file)}
+
 
 class TestMatrixDiagnostics:
     def test_diagnostics_redacts_credentials_and_reports_status(self, monkeypatch):

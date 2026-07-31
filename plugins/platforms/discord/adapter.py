@@ -3570,11 +3570,24 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
                 if self._is_forum_parent(channel):
-                    await self._forum_post_file(
+                    forum_result = await self._forum_post_file(
                         channel,
                         content=(content or "").strip(),
                         files=files,
                     )
+                    # A forum starter can be created without its attachments;
+                    # _forum_post_file reports that as success=False rather than
+                    # raising, so only acknowledge on a real attachment delivery.
+                    if not (
+                        getattr(forum_result, "success", False)
+                        and getattr(forum_result, "attachment_delivered", None) is not False
+                    ):
+                        logger.warning(
+                            "[%s] Forum batch chunk %d/%d not acknowledged: %s",
+                            self.name, chunk_idx + 1, len(chunks),
+                            getattr(forum_result, "error", None),
+                        )
+                        continue
                 else:
                     await channel.send(content=content, files=files)
                 delivered_paths.update(chunk_local_paths)

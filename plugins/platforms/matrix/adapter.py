@@ -2148,7 +2148,11 @@ class MatrixAdapter(BasePlatformAdapter):
                     caption=caption,
                     metadata=metadata,
                 )
-            if result.success and local_path is not None:
+            if (
+                result.success
+                and getattr(result, "attachment_delivered", None) is not False
+                and local_path is not None
+            ):
                 delivered_paths.add(local_path)
             elif not result.success:
                 logger.warning("Matrix: failed to send image %d/%d: %s", idx, total, result.error)
