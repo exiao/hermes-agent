@@ -323,7 +323,7 @@ class ModalEnvironment(BaseEnvironment):
     interrupt or timeout never destroys the sandbox.
     """
 
-    _stdin_mode = "heredoc"
+    _stdin_mode = "pipe"
     _snapshot_timeout = 60  # Modal cold starts can be slow
 
     def __init__(
@@ -635,6 +635,19 @@ class ModalEnvironment(BaseEnvironment):
                         # cancellation transport failure must not prevent this
                         # handle from draining and waiting for its target.
                         logger.warning("Modal: could not cancel remote command: %s", exc)
+                # Feed stdin before draining stdout. File writes pass their
+                # body through this pipe, and an explicit EOF is required for
+                # the remote `cat` to finish. Chunk writes to stay below the
+                # SDK's per-write buffer cap.
+                if stdin_data is not None:
+                    offset = 0
+                    chunk_size = self._STDIN_CHUNK_SIZE
+                    while offset < len(stdin_data):
+                        process.stdin.write(stdin_data[offset:offset + chunk_size])
+                        await process.stdin.drain.aio()
+                        offset += chunk_size
+                    process.stdin.write_eof()
+                    await process.stdin.drain.aio()
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
                 exit_code = await process.wait.aio()
