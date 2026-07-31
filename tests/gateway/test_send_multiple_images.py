@@ -702,7 +702,9 @@ class TestEmailMultiImage:
         images = [(f"file://{p}", f"alt {i}") for i, p in enumerate(paths)]
 
         with patch.object(
-            adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
+            adapter,
+            "_send_email_with_attachments",
+            MagicMock(return_value={str(p) for p in paths}),
         ) as mock_send:
             delivered = _run(adapter.send_multiple_images("user@example.com", images))
 

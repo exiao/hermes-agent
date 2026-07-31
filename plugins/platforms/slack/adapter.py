@@ -4034,7 +4034,9 @@ class SlackAdapter(BasePlatformAdapter):
             text = "⚠️ Couldn't deliver the image attachment."
             if caption:
                 text = f"{caption}\n{text}"
-            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            result = await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            result.attachment_delivered = False
+            return result
 
     async def send_image(
         self,
@@ -4195,7 +4197,9 @@ class SlackAdapter(BasePlatformAdapter):
             text = "⚠️ Couldn't deliver the video attachment."
             if caption:
                 text = f"{caption}\n{text}"
-            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            result = await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            result.attachment_delivered = False
+            return result
 
     async def send_document(
         self,
@@ -4263,7 +4267,9 @@ class SlackAdapter(BasePlatformAdapter):
             text = f"⚠️ Couldn't deliver the file attachment ({display_name})."
             if caption:
                 text = f"{caption}\n{text}"
-            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            result = await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            result.attachment_delivered = False
+            return result
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Slack channel."""

@@ -2571,7 +2571,9 @@ class MatrixAdapter(BasePlatformAdapter):
             )
             text = f"{caption}\n⚠️ Couldn't deliver the attachment." if caption \
                 else "⚠️ Couldn't deliver the attachment."
-            return await self.send(room_id, text, reply_to)
+            result = await self.send(room_id, text, reply_to)
+            result.attachment_delivered = False
+            return result
         try:
             file_size = p.stat().st_size
         except OSError:

@@ -586,7 +586,7 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.warning(
                 "Mattermost: local file not found, skipping: %s", file_path
             )
-            return SendResult(success=True, message_id=None)
+            return SendResult(success=True, message_id=None, attachment_delivered=False)
 
         fname = file_name or p.name
         ct = mimetypes.guess_type(fname)[0] or "application/octet-stream"
