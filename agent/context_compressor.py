@@ -5095,17 +5095,22 @@ This compaction should PRIORITISE preserving all information related to the focu
         # history. This is intentionally a boundary adjustment rather than a
         # metadata copy, so in-place compaction persists the same marked row.
         #
-        # Every original user row carries this marker and stale ones are never
-        # cleared, so scan BACKWARD: the newest marker in the window is the
-        # active turn. A forward scan would latch onto the oldest marked turn
-        # and shrink the window to a single row, and once head protection
-        # decayed a stale marker sitting on compress_start would leave no
-        # compressible window at all. Stopping above compress_start keeps that
-        # degenerate empty-window case impossible.
+        # The turn prologue clears stale markers, so at most one row is marked
+        # and it is the active turn. Scan backward anyway: on a transcript
+        # persisted by an older build several rows can still carry the marker,
+        # and the NEWEST one is the active turn. A forward scan would latch onto
+        # the oldest and shrink the window to a single row.
+        #
+        # compress_start is included: a marker landing exactly on the head
+        # boundary must still be protected. That can yield an empty window,
+        # which is the honest answer — it means the whole window belongs to the
+        # active turn and there is nothing older to summarize. This is only
+        # safe because stale markers are cleared; a leftover marker from an old
+        # turn sitting at compress_start is what previously starved compression.
         current_turn_start_idx = next(
             (
                 idx
-                for idx in range(compress_end - 1, compress_start, -1)
+                for idx in range(compress_end - 1, compress_start - 1, -1)
                 if isinstance(messages[idx].get("display_metadata"), dict)
                 and messages[idx]["display_metadata"].get(
                     "_hermes_current_turn_start"

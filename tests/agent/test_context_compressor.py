@@ -106,6 +106,43 @@ class TestCurrentTurnStartBoundary:
         # forward scan (stopping at the first stale marker) would have kept.
         assert not any("STALE_ANSWER" in c for c in contents)
 
+    def test_marker_at_compress_start_is_still_protected(self, compressor):
+        """A marker landing exactly on the head boundary must not be summarized.
+
+        The window can legitimately end up empty here; that just means the whole
+        window belongs to the active turn. Safe only because stale markers are
+        cleared, so a marker at compress_start is genuinely the active turn.
+        """
+        compressor._find_tail_cut_by_tokens = lambda _messages, _start: 6
+        compressor._generate_summary = lambda _turns, **_kwargs: "SUMMARY"
+        active = {"_hermes_current_turn_start": True}
+        messages = [
+            # protect_first_n=2 -> compress_start lands on index 2, exactly the
+            # marked row.
+            {"role": "user", "content": "preamble"},
+            {"role": "assistant", "content": "preamble answer"},
+            {"role": "user", "content": "MAKE_IMAGE", "display_metadata": active},
+            {"role": "assistant", "content": "image tool call"},
+            {"role": "user", "content": "correction"},
+            {"role": "assistant", "content": "mid"},
+            {"role": "user", "content": "more"},
+            {"role": "assistant", "content": "final"},
+        ]
+
+        compressed = compressor.compress(messages)
+
+        contents = [str(m.get("content", "")) for m in compressed]
+        # The marked row must survive verbatim rather than being folded into
+        # the summary; excluding compress_start previously summarized it away.
+        assert any("MAKE_IMAGE" in c for c in contents)
+        marked = [
+            m
+            for m in compressed
+            if isinstance(m.get("display_metadata"), dict)
+            and m["display_metadata"].get("_hermes_current_turn_start")
+        ]
+        assert len(marked) == 1
+
 
 class TestSummarizeToolResultWebExtract:
     """Pre-compression pruning must survive web_extract calls whose ``urls`` are

@@ -64,6 +64,35 @@ def _mark_current_turn_start(message: Any) -> None:
     message["display_metadata"] = turn_metadata
 
 
+def _clear_stale_turn_start_markers(messages: Any, keep: Any) -> None:
+    """Strip the turn-start marker from every row except the active one.
+
+    The marker names ONE row: where the active turn begins. Leaving old
+    markers behind makes "the marker" ambiguous, and every consumer then has
+    to guess which one is live — the compressor picking the wrong one collapses
+    its compression window, and the delivery boundary picking the wrong one
+    misclassifies current-turn media as already-sent history. Keeping exactly
+    one marker in the transcript removes the ambiguity at the source.
+    """
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict) or message is keep:
+            continue
+        turn_metadata = message.get("display_metadata")
+        if not isinstance(turn_metadata, dict):
+            continue
+        if CURRENT_TURN_START_METADATA_KEY not in turn_metadata:
+            continue
+        turn_metadata = dict(turn_metadata)
+        turn_metadata.pop(CURRENT_TURN_START_METADATA_KEY, None)
+        # Drop an emptied dict rather than persisting `{}`, so rows that never
+        # carried display metadata round-trip byte-identically.
+        message["display_metadata"] = turn_metadata or None
+        if message["display_metadata"] is None:
+            del message["display_metadata"]
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -720,7 +749,9 @@ def build_turn_context(
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
     # Stamp before idle/preflight compaction: in-place compaction may persist
-    # this newly appended row before the late crash-resilience flush.
+    # this newly appended row before the late crash-resilience flush. Clear any
+    # marker left by an earlier turn first so exactly one row is ever marked.
+    _clear_stale_turn_start_markers(messages, user_msg)
     _mark_current_turn_start(user_msg)
 
     # Track user turns for memory flush and periodic nudge logic.
@@ -1221,6 +1252,7 @@ def build_turn_context(
     # The early stamp above covers compaction writes; this one covers the
     # re-anchored copy used by the rest of the turn.
     if 0 <= current_turn_user_idx < len(messages):
+        _clear_stale_turn_start_markers(messages, messages[current_turn_user_idx])
         _mark_current_turn_start(messages[current_turn_user_idx])
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).

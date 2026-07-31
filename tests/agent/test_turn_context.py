@@ -247,6 +247,48 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
 
 
+def test_turn_start_clears_the_previous_turns_marker():
+    """Exactly one row may carry the turn-start marker.
+
+    Stale markers made "the marker" ambiguous: the compressor picked one and
+    collapsed its window, the delivery boundary picked another and suppressed
+    current-turn attachments.
+    """
+    agent = _FakeAgent()
+    prior_history = [
+        {
+            "role": "user",
+            "content": "previous turn",
+            "display_metadata": {"_hermes_current_turn_start": True},
+        },
+        {"role": "assistant", "content": "previous answer"},
+        {
+            "role": "user",
+            "content": "turn with other metadata",
+            "display_metadata": {
+                "_hermes_current_turn_start": True,
+                "keep_me": "yes",
+            },
+        },
+        {"role": "assistant", "content": "another answer"},
+    ]
+
+    ctx = _build(agent, conversation_history=prior_history)
+
+    marked = [
+        message
+        for message in ctx.messages
+        if isinstance(message.get("display_metadata"), dict)
+        and message["display_metadata"].get("_hermes_current_turn_start")
+    ]
+    assert len(marked) == 1
+    assert marked[0]["content"] == "hello"
+    # A row that only ever held the marker loses display_metadata entirely...
+    assert "display_metadata" not in ctx.messages[0]
+    # ...while unrelated metadata on a cleared row survives.
+    assert ctx.messages[2]["display_metadata"] == {"keep_me": "yes"}
+
+
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)
