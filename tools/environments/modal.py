@@ -27,6 +27,7 @@ from tools.environments.file_sync import (
     iter_sync_files,
     quoted_mkdir_command,
     quoted_rm_command,
+    quoted_purge_command,
     unique_parent_dirs,
 )
 
@@ -428,6 +429,9 @@ class ModalEnvironment(BaseEnvironment):
                 self._app, self._sandbox = self._worker.run_coroutine(
                     _create_sandbox(base_image), timeout=300,
                 )
+                # The fallback sandbox is a pristine base image, so there is no
+                # prior-instance state to reconcile.
+                restored_snapshot_id = None
             else:
                 if restored_snapshot_id and restored_from_legacy_key:
                     _store_direct_snapshot(self._task_id, restored_snapshot_id)
@@ -436,6 +440,13 @@ class ModalEnvironment(BaseEnvironment):
             raise
 
         logger.info("Modal: sandbox created (task=%s)", self._task_id)
+
+        if restored_snapshot_id:
+            # A restored snapshot still holds the previous instance's synced
+            # files, but the fresh FileSyncManager below starts with an empty
+            # map and so computes no deletions for them.  Clear the sync-owned
+            # subtrees; the forced sync re-uploads everything still on the host.
+            self._purge_synced_subtrees()
 
         self._sync_manager = FileSyncManager(
             get_files_fn=lambda: iter_sync_files("/root/.hermes"),
@@ -541,6 +552,16 @@ class ModalEnvironment(BaseEnvironment):
         if isinstance(tar_bytes, str):
             tar_bytes = tar_bytes.encode()
         dest.write_bytes(tar_bytes)
+
+    def _purge_synced_subtrees(self) -> None:
+        """Clear sync-owned directories in a restored sandbox."""
+        cmd = quoted_purge_command("/root/.hermes")
+
+        async def _purge():
+            proc = await self._sandbox.exec.aio("bash", "-c", cmd)
+            await proc.wait.aio()
+
+        self._worker.run_coroutine(_purge(), timeout=30)
 
     def _modal_delete(self, remote_paths: list[str]) -> None:
         """Batch-delete remote files via exec."""

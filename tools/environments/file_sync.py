@@ -102,6 +102,35 @@ def _credential_host_paths() -> set[str]:
     return paths
 
 
+def synced_subtree_roots(container_base: str = "/root/.hermes") -> list[str]:
+    """Remote directories whose entire contents are owned by the file sync.
+
+    Every file under these roots is (re)uploaded by a forced sync, so they can
+    be safely cleared when a sandbox is restored from a snapshot.  Credential
+    files are deliberately excluded: they sit at individual paths interleaved
+    with runtime state, so their parents are not sync-owned.
+    """
+    from tools.credential_files import _CACHE_DIRS
+
+    base = container_base.rstrip("/")
+    roots = [f"{base}/skills", f"{base}/external_skills", f"{base}/plans"]
+    roots.extend(f"{base}/{subpath}" for subpath, _ in _CACHE_DIRS)
+    return roots
+
+
+def quoted_purge_command(container_base: str = "/root/.hermes") -> str:
+    """Build a shell command clearing every sync-owned subtree.
+
+    A ``FileSyncManager`` is constructed fresh per environment with an empty
+    ``_synced_files`` map, so it computes no deletions for files uploaded by a
+    previous instance.  Restoring a snapshot therefore resurrects plans, skills
+    and cache entries that were since removed from the host.  Clearing the
+    sync-owned roots before the initial forced sync makes the restored sandbox
+    match the host exactly.
+    """
+    return "rm -rf " + " ".join(shlex.quote(p) for p in synced_subtree_roots(container_base))
+
+
 def quoted_rm_command(remote_paths: list[str]) -> str:
     """Build a shell ``rm -f`` command for a batch of remote paths."""
     return "rm -f " + " ".join(shlex.quote(p) for p in remote_paths)

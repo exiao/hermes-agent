@@ -126,11 +126,13 @@ def _install_modal_test_modules(
         get_credential_file_mounts=lambda: [],
         iter_skills_files=lambda **kw: [],
         iter_cache_files=lambda **kw: [],
+        _CACHE_DIRS=[("cache/documents", "document_cache")],
     )
 
     from_id_calls: list[str] = []
     registry_calls: list[tuple[str, list[str] | None]] = []
     create_calls: list[dict] = []
+    exec_calls: list[tuple] = []
 
     class _FakeImage:
         @staticmethod
@@ -156,6 +158,15 @@ def _install_modal_test_modules(
             async def _terminate_aio():
                 return None
 
+            async def _exec_aio(*cmd):
+                exec_calls.append(cmd)
+
+                async def _wait_aio():
+                    return 0
+
+                return types.SimpleNamespace(wait=types.SimpleNamespace(aio=_wait_aio))
+
+            self.exec = types.SimpleNamespace(aio=_exec_aio)
             self.snapshot_filesystem = types.SimpleNamespace(aio=_snapshot_aio)
             self.terminate = types.SimpleNamespace(aio=_terminate_aio)
 
@@ -194,6 +205,7 @@ def _install_modal_test_modules(
         "create_calls": create_calls,
         "from_id_calls": from_id_calls,
         "registry_calls": registry_calls,
+        "exec_calls": exec_calls,
     }
 
 
@@ -256,3 +268,58 @@ def test_resolve_modal_image_uses_snapshot_ids_and_registry_images(tmp_path):
     assert state["from_id_calls"] == ["im-snapshot123"]
     assert state["registry_calls"][0][0] == "python:3.11"
     assert "ensurepip" in state["registry_calls"][0][1][0]
+
+
+def test_restored_sandbox_purges_sync_owned_subtrees_before_first_sync(tmp_path):
+    """A fresh FileSyncManager issues no deletes for the prior instance's uploads.
+
+    Without the purge, a plan/skill/cache file removed from the host survives in
+    the restored sandbox for that sandbox's whole lifetime.
+    """
+    state = _install_modal_test_modules(tmp_path)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-restore": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-restore")
+
+    try:
+        purges = [c for c in state["exec_calls"] if any("rm -rf" in str(a) for a in c)]
+        assert len(purges) == 1, state["exec_calls"]
+        cmd = purges[0][-1]
+        for root in ("/root/.hermes/plans", "/root/.hermes/skills",
+                     "/root/.hermes/external_skills", "/root/.hermes/cache/documents"):
+            assert root in cmd
+        assert "rm -rf /root/.hermes " not in cmd
+    finally:
+        env.cleanup()
+
+
+def test_fresh_sandbox_does_not_purge(tmp_path):
+    """No snapshot means nothing stale; purging would be wasted work."""
+    state = _install_modal_test_modules(tmp_path)
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-fresh")
+
+    try:
+        assert not [c for c in state["exec_calls"] if any("rm -rf" in str(a) for a in c)]
+    finally:
+        env.cleanup()
+
+
+def test_failed_restore_falls_back_to_base_image_without_purge(tmp_path):
+    """The retry sandbox is a clean base image, so there is nothing to reconcile."""
+    state = _install_modal_test_modules(tmp_path, fail_on_snapshot_ids={"im-stale123"})
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-stale2": "im-stale123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-stale2")
+
+    try:
+        assert not [c for c in state["exec_calls"] if any("rm -rf" in str(a) for a in c)]
+    finally:
+        env.cleanup()
