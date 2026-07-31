@@ -377,9 +377,109 @@ _STRICT_URL_PARAM_RE = re.compile(
 # Match userinfo in both absolute (``scheme://user:pass@host``) and
 # network-path (``//user:pass@host``) references. The authority boundary stops
 # at path/query/fragment delimiters so an ``@`` elsewhere in a URL is ignored.
-_STRICT_URL_USERINFO_RE = re.compile(
-    r"((?:[A-Za-z][A-Za-z0-9+.-]*:)?//)([^/\s?#@]+)@"
+#
+# Applied by ``_sub_url_userinfo`` ANCHORED just past a literal ``//`` rather
+# than scanned across the whole string. Scanning was quadratic: ``//`` followed
+# by a long delimiter-free run made the engine try the optional scheme at every
+# one of N start positions, each walking up to the next delimiter. A 100 KB run
+# cost ~15s, and compaction text (chat logs, code, paths) routinely contains
+# both ``//`` and ``@``, so a delimiter presence check does not avoid it.
+# ``str.find`` locates the mandatory ``//`` in linear time, so the regex only
+# ever runs on the short authority window that follows one.
+_STRICT_URL_USERINFO_AUTHORITY_RE = re.compile(r"([^/\s?#@]+)@")
+
+# Trailing ``scheme:`` immediately before a ``//`` (``https://``), so an
+# absolute reference is redacted from the scheme rather than from the slashes.
+# Matched by ``_scheme_start`` walking BACKWARD from the slashes rather than
+# by a regex ``search`` over the emitted prefix: an unanchored ``$``-anchored
+# pattern retries from every one of N prefix positions, which is quadratic on
+# a long non-URL run (``"p" * 32000 + " //user:pw@host/x"`` cost 1.6s).
+_SCHEME_TAIL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
 )
+_SCHEME_HEAD_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
+
+
+def _scheme_start(text: str, slashes: int, floor: int) -> int:
+    """Start index of a ``scheme:`` ending at ``slashes``, else ``slashes``.
+
+    Implements ``[A-Za-z][A-Za-z0-9+.-]*:$`` as a bounded backward walk over
+    the characters immediately preceding ``//``. Work is proportional to the
+    scheme run actually present (a handful of characters for real URLs), not
+    to the length of the text before it, so unrelated prose ahead of a match
+    costs nothing. ``floor`` is the last emitted position — never look behind
+    already-consumed text.
+    """
+    if slashes - 1 < floor or text[slashes - 1] != ":":
+        return slashes
+    index = slashes - 1
+    while index - 1 >= floor and text[index - 1] in _SCHEME_TAIL_CHARS:
+        index -= 1
+    # The regex took the LEFTMOST match, so a run that starts with non-letter
+    # scheme characters (``99abc://``) still matched from the first letter.
+    # Advance to it rather than rejecting the whole run.
+    while index < slashes - 1 and text[index] not in _SCHEME_HEAD_CHARS:
+        index += 1
+    # A scheme must lead with a letter and be non-empty; ``123://`` is not one.
+    if index == slashes - 1 or text[index] not in _SCHEME_HEAD_CHARS:
+        return slashes
+    return index
+
+
+def _sub_url_userinfo(text: str, repl) -> str:
+    """Replace ``[scheme:]//userinfo@`` runs without a quadratic scan.
+
+    Equivalent to ``_STRICT_URL_USERINFO_RE.sub(repl, text)`` but linear in
+    ``len(text)``: the mandatory ``//`` is found with ``str.find`` and the
+    authority pattern is matched anchored at the following character, so the
+    engine never restarts the optional-scheme alternation at every offset.
+
+    ``repl`` receives a match whose group(1) is the ``[scheme:]//`` prefix and
+    group(2) the userinfo, matching the original pattern's groups.
+    """
+    if "//" not in text or "@" not in text:
+        return text
+
+    out: list[str] = []
+    pos = 0
+    search_from = 0
+    while True:
+        slashes = text.find("//", search_from)
+        if slashes < 0:
+            break
+        authority = _STRICT_URL_USERINFO_AUTHORITY_RE.match(text, slashes + 2)
+        if authority is None:
+            # Advance one character so overlapping ``//`` candidates in runs
+            # such as ``///user:password@host`` are not skipped.
+            search_from = slashes + 1
+            continue
+        start = _scheme_start(text, slashes, pos)
+        prefix = text[start:slashes + 2]
+        out.append(text[pos:start])
+        out.append(repl(_UserinfoMatch(prefix, authority.group(1))))
+        pos = authority.end()
+        search_from = pos
+    out.append(text[pos:])
+    return "".join(out)
+
+
+class _UserinfoMatch:
+    """Minimal ``re.Match`` stand-in exposing the two groups callers read."""
+
+    __slots__ = ("_prefix", "_userinfo")
+
+    def __init__(self, prefix: str, userinfo: str) -> None:
+        self._prefix = prefix
+        self._userinfo = userinfo
+
+    def group(self, index: int = 0) -> str:
+        if index == 1:
+            return self._prefix
+        if index == 2:
+            return self._userinfo
+        return f"{self._prefix}{self._userinfo}@"
 
 # HTTP access logs often use a relative request target rather than a full URL:
 # `"POST /webhook?password=... HTTP/1.1"`. The full-URL redactor above only
@@ -539,7 +639,8 @@ def _redact_strict_url_credentials(text: str) -> str:
         return f"{match.group(1)}***@"
 
     text = _STRICT_URL_PARAM_RE.sub(_redact_param, text)
-    return _STRICT_URL_USERINFO_RE.sub(_redact_userinfo, text)
+    text = _sub_url_userinfo(text, _redact_userinfo)
+    return text
 
 
 def redact_cdp_url(value: object) -> str:

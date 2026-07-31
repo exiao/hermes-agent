@@ -1,9 +1,12 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
 import logging
+import time
+from unittest.mock import MagicMock
 
 import pytest
 
+import agent.redact as redact
 from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
 
 
@@ -589,6 +592,95 @@ class TestWebUrlsNotRedacted:
 
 
 class TestStrictUrlCredentialRedaction:
+    def test_userinfo_scan_is_linear_on_large_non_url_text(self):
+        """Userinfo redaction must not degrade superlinearly on big text.
+
+        The scan used to be quadratic: a ``//`` followed by a long
+        delimiter-free run made the regex retry the optional scheme at every
+        offset, so a 100 KB run cost ~15s and every compaction of a large
+        conversation paid it. Assert the scaling contract (doubling the input
+        must not quadruple the time), not the mechanism.
+        """
+        base = "//" + ("x" * 50_000) + " @"
+        doubled = "//" + ("x" * 100_000) + " @"
+
+        start = time.perf_counter()
+        redact_sensitive_text(base, redact_url_credentials=True)
+        base_seconds = time.perf_counter() - start
+
+        start = time.perf_counter()
+        redact_sensitive_text(doubled, redact_url_credentials=True)
+        doubled_seconds = time.perf_counter() - start
+
+        # Generous absolute ceiling: the quadratic version took >10s here.
+        assert doubled_seconds < 1.0
+        # And the growth must stay roughly linear, not quadratic (~4x).
+        assert doubled_seconds < max(base_seconds * 3.0, 0.05)
+
+    def test_userinfo_scan_is_linear_when_a_real_match_follows_long_text(self):
+        """Linear scaling must hold when the match SUCCEEDS, not just when it fails.
+
+        The first fix made candidate discovery linear but still located the
+        optional ``scheme:`` with an unanchored ``$``-anchored regex searched
+        over the whole emitted prefix, which retries from every offset. So
+        ``"p" * n + " //user:pw@host/x"`` stayed quadratic (0.1s/0.4s/1.6s at
+        8K/16K/32K) even though no scheme was present. Scheme detection now
+        walks backward from the slashes, bounded by the scheme run itself.
+        """
+        base = ("p" * 50_000) + " //user:pw@host/x"
+        doubled = ("p" * 100_000) + " //user:pw@host/x"
+
+        start = time.perf_counter()
+        base_result = redact_sensitive_text(base, redact_url_credentials=True)
+        base_seconds = time.perf_counter() - start
+
+        start = time.perf_counter()
+        redact_sensitive_text(doubled, redact_url_credentials=True)
+        doubled_seconds = time.perf_counter() - start
+
+        # The credential must still be removed -- speed is worthless if the
+        # redaction silently stopped happening.
+        assert "user:pw" not in base_result
+        assert doubled_seconds < 1.0
+        assert doubled_seconds < max(base_seconds * 3.0, 0.05)
+
+    def test_scheme_prefix_boundaries(self):
+        """Backward scheme detection must match the original regex exactly."""
+        # Scheme present: redaction starts at the scheme, not the slashes.
+        assert redact_sensitive_text(
+            "https://user:pw@host/x", redact_url_credentials=True
+        ) == "https://user:***@host/x"
+        # Punctuation-rich but valid scheme characters.
+        assert redact_sensitive_text(
+            "a.b-c+d://user:pw@host/x", redact_url_credentials=True
+        ) == "a.b-c+d://user:***@host/x"
+        # Leading digits are not part of a scheme, but the letter run after
+        # them still is -- the original regex took the leftmost valid match.
+        assert redact_sensitive_text(
+            "99abc://user:pw@host/x", redact_url_credentials=True
+        ) == "99abc://user:***@host/x"
+        # No letter at all: not a scheme, redact from the slashes.
+        assert redact_sensitive_text(
+            "123://user:pw@host/x", redact_url_credentials=True
+        ) == "123://user:***@host/x"
+        # Bare network-path reference with no scheme.
+        assert redact_sensitive_text(
+            "//user:pw@host/x", redact_url_credentials=True
+        ) == "//user:***@host/x"
+
+    def test_userinfo_still_redacted_after_unrelated_double_slash(self):
+        """A ``//`` with no userinfo must not stop a later real match."""
+        assert redact_sensitive_text(
+            "see a//b then https://user:pw@host/x",
+            redact_url_credentials=True,
+        ) == "see a//b then https://user:***@host/x"
+
+    @pytest.mark.parametrize("text", ["///user:pw@host/x", "https:///user:pw@host/x"])
+    def test_userinfo_redacts_after_overlapping_double_slash(self, text):
+        assert redact_sensitive_text(text, redact_url_credentials=True) == text.replace(
+            "user:pw@", "user:***@"
+        )
+
     @pytest.mark.parametrize(
         ("text", "secret", "expected"),
         [
