@@ -73,6 +73,39 @@ class TestCurrentTurnStartBoundary:
         assert len(marked) == 1
         assert "make image" in marked[0]["content"]
 
+    def test_stale_marker_does_not_shrink_the_window(self, compressor):
+        """Old turns keep their markers, so the NEWEST one is the active turn.
+
+        A forward scan latched onto the oldest marked row, collapsing the
+        compressible window and leaving the transcript uncompressed.
+        """
+        compressor._find_tail_cut_by_tokens = lambda _messages, _start: 9
+        compressor._generate_summary = lambda _turns, **_kwargs: "summary"
+        stale = {"_hermes_current_turn_start": True}
+        active = {"_hermes_current_turn_start": True}
+        messages = [
+            # protect_first_n=2 keeps these two out of the window entirely.
+            {"role": "user", "content": "system-ish preamble"},
+            {"role": "assistant", "content": "preamble answer"},
+            {"role": "user", "content": "stale request", "display_metadata": stale},
+            {"role": "assistant", "content": "STALE_ANSWER"},
+            {"role": "user", "content": "second stale", "display_metadata": stale},
+            {"role": "assistant", "content": "second stale answer"},
+            {"role": "assistant", "content": "prior tool result"},
+            {"role": "user", "content": "make image", "display_metadata": active},
+            {"role": "assistant", "content": "image tool call"},
+            {"role": "user", "content": "correction"},
+        ]
+
+        compressed = compressor.compress(messages)
+
+        contents = [str(m.get("content", "")) for m in compressed]
+        # The active turn survives...
+        assert any("make image" in c for c in contents)
+        # ...and the older marked turns were actually compressed away, which a
+        # forward scan (stopping at the first stale marker) would have kept.
+        assert not any("STALE_ANSWER" in c for c in contents)
+
 
 class TestSummarizeToolResultWebExtract:
     """Pre-compression pruning must survive web_extract calls whose ``urls`` are

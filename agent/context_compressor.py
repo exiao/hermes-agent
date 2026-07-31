@@ -5094,10 +5094,18 @@ This compaction should PRIORITISE preserving all information related to the focu
         # later correction row and misclassifies media from this turn as old
         # history. This is intentionally a boundary adjustment rather than a
         # metadata copy, so in-place compaction persists the same marked row.
+        #
+        # Every original user row carries this marker and stale ones are never
+        # cleared, so scan BACKWARD: the newest marker in the window is the
+        # active turn. A forward scan would latch onto the oldest marked turn
+        # and shrink the window to a single row, and once head protection
+        # decayed a stale marker sitting on compress_start would leave no
+        # compressible window at all. Stopping above compress_start keeps that
+        # degenerate empty-window case impossible.
         current_turn_start_idx = next(
             (
                 idx
-                for idx in range(compress_start, compress_end)
+                for idx in range(compress_end - 1, compress_start, -1)
                 if isinstance(messages[idx].get("display_metadata"), dict)
                 and messages[idx]["display_metadata"].get(
                     "_hermes_current_turn_start"
