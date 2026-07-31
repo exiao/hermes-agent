@@ -139,6 +139,7 @@ def test_current_user_turn_is_persisted_before_provider_call(agent):
     assert persisted_messages[-1] == {
         "role": "user",
         "content": "new message that must survive a crash",
+        "display_metadata": {"_hermes_current_turn_start": True},
     }
 
 
@@ -502,7 +503,11 @@ class TestHTTP413Compression:
         ):
             # Compression returns same number of messages → can't compress further
             mock_compress.return_value = (
-                [{"role": "user", "content": "hello"}],
+                [{
+                    "role": "user",
+                    "content": "hello",
+                    "display_metadata": {"_hermes_current_turn_start": True},
+                }],
                 "same prompt",
             )
             result = agent.run_conversation("hello")
