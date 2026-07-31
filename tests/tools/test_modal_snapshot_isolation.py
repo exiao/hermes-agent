@@ -125,6 +125,7 @@ def _install_modal_test_modules(
     sys.modules["tools.credential_files"] = types.SimpleNamespace(
         get_credential_file_mounts=lambda: [],
         iter_skills_files=lambda **kw: [],
+        iter_plans_files=lambda **kw: [],
         iter_cache_files=lambda **kw: [],
     )
 
