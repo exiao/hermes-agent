@@ -305,6 +305,15 @@ def test_managed_modal_transports_plans_over_exec(monkeypatch, tmp_path):
     )
 
     calls = []
+    read_calls = []
+    original_read_bytes = mm.Path.read_bytes
+
+    def counting_read_bytes(path):
+        if path == plan:
+            read_calls.append(path)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(mm.Path, "read_bytes", counting_read_bytes)
 
     class _Resp:
         status_code = 200
@@ -341,9 +350,12 @@ def test_managed_modal_transports_plans_over_exec(monkeypatch, tmp_path):
     env = mm.ManagedModalEnvironment(image="img")
     plan.write_text("# changed plan\n", encoding="utf-8")
     env._sync_plan_files()
+    env._sync_plan_files()
+    monkeypatch.setattr(cf, "iter_plans_files", lambda *a, **k: [])
+    env._sync_plan_files()
 
     exec_calls = [c for c in calls if c[1].endswith("/execs")]
-    assert len(exec_calls) == 2, "changed plans should resync in a reused sandbox"
+    assert len(exec_calls) == 3, "changed plans should resync in a reused sandbox"
     payload = exec_calls[0][2]
     assert payload["command"] == (
         "mkdir -p /root/.hermes && "
@@ -356,7 +368,11 @@ def test_managed_modal_transports_plans_over_exec(monkeypatch, tmp_path):
     changed_encoded = base64.b64decode(exec_calls[1][2]["stdinData"])
     with tarfile.open(fileobj=io.BytesIO(changed_encoded)) as archive:
         assert archive.extractfile("plans/task.md").read() == b"# changed plan\n"
-    assert [c[0] for c in calls if "/execs" in c[1]] == ["POST", "GET", "POST", "GET"]
+    assert read_calls == [plan, plan]
+    assert exec_calls[2][2]["command"] == "rm -f -- /root/.hermes/plans/task.md"
+    assert [c[0] for c in calls if "/execs" in c[1]] == [
+        "POST", "GET", "POST", "GET", "POST", "GET"
+    ]
 
 
 def test_plans_do_not_reroute_auto_modal_selection(monkeypatch, tmp_path):
@@ -402,8 +418,8 @@ def test_plan_enumeration_failure_does_not_delete_last_synced_plan(tmp_path):
 
     plan = tmp_path / "task.md"
     plan.write_text("# plan", encoding="utf-8")
-    remote = "/root/.hermes/plans/task.md"
-    current = SyncFileList([(str(plan), remote)])
+    remote = "/home/daytona/plans/task.md"
+    current = SyncFileList([(str(plan), remote)], plan_remote_paths={remote})
     delete_calls = []
     manager = FileSyncManager(
         get_files_fn=lambda: current,

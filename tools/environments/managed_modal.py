@@ -77,6 +77,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         self._create_idempotency_key = str(uuid.uuid4())
         self._sandbox_id = self._create_sandbox()
         self._plans_synced: dict[str, str] = {}
+        self._plan_file_metadata: dict[str, tuple[int, int]] = {}
         self._sync_plan_files()
 
     def _sync_plan_files(self) -> None:
@@ -87,8 +88,8 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         keeps large plan trees out of the exec command argument. The copy exec
         is validated and polled to completion before this method returns, so a
         newly created sandbox is not exposed while its plan context is still
-        in flight. A failed transfer remains best-effort and leaves the
-        pre-existing "no plan visible" behavior intact.
+        in flight. A failed transfer is best-effort and leaves the last known
+        remote plan state intact.
         """
         try:
             from tools.credential_files import iter_plans_files
@@ -96,11 +97,10 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
             entries = iter_plans_files()
         except Exception:
             return
-        if not entries:
-            return
 
-        pending: list[tuple[str, str, bytes]] = []
+        pending: list[tuple[str, str, bytes, tuple[int, int]]] = []
         container_root = "/root/.hermes/"
+        enumerated_paths: set[str] = set()
         for entry in entries:
             host_path = entry.get("host_path")
             container_path = entry.get("container_path")
@@ -108,46 +108,89 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
                 continue
             if not container_path.startswith(container_root + "plans/"):
                 continue
+            enumerated_paths.add(container_path)
+            try:
+                stat = Path(host_path).stat()
+            except OSError:
+                continue
+            metadata = (stat.st_mtime_ns, stat.st_size)
+            if (
+                container_path in self._plans_synced
+                and self._plan_file_metadata.get(container_path) == metadata
+            ):
+                continue
             try:
                 content = Path(host_path).read_bytes()
             except OSError:
                 continue
             digest = hashlib.sha256(content).hexdigest()
             if self._plans_synced.get(container_path) == digest:
+                self._plan_file_metadata[container_path] = metadata
                 continue
-            pending.append((container_path[len(container_root):], digest, content))
+            pending.append(
+                (container_path[len(container_root):], digest, content, metadata)
+            )
 
-        if not pending:
-            return
+        stale_paths = sorted(set(self._plans_synced) - enumerated_paths)
 
-        archive = io.BytesIO()
-        with tarfile.open(fileobj=archive, mode="w") as tar:
-            for relative_path, _digest, content in pending:
-                info = tarfile.TarInfo(relative_path)
-                info.size = len(content)
-                info.mode = 0o600
-                tar.addfile(info, io.BytesIO(content))
+        if pending:
+            archive = io.BytesIO()
+            with tarfile.open(fileobj=archive, mode="w") as tar:
+                for relative_path, _digest, content, _metadata in pending:
+                    info = tarfile.TarInfo(relative_path)
+                    info.size = len(content)
+                    info.mode = 0o600
+                    tar.addfile(info, io.BytesIO(content))
 
-        prepared = PreparedModalExec(
-            command=(
-                "mkdir -p /root/.hermes && "
-                "base64 -d | tar -xf - -C /root/.hermes"
-            ),
-            cwd=self.cwd,
-            timeout=self._PLAN_SYNC_TIMEOUT_SECONDS,
-            stdin_data=base64.b64encode(archive.getvalue()).decode("ascii"),
-        )
-        try:
-            start = self._start_modal_exec(prepared)
-            result = self._wait_for_plan_sync(start)
-        except Exception as exc:
-            logger.warning("Managed Modal plan sync failed: %s", exc)
-            return
-        if result.get("returncode") != 0:
-            logger.warning("Managed Modal plan sync failed: %s", result.get("output", "unknown error"))
-            return
-        for relative_path, digest, _content in pending:
-            self._plans_synced[container_root + relative_path] = digest
+            prepared = PreparedModalExec(
+                command=(
+                    "mkdir -p /root/.hermes && "
+                    "base64 -d | tar -xf - -C /root/.hermes"
+                ),
+                cwd=self.cwd,
+                timeout=self._PLAN_SYNC_TIMEOUT_SECONDS,
+                stdin_data=base64.b64encode(archive.getvalue()).decode("ascii"),
+            )
+            try:
+                start = self._start_modal_exec(prepared)
+                result = self._wait_for_plan_sync(start)
+            except Exception as exc:
+                logger.warning("Managed Modal plan sync failed: %s", exc)
+                return
+            if result.get("returncode") != 0:
+                logger.warning(
+                    "Managed Modal plan sync failed: %s",
+                    result.get("output", "unknown error"),
+                )
+                return
+            for relative_path, digest, _content, metadata in pending:
+                remote_path = container_root + relative_path
+                self._plans_synced[remote_path] = digest
+                self._plan_file_metadata[remote_path] = metadata
+
+        if stale_paths:
+            prepared = PreparedModalExec(
+                command="rm -f -- " + " ".join(
+                    shlex.quote(path) for path in stale_paths
+                ),
+                cwd=self.cwd,
+                timeout=self._PLAN_SYNC_TIMEOUT_SECONDS,
+            )
+            try:
+                start = self._start_modal_exec(prepared)
+                result = self._wait_for_plan_sync(start)
+            except Exception as exc:
+                logger.warning("Managed Modal stale-plan cleanup failed: %s", exc)
+                return
+            if result.get("returncode") != 0:
+                logger.warning(
+                    "Managed Modal stale-plan cleanup failed: %s",
+                    result.get("output", "unknown error"),
+                )
+                return
+            for path in stale_paths:
+                self._plans_synced.pop(path, None)
+                self._plan_file_metadata.pop(path, None)
 
     def _wait_for_plan_sync(self, start: ModalExecStart) -> dict:
         """Wait for the plan-copy exec so callers never race its writes."""

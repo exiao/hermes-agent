@@ -58,9 +58,11 @@ class SyncFileList(list[tuple[str, str]]):
         entries: list[tuple[str, str]] | None = None,
         *,
         plan_enumeration_failed: bool = False,
+        plan_remote_paths: set[str] | None = None,
     ):
         super().__init__(entries or [])
         self.plan_enumeration_failed = plan_enumeration_failed
+        self.plan_remote_paths = plan_remote_paths
 
 
 def iter_sync_files(container_base: str = "/root/.hermes") -> SyncFileList:
@@ -87,7 +89,8 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> SyncFileList:
     except ImportError:
         iter_plans_files = None
 
-    files = SyncFileList()
+    plan_remote_paths: set[str] = set()
+    files = SyncFileList(plan_remote_paths=plan_remote_paths)
     for entry in get_credential_file_mounts():
         remote = entry["container_path"].replace(
             "/root/.hermes", container_base, 1
@@ -108,9 +111,12 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> SyncFileList:
         # syncing too. Plans are the enhancement; they degrade alone.
         try:
             for entry in iter_plans_files(container_base=container_base):
-                files.append((entry["host_path"], entry["container_path"]))
+                remote_path = entry["container_path"]
+                files.append((entry["host_path"], remote_path))
+                plan_remote_paths.add(remote_path)
         except Exception:
             files.plan_enumeration_failed = True
+            files.plan_remote_paths = None
             logger.warning("plan enumeration failed; syncing without plans", exc_info=True)
     for entry in iter_cache_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))
@@ -170,6 +176,13 @@ def _plan_host_paths() -> set[str]:
     return paths
 
 
+def _normalise_host_path(path: str) -> str:
+    try:
+        return str(Path(path).expanduser().resolve())
+    except OSError:
+        return str(Path(path).expanduser())
+
+
 def quoted_rm_command(remote_paths: list[str]) -> str:
     """Build a shell ``rm -f`` command for a batch of remote paths."""
     return "rm -f " + " ".join(shlex.quote(p) for p in remote_paths)
@@ -227,6 +240,7 @@ class FileSyncManager:
         self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
         self._upload_only_host_paths: set[str] = set()
+        self._plan_remote_paths: set[str] = set()
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
 
@@ -246,17 +260,23 @@ class FileSyncManager:
 
         current_files = self._get_files_fn()
         self._upload_only_host_paths.update(_credential_host_paths())
-        self._upload_only_host_paths.update(_plan_host_paths())
+        plan_host_paths = _plan_host_paths()
+        self._upload_only_host_paths.update(plan_host_paths)
         current_remote_paths = {remote for _, remote in current_files}
+        current_plan_remote_paths = getattr(current_files, "plan_remote_paths", None)
+        if current_plan_remote_paths is None and not getattr(
+            current_files, "plan_enumeration_failed", False
+        ):
+            current_plan_remote_paths = {
+                remote
+                for host, remote in current_files
+                if _normalise_host_path(host) in plan_host_paths
+            }
         if getattr(current_files, "plan_enumeration_failed", False):
             # An unavailable plans subtree is not evidence that the previously
             # mirrored plans were deleted. Preserve those paths until a later
             # successful enumeration can authoritatively report their removal.
-            current_remote_paths.update(
-                remote
-                for remote in self._synced_files
-                if "/.hermes/plans/" in remote
-            )
+            current_remote_paths.update(self._plan_remote_paths)
 
         # --- Uploads: new or changed files ---
         to_upload: list[tuple[str, str]] = []
@@ -274,12 +294,15 @@ class FileSyncManager:
         to_delete = [p for p in self._synced_files if p not in current_remote_paths]
 
         if not to_upload and not to_delete:
+            if not getattr(current_files, "plan_enumeration_failed", False):
+                self._plan_remote_paths = set(current_plan_remote_paths or ())
             self._last_sync_time = _monotonic()
             return
 
         # Snapshot for rollback (only when there's work to do)
         prev_files = dict(self._synced_files)
         prev_hashes = dict(self._pushed_hashes)
+        prev_plan_remote_paths = set(self._plan_remote_paths)
 
         if to_upload:
             logger.debug("file_sync: uploading %d file(s)", len(to_upload))
@@ -308,11 +331,14 @@ class FileSyncManager:
                 self._pushed_hashes.pop(p, None)
 
             self._synced_files = new_files
+            if not getattr(current_files, "plan_enumeration_failed", False):
+                self._plan_remote_paths = set(current_plan_remote_paths or ())
             self._last_sync_time = _monotonic()
 
         except Exception as exc:
             self._synced_files = prev_files
             self._pushed_hashes = prev_hashes
+            self._plan_remote_paths = prev_plan_remote_paths
             # Do NOT advance _last_sync_time here: a failed cycle rolls state
             # back so the next cycle can retry. Bumping the rate-limit clock on
             # failure would make the next non-forced sync() return early (the
