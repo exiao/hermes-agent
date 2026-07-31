@@ -51,6 +51,19 @@ logger = logging.getLogger(__name__)
 CURRENT_TURN_START_METADATA_KEY = "_hermes_current_turn_start"
 
 
+def _mark_current_turn_start(message: Any) -> None:
+    """Mark the current user row before any compaction can persist it."""
+    if not isinstance(message, dict):
+        return
+    turn_metadata = message.get("display_metadata")
+    if not isinstance(turn_metadata, dict):
+        turn_metadata = {}
+    else:
+        turn_metadata = dict(turn_metadata)
+    turn_metadata[CURRENT_TURN_START_METADATA_KEY] = True
+    message["display_metadata"] = turn_metadata
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -706,6 +719,9 @@ def build_turn_context(
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+    # Stamp before idle/preflight compaction: in-place compaction may persist
+    # this newly appended row before the late crash-resilience flush.
+    _mark_current_turn_start(user_msg)
 
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1
@@ -1201,22 +1217,11 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
-    # Persist one authoritative boundary for delivery-time history consumers.
-    # Synthetic user rows can be appended throughout this turn (redirects,
-    # output-length retries, intermediate acknowledgments, and observed rows),
-    # so identifying the boundary by the last role=="user" row is inherently
-    # racy. Keep the marker in display-only metadata so it survives transcript
-    # persistence/reload without changing the model-facing message.
+    # Re-assert the boundary after compression rebuilds the live message list.
+    # The early stamp above covers compaction writes; this one covers the
+    # re-anchored copy used by the rest of the turn.
     if 0 <= current_turn_user_idx < len(messages):
-        current_turn_user = messages[current_turn_user_idx]
-        if isinstance(current_turn_user, dict):
-            turn_metadata = current_turn_user.get("display_metadata")
-            if not isinstance(turn_metadata, dict):
-                turn_metadata = {}
-            else:
-                turn_metadata = dict(turn_metadata)
-            turn_metadata[CURRENT_TURN_START_METADATA_KEY] = True
-            current_turn_user["display_metadata"] = turn_metadata
+        _mark_current_turn_start(messages[current_turn_user_idx])
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
