@@ -14136,6 +14136,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
+                                            # Hygiene runs between turns, so a
+                                            # completed marker must not pin the
+                                            # compaction window like an active
+                                            # turn marker does.
+                                            force=True,
                                             commit_fence=_hyg_commit_fence,
                                         ),
                                     )

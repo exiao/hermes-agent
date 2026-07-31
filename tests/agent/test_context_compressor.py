@@ -168,6 +168,36 @@ class TestCurrentTurnStartBoundary:
         assert any("SUMMARY" in content for content in contents)
         assert len(compressed) < len(messages)
 
+    def test_oversized_active_turn_compresses_after_marker(self, compressor):
+        """A live marker protects the boundary without pinning the whole turn."""
+        compressor._find_tail_cut_by_tokens = lambda _messages, _start: 7
+        compressor._generate_summary = lambda _turns, **_kwargs: "SUMMARY"
+        messages = [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {
+                "role": "user",
+                "content": "active request",
+                "display_metadata": {"_hermes_current_turn_start": True},
+            },
+            {"role": "assistant", "content": "ACTIVE_TOOL_CALL"},
+            {"role": "tool", "content": "ACTIVE_TOOL_RESULT"},
+            {"role": "assistant", "content": "ACTIVE_CONTINUATION"},
+            {"role": "user", "content": "active correction"},
+            {"role": "assistant", "content": "latest response"},
+        ]
+
+        compressed = compressor.compress(messages)
+
+        contents = [str(message.get("content", "")) for message in compressed]
+        assert any(
+            isinstance(message.get("display_metadata"), dict)
+            and message["display_metadata"].get("_hermes_current_turn_start")
+            for message in compressed
+        )
+        assert any("SUMMARY" in content for content in contents)
+        assert not any("ACTIVE_TOOL_RESULT" in content for content in contents)
+
 
 class TestSummarizeToolResultWebExtract:
     """Pre-compression pruning must survive web_extract calls whose ``urls`` are

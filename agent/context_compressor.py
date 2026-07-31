@@ -5089,42 +5089,42 @@ This compaction should PRIORITISE preserving all information related to the focu
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
 
         # The gateway's media-dedup boundary is stamped on the first user row
-        # of the active turn. Keep that row, and everything after it, in the
-        # protected tail: compressing it away forces the caller to anchor on a
-        # later correction row and misclassifies media from this turn as old
-        # history. This is intentionally a boundary adjustment rather than a
-        # metadata copy, so in-place compaction persists the same marked row.
-        # Manual /compress passes force=True and runs out of turn against a
-        # completed transcript, so its last-turn marker is not an active
-        # boundary and must not starve an otherwise compressible window.
+        # of the active turn. That row must survive compaction: the adapter
+        # slices history before it, so moving or dropping the marker can make
+        # current-turn media look like a previously delivered attachment.
+        # Manual /compress passes force=True and run out of turn against a
+        # completed transcript, so their last-turn marker is intentionally
+        # ignored and must not starve an otherwise compressible window.
         #
-        # The turn prologue clears stale markers, so at most one row is marked
-        # and it is the active turn. Scan backward anyway: on a transcript
-        # persisted by an older build several rows can still carry the marker,
-        # and the NEWEST one is the active turn. A forward scan would latch onto
-        # the oldest and shrink the window to a single row.
-        #
-        # compress_start is included: a marker landing exactly on the head
-        # boundary must still be protected. That can yield an empty window,
-        # which is the honest answer — it means the whole window belongs to the
-        # active turn and there is nothing older to summarize. This is only
-        # safe because stale markers are cleared; a leftover marker from an old
-        # turn sitting at compress_start is what previously starved compression.
+        # The turn prologue clears stale markers, so a live transcript has one
+        # marker. Keep that marker in the protected head while allowing the
+        # oversized active-turn rows after it into the compression window. Scan
+        # backward anyway: older transcripts can retain several stale markers;
+        # those legacy shapes keep the conservative boundary-only behavior.
         current_turn_start_idx = None
         if not force:
-            current_turn_start_idx = next(
-                (
-                    idx
-                    for idx in range(compress_end - 1, compress_start - 1, -1)
-                    if isinstance(messages[idx].get("display_metadata"), dict)
-                    and messages[idx]["display_metadata"].get(
-                        "_hermes_current_turn_start"
+            marker_indices = [
+                idx
+                for idx in range(compress_end - 1, compress_start - 1, -1)
+                if isinstance(messages[idx].get("display_metadata"), dict)
+                and messages[idx]["display_metadata"].get(
+                    "_hermes_current_turn_start"
+                )
+            ]
+            current_turn_start_idx = marker_indices[0] if marker_indices else None
+            if current_turn_start_idx is not None:
+                if len(marker_indices) == 1:
+                    # A live turn has exactly one marker. Keep that boundary
+                    # row in the head, but let the oversized tool-heavy part
+                    # after it enter the compression window. Older transcripts
+                    # can contain several stale markers; retain the conservative
+                    # boundary-only behavior for those legacy shapes.
+                    compress_start = current_turn_start_idx + 1
+                    compress_end = self._find_tail_cut_by_tokens(
+                        messages, compress_start
                     )
-                ),
-                None,
-            )
-        if current_turn_start_idx is not None:
-            compress_end = current_turn_start_idx
+                else:
+                    compress_end = current_turn_start_idx
 
         # A double role collision can merge the summary into the first tail
         # row. Keep an actionable user event out of that position by retaining

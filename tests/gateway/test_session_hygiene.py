@@ -313,6 +313,7 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
         def __init__(self, **kwargs):
             self.model = kwargs.get("model")
             self.session_id = kwargs.get("session_id", "fake-session")
+            self.force_values = []
             self._print_fn = None
             self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock()
@@ -320,6 +321,7 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
 
         def _compress_context(self, messages, *_args, **_kwargs):
             # Simulate real _compress_context: create a new session_id
+            self.force_values.append(_kwargs.get("force"))
             self.session_id = f"{self.session_id}_compressed"
             return ([{"role": "assistant", "content": "compressed"}], None)
 
@@ -394,6 +396,7 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     # happens silently with server-side logging only.
     assert len(adapter.sent) == 0
     assert FakeCompressAgent.last_instance is not None
+    assert FakeCompressAgent.last_instance.force_values == [True]
     FakeCompressAgent.last_instance.shutdown_memory_provider.assert_called_once()
     FakeCompressAgent.last_instance.close.assert_called_once()
 
