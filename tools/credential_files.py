@@ -491,6 +491,48 @@ def to_agent_visible_cache_path(
     return mapped if mapped is not None else host_path
 
 
+def iter_plans_files(
+    container_base: str = "/root/.hermes",
+) -> List[Dict[str, str]]:
+    """Yield individual (host_path, container_path) entries for plan files.
+
+    Kanban card briefs routinely link a plan by host path
+    (``~/.hermes/plans/<task>.md``), so a worker on a remote backend could not
+    read the plan it was told to follow and blocked instead.  Skips symlinks;
+    markdown/text only, and skips archived subtrees, so a stray artifact in
+    plans/ can't bloat every sandbox.
+    """
+    result: List[Dict[str, str]] = []
+
+    hermes_home = _resolve_hermes_home()
+    plans_dir = hermes_home / "plans"
+    # Do not follow a symlinked plans root: the per-file symlink filter below
+    # cannot protect the tree once rglob() has followed the root out of
+    # HERMES_HOME.
+    if plans_dir.is_symlink() or not plans_dir.is_dir():
+        return result
+
+    container_root = f"{container_base.rstrip('/')}/plans"
+    allowed_suffixes = {".md", ".txt", ".json", ".yaml", ".yml", ".svg"}
+    # Subtrees a worker never needs: archived/superseded plans and rescued run
+    # artifacts.  Without this the sync is ~4.5k files / 44MB on every start.
+    skip_roots = {"archive", "wt-reaper-rescued", "shelved", "babysit-split-backup"}
+    for item in plans_dir.rglob("*"):
+        if item.is_symlink() or not item.is_file():
+            continue
+        if item.suffix.lower() not in allowed_suffixes:
+            continue
+        rel = item.relative_to(plans_dir)
+        if rel.parts and rel.parts[0] in skip_roots:
+            continue
+        result.append({
+            "host_path": str(item),
+            "container_path": f"{container_root}/{rel.as_posix()}",
+        })
+
+    return result
+
+
 def iter_cache_files(
     container_base: str = "/root/.hermes",
 ) -> List[Dict[str, str]]:
