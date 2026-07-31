@@ -3433,6 +3433,43 @@ class BasePlatformAdapter(ABC):
                 )
         return history_paths & delivered_paths or None
 
+    def _has_durable_media_receipt(
+        self,
+        store: Any,
+        session_id: Optional[str],
+        path: str,
+        route_key: Optional[str],
+    ) -> bool:
+        """True when a receipt for ``path`` still exists in the transcript.
+
+        The in-memory ledger is process-local and never shrinks, but the
+        transcript can: ``/retry`` truncates the previous assistant response
+        along with its receipt row. Treating the ledger as proof of persistence
+        means the replacement receipt is never written, so dedup works until the
+        next restart and then silently re-uploads the path.
+        """
+        load = getattr(store, "load_transcript", None)
+        if not session_id or not callable(load):
+            return False
+        try:
+            transcript = load(session_id) or []
+        except Exception:
+            logger.debug("failed to read media delivery receipts", exc_info=True)
+            # Unknown, not absent: assume present so a transient read error
+            # can't spam duplicate receipt rows into the transcript.
+            return True
+        if not isinstance(transcript, list):
+            return True
+        for msg in transcript:
+            if not isinstance(msg, dict) or msg.get("role") != "session_meta":
+                continue
+            metadata = msg.get("display_metadata") or {}
+            if route_key is not None and metadata.get("media_delivery_route") != route_key:
+                continue
+            if any(str(p) == path for p in metadata.get("media_delivered", []) if p):
+                return True
+        return False
+
     def _record_media_delivery(
         self, session_key: str, path: str, route_key: Optional[str] = None
     ) -> None:
@@ -3440,11 +3477,15 @@ class BasePlatformAdapter(ABC):
         store = getattr(self, "_session_store", None)
         peek = getattr(store, "peek_session_id", None)
         session_id = peek(session_key) if callable(peek) else None
+        if session_id is not None and not isinstance(session_id, str):
+            session_id = str(session_id)
         ledger_key = (session_id or session_key, route_key)
         delivered_paths = self._delivered_media_paths_by_session.setdefault(
             ledger_key, set()
         )
-        if path in delivered_paths:
+        if path in delivered_paths and self._has_durable_media_receipt(
+            store, session_id, path, route_key
+        ):
             return
         delivered_paths.add(path)
 

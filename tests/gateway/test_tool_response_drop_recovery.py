@@ -261,6 +261,36 @@ class TestHistoryMediaDedupUsesDeliveryOutcome:
         assert adapter._history_media_paths_for_session(session_key, "route-a") == {str(path)}
         assert adapter._history_media_paths_for_session(session_key, "route-b") is None
 
+    def test_receipt_is_rewritten_after_a_transcript_rewind(self, tmp_path):
+        """/retry can truncate a receipt row; the next delivery must re-persist it.
+
+        The in-memory ledger never shrinks, so treating it as proof of
+        persistence left the path deduplicated only until the next restart.
+        """
+        path = tmp_path / "retried.png"
+        path.write_bytes(b"png")
+        adapter = _DummyAdapter(Platform.DISCORD)
+        store = _TranscriptStore([{"role": "assistant", "content": f"MEDIA:{path}"}])
+        adapter.set_session_store(store)
+        session_key = build_session_key(_make_event(Platform.DISCORD).source)
+
+        adapter._record_media_delivery(session_key, str(path))
+        assert len(store.appended) == 1
+        # The receipt lands in the transcript...
+        store.transcript.append(store.appended[-1][1])
+
+        # ...a second delivery of the same path is a no-op while it is durable.
+        adapter._record_media_delivery(session_key, str(path))
+        assert len(store.appended) == 1
+
+        # /retry truncates the assistant turn along with its receipt row.
+        store.transcript = [{"role": "assistant", "content": f"MEDIA:{path}"}]
+
+        # The retried response delivers the path again: persist a replacement.
+        adapter._record_media_delivery(session_key, str(path))
+        assert len(store.appended) == 2
+        assert store.appended[-1][1]["display_metadata"]["media_delivered"] == [str(path)]
+
     def test_session_metadata_receipt_round_trips_without_counting_as_turn(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
         db.create_session("session-1", "discord")
