@@ -48,6 +48,8 @@ from agent.model_metadata import (
 
 logger = logging.getLogger(__name__)
 
+CURRENT_TURN_START_METADATA_KEY = "_hermes_current_turn_start"
+
 
 def compose_user_api_content(
     content: Any,
@@ -1198,6 +1200,23 @@ def build_turn_context(
             messages, user_message
         )
         agent._persist_user_message_idx = current_turn_user_idx
+
+    # Persist one authoritative boundary for delivery-time history consumers.
+    # Synthetic user rows can be appended throughout this turn (redirects,
+    # output-length retries, intermediate acknowledgments, and observed rows),
+    # so identifying the boundary by the last role=="user" row is inherently
+    # racy. Keep the marker in display-only metadata so it survives transcript
+    # persistence/reload without changing the model-facing message.
+    if 0 <= current_turn_user_idx < len(messages):
+        current_turn_user = messages[current_turn_user_idx]
+        if isinstance(current_turn_user, dict):
+            turn_metadata = current_turn_user.get("display_metadata")
+            if not isinstance(turn_metadata, dict):
+                turn_metadata = {}
+            else:
+                turn_metadata = dict(turn_metadata)
+            turn_metadata[CURRENT_TURN_START_METADATA_KEY] = True
+            current_turn_user["display_metadata"] = turn_metadata
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""

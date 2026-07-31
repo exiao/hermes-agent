@@ -3363,10 +3363,11 @@ class BasePlatformAdapter(ABC):
     def _history_media_paths_for_session(self, session_key: str) -> Optional[set]:
         """Return media paths already delivered in prior turns of this session.
 
-        Loads the persisted transcript, drops the most recent assistant entry
-        (which belongs to the current response), and scans the remaining history
-        for MEDIA: tags and image_generate JSON payloads.  Used to prevent the
-        model from re-delivering the same file when it echoes an old MEDIA tag.
+        Loads the persisted transcript, slices at the explicit current-turn
+        start marker, and scans prior rows for MEDIA: tags and image_generate
+        JSON payloads. Legacy transcripts use the previous row-pattern fallback.
+        Used to prevent the model from re-delivering the same file when it
+        echoes an old MEDIA tag.
         """
         store = getattr(self, "_session_store", None)
         if not store:
@@ -3385,53 +3386,48 @@ class BasePlatformAdapter(ABC):
         if not transcript:
             return None
         # Exclude the CURRENT TURN entirely: the agent persists tool results and
-        # the final assistant row before this delivery-time dedup runs. Everything
-        # from the last user message onward is current-turn state, not a prior
-        # attachment delivery. Keep the old trailing-assistant fallback only for
-        # unusual transcripts with no user row.
+        # the final assistant row before this delivery-time dedup runs. The turn
+        # prologue stamps its first user row, so synthetic user rows appended
+        # during the turn cannot move this boundary forward.
         history = list(transcript)
-        last_user_idx = next(
-            (i for i in range(len(history) - 1, -1, -1)
-             if history[i].get("role") == "user" and not history[i].get("observed")),
+        from agent.turn_context import CURRENT_TURN_START_METADATA_KEY
+
+        current_turn_start_idx = next(
+            (
+                i
+                for i in range(len(history) - 1, -1, -1)
+                if history[i].get("role") == "user"
+                and isinstance(history[i].get("display_metadata"), dict)
+                and history[i]["display_metadata"].get(
+                    CURRENT_TURN_START_METADATA_KEY
+                )
+            ),
             None,
         )
-        if last_user_idx is not None:
-            # A redirect can append a second non-observed user row after the
-            # media-producing part of the same turn. Walk past that correction
-            # and its provider checkpoint so the boundary remains before the
-            # original user message.
-            while last_user_idx is not None:
-                correction_api_content = history[last_user_idx].get("api_content")
-                is_redirect_correction = (
-                    isinstance(correction_api_content, str)
-                    and "[Context from the interrupted assistant response]" in correction_api_content
-                )
-                checkpoint_idx = last_user_idx - 1
-                checkpoint_api_content = (
-                    history[checkpoint_idx].get("api_content")
-                    if checkpoint_idx >= 0
-                    else None
-                )
-                is_redirect_checkpoint = (
-                    checkpoint_idx >= 0
-                    and history[checkpoint_idx].get("role") == "assistant"
-                    and isinstance(checkpoint_api_content, str)
-                    and "[This response was interrupted by a user correction.]" in checkpoint_api_content
-                )
-                if not (is_redirect_correction or is_redirect_checkpoint):
-                    break
-                last_user_idx = next(
-                    (i for i in range(last_user_idx - 1, -1, -1)
-                     if history[i].get("role") == "user" and not history[i].get("observed")),
-                    None,
-                )
+        if current_turn_start_idx is not None:
+            history = history[:current_turn_start_idx]
+        else:
+            # Legacy transcripts created before the explicit marker shipped do
+            # not have an authoritative boundary. Preserve a conservative
+            # last-user fallback until the next turn stamps one.
+            last_user_idx = next(
+                (
+                    i
+                    for i in range(len(history) - 1, -1, -1)
+                    if history[i].get("role") == "user"
+                    and not history[i].get("observed")
+                ),
+                None,
+            )
             if last_user_idx is not None:
                 history = history[:last_user_idx]
-        else:
-            for msg in reversed(history):
-                if msg.get("role") == "assistant":
-                    history.remove(msg)
-                    break
+            else:
+                # Keep the original trailing-assistant fallback for unusual
+                # transcripts with no user row at all.
+                for msg in reversed(history):
+                    if msg.get("role") == "assistant":
+                        history.remove(msg)
+                        break
         if not history:
             return None
         # Avoid circular import: gateway.run already imports this module.

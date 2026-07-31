@@ -1,5 +1,6 @@
 """Regression: current-turn MEDIA must not be treated as prior history."""
 
+from agent.turn_context import CURRENT_TURN_START_METADATA_KEY
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 
@@ -34,18 +35,37 @@ class _Adapter(BasePlatformAdapter):
 
 
 def test_current_turn_media_is_not_treated_as_history():
-    path = "/tmp/current.png"
+    prior_path = "/tmp/prior.png"
+    current_path = "/tmp/current.png"
     adapter = _Adapter([
         {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "old reply"},
-        {"role": "user", "content": "make image"},
+        {"role": "assistant", "content": f"old reply MEDIA:{prior_path}"},
+        {
+            "role": "user",
+            "content": "make image",
+            "display_metadata": {CURRENT_TURN_START_METADATA_KEY: True},
+        },
         {"role": "assistant", "tool_calls": [{"id": "t1", "function": {"name": "image_generate"}}]},
-        {"role": "tool", "tool_call_id": "t1", "content": f"MEDIA:{path}"},
-        {"role": "assistant", "content": f"MEDIA:{path}"},
+        {"role": "tool", "tool_call_id": "t1", "content": f"MEDIA:{current_path}"},
+        {
+            "role": "assistant",
+            "content": "",
+            "api_content": "[This response was interrupted by a user correction.]",
+        },
+        {
+            "role": "user",
+            "content": "change course",
+            "api_content": "[Context from the interrupted assistant response]",
+        },
+        {"role": "assistant", "content": "redirected"},
+        {"role": "user", "content": "[System: Continue after output length.]"},
+        {"role": "assistant", "content": "continuing"},
+        {"role": "user", "content": "[System: Continue now and finish the task.]"},
+        {"role": "assistant", "content": f"MEDIA:{current_path}"},
         {"role": "user", "content": "[alice|u2]\nunrelated group message", "observed": True},
     ])
     paths = adapter._history_media_paths_for_session("session-key")
-    assert not paths or path not in paths
+    assert paths == {prior_path}
 
 
 def test_redirect_correction_keeps_pre_redirect_media_out_of_history():
@@ -54,7 +74,11 @@ def test_redirect_correction_keeps_pre_redirect_media_out_of_history():
     adapter = _Adapter([
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": f"MEDIA:{prior_path}"},
-        {"role": "user", "content": "make image"},
+        {
+            "role": "user",
+            "content": "make image",
+            "display_metadata": {CURRENT_TURN_START_METADATA_KEY: True},
+        },
         {"role": "assistant", "tool_calls": [{"id": "t1"}]},
         {"role": "tool", "tool_call_id": "t1", "content": f"MEDIA:{current_path}"},
         {

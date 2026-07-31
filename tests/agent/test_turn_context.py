@@ -203,7 +203,11 @@ def test_returns_turn_context_with_user_message_appended():
     assert isinstance(ctx, TurnContext)
     assert ctx.user_message == "hello"
     # The user turn was appended and indexed.
-    assert ctx.messages[-1] == {"role": "user", "content": "hello"}
+    assert ctx.messages[-1] == {
+        "role": "user",
+        "content": "hello",
+        "display_metadata": {"_hermes_current_turn_start": True},
+    }
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
 
@@ -235,7 +239,11 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert agent._current_turn_id.startswith("compression-child:")
     log_context.assert_called_once_with("compression-child")
     assert ctx.conversation_history == compacted_history
-    assert ctx.messages == compacted_history + [{"role": "user", "content": "hello"}]
+    assert ctx.messages == compacted_history + [{
+        "role": "user",
+        "content": "hello",
+        "display_metadata": {"_hermes_current_turn_start": True},
+    }]
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
 
 
