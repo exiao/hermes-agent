@@ -97,6 +97,19 @@ class TestModalRunBashStdin:
         )
         stdin.write_eof.assert_called_once()
 
+    def test_multibyte_stdin_is_chunked_by_encoded_size(self):
+        env = _make_env()
+        stdin = _wire(env)
+        env._STDIN_CHUNK_SIZE = 7
+        payload = "🙂" * 5
+
+        handle = env._run_bash('cat > "$tmp"', stdin_data=payload)
+        handle.wait()
+
+        assert "".join(stdin._written) == payload
+        assert all(len(chunk.encode("utf-8")) <= 7 for chunk in stdin._written)
+        stdin.write_eof.assert_called_once()
+
     def test_no_stdin_data_leaves_the_pipe_untouched(self):
         env = _make_env()
         stdin = _wire(env)
