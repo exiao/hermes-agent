@@ -21,6 +21,7 @@ Salvaged and de-scoped from the superseded Discord-only PR #33842.
 
 import asyncio
 import logging
+from typing import Any
 
 import pytest
 
@@ -355,7 +356,10 @@ class TestExtractStripRecoveryAllPlatforms:
         monkeypatch.setattr(
             type(adapter), "extract_local_files", staticmethod(lambda content: ([], ""))
         )
-        adapter.send_multiple_images = lambda *a, **kw: asyncio.sleep(0, result=None)
+        async def _no_media(*_args: Any, **_kwargs: Any) -> set[str]:
+            return set()
+
+        adapter.send_multiple_images = _no_media
 
         event = _make_event(platform)
         await adapter._process_message_background(event, build_session_key(event.source))

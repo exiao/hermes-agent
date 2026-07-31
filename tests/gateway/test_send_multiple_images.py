@@ -142,6 +142,19 @@ class TestTelegramMultiImage:
         assert call_kwargs["chat_id"] == 12345
         assert len(call_kwargs["media"]) == 3
 
+    def test_local_batch_returns_acknowledged_paths(self, adapter, tmp_path):
+        import telegram
+
+        path = tmp_path / "local.png"
+        path.write_bytes(b"png")
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media}
+        )
+
+        delivered = _run(adapter.send_multiple_images("12345", [(f"file://{path}", "")]))
+
+        assert delivered == {str(path)}
+
     def test_batch_over_10_chunks(self, adapter):
         """15 photos → two send_media_group calls (10 + 5)."""
         import telegram
@@ -236,8 +249,9 @@ class TestDiscordMultiImage:
         adapter._is_forum_parent = MagicMock(return_value=False)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("67890", images))
+        delivered = _run(adapter.send_multiple_images("67890", images))
 
+        assert delivered == {str(p) for p in paths}
         mock_channel.send.assert_awaited_once()
         assert len(mock_channel.send.call_args.kwargs["files"]) == 3
 
@@ -526,8 +540,9 @@ class TestSlackMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("C12345", images))
+        delivered = _run(adapter.send_multiple_images("C12345", images))
 
+        assert delivered == {str(p) for p in paths}
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_awaited_once()
         kwargs = client.files_upload_v2.await_args.kwargs
@@ -628,8 +643,9 @@ class TestMattermostMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("channel123", images))
+        delivered = _run(adapter.send_multiple_images("channel123", images))
 
+        assert delivered == {str(p) for p in paths}
         assert adapter._upload_file.await_count == 3
         adapter._api_post.assert_awaited_once()
         payload = adapter._api_post.await_args.args[1]
@@ -688,8 +704,9 @@ class TestEmailMultiImage:
         with patch.object(
             adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
         ) as mock_send:
-            _run(adapter.send_multiple_images("user@example.com", images))
+            delivered = _run(adapter.send_multiple_images("user@example.com", images))
 
+        assert delivered == {str(p) for p in paths}
         mock_send.assert_called_once()
         to_addr, body, file_paths = mock_send.call_args.args
         assert to_addr == "user@example.com"

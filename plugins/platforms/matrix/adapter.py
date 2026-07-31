@@ -2118,12 +2118,13 @@ class MatrixAdapter(BasePlatformAdapter):
         images: list[tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> set[str]:
         """Send multiple Matrix images as one ordered logical batch."""
         if not images:
-            return
+            return set()
         from urllib.parse import unquote as _unquote
 
+        delivered_paths: set[str] = set()
         total = len(images)
         for idx, (image_url, alt_text) in enumerate(images, start=1):
             if human_delay > 0 and idx > 1:
@@ -2131,10 +2132,12 @@ class MatrixAdapter(BasePlatformAdapter):
             caption = alt_text or None
             if total > 1 and caption:
                 caption = f"{caption} ({idx}/{total})"
+            local_path = None
             if image_url.startswith("file://"):
+                local_path = _unquote(image_url[7:])
                 result = await self.send_image_file(
                     chat_id=chat_id,
-                    image_path=_unquote(image_url[7:]),
+                    image_path=local_path,
                     caption=caption,
                     metadata=metadata,
                 )
@@ -2145,8 +2148,12 @@ class MatrixAdapter(BasePlatformAdapter):
                     caption=caption,
                     metadata=metadata,
                 )
-            if not result.success:
+            if result.success and local_path is not None:
+                delivered_paths.add(local_path)
+            elif not result.success:
                 logger.warning("Matrix: failed to send image %d/%d: %s", idx, total, result.error)
+
+        return delivered_paths
 
     async def send_document(
         self,

@@ -616,7 +616,7 @@ class MattermostAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> set[str]:
         """Send a batch of images as a single Mattermost post with multiple attachments.
 
         Mattermost supports up to 5 ``file_ids`` per post. Each image is
@@ -626,8 +626,9 @@ class MattermostAdapter(BasePlatformAdapter):
         base per-image loop on total failure.
         """
         if not images:
-            return
+            return set()
 
+        delivered_paths: set[str] = set()
         import mimetypes
         import aiohttp
         from urllib.parse import unquote as _unquote
@@ -640,6 +641,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 await asyncio.sleep(human_delay)
 
             file_ids: List[str] = []
+            chunk_local_paths: set[str] = set()
             caption_parts: List[str] = []
             try:
                 for image_url, alt_text in chunk:
@@ -680,6 +682,8 @@ class MattermostAdapter(BasePlatformAdapter):
                     fid = await self._upload_file(chat_id, file_data, fname, ct)
                     if fid:
                         file_ids.append(fid)
+                        if image_url.startswith("file://"):
+                            chunk_local_paths.add(local_path)
 
                 if not file_ids:
                     continue
@@ -699,13 +703,23 @@ class MattermostAdapter(BasePlatformAdapter):
                 data = await self._post_preserving_thread(chat_id, payload, metadata)
                 if not data or "id" not in data:
                     logger.warning("Mattermost: multi-image post failed, falling back")
-                    await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                    fallback_paths = await super().send_multiple_images(
+                        chat_id, chunk, metadata, human_delay=human_delay
+                    )
+                    delivered_paths.update(fallback_paths or set())
+                else:
+                    delivered_paths.update(chunk_local_paths)
             except Exception as e:
                 logger.warning(
                     "Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
                     chunk_idx + 1, len(chunks), e, exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback_paths = await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay
+                )
+                delivered_paths.update(fallback_paths or set())
+
+        return delivered_paths
 
     # ------------------------------------------------------------------
     # WebSocket

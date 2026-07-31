@@ -2343,12 +2343,13 @@ class TestMatrixUploadAndSend:
         first.write_bytes(b"one")
         second.write_bytes(b"two")
 
-        await adapter.send_multiple_images(
+        delivered = await adapter.send_multiple_images(
             "!room:example.org",
             [(f"file://{first}", "First image"), (f"file://{second}", "Second image")],
             metadata={"thread_id": "$root"},
         )
 
+        assert delivered == {str(first), str(second)}
         assert mock_client.send_message_event.await_count == 2
         bodies = [call.args[2]["body"] for call in mock_client.send_message_event.await_args_list]
         assert bodies == ["First image (1/2)", "Second image (2/2)"]

@@ -3217,7 +3217,7 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> set[str]:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
         Uses ``files_upload_v2`` with its ``file_uploads`` parameter so all
@@ -3232,11 +3232,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Suppressed multi-image upload in configured ignored channel %s",
                 chat_id,
             )
-            return
+            return set()
         if not self._app:
-            return
+            return set()
         if not images:
-            return
+            return set()
 
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
@@ -3249,9 +3249,9 @@ class SlackAdapter(BasePlatformAdapter):
                 is_safe_url as _is_safe_url,
             )
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
+        delivered_paths: set[str] = set()
         thread_ts = self._resolve_thread_ts(None, metadata)
 
         CHUNK = 10
@@ -3262,6 +3262,7 @@ class SlackAdapter(BasePlatformAdapter):
                 await asyncio.sleep(human_delay)
 
             file_uploads: List[Dict[str, Any]] = []
+            chunk_local_paths: set[str] = set()
             initial_comment_parts: List[str] = []
             try:
                 async with create_ssrf_safe_async_client(
@@ -3286,6 +3287,7 @@ class SlackAdapter(BasePlatformAdapter):
                                     "filename": os.path.basename(local_path),
                                 }
                             )
+                            chunk_local_paths.add(local_path)
                         else:
                             if not _is_safe_url(image_url):
                                 logger.warning(
@@ -3338,6 +3340,7 @@ class SlackAdapter(BasePlatformAdapter):
                     thread_ts=thread_ts,
                 )
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
+                delivered_paths.update(chunk_local_paths)
                 _ = result
             except Exception as e:
                 logger.warning(
@@ -3347,9 +3350,12 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(
+                fallback_paths = await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay
                 )
+                delivered_paths.update(fallback_paths or set())
+
+        return delivered_paths
 
     def _record_uploaded_file_thread(
         self,

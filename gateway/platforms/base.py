@@ -3450,7 +3450,7 @@ class BasePlatformAdapter(ABC):
         try:
             append = getattr(store, "append_to_transcript", None)
             if session_id and callable(append):
-                display_metadata = {"media_delivered": [path]}
+                display_metadata: dict[str, Any] = {"media_delivered": [path]}
                 if route_key is not None:
                     display_metadata["media_delivery_route"] = route_key
                 append(
