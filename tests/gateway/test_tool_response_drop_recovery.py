@@ -195,6 +195,18 @@ class TestHistoryMediaDedupUsesDeliveryOutcome:
         assert retry_adapter.sent_documents == []
 
     @pytest.mark.asyncio
+    async def test_fallback_notice_is_not_recorded_as_attachment_delivery(self):
+        adapter = _DummyAdapter(Platform.DISCORD)
+
+        result = await BasePlatformAdapter.send_document(
+            adapter, "111", "/tmp/report.pdf"
+        )
+
+        assert result.success is True
+        assert result.attachment_delivered is False
+        assert adapter.sent and "Couldn't deliver" in adapter.sent[0]["content"]
+
+    @pytest.mark.asyncio
     async def test_unknown_batch_receipt_does_not_suppress_retry(self, tmp_path):
         path = tmp_path / "unknown-batch.png"
         path.write_bytes(b"png")

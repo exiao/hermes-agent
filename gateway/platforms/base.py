@@ -2214,6 +2214,10 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # A fallback can successfully send a failure notice without delivering the
+    # requested attachment. Native adapters leave this unset; ``False`` is an
+    # explicit acknowledgement that only the fallback notice was delivered.
+    attachment_delivered: Optional[bool] = None
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -3873,7 +3877,7 @@ class BasePlatformAdapter(ABC):
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
-                if img_result.success:
+                if img_result.success and getattr(img_result, "attachment_delivered", None) is not False:
                     if image_url.startswith("file://"):
                         delivered_paths.add(_unquote(image_url[7:]))
                 else:
@@ -4000,7 +4004,9 @@ class BasePlatformAdapter(ABC):
         text = "⚠️ Couldn't deliver the audio attachment."
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result = await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result.attachment_delivered = False
+        return result
 
     def prepare_tts_text(self, text: str) -> str:
         """Prepare a spoken script for TTS.
@@ -4058,7 +4064,9 @@ class BasePlatformAdapter(ABC):
         text = "⚠️ Couldn't deliver the video attachment."
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result = await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result.attachment_delivered = False
+        return result
 
     async def send_document(
         self,
@@ -4092,7 +4100,9 @@ class BasePlatformAdapter(ABC):
             text = "⚠️ Couldn't deliver the file attachment."
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result = await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result.attachment_delivered = False
+        return result
 
     async def _notify_media_delivery_failure(
         self,
@@ -4159,7 +4169,9 @@ class BasePlatformAdapter(ABC):
         text = "⚠️ Couldn't deliver the image attachment."
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result = await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+        result.attachment_delivered = False
+        return result
 
     @staticmethod
     def validate_media_delivery_path(path: str) -> Optional[str]:
@@ -6178,18 +6190,19 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
-                        if media_result.success:
+                        if media_result.success and getattr(media_result, "attachment_delivered", None) is not False:
                             self._record_media_delivery(
                                 session_key, media_path, delivery_route_key
                             )
                         else:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                media_path,
-                                is_voice=is_voice,
-                                metadata=_final_thread_metadata,
-                            )
+                            if getattr(media_result, "attachment_delivered", None) is not False:
+                                await self._notify_media_delivery_failure(
+                                    event.source.chat_id,
+                                    media_path,
+                                    is_voice=is_voice,
+                                    metadata=_final_thread_metadata,
+                                )
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
@@ -6211,7 +6224,7 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
-                        if file_result.success:
+                        if file_result.success and getattr(file_result, "attachment_delivered", None) is not False:
                             self._record_media_delivery(
                                 session_key, file_path, delivery_route_key
                             )
@@ -6222,11 +6235,12 @@ class BasePlatformAdapter(ABC):
                                 ext,
                                 file_result.error,
                             )
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                file_path,
-                                metadata=_final_thread_metadata,
-                            )
+                            if getattr(file_result, "attachment_delivered", None) is not False:
+                                await self._notify_media_delivery_failure(
+                                    event.source.chat_id,
+                                    file_path,
+                                    metadata=_final_thread_metadata,
+                                )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 

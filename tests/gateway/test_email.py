@@ -267,6 +267,27 @@ class TestDispatchMessage(unittest.TestCase):
             adapter = EmailAdapter(PlatformConfig(enabled=True))
         return adapter
 
+    def test_multi_image_acknowledges_only_files_attached_to_email(self):
+        """A per-file read error must not create a false delivery receipt."""
+        import tempfile
+
+        adapter = self._make_adapter()
+        smtp = MagicMock()
+        adapter._connect_smtp = MagicMock(return_value=smtp)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            delivered = os.path.join(tmp_dir, "delivered.png")
+            missing = os.path.join(tmp_dir, "missing.png")
+            with open(delivered, "wb") as f:
+                f.write(b"png")
+
+            acknowledged = adapter._send_email_with_attachments(
+                "user@test.com", "See files", [delivered, missing]
+            )
+
+        self.assertEqual(acknowledged, {delivered})
+        smtp.send_message.assert_called_once()
+
     def test_self_message_filtered(self):
         """Messages from the agent's own address should be skipped."""
         import asyncio

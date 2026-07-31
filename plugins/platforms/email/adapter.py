@@ -1022,14 +1022,14 @@ class EmailAdapter(BasePlatformAdapter):
 
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
+            delivered_paths = await loop.run_in_executor(
                 None,
                 self._send_email_with_attachments,
                 chat_id,
                 body,
                 local_paths,
             )
-            return set(local_paths)
+            return delivered_paths
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
             return await super().send_multiple_images(chat_id, images, metadata, human_delay)
@@ -1039,7 +1039,7 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         file_paths: List[str],
-    ) -> str:
+    ) -> set[str]:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
@@ -1063,6 +1063,7 @@ class EmailAdapter(BasePlatformAdapter):
         if body:
             msg.attach(MIMEText(body, "plain", "utf-8"))
 
+        delivered_paths: set[str] = set()
         for file_path in file_paths:
             p = Path(file_path)
             try:
@@ -1072,6 +1073,7 @@ class EmailAdapter(BasePlatformAdapter):
                     encoders.encode_base64(part)
                     part.add_header("Content-Disposition", f"attachment; filename={p.name}")
                     msg.attach(part)
+                    delivered_paths.add(file_path)
             except Exception as e:
                 logger.warning("[Email] Failed to attach %s: %s", file_path, e)
 
@@ -1085,8 +1087,8 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception:
                 smtp.close()
 
-        logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(file_paths))
-        return msg_id
+        logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(delivered_paths))
+        return delivered_paths
 
     async def send_document(
         self,

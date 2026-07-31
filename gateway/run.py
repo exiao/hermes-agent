@@ -15230,6 +15230,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
+                            session_key=session_key,
                             history_media_paths=_collect_history_media_paths(history),
                         )
                 # Streaming already delivered the body text, but the footer was
@@ -16349,6 +16350,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
+        session_key: Optional[str] = None,
         history_media_paths: Optional[set] = None,
     ) -> None:
         """Extract explicit MEDIA: tags from a response and deliver them.
@@ -16377,13 +16379,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import (
+                BasePlatformAdapter,
+                _media_delivery_route_key,
+                should_send_media_as_audio,
+            )
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-            # Deduplicate against media already delivered in prior turns —
-            # the model may echo a previous turn's MEDIA: tag in a later
-            # response; without this guard the same file is re-sent.
+            delivery_route_key = _media_delivery_route_key(event.source)
+            if session_key is not None:
+                history_media_paths = adapter._history_media_paths_for_session(
+                    session_key, delivery_route_key
+                )
+            # Deduplicate only against receipts for this session and route.
+            # Transcript MEDIA tags alone are intent, not proof of delivery.
             if history_media_paths:
                 media_files = [
                     (path, is_voice)
@@ -16420,11 +16430,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    delivered_image_paths = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
+                    if session_key is not None:
+                        for delivered_path in delivered_image_paths or set():
+                            adapter._record_media_delivery(
+                                session_key, delivered_path, delivery_route_key
+                            )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
 
@@ -16432,22 +16447,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        media_result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        media_result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        media_result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
+                        )
+                    if (
+                        session_key is not None
+                        and media_result.success
+                        and getattr(media_result, "attachment_delivered", None) is not False
+                    ):
+                        adapter._record_media_delivery(
+                            session_key, media_path, delivery_route_key
                         )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
