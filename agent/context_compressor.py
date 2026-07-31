@@ -5088,6 +5088,26 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Use token-budget tail protection instead of fixed message count
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
 
+        # The gateway's media-dedup boundary is stamped on the first user row
+        # of the active turn. Keep that row, and everything after it, in the
+        # protected tail: compressing it away forces the caller to anchor on a
+        # later correction row and misclassifies media from this turn as old
+        # history. This is intentionally a boundary adjustment rather than a
+        # metadata copy, so in-place compaction persists the same marked row.
+        current_turn_start_idx = next(
+            (
+                idx
+                for idx in range(compress_start, compress_end)
+                if isinstance(messages[idx].get("display_metadata"), dict)
+                and messages[idx]["display_metadata"].get(
+                    "_hermes_current_turn_start"
+                )
+            ),
+            None,
+        )
+        if current_turn_start_idx is not None:
+            compress_end = current_turn_start_idx
+
         # A double role collision can merge the summary into the first tail
         # row. Keep an actionable user event out of that position by retaining
         # the genuinely older assistant/tool bridge when one exists.

@@ -2755,3 +2755,27 @@ class TestGatewayRoutingTable:
         )
         assert entry.session_key not in rows
         restarted._db.close()
+
+
+class TestTranscriptDisplayMetadataFallback:
+    def test_append_transcript_preserves_display_boundary(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        session_id = "display-boundary"
+        store._db.create_session(session_id=session_id, source="gateway")
+
+        store._append_transcript_message(
+            session_id,
+            {
+                "role": "user",
+                "content": "continue",
+                "display_kind": "auto_continue",
+                "display_metadata": {"_hermes_current_turn_start": True},
+            },
+        )
+
+        [row] = store._db.get_messages_as_conversation(session_id)
+        assert row["display_kind"] == "auto_continue"
+        assert row["display_metadata"] == {"_hermes_current_turn_start": True}

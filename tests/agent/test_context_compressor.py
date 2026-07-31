@@ -40,6 +40,40 @@ def compressor():
         return c
 
 
+class TestCurrentTurnStartBoundary:
+    def test_marked_current_turn_stays_in_protected_tail(self, compressor):
+        """Compaction must not replace the marked turn start with a correction.
+
+        The correction is a later user row in the same active turn; the marker
+        is the only reliable boundary for gateway media deduplication.
+        """
+        compressor._find_tail_cut_by_tokens = lambda _messages, _start: 5
+        compressor._generate_summary = lambda _turns, **_kwargs: "summary"
+        marker = {"_hermes_current_turn_start": True}
+        messages = [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "assistant", "content": "prior tool result"},
+            {
+                "role": "user",
+                "content": "make image",
+                "display_metadata": marker,
+            },
+            {"role": "assistant", "content": "image tool call"},
+            {"role": "user", "content": "correction"},
+        ]
+
+        compressed = compressor.compress(messages)
+
+        marked = [
+            message
+            for message in compressed
+            if message.get("display_metadata") == marker
+        ]
+        assert len(marked) == 1
+        assert "make image" in marked[0]["content"]
+
+
 class TestSummarizeToolResultWebExtract:
     """Pre-compression pruning must survive web_extract calls whose ``urls`` are
     web_search result dicts ({"url"/"href": ...}), which models routinely forward
