@@ -143,6 +143,31 @@ class TestCurrentTurnStartBoundary:
         ]
         assert len(marked) == 1
 
+    def test_manual_compression_ignores_completed_turn_marker(self, compressor):
+        """Out-of-turn /compress must not protect the last completed turn."""
+        compressor._find_tail_cut_by_tokens = lambda _messages, _start: 6
+        compressor._generate_summary = lambda _turns, **_kwargs: "SUMMARY"
+        messages = [
+            {"role": "user", "content": "preamble"},
+            {"role": "assistant", "content": "preamble answer"},
+            {
+                "role": "user",
+                "content": "completed request",
+                "display_metadata": {"_hermes_current_turn_start": True},
+            },
+            {"role": "assistant", "content": "completed answer"},
+            {"role": "user", "content": "older follow-up"},
+            {"role": "assistant", "content": "older answer"},
+            {"role": "user", "content": "latest request"},
+            {"role": "assistant", "content": "latest answer"},
+        ]
+
+        compressed = compressor.compress(messages, force=True)
+
+        contents = [str(m.get("content", "")) for m in compressed]
+        assert any("SUMMARY" in content for content in contents)
+        assert len(compressed) < len(messages)
+
 
 class TestSummarizeToolResultWebExtract:
     """Pre-compression pruning must survive web_extract calls whose ``urls`` are

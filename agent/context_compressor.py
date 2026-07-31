@@ -5094,6 +5094,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         # later correction row and misclassifies media from this turn as old
         # history. This is intentionally a boundary adjustment rather than a
         # metadata copy, so in-place compaction persists the same marked row.
+        # Manual /compress passes force=True and runs out of turn against a
+        # completed transcript, so its last-turn marker is not an active
+        # boundary and must not starve an otherwise compressible window.
         #
         # The turn prologue clears stale markers, so at most one row is marked
         # and it is the active turn. Scan backward anyway: on a transcript
@@ -5107,17 +5110,19 @@ This compaction should PRIORITISE preserving all information related to the focu
         # active turn and there is nothing older to summarize. This is only
         # safe because stale markers are cleared; a leftover marker from an old
         # turn sitting at compress_start is what previously starved compression.
-        current_turn_start_idx = next(
-            (
-                idx
-                for idx in range(compress_end - 1, compress_start - 1, -1)
-                if isinstance(messages[idx].get("display_metadata"), dict)
-                and messages[idx]["display_metadata"].get(
-                    "_hermes_current_turn_start"
-                )
-            ),
-            None,
-        )
+        current_turn_start_idx = None
+        if not force:
+            current_turn_start_idx = next(
+                (
+                    idx
+                    for idx in range(compress_end - 1, compress_start - 1, -1)
+                    if isinstance(messages[idx].get("display_metadata"), dict)
+                    and messages[idx]["display_metadata"].get(
+                        "_hermes_current_turn_start"
+                    )
+                ),
+                None,
+            )
         if current_turn_start_idx is not None:
             compress_end = current_turn_start_idx
 
