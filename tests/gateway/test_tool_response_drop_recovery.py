@@ -268,6 +268,12 @@ class TestHistoryMediaDedupUsesDeliveryOutcome:
             "media_delivered": ["/tmp/delivered.pdf"]
         }
 
+        db.append_message("session-1", "user", "question")
+        db.append_message("session-1", "assistant", "answer")
+        transcript = db.get_messages_as_conversation("session-1")
+        db.replace_messages("session-1", transcript)
+        assert db.get_session("session-1")["message_count"] == 2
+
 
 @pytest.mark.parametrize("platform", [Platform.DISCORD, Platform.TELEGRAM])
 class TestExtractStripRecoveryAllPlatforms:

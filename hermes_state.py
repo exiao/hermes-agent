@@ -7243,7 +7243,9 @@ class SessionDB:
         Shared by :meth:`replace_messages` (delete-then-insert) and
         :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
         caller's write transaction (takes the live ``conn``). Returns
-        ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
+        ``(counted_message_count, tool_call_count)``. Delivery receipt rows are
+        inserted but excluded from both returned counts, matching ``append_message``.
+        Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
         """
         now_ts = time.time()
@@ -7295,6 +7297,12 @@ class SessionDB:
             )
 
             api_content = msg.get("api_content")
+            display_metadata = msg.get("display_metadata")
+            is_media_receipt = (
+                role == "session_meta"
+                and isinstance(display_metadata, dict)
+                and "media_delivered" in display_metadata
+            )
 
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
@@ -7326,11 +7334,12 @@ class SessionDB:
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
-            inserted += 1
-            if tool_calls is not None:
-                tool_calls_total += (
-                    len(tool_calls) if isinstance(tool_calls, list) else 1
-                )
+            if not is_media_receipt:
+                inserted += 1
+                if tool_calls is not None:
+                    tool_calls_total += (
+                        len(tool_calls) if isinstance(tool_calls, list) else 1
+                    )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
         return inserted, tool_calls_total
 
