@@ -427,3 +427,29 @@ def test_legacy_snapshot_store_error_does_not_leak_the_sandbox(tmp_path, monkeyp
 
     assert state["sandbox_instances"], "no sandbox was created"
     assert all(s.terminated for s in state["sandbox_instances"])
+
+
+def test_late_synced_credentials_are_removed_before_snapshot(tmp_path):
+    """Credentials registered after construction must not enter snapshots."""
+    late_mounts: list[dict[str, str]] = []
+    state = _install_modal_test_modules(tmp_path, credential_mounts=late_mounts)
+    late_host_path = tmp_path / "late-token.json"
+    late_host_path.write_text("secret")
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-late-credential")
+
+    late_mounts.append({
+        "host_path": str(late_host_path),
+        "container_path": "/root/.hermes/late-token.json",
+    })
+    env._before_execute()
+    env._sync_manager.sync_back = lambda: None
+    env.cleanup()
+
+    removals = [
+        call for call in state["exec_calls"]
+        if any("rm -f" in str(arg) for arg in call)
+    ]
+    assert len(removals) == 1, state["exec_calls"]
+    assert removals[0][-1] == "rm -f /root/.hermes/late-token.json"

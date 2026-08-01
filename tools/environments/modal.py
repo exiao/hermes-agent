@@ -360,6 +360,7 @@ class ModalEnvironment(BaseEnvironment):
         import modal as _modal
 
         credential_mounts = []
+        initial_credential_remote_paths: set[str] = set()
         sync_mounts = []
         try:
             from tools.credential_files import (
@@ -375,6 +376,7 @@ class ModalEnvironment(BaseEnvironment):
                         remote_path=mount_entry["container_path"],
                     )
                 )
+                initial_credential_remote_paths.add(mount_entry["container_path"])
             for entry in iter_skills_files():
                 sync_mounts.append(
                     _modal.Mount.from_local_file(
@@ -394,6 +396,8 @@ class ModalEnvironment(BaseEnvironment):
             logger.debug("Modal: could not load credential file mounts: %s", e)
 
         self._worker.start()
+        self._initial_credential_remote_paths = initial_credential_remote_paths
+        self._late_credential_remote_paths: set[str] = set()
 
         async def _create_sandbox(image_spec: Any):
             app = await _modal.App.lookup.aio("hermes-agent", create_if_missing=True)
@@ -629,8 +633,42 @@ class ModalEnvironment(BaseEnvironment):
 
         self._worker.run_coroutine(_rm(), timeout=15)
 
+    def _remove_late_credential_files(self) -> None:
+        """Remove credentials uploaded after construction before snapshotting.
+
+        Credential mounts are excluded from the restored-subtree purge because
+        Modal mounts remain available without being copied into snapshots.  A
+        credential registered after sandbox creation has no such mount, so the
+        recurring sync would otherwise copy it into the filesystem snapshot.
+        """
+        if not self._late_credential_remote_paths:
+            return
+
+        cmd = quoted_rm_command(sorted(self._late_credential_remote_paths))
+
+        async def _remove():
+            proc = await self._sandbox.exec.aio("bash", "-c", cmd)
+            return await proc.wait.aio()
+
+        exit_code = self._worker.run_coroutine(_remove(), timeout=30)
+        if exit_code != 0:
+            raise RuntimeError(
+                "Modal: failed to remove late-synced credentials before snapshot "
+                f"(exit {exit_code})"
+            )
+
     def _before_execute(self) -> None:
         """Sync files to sandbox via FileSyncManager (rate-limited internally)."""
+        try:
+            from tools.credential_files import get_credential_file_mounts
+
+            self._late_credential_remote_paths.update(
+                entry["container_path"]
+                for entry in get_credential_file_mounts()
+                if entry["container_path"] not in self._initial_credential_remote_paths
+            )
+        except Exception as exc:
+            logger.debug("Modal: could not track late credential mounts: %s", exc)
         self._sync_manager.sync()
 
     # ------------------------------------------------------------------
@@ -751,6 +789,8 @@ class ModalEnvironment(BaseEnvironment):
 
         if self._persistent:
             try:
+                self._remove_late_credential_files()
+
                 async def _snapshot():
                     img = await self._sandbox.snapshot_filesystem.aio()
                     return img.object_id
