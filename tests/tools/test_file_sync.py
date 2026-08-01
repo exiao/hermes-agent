@@ -141,6 +141,15 @@ class TestTransactionalRollback:
         mgr.sync(force=True)
         assert good_upload.call_count == 3, "all files should be retried after rollback"
 
+    def test_upload_failure_can_be_propagated(self, tmp_files):
+        upload = MagicMock(side_effect=RuntimeError("upload failed"))
+        mgr = _make_manager(tmp_files, upload=upload)
+
+        with pytest.raises(RuntimeError, match="upload failed"):
+            mgr.sync(force=True, raise_on_error=True)
+
+        assert mgr._synced_files == {}
+
     def test_delete_failure_rolls_back(self, tmp_files):
         upload = MagicMock()
         mgr = _make_manager(tmp_files, upload=upload)

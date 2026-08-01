@@ -28,6 +28,7 @@ from tools.environments.file_sync import (
     quoted_mkdir_command,
     quoted_rm_command,
     quoted_purge_command,
+    synced_subtree_roots,
     unique_parent_dirs,
 )
 
@@ -361,6 +362,7 @@ class ModalEnvironment(BaseEnvironment):
 
         credential_mounts = []
         initial_credential_remote_paths: set[str] = set()
+        late_credential_remote_paths: set[str] = set()
         sync_mounts = []
         try:
             from tools.credential_files import (
@@ -370,13 +372,28 @@ class ModalEnvironment(BaseEnvironment):
             )
 
             for mount_entry in get_credential_file_mounts():
+                remote_path = mount_entry["container_path"]
+                if any(
+                    remote_path == root or remote_path.startswith(root + "/")
+                    for root in synced_subtree_roots("/root/.hermes")
+                ):
+                    # Modal mounts are read-only. A recursive purge of a
+                    # sync-owned root would therefore fail if a credential
+                    # mount lived below it. Keep this credential writable via
+                    # the normal sync path and scrub it before snapshotting.
+                    late_credential_remote_paths.add(remote_path)
+                    logger.warning(
+                        "Modal: not mounting credential below sync root: %s",
+                        remote_path,
+                    )
+                    continue
                 credential_mounts.append(
                     _modal.Mount.from_local_file(
                         mount_entry["host_path"],
-                        remote_path=mount_entry["container_path"],
+                        remote_path=remote_path,
                     )
                 )
-                initial_credential_remote_paths.add(mount_entry["container_path"])
+                initial_credential_remote_paths.add(remote_path)
             for entry in iter_skills_files():
                 sync_mounts.append(
                     _modal.Mount.from_local_file(
@@ -397,7 +414,7 @@ class ModalEnvironment(BaseEnvironment):
 
         self._worker.start()
         self._initial_credential_remote_paths = initial_credential_remote_paths
-        self._late_credential_remote_paths: set[str] = set()
+        self._late_credential_remote_paths = late_credential_remote_paths
 
         async def _create_sandbox(image_spec: Any):
             app = await _modal.App.lookup.aio("hermes-agent", create_if_missing=True)
@@ -465,7 +482,7 @@ class ModalEnvironment(BaseEnvironment):
                 bulk_upload_fn=self._modal_bulk_upload,
                 bulk_download_fn=self._modal_bulk_download,
             )
-            self._sync_manager.sync(force=True)
+            self._sync_manager.sync(force=True, raise_on_error=True)
             self.init_session()
         except Exception:
             # The sandbox is live by now, so it outlives the constructor unless

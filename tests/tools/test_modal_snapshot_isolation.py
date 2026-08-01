@@ -335,6 +335,37 @@ def test_restored_sandbox_keeps_credentials_but_not_sync_mounts(tmp_path):
         env.cleanup()
 
 
+def test_restored_sandbox_does_not_mount_credentials_below_sync_roots(tmp_path):
+    """Credentials below purge roots use sync and are scrubbed before snapshot."""
+    state = _install_modal_test_modules(
+        tmp_path,
+        credential_mounts=[
+            {"host_path": "/host/token.json", "container_path": "/root/.hermes/token.json"},
+            {
+                "host_path": "/host/skill-token.json",
+                "container_path": "/root/.hermes/skills/skill-token.json",
+            },
+        ],
+    )
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-nested-credential": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-nested-credential")
+    env._sync_manager.sync_back = lambda: None
+    env.cleanup()
+
+    assert state["create_calls"][0]["mounts"] == [
+        {"host_path": "/host/token.json", "remote_path": "/root/.hermes/token.json"}
+    ]
+    removals = [
+        call for call in state["exec_calls"]
+        if any("rm -f" in str(arg) for arg in call)
+    ]
+    assert removals[-1][-1] == "rm -f /root/.hermes/skills/skill-token.json"
+
+
 def test_fresh_sandbox_does_not_purge(tmp_path):
     """No snapshot means nothing stale; purging would be wasted work."""
     state = _install_modal_test_modules(tmp_path)
@@ -346,6 +377,27 @@ def test_fresh_sandbox_does_not_purge(tmp_path):
         assert not [c for c in state["exec_calls"] if any("rm -rf" in str(a) for a in c)]
     finally:
         env.cleanup()
+
+
+def test_forced_reconciliation_sync_failure_terminates_sandbox(tmp_path, monkeypatch):
+    """A restored sandbox must not run after its initial sync fails."""
+    state = _install_modal_test_modules(tmp_path)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-sync-failure": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+
+    def fail_sync(_manager, **kwargs):
+        assert kwargs == {"force": True, "raise_on_error": True}
+        raise RuntimeError("sync failed")
+
+    monkeypatch.setattr(modal_module.FileSyncManager, "sync", fail_sync)
+    with pytest.raises(RuntimeError, match="sync failed"):
+        modal_module.ModalEnvironment(image="python:3.11", task_id="task-sync-failure")
+
+    assert state["sandbox_instances"], "no sandbox was created"
+    assert all(s.terminated for s in state["sandbox_instances"])
 
 
 def test_failed_restore_falls_back_to_base_image_without_purge(tmp_path):
