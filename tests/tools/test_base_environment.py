@@ -414,12 +414,43 @@ class TestExtractCwdFromOutput:
 
 
 class TestEmbedStdinHeredoc:
-    def test_heredoc_format(self):
+    def test_heredoc_delivers_body_to_the_command(self):
+        """Assert the behavior (body reaches the command), not the string shape.
+
+        The old form asserted ``startswith("cat << '")``, which froze the
+        exact wrapper text and passed while the heredoc was attached to the
+        WRONG command in a multi-command sequence.
+        """
+        import subprocess
+
         result = BaseEnvironment._embed_stdin_heredoc("cat", "hello world")
 
-        assert result.startswith("cat << '")
         assert "hello world" in result
         assert "HERMES_STDIN_" in result
+        proc = subprocess.run(
+            ["bash", "-c", result], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.startswith("hello world")
+
+    def test_body_goes_to_the_stdin_reader_not_the_last_command(self):
+        """A redirect binds to one command; the wrapper must cover them all."""
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "out.txt"
+            # `cat` is NOT the final command, mirroring _atomic_write.
+            script = f"cat > {target}; true"
+            wrapped = BaseEnvironment._embed_stdin_heredoc(script, "payload\n")
+            proc = subprocess.run(
+                ["bash", "-c", wrapped], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=30,
+            )
+            assert proc.returncode == 0, proc.stderr
+            assert target.read_text().startswith("payload\n")
 
     def test_unique_delimiter_each_call(self):
         r1 = BaseEnvironment._embed_stdin_heredoc("cat", "data")

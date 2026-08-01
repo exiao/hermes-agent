@@ -43,11 +43,18 @@ class ModalExecStart:
 
 
 def wrap_modal_stdin_heredoc(command: str, stdin_data: str) -> str:
-    """Append stdin as a shell heredoc for transports without stdin piping."""
+    """Append stdin as a shell heredoc for transports without stdin piping.
+
+    Wraps the command in a brace group so the heredoc feeds EVERY command in
+    the sequence. A bare ``cmd << EOF`` binds the redirect to the last command
+    only, which silently starved ``cat > "$tmp"`` inside the multi-command
+    atomic-write script (empty file, or a hang until timeout). See
+    ``BaseEnvironment._embed_stdin_heredoc``.
+    """
     marker = f"HERMES_EOF_{uuid.uuid4().hex[:8]}"
     while marker in stdin_data:
         marker = f"HERMES_EOF_{uuid.uuid4().hex[:8]}"
-    return f"{command} << '{marker}'\n{stdin_data}\n{marker}"
+    return f"{{ {command}\n}} << '{marker}'\n{stdin_data}\n{marker}"
 
 
 def wrap_modal_sudo_pipe(command: str, sudo_stdin: str) -> str:
