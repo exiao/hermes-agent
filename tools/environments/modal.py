@@ -441,22 +441,31 @@ class ModalEnvironment(BaseEnvironment):
 
         logger.info("Modal: sandbox created (task=%s)", self._task_id)
 
-        if restored_snapshot_id:
-            # A restored snapshot still holds the previous instance's synced
-            # files, but the fresh FileSyncManager below starts with an empty
-            # map and so computes no deletions for them.  Clear the sync-owned
-            # subtrees; the forced sync re-uploads everything still on the host.
-            self._purge_synced_subtrees()
+        try:
+            if restored_snapshot_id:
+                # A restored snapshot still holds the previous instance's synced
+                # files, but the fresh FileSyncManager below starts with an empty
+                # map and so computes no deletions for them.  Clear the sync-owned
+                # subtrees; the forced sync re-uploads everything still on the host.
+                self._purge_synced_subtrees()
 
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files("/root/.hermes"),
-            upload_fn=self._modal_upload,
-            delete_fn=self._modal_delete,
-            bulk_upload_fn=self._modal_bulk_upload,
-            bulk_download_fn=self._modal_bulk_download,
-        )
-        self._sync_manager.sync(force=True)
-        self.init_session()
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files("/root/.hermes"),
+                upload_fn=self._modal_upload,
+                delete_fn=self._modal_delete,
+                bulk_upload_fn=self._modal_bulk_upload,
+                bulk_download_fn=self._modal_bulk_download,
+            )
+            self._sync_manager.sync(force=True)
+            self.init_session()
+        except Exception:
+            # The sandbox is live by now, so it outlives the constructor unless
+            # we tear it down here. Without this the caller sees an exception
+            # while a paid sandbox and its worker thread keep running until the
+            # sandbox timeout.
+            self._terminate_sandbox_quietly()
+            self._worker.stop()
+            raise
 
     def _modal_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via base64 piped through stdin."""
@@ -553,15 +562,42 @@ class ModalEnvironment(BaseEnvironment):
             tar_bytes = tar_bytes.encode()
         dest.write_bytes(tar_bytes)
 
+    def _terminate_sandbox_quietly(self) -> None:
+        """Best-effort sandbox teardown for a failed construction path."""
+        sandbox = self._sandbox
+        if sandbox is None:
+            return
+        try:
+            async def _terminate():
+                await sandbox.terminate.aio()
+
+            self._worker.run_coroutine(_terminate(), timeout=30)
+        except Exception as exc:
+            logger.warning("Modal: could not terminate sandbox after failure: %s", exc)
+        finally:
+            self._sandbox = None
+
     def _purge_synced_subtrees(self) -> None:
-        """Clear sync-owned directories in a restored sandbox."""
+        """Clear sync-owned directories in a restored sandbox.
+
+        Raises on a nonzero exit. ``sync(force=True)`` only uploads files that
+        still exist on the host, so it cannot discover -- let alone delete --
+        remote paths a previous instance left behind. A silently failed purge
+        therefore leaves the sandbox serving the very files this reconciliation
+        exists to remove, with nothing downstream able to notice.
+        """
         cmd = quoted_purge_command("/root/.hermes")
 
         async def _purge():
             proc = await self._sandbox.exec.aio("bash", "-c", cmd)
-            await proc.wait.aio()
+            return await proc.wait.aio()
 
-        self._worker.run_coroutine(_purge(), timeout=30)
+        exit_code = self._worker.run_coroutine(_purge(), timeout=30)
+        if exit_code != 0:
+            raise RuntimeError(
+                f"Modal: failed to purge sync-owned subtrees (exit {exit_code}); "
+                "refusing to run on unreconciled snapshot state"
+            )
 
     def _modal_delete(self, remote_paths: list[str]) -> None:
         """Batch-delete remote files via exec."""

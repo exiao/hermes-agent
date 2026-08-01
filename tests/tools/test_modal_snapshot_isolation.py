@@ -56,6 +56,8 @@ def _install_modal_test_modules(
     *,
     fail_on_snapshot_ids: set[str] | None = None,
     snapshot_id: str = "im-fresh",
+    purge_exit_code: int = 0,
+    purge_raises: bool = False,
 ):
     _reset_modules(("tools", "hermes_cli", "modal"))
 
@@ -133,6 +135,7 @@ def _install_modal_test_modules(
     registry_calls: list[tuple[str, list[str] | None]] = []
     create_calls: list[dict] = []
     exec_calls: list[tuple] = []
+    sandbox_instances: list = []
 
     class _FakeImage:
         @staticmethod
@@ -151,24 +154,30 @@ def _install_modal_test_modules(
     class _FakeSandboxInstance:
         def __init__(self, image):
             self.image = image
+            self.terminated = False
 
             async def _snapshot_aio():
                 return types.SimpleNamespace(object_id=snapshot_id)
 
             async def _terminate_aio():
+                self.terminated = True
                 return None
 
             async def _exec_aio(*cmd):
                 exec_calls.append(cmd)
+                is_purge = any("rm -rf" in str(a) for a in cmd)
+                if is_purge and purge_raises:
+                    raise RuntimeError("exec transport failed")
 
                 async def _wait_aio():
-                    return 0
+                    return purge_exit_code if is_purge else 0
 
                 return types.SimpleNamespace(wait=types.SimpleNamespace(aio=_wait_aio))
 
             self.exec = types.SimpleNamespace(aio=_exec_aio)
             self.snapshot_filesystem = types.SimpleNamespace(aio=_snapshot_aio)
             self.terminate = types.SimpleNamespace(aio=_terminate_aio)
+            sandbox_instances.append(self)
 
     async def _create_aio(*_args, image=None, app=None, timeout=None, **kwargs):
         create_calls.append({
@@ -206,6 +215,7 @@ def _install_modal_test_modules(
         "from_id_calls": from_id_calls,
         "registry_calls": registry_calls,
         "exec_calls": exec_calls,
+        "sandbox_instances": sandbox_instances,
     }
 
 
@@ -323,3 +333,48 @@ def test_failed_restore_falls_back_to_base_image_without_purge(tmp_path):
         assert not [c for c in state["exec_calls"] if any("rm -rf" in str(a) for a in c)]
     finally:
         env.cleanup()
+
+
+def test_failed_purge_aborts_instead_of_running_on_stale_state(tmp_path):
+    """A nonzero purge must not be swallowed.
+
+    `sync(force=True)` only uploads files still on the host; it can never
+    discover remote paths the previous instance left behind. So if the purge
+    silently fails, the sandbox keeps serving exactly the deleted plans and
+    skills this PR exists to remove -- and nothing downstream can detect it.
+    Failing loudly is the only safe outcome.
+    """
+    state = _install_modal_test_modules(tmp_path, purge_exit_code=1)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-badpurge": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+
+    with pytest.raises(RuntimeError, match="purge"):
+        modal_module.ModalEnvironment(image="python:3.11", task_id="task-badpurge")
+
+    # The half-built sandbox must not be leaked when construction aborts.
+    assert state["sandbox_instances"], "no sandbox was created"
+    assert all(s.terminated for s in state["sandbox_instances"])
+
+
+def test_purge_transport_error_does_not_leak_the_sandbox(tmp_path):
+    """An exception from exec.aio escapes outside the constructor's cleanup.
+
+    The purge runs after the create try/except that stops the worker, so a
+    transport failure would otherwise leave a live sandbox and a running
+    worker thread behind for the sandbox's full timeout.
+    """
+    state = _install_modal_test_modules(tmp_path, purge_raises=True)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-purgeboom": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+
+    with pytest.raises(RuntimeError):
+        modal_module.ModalEnvironment(image="python:3.11", task_id="task-purgeboom")
+
+    assert state["sandbox_instances"], "no sandbox was created"
+    assert all(s.terminated for s in state["sandbox_instances"])
