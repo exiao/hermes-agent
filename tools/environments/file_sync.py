@@ -63,6 +63,7 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     from tools.credential_files import (
         get_credential_file_mounts,
         iter_cache_files,
+        iter_plans_files,
         iter_skills_files,
     )
 
@@ -73,6 +74,11 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
         )
         files.append((entry["host_path"], remote))
     for entry in iter_skills_files(container_base=container_base):
+        files.append((entry["host_path"], entry["container_path"]))
+    # Plans join the RECURRING sync, not just sandbox construction: a card can
+    # link a plan written or edited after its environment was cached, and a
+    # creation-time-only mount would stay stale for that sandbox's lifetime.
+    for entry in iter_plans_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))
     for entry in iter_cache_files(container_base=container_base):
         files.append((entry["host_path"], entry["container_path"]))
@@ -408,6 +414,12 @@ class FileSyncManager:
                         staged_file = os.path.join(dirpath, fname)
                         rel = os.path.relpath(staged_file, staging)
                         remote_path = "/" + rel
+
+                        # Plans are read-only card context: push down, never
+                        # pull back, or a worker editing its own plan would
+                        # overwrite the authoritative copy on the host.
+                        if "/plans/" in remote_path:
+                            continue
 
                         pushed_hash = self._pushed_hashes.get(remote_path)
 

@@ -144,3 +144,39 @@ async def test_explicit_media_document_still_delivers_post_stream(tmp_path, monk
         file_path=str(media_file),
         metadata={},
     )
+
+
+@pytest.mark.asyncio
+async def test_media_already_in_history_is_delivered_again(tmp_path, monkeypatch):
+    """A path named in an earlier turn must still upload when re-requested.
+
+    A ``MEDIA:`` tag records what the model ASKED to send, never what the
+    platform accepted. Delivery-time dedup read it as a receipt, so a failed
+    upload became permanently unsendable and a fresh attachment could be
+    dropped when the history boundary shifted. There is deliberately no
+    prior-turn suppression: a duplicate image is the cheaper failure.
+    """
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")
+    adapter = _adapter()
+
+    # Turn 1: the model asks to send the chart. The upload is attempted.
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"Here is the chart.\nMEDIA:{media_file}",
+        _event(),
+        adapter,
+    )
+    assert adapter.send_multiple_images.await_count == 1
+
+    # Turn 2: same path, same session. Under the old dedup this was suppressed
+    # because the tag was already in history; the user got nothing.
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"Resending the chart.\nMEDIA:{media_file}",
+        _event(),
+        adapter,
+    )
+
+    assert adapter.send_multiple_images.await_count == 2
+    images_kwargs = adapter.send_multiple_images.await_args.kwargs
+    assert str(media_file) in images_kwargs["images"][0][0]

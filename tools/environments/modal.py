@@ -324,7 +324,7 @@ class ModalEnvironment(BaseEnvironment):
     interrupt or timeout never destroys the sandbox.
     """
 
-    _stdin_mode = "heredoc"
+    _stdin_mode = "pipe"
     _snapshot_timeout = 60  # Modal cold starts can be slow
 
     def __init__(
@@ -501,6 +501,21 @@ class ModalEnvironment(BaseEnvironment):
     # compatibility.  Chunks are written below this threshold and flushed
     # individually via drain().
     _STDIN_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB — safe for both transport paths
+
+    @staticmethod
+    def _iter_stdin_chunks(payload: str, max_bytes: int):
+        """Yield payload chunks whose UTF-8 encoding fits the transport cap."""
+        start = 0
+        chunk_bytes = 0
+        for index, char in enumerate(payload):
+            char_bytes = len(char.encode("utf-8"))
+            if chunk_bytes and chunk_bytes + char_bytes > max_bytes:
+                yield payload[start:index]
+                start = index
+                chunk_bytes = 0
+            chunk_bytes += char_bytes
+        if start < len(payload):
+            yield payload[start:]
 
     def _modal_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         """Upload many files via tar archive piped through stdin.
@@ -697,6 +712,17 @@ class ModalEnvironment(BaseEnvironment):
                         # cancellation transport failure must not prevent this
                         # handle from draining and waiting for its target.
                         logger.warning("Modal: could not cancel remote command: %s", exc)
+                # Feed stdin before draining stdout. File writes pass their
+                # body through this pipe, and an explicit EOF is required for
+                # the remote `cat` to finish. Chunk writes to stay below the
+                # SDK's per-write buffer cap.
+                if stdin_data is not None:
+                    chunk_size = self._STDIN_CHUNK_SIZE
+                    for chunk in self._iter_stdin_chunks(stdin_data, chunk_size):
+                        process.stdin.write(chunk)
+                        await process.stdin.drain.aio()
+                    process.stdin.write_eof()
+                    await process.stdin.drain.aio()
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
                 exit_code = await process.wait.aio()

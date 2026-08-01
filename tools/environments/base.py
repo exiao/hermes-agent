@@ -759,9 +759,26 @@ class BaseEnvironment(ABC):
 
     @staticmethod
     def _embed_stdin_heredoc(command: str, stdin_data: str) -> str:
-        """Append stdin_data as a shell heredoc to the command string."""
+        """Append stdin_data as a shell heredoc to the command string.
+
+        The heredoc is attached to a **brace group** wrapping the whole
+        command, not to the bare string. A redirect binds only to the single
+        command it follows, so appending ``<< EOF`` to a multi-command
+        sequence (``a; b; cat > f; d``) feeds the body to ``d`` — the last
+        command — and leaves ``cat`` reading the real stdin.
+
+        That is exactly the shape ``FileOperations._atomic_write`` emits: it
+        ends in ``trap - EXIT``, so the file body was handed to ``trap`` and
+        the write either produced an EMPTY FILE (stdin closed) or blocked
+        until the command timeout (stdin open but never written). Both were
+        seen live on Modal-backed lanes.
+
+        The newline before ``}`` is load-bearing: ``}`` must be the first
+        token of a command, and it also stops a trailing comment in the
+        command from swallowing the brace.
+        """
         delimiter = f"HERMES_STDIN_{uuid.uuid4().hex[:12]}"
-        return f"{command} << '{delimiter}'\n{stdin_data}\n{delimiter}"
+        return f"{{ {command}\n}} << '{delimiter}'\n{stdin_data}\n{delimiter}"
 
     # ------------------------------------------------------------------
     # Process lifecycle

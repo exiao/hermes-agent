@@ -15268,7 +15268,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
-                            history_media_paths=_collect_history_media_paths(history),
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -16387,7 +16386,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
-        history_media_paths: Optional[set] = None,
     ) -> None:
         """Extract explicit MEDIA: tags from a response and deliver them.
 
@@ -16419,15 +16417,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-            # Deduplicate against media already delivered in prior turns —
-            # the model may echo a previous turn's MEDIA: tag in a later
-            # response; without this guard the same file is re-sent.
-            if history_media_paths:
-                media_files = [
-                    (path, is_voice)
-                    for path, is_voice in media_files
-                    if path not in history_media_paths
-                ]
+            # No dedup against prior-turn media: a MEDIA: tag records what the
+            # model asked to send, never what the platform accepted. A
+            # duplicate image is cheaper than a silently dropped one.
             # Strip image URLs from the cleaned text for parity with the
             # non-streaming chain, but do NOT run extract_local_files here:
             # post-stream delivery is explicit-only (#20834). Bare local paths

@@ -216,15 +216,16 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
 
 
 @pytest.mark.asyncio
-async def test_streamed_response_receives_prior_turn_media_paths(
+async def test_streamed_response_completes_post_stream_media_delivery(
     monkeypatch, tmp_path
 ):
     """An ordinary streamed reply completes the post-stream delivery branch.
 
-    The history-derived dedup set is part of that branch's contract, rather
-    than an optional best-effort hint: passing an undefined local crashes the
-    entire reply, while passing an empty set reintroduces duplicate MEDIA
-    attachments on later streamed responses.
+    This branch previously referenced an undefined local, which crashed the
+    entire reply. It must still be awaited cleanly. There is deliberately no
+    prior-turn dedup: a MEDIA: tag records what the model asked to send, not
+    what the platform accepted, so suppressing on it silently drops
+    attachments and makes a failed upload unretryable.
     """
     runner = _bootstrap(monkeypatch, tmp_path)
     prior_path = "/tmp/already-delivered.png"
@@ -255,9 +256,9 @@ async def test_streamed_response_receives_prior_turn_media_paths(
 
     assert response is None
     runner._deliver_media_from_response.assert_awaited_once()
-    assert runner._deliver_media_from_response.await_args.kwargs[
-        "history_media_paths"
-    ] == {prior_path}
+    assert "history_media_paths" not in (
+        runner._deliver_media_from_response.await_args.kwargs
+    )
 
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
