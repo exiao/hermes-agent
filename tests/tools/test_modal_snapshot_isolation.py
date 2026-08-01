@@ -58,6 +58,7 @@ def _install_modal_test_modules(
     snapshot_id: str = "im-fresh",
     purge_exit_code: int = 0,
     purge_raises: bool = False,
+    credential_mounts: list[dict[str, str]] | None = None,
 ):
     _reset_modules(("tools", "hermes_cli", "modal"))
 
@@ -125,7 +126,7 @@ def _install_modal_test_modules(
     )
     sys.modules["tools.interrupt"] = types.SimpleNamespace(is_interrupted=lambda: False)
     sys.modules["tools.credential_files"] = types.SimpleNamespace(
-        get_credential_file_mounts=lambda: [],
+        get_credential_file_mounts=lambda: credential_mounts or [],
         iter_skills_files=lambda **kw: [],
         iter_cache_files=lambda **kw: [],
         _CACHE_DIRS=[("cache/documents", "document_cache")],
@@ -306,6 +307,27 @@ def test_restored_sandbox_purges_sync_owned_subtrees_before_first_sync(tmp_path)
         env.cleanup()
 
 
+def test_restored_sandbox_does_not_mount_read_only_sync_paths(tmp_path):
+    """Restored snapshots must be purged before any read-only mounts attach."""
+    state = _install_modal_test_modules(
+        tmp_path,
+        credential_mounts=[
+            {"host_path": "/host/token.json", "container_path": "/root/.hermes/token.json"}
+        ],
+    )
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-mounted": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-mounted")
+
+    try:
+        assert "mounts" not in state["create_calls"][0]
+    finally:
+        env.cleanup()
+
+
 def test_fresh_sandbox_does_not_purge(tmp_path):
     """No snapshot means nothing stale; purging would be wasted work."""
     state = _install_modal_test_modules(tmp_path)
@@ -375,6 +397,26 @@ def test_purge_transport_error_does_not_leak_the_sandbox(tmp_path):
 
     with pytest.raises(RuntimeError):
         modal_module.ModalEnvironment(image="python:3.11", task_id="task-purgeboom")
+
+    assert state["sandbox_instances"], "no sandbox was created"
+    assert all(s.terminated for s in state["sandbox_instances"])
+
+
+def test_legacy_snapshot_store_error_does_not_leak_the_sandbox(tmp_path, monkeypatch):
+    """Legacy-key migration errors must clean up the already-created sandbox."""
+    state = _install_modal_test_modules(tmp_path)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"task-legacy-store": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+
+    def fail_store(*_args):
+        raise RuntimeError("snapshot store failed")
+
+    monkeypatch.setattr(modal_module, "_store_direct_snapshot", fail_store)
+    with pytest.raises(RuntimeError, match="snapshot store failed"):
+        modal_module.ModalEnvironment(image="python:3.11", task_id="task-legacy-store")
 
     assert state["sandbox_instances"], "no sandbox was created"
     assert all(s.terminated for s in state["sandbox_instances"])

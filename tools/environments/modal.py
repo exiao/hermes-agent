@@ -397,7 +397,10 @@ class ModalEnvironment(BaseEnvironment):
         async def _create_sandbox(image_spec: Any):
             app = await _modal.App.lookup.aio("hermes-agent", create_if_missing=True)
             create_kwargs = dict(sandbox_kwargs)
-            if cred_mounts:
+            # A restored snapshot may already contain files under these paths,
+            # while Modal mounts are read-only. Let reconciliation purge the
+            # snapshot first and let the forced sync restore current host files.
+            if cred_mounts and not restored_snapshot_id:
                 existing_mounts = list(create_kwargs.pop("mounts", []))
                 existing_mounts.extend(cred_mounts)
                 create_kwargs["mounts"] = existing_mounts
@@ -432,9 +435,6 @@ class ModalEnvironment(BaseEnvironment):
                 # The fallback sandbox is a pristine base image, so there is no
                 # prior-instance state to reconcile.
                 restored_snapshot_id = None
-            else:
-                if restored_snapshot_id and restored_from_legacy_key:
-                    _store_direct_snapshot(self._task_id, restored_snapshot_id)
         except Exception:
             self._worker.stop()
             raise
@@ -442,6 +442,8 @@ class ModalEnvironment(BaseEnvironment):
         logger.info("Modal: sandbox created (task=%s)", self._task_id)
 
         try:
+            if restored_snapshot_id and restored_from_legacy_key:
+                _store_direct_snapshot(self._task_id, restored_snapshot_id)
             if restored_snapshot_id:
                 # A restored snapshot still holds the previous instance's synced
                 # files, but the fresh FileSyncManager below starts with an empty
