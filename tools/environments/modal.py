@@ -359,7 +359,8 @@ class ModalEnvironment(BaseEnvironment):
         _ensure_modal_sdk()
         import modal as _modal
 
-        cred_mounts = []
+        credential_mounts = []
+        sync_mounts = []
         try:
             from tools.credential_files import (
                 get_credential_file_mounts,
@@ -368,14 +369,14 @@ class ModalEnvironment(BaseEnvironment):
             )
 
             for mount_entry in get_credential_file_mounts():
-                cred_mounts.append(
+                credential_mounts.append(
                     _modal.Mount.from_local_file(
                         mount_entry["host_path"],
                         remote_path=mount_entry["container_path"],
                     )
                 )
             for entry in iter_skills_files():
-                cred_mounts.append(
+                sync_mounts.append(
                     _modal.Mount.from_local_file(
                         entry["host_path"],
                         remote_path=entry["container_path"],
@@ -383,7 +384,7 @@ class ModalEnvironment(BaseEnvironment):
                 )
             cache_files = iter_cache_files()
             for entry in cache_files:
-                cred_mounts.append(
+                sync_mounts.append(
                     _modal.Mount.from_local_file(
                         entry["host_path"],
                         remote_path=entry["container_path"],
@@ -400,9 +401,11 @@ class ModalEnvironment(BaseEnvironment):
             # A restored snapshot may already contain files under these paths,
             # while Modal mounts are read-only. Let reconciliation purge the
             # snapshot first and let the forced sync restore current host files.
-            if cred_mounts and not restored_snapshot_id:
+            if credential_mounts or sync_mounts:
                 existing_mounts = list(create_kwargs.pop("mounts", []))
-                existing_mounts.extend(cred_mounts)
+                existing_mounts.extend(credential_mounts)
+                if not restored_snapshot_id:
+                    existing_mounts.extend(sync_mounts)
                 create_kwargs["mounts"] = existing_mounts
             sandbox = await _modal.Sandbox.create.aio(
                 "sleep", "infinity",

@@ -59,6 +59,7 @@ def _install_modal_test_modules(
     purge_exit_code: int = 0,
     purge_raises: bool = False,
     credential_mounts: list[dict[str, str]] | None = None,
+    sync_mounts: list[dict[str, str]] | None = None,
 ):
     _reset_modules(("tools", "hermes_cli", "modal"))
 
@@ -127,7 +128,7 @@ def _install_modal_test_modules(
     sys.modules["tools.interrupt"] = types.SimpleNamespace(is_interrupted=lambda: False)
     sys.modules["tools.credential_files"] = types.SimpleNamespace(
         get_credential_file_mounts=lambda: credential_mounts or [],
-        iter_skills_files=lambda **kw: [],
+        iter_skills_files=lambda **kw: sync_mounts or [],
         iter_cache_files=lambda **kw: [],
         _CACHE_DIRS=[("cache/documents", "document_cache")],
     )
@@ -307,12 +308,15 @@ def test_restored_sandbox_purges_sync_owned_subtrees_before_first_sync(tmp_path)
         env.cleanup()
 
 
-def test_restored_sandbox_does_not_mount_read_only_sync_paths(tmp_path):
-    """Restored snapshots must be purged before any read-only mounts attach."""
+def test_restored_sandbox_keeps_credentials_but_not_sync_mounts(tmp_path):
+    """Restored snapshots keep credential mounts while sync paths stay writable."""
     state = _install_modal_test_modules(
         tmp_path,
         credential_mounts=[
             {"host_path": "/host/token.json", "container_path": "/root/.hermes/token.json"}
+        ],
+        sync_mounts=[
+            {"host_path": "/host/skill.md", "container_path": "/root/.hermes/skills/skill.md"}
         ],
     )
     snapshot_store = state["snapshot_store"]
@@ -323,7 +327,9 @@ def test_restored_sandbox_does_not_mount_read_only_sync_paths(tmp_path):
     env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-mounted")
 
     try:
-        assert "mounts" not in state["create_calls"][0]
+        assert state["create_calls"][0]["mounts"] == [
+            {"host_path": "/host/token.json", "remote_path": "/root/.hermes/token.json"}
+        ]
     finally:
         env.cleanup()
 
