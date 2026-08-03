@@ -34,7 +34,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, MutableMapping, Optional
+from typing import Any, Dict, List, MutableMapping, Optional
 
 from agent.secret_sources.base import (
     SECRET_SOURCE_API_VERSION,
@@ -199,12 +199,28 @@ def _reset_registry_for_tests() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Sentinel: ``None`` is a MEANINGFUL value for the environ forwarded to
+# fetch() (it selects process-auth mode), so "argument omitted" needs its own
+# marker distinct from None.
+_RAW_ENVIRON_UNSET = object()
+
+
 def _fetch_with_timeout(
     source: SecretSource, cfg: dict, home_path: Path,
     environ: MutableMapping[str, str],
     scoped: bool = False,
+    raw_environ: Any = _RAW_ENVIRON_UNSET,
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
+
+    ``environ`` is the MATERIALIZED mapping (``os.environ`` on the default
+    path) used for the source-environment contextvar. ``raw_environ`` is the
+    caller's None-preserving value and is what gets forwarded to ``fetch()``:
+    OnePasswordSource treats any non-None ``environ`` as isolated mode
+    (``include_process_auth=False``), so forwarding the materialized
+    ``os.environ`` on the default path would run ``op`` with an isolated HOME
+    and drop an interactive 1Password session. Defaults to ``environ`` so
+    existing callers keep their behaviour.
 
     ``scoped`` marks a genuine profile-isolation apply (a named profile under
     ``gateway.multiplex_profiles``): a source whose ``fetch()`` cannot consume
@@ -228,6 +244,10 @@ def _fetch_with_timeout(
     # the plain ThreadPoolExecutor worker, since ContextVars do not propagate to
     # pool threads. Mirrors the copy_context() pattern in account_usage.py.
     ctx = contextvars.copy_context()
+    # None-preserving value forwarded to fetch(); see the docstring. _UNSET (not
+    # None) marks "caller didn't distinguish", because None is itself meaningful
+    # here — it is what keeps the default path in process-auth mode.
+    fetch_environ = environ if raw_environ is _RAW_ENVIRON_UNSET else raw_environ
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
@@ -255,7 +275,7 @@ def _fetch_with_timeout(
             token = set_source_environment(environ)
             try:
                 if "environ" in fetch_params:
-                    return source.fetch(cfg, home_path, environ=environ)
+                    return source.fetch(cfg, home_path, environ=fetch_environ)
                 return source.fetch(cfg, home_path)
             finally:
                 reset_source_environment(token)
@@ -442,7 +462,9 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path, env, scoped=scoped)
+        result = _fetch_with_timeout(
+            source, cfg, home_path, env, scoped=scoped, raw_environ=environ
+        )
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):

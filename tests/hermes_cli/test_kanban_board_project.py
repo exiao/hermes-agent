@@ -7,6 +7,7 @@ metadata round-trip and the create-time inheritance.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -56,9 +57,20 @@ def test_create_board_accepts_project_id(fresh_home):
     assert kb.read_board_metadata("proj-board")["project_id"] == "p_xyz"
 
 
+def _init_repo(path: Path) -> Path:
+    """Create a real git repo at *path*.
+
+    A project's primary_path is used as a worktree anchor, and kanban_db now
+    validates that the anchor resolves to a git repo root (upstream). A bare
+    mkdir() therefore fails task creation with "not inside a git repo".
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return path
+
+
 def test_create_task_inherits_board_project(fresh_home, tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _init_repo(tmp_path / "repo")
     with pdb.connect_closing() as pconn:
         proj_id = pdb.create_project(pconn, name="Widget", primary_path=str(repo))
 
@@ -72,8 +84,8 @@ def test_create_task_inherits_board_project(fresh_home, tmp_path):
 
 
 def test_create_task_explicit_project_beats_board(fresh_home, tmp_path):
-    (tmp_path / "a").mkdir()
-    (tmp_path / "b").mkdir()
+    _init_repo(tmp_path / "a")
+    _init_repo(tmp_path / "b")
     with pdb.connect_closing() as pconn:
         board_proj = pdb.create_project(pconn, name="BoardProj", primary_path=str(tmp_path / "a"))
         task_proj = pdb.create_project(pconn, name="TaskProj", primary_path=str(tmp_path / "b"))

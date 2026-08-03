@@ -6599,6 +6599,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
+            # Same re-persist idempotency guard as append_message (#860 /
+            # #42039). append_messages_batch is upstream's newer multi-row
+            # writer, so the fork's guard — which only lived on the single-row
+            # path — did not cover it, and a rotation flush of reloaded history
+            # re-inserted every message. Byte-identical on the natural key
+            # (session, role, timestamp, content, tool ids) is a re-persist,
+            # not a distinct message: new messages always get a fresh
+            # timestamp. Runs inside the caller's BEGIN IMMEDIATE, so
+            # check+insert stays atomic under the single writer.
+            _stored_content = self._encode_content(msg.get("content"))
+            _dup = conn.execute(
+                """SELECT id FROM messages
+                   WHERE session_id = ? AND role = ? AND timestamp = ?
+                     AND content IS ? AND tool_call_id IS ? AND tool_calls IS ?
+                   LIMIT 1""",
+                (session_id, role, message_timestamp, _stored_content,
+                 msg.get("tool_call_id"), tool_calls_json),
+            ).fetchone()
+            if _dup is not None:
+                continue
+
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,

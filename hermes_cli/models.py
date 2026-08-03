@@ -2796,8 +2796,16 @@ def _openai_discovery_base_url(provider: str) -> str:
     → the canonical default. Previously this read the env var only, so a
     config-set data-residency host (``us.api.openai.com``) was ignored and
     the catalog kept coming from ``api.openai.com``.
+
+    Reads the env override through the secret scope, not ``os.getenv``: under
+    multiplexing the caller's key comes from the active profile's scope, so
+    taking the base URL from the process env would pair a PROFILE key with the
+    DEFAULT profile's endpoint and probe the wrong host with the wrong
+    credential.
     """
-    env_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+    from agent.secret_scope import get_secret as _get_secret
+
+    env_raw = (_get_secret("OPENAI_BASE_URL", "") or "").strip().rstrip("/")
     if env_raw:
         return env_raw
     try:
