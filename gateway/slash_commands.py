@@ -1903,15 +1903,16 @@ class GatewaySlashCommandsMixin:
             multiplexing is off — single-profile gateways behave as before.
             """
             from hermes_constants import get_hermes_home
-            from hermes_cli.config import save_config
+            from hermes_cli.config import read_user_config_raw, save_config
 
             def _do_persist() -> None:
                 cfg_path = get_hermes_home() / "config.yaml"
-                if cfg_path.exists():
-                    with open(cfg_path, encoding="utf-8") as f:
-                        cfg = yaml.safe_load(f) or {}
-                else:
-                    cfg = {}
+                # Write-back round-trip: read EXACTLY what is on disk (no
+                # DEFAULT_CONFIG merge, no managed overlay, no ${ENV} expansion)
+                # so saving back cannot persist hundreds of defaults into the
+                # user's file. Raw yaml.safe_load here is a config-read-guard
+                # violation; read_user_config_raw is the sanctioned primitive.
+                cfg = read_user_config_raw(cfg_path) if cfg_path.exists() else {}
                 # Coerce scalar/None ``model:`` into a dict before mutation —
                 # otherwise the assignment below raises TypeError when
                 # config.yaml has a flat ``model: <name>`` string.
