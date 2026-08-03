@@ -6613,6 +6613,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """SELECT id FROM messages
                    WHERE session_id = ? AND role = ? AND timestamp = ?
                      AND content IS ? AND tool_call_id IS ? AND tool_calls IS ?
+                     AND active = 1
                    LIMIT 1""",
                 (session_id, role, message_timestamp, _stored_content,
                  msg.get("tool_call_id"), tool_calls_json),
