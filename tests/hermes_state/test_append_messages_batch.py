@@ -113,6 +113,19 @@ class TestAppendMessagesBatch:
     def test_returns_inserted_count(self, db):
         assert db.append_messages_batch("sess-batch", _turn_messages()) == 4
 
+    def test_archive_compact_reinserts_archived_duplicate_as_active(self, db):
+        """Compaction must not deduplicate against the rows it just archived."""
+        message = {"role": "user", "content": "retained tail", "timestamp": 123.0}
+
+        assert db.append_messages_batch("sess-batch", [message]) == 1
+        assert db.archive_and_compact("sess-batch", [message]) == 1
+
+        rows = db._conn.execute(
+            "SELECT active, compacted FROM messages WHERE session_id = ? ORDER BY id",
+            ("sess-batch",),
+        ).fetchall()
+        assert [(row["active"], row["compacted"]) for row in rows] == [(0, 1), (1, 0)]
+
     def test_empty_batch_is_noop(self, db):
         assert db.append_messages_batch("sess-batch", []) == 0
         row = db._conn.execute(

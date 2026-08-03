@@ -41,6 +41,12 @@ def _make_runner(adapter):
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    # Subscriptions here carry no notifier_profile stamp, so they are "unowned"
+    # and only the gateway holding the singleton dispatcher lock collects them
+    # (_owns_kanban_dispatcher_lock -> include_unowned). Model the default
+    # gateway after lock acquisition, as tests/gateway/test_kanban_notifier.py
+    # does; otherwise the tick collects zero subs and nothing is sent.
+    runner._kanban_dispatcher_lock_handle = object()
     return runner
 
 

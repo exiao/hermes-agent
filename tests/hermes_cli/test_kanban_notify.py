@@ -61,6 +61,10 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner._kanban_sub_fail_counts = {}
+    # Unstamped (no notifier_profile) subs are collected only by the gateway
+    # holding the singleton dispatcher lock; without this the tick sees zero
+    # subscriptions and delivers nothing.
+    runner._kanban_dispatcher_lock_handle = object()
 
     fake_adapter = MagicMock()
 
@@ -121,6 +125,10 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner._kanban_sub_fail_counts = {}
+    # Unstamped (no notifier_profile) subs are collected only by the gateway
+    # holding the singleton dispatcher lock; without this the tick sees zero
+    # subscriptions and delivers nothing.
+    runner._kanban_dispatcher_lock_handle = object()
 
     fake_adapter = MagicMock()
 
@@ -176,6 +184,10 @@ async def test_notifier_second_blocked_delivers(kanban_home):
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner._kanban_sub_fail_counts = {}
+    # Unstamped (no notifier_profile) subs are collected only by the gateway
+    # holding the singleton dispatcher lock; without this the tick sees zero
+    # subscriptions and delivers nothing.
+    runner._kanban_dispatcher_lock_handle = object()
 
     delivered_msgs: list[str] = []
 

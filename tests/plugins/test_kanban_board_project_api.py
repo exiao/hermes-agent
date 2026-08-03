@@ -9,6 +9,7 @@ on a scoped board inheriting the project.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -51,6 +52,10 @@ def client(kanban_home):
 def project(tmp_path):
     repo = tmp_path / "widget-repo"
     repo.mkdir()
+    # primary_path doubles as a worktree anchor, and kanban_db validates that
+    # the anchor resolves to a git repo root. A bare mkdir() makes task
+    # creation fail with "not inside a git repo".
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
     with pdb.connect_closing() as conn:
         pid = pdb.create_project(conn, name="Widget", primary_path=str(repo))
     return {"id": pid, "primary_path": str(repo)}

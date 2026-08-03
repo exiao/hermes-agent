@@ -1545,6 +1545,16 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
         content = str(msg.get("content") or "")
         if "MEDIA:" in content:
             media_paths.update(_iter_tool_media_paths(content))
+            # The regex alone misses quoted, spaced and ``~``-relative paths
+            # that the delivery pipeline's grammar accepts. Collect through the
+            # SAME extractor delivery uses, in its expanded/delivery form, so
+            # the dedup set contains what was actually sent — otherwise a
+            # ``MEDIA:"~/audio cache/x.ogg"`` tag is re-delivered every turn.
+            try:
+                media_files, _ = BasePlatformAdapter.extract_media(content)
+                media_paths.update(path for path, _is_voice in media_files)
+            except Exception:
+                pass
 
     for msg in agent_history:
         if msg.get("role") not in {"tool", "function"}:
