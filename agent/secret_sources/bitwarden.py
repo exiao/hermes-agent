@@ -58,6 +58,7 @@ from agent.secret_sources._cache import (
     is_valid_env_name as _is_valid_env_name,
 )
 from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_sources.base import get_source_environment
 
 logger = logging.getLogger(__name__)
 
@@ -711,17 +712,20 @@ def _run_bws_list(
     scoped_env: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
+    # bws child intentionally receives the access token.  Under a profile-local
+    # fetch it must not inherit sibling credentials from process-global env.
+    source_env = get_source_environment()
     if scoped_env is not None:
         # Named-profile isolation under gateway.multiplex_profiles. The gateway
         # process env is loaded from the DEFAULT profile, so inheriting the full
-        # ``os.environ`` would hand this named profile's ``bws`` subprocess the
-        # default profile's provider secrets (OPENAI_API_KEY, ANTHROPIC_API_KEY,
-        # …) while it resolves a DIFFERENT profile's vault — a cross-profile
-        # leak. Start from a minimal OS/runtime allowlist (what the binary needs
-        # to run + reach the network), NOT the process env, then overlay only
-        # this profile's scoped ``BWS_*`` plumbing. ``bws`` needs no third-party
-        # provider keys, so none are carried over.
-        env: Dict[str, str] = {
+        # env would hand this named profile's ``bws`` subprocess the default
+        # profile's provider secrets (OPENAI_API_KEY, ANTHROPIC_API_KEY, …)
+        # while it resolves a DIFFERENT profile's vault — a cross-profile leak.
+        # Start from a minimal OS/runtime allowlist (what the binary needs to
+        # run + reach the network) — note ``dict(scoped_env)`` alone would drop
+        # PATH and the child could not exec — then overlay only this profile's
+        # scoped ``BWS_*`` plumbing. ``bws`` needs no third-party provider keys.
+        env = {
             k: v
             for k, v in os.environ.items()
             if isinstance(v, str) and _is_bws_runtime_env(k)
@@ -730,10 +734,12 @@ def _run_bws_list(
         for key, value in scoped_env.items():
             if key.startswith("BWS_") and isinstance(value, str):
                 env[key] = value
+    elif source_env is os.environ:
+        from tools.environments.local import build_subprocess_env
+
+        env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     else:
-        # Single-profile (no multiplexing): unchanged — inherit the process env
-        # so manual BWS_* / proxy / cert overrides in the shell keep working.
-        env = os.environ.copy()
+        env = dict(source_env)
     env["BWS_ACCESS_TOKEN"] = access_token
     # Make sure we're not echoing telemetry / colour codes into json.
     env.setdefault("NO_COLOR", "1")
@@ -977,7 +983,10 @@ class BitwardenSource(SecretSource):
         result = FetchResult()
 
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
-        access_token = env.get(access_token_env, "").strip()
+        access_token = (
+            env.get(access_token_env)
+            or get_source_environment().get(access_token_env, "")
+        ).strip()
         if not access_token:
             result.error = (
                 f"secrets.bitwarden.enabled is true but {access_token_env} is "

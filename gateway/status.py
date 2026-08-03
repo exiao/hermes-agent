@@ -11,6 +11,7 @@ that will be useful when we add named profiles (multiple agents running
 concurrently under distinct configurations).
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -518,9 +519,12 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     explicit ``HERMES_HOME=<path>``) on its argv; the default/root gateway runs
     bare with no profile flag.
     """
-    command_lc = command.lower()
+    # Normalize separators before the substring match: on Windows,
+    # str(Path) renders backslashes while a HERMES_HOME= value on the argv
+    # may carry forward slashes (Git Bash, JSON configs) — and vice versa.
+    command_lc = command.lower().replace("\\", "/")
     profile_name = _profile_name_for_home(profile_home)
-    home_lc = str(profile_home).lower()
+    home_lc = str(profile_home).lower().replace("\\", "/")
 
     if profile_name is not None and profile_name != "default":
         profile_lc = profile_name.lower()
@@ -1048,6 +1052,7 @@ def _write_runtime_status_unlocked(
         # A lifecycle command may establish durable desired-state before the
         # gateway has ever run. Do not stamp that record with the CLI PID.
         payload = _build_runtime_status_record() if refresh_pid_metadata else {}
+    previous_payload = copy.deepcopy(payload)
     payload.setdefault("platforms", {})
     if refresh_pid_metadata:
         current_record = _build_pid_record()
@@ -1085,6 +1090,11 @@ def _write_runtime_status_unlocked(
         payload["platforms"][platform] = platform_payload
 
     _write_json_file(path, payload)
+    try:
+        from agent.monitoring.gateway_health import emit_runtime_status_transition
+        emit_runtime_status_transition(previous_payload, payload)
+    except Exception:
+        pass
 
 
 def write_runtime_status(

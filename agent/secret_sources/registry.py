@@ -34,7 +34,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, MutableMapping, Optional
 
 from agent.secret_sources.base import (
     SECRET_SOURCE_API_VERSION,
@@ -42,6 +42,8 @@ from agent.secret_sources.base import (
     FetchResult,
     SecretSource,
     is_valid_env_name,
+    reset_source_environment,
+    set_source_environment,
 )
 
 logger = logging.getLogger(__name__)
@@ -198,10 +200,8 @@ def _reset_registry_for_tests() -> None:
 
 
 def _fetch_with_timeout(
-    source: SecretSource,
-    cfg: dict,
-    home_path: Path,
-    environ: Optional[Dict[str, str]] = None,
+    source: SecretSource, cfg: dict, home_path: Path,
+    environ: MutableMapping[str, str],
     scoped: bool = False,
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
@@ -232,20 +232,14 @@ def _fetch_with_timeout(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
     try:
+        # Fail closed BEFORE dispatching: under a profile-scoped apply (a named
+        # profile in gateway.multiplex_profiles) a source whose fetch() cannot
+        # take ``environ`` would read bootstrap credentials from the process
+        # ``os.environ`` — another profile's env — and populate this profile
+        # from another profile's vault. Refuse rather than leak. Upstream's
+        # contextvar handoff below covers sources that DO take ``environ``.
         fetch_params = inspect.signature(source.fetch).parameters
-        if "environ" in fetch_params:
-            future = executor.submit(
-                ctx.run, source.fetch, cfg, home_path, environ=environ
-            )
-        elif scoped:
-            # Fail closed: a profile-scoped mapping is being applied (a named
-            # profile under gateway.multiplex_profiles) but this source's
-            # fetch() predates the ``environ`` contract and would read bootstrap
-            # credentials from the process ``os.environ`` — which under
-            # multiplexing is the DEFAULT profile's environment. Running it
-            # env-less here would populate the scoped profile from another
-            # profile's vault. Refuse rather than leak; the source author must
-            # accept ``environ`` to participate in scoped resolution.
+        if scoped and "environ" not in fetch_params:
             res = FetchResult()
             res.error = (
                 f"secret source '{source.name}' cannot consume a scoped "
@@ -256,8 +250,17 @@ def _fetch_with_timeout(
             )
             res.error_kind = ErrorKind.NOT_CONFIGURED
             return res
-        else:
-            future = executor.submit(ctx.run, source.fetch, cfg, home_path)
+
+        def _fetch() -> FetchResult:
+            token = set_source_environment(environ)
+            try:
+                if "environ" in fetch_params:
+                    return source.fetch(cfg, home_path, environ=environ)
+                return source.fetch(cfg, home_path)
+            finally:
+                reset_source_environment(token)
+
+        future = executor.submit(ctx.run, _fetch)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -367,7 +370,7 @@ def _profile_alias_target(var: str, profile: str) -> Optional[str]:
 
 
 def apply_all(secrets_cfg: dict, home_path: Path,
-              environ: Optional[Dict[str, str]] = None,
+              environ: Optional[MutableMapping[str, str]] = None,
               scoped: bool = False) -> ApplyReport:
     """Fetch from every enabled source and apply the merged result to env.
 
@@ -439,7 +442,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path, environ, scoped=scoped)
+        result = _fetch_with_timeout(source, cfg, home_path, env, scoped=scoped)
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):

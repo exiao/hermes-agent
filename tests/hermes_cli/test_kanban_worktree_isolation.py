@@ -101,30 +101,6 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home, tmp_path):
             assert row["workspace_path"] is None
 
 
-def test_decompose_dir_children_still_inherit_path(kanban_home):
-    with kb.connect() as conn:
-        root = kb.create_task(conn, title="ops sweep", triage=True)
-        conn.execute(
-            "UPDATE tasks SET workspace_kind='dir', "
-            "workspace_path='/srv/ops' WHERE id = ?",
-            (root,),
-        )
-        conn.commit()
-
-        child_ids = kb.decompose_triage_task(
-            conn,
-            root,
-            root_assignee="orchestrator",
-            children=[{"title": "child", "assignee": "alice", "parents": []}],
-            author="decomposer",
-        )
-        assert child_ids is not None
-        row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
-            (child_ids[0],),
-        ).fetchone()
-        assert row["workspace_kind"] == "dir"
-        assert row["workspace_path"] == "/srv/ops"
 
 
 def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):

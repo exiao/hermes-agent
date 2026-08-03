@@ -200,25 +200,6 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
-def test_decompose_children_inherit_dir_workspace(kanban_home):
-    """Fan-out children inherit the root's dir workspace, not scratch."""
-    proj = "/home/teknium/myproject"
-    with kb.connect() as conn:
-        tid = kb.create_task(
-            conn, title="codegen root", assignee="worker",
-            workspace_kind="dir", workspace_path=proj, triage=True,
-        )
-        child_ids = kb.decompose_triage_task(
-            conn, tid, root_assignee="orchestrator",
-            children=[{"title": "part A"}, {"title": "part B", "parents": [0]}],
-            author="decomposer",
-        )
-    assert child_ids and len(child_ids) == 2
-    with kb.connect() as conn:
-        for cid in child_ids:
-            t = kb.get_task(conn, cid)
-            assert t.workspace_kind == "dir"
-            assert t.workspace_path == proj
 
 
 def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):

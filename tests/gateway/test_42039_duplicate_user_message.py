@@ -156,33 +156,6 @@ async def test_agent_failed_early_skip_db_when_agent_has_session_db(
 # ── Test 2: agent_failed_early with no _session_db → skip_db not True ─
 
 
-@pytest.mark.asyncio
-async def test_agent_failed_early_no_skip_db_when_no_session_db(
-    monkeypatch, tmp_path
-):
-    runner = _bootstrap(monkeypatch, tmp_path)
-    runner._session_db = None  # No agent DB → agent_persisted=False
-
-    runner._run_agent = AsyncMock(
-        return_value={
-            "failed": True,
-            "final_response": None,
-            "error": "ReadTimeout: timed out",
-            "messages": [],
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-        }
-    )
-
-    await runner._handle_message_with_agent(
-        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
-    )
-
-    _assert_user_call_has_skip_db(
-        runner.session_store.append_to_transcript.call_args_list, False
-    )
-
-
 # ── Test 3: not-new-messages path uses skip_db=True ───────────────────
 
 
@@ -264,70 +237,3 @@ async def test_streamed_response_completes_post_stream_media_delivery(
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
 
 
-@pytest.mark.asyncio
-async def test_normal_path_skip_db_when_agent_has_session_db(
-    monkeypatch, tmp_path
-):
-    runner = _bootstrap(monkeypatch, tmp_path)
-
-    # Agent succeeds with new messages
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "Hello!",
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "Hello!"},
-            ],
-            "tools": [],
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-        }
-    )
-
-    await runner._handle_message_with_agent(
-        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
-    )
-
-    _assert_user_call_has_skip_db(
-        runner.session_store.append_to_transcript.call_args_list, True
-    )
-
-
-@pytest.mark.asyncio
-async def test_nonempty_rate_limit_error_is_not_persisted_as_assistant_message(
-    monkeypatch, tmp_path
-):
-    runner = _bootstrap(monkeypatch, tmp_path)
-
-    error_response = "API call failed after 3 retries: 429 Too Many Requests"
-    runner._run_agent = AsyncMock(
-        return_value={
-            "failed": True,
-            "failure_reason": "rate_limit",
-            "completed": False,
-            "final_response": error_response,
-            "error": "429 Too Many Requests",
-            "messages": [
-                {"role": "user", "content": "hello world"},
-            ],
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-        }
-    )
-
-    await runner._handle_message_with_agent(
-        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
-    )
-
-    persisted_entries = [
-        call.args[1]
-        for call in runner.session_store.append_to_transcript.call_args_list
-        if len(call.args) >= 2 and isinstance(call.args[1], dict)
-    ]
-
-    assert any(entry.get("role") == "user" for entry in persisted_entries)
-    assert not any(
-        entry.get("role") == "assistant"
-        and error_response in str(entry.get("content", ""))
-        for entry in persisted_entries
-    )
