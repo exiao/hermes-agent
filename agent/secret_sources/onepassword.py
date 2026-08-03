@@ -42,7 +42,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -56,6 +55,7 @@ from agent.secret_sources._cache import (
     is_valid_env_name,
 )
 from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_sources.base import get_source_environment
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +73,10 @@ _OP_RUN_TIMEOUT = 30
 # looks for.
 _DEFAULT_TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
 
-# Strip whole ANSI CSI sequences (colour, cursor moves, line erases) from any
-# `op` diagnostic we surface — not just the lone ESC byte — so a control
-# sequence can't reposition the cursor or hide text after a redaction marker.
-_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+# ANSI stripping for `op` diagnostics we surface uses the shared
+# tools.ansi_strip.strip_ansi (full ECMA-48: CSI, OSC, DCS/SOS/PM/APC,
+# C1) so a control sequence can't reposition the cursor or hide text
+# after a redaction marker.
 
 # Env vars the `op` child actually needs.  We build a minimal allowlisted env
 # rather than copying all of os.environ (which, post-dotenv, holds every
@@ -189,20 +189,22 @@ def _auth_fingerprint(
     previous identity is never served under a new one.  Never logged or
     displayed; the raw token never leaves this hash.
     """
+    source_env = get_source_environment()
     resolved_token = (
-        os.environ.get(token_env, "") if token_value is None else token_value
+        source_env.get(token_env, "") if token_value is None else token_value
     )
     parts: List[str] = [
         f"token={resolved_token}",
         f"auth_mode={'process' if include_process_auth else 'isolated'}",
     ]
     if include_process_auth:
-        parts.append(f"account={os.environ.get('OP_ACCOUNT', '')}")
-        # 1Password Connect auth material (upstream): folded in only under
-        # process auth — an isolated/named-profile fetch must not key off the
-        # default profile's process env.
-        parts.append(f"connect_host={os.environ.get('OP_CONNECT_HOST', '')}")
-        parts.append(f"connect_token={os.environ.get('OP_CONNECT_TOKEN', '')}")
+        parts.append(f"account={source_env.get('OP_ACCOUNT', '')}")
+        parts.append(f"connect_host={source_env.get('OP_CONNECT_HOST', '')}")
+        parts.append(f"connect_token={source_env.get('OP_CONNECT_TOKEN', '')}")
+        # The auth PATH vars select WHICH on-disk 1Password config/session `op`
+        # reads. Two process owners differing only by HOME must not collide on
+        # one cache key, or a value cached under one identity is served under
+        # the other.
         for key in (
             "HOME",
             "USERPROFILE",
@@ -211,10 +213,10 @@ def _auth_fingerprint(
             "XDG_CONFIG_HOME",
             "XDG_RUNTIME_DIR",
         ):
-            parts.append(f"{key}={os.environ.get(key, '')}")
-        for key in sorted(os.environ):
+            parts.append(f"{key}={source_env.get(key, '')}")
+        for key in sorted(source_env):
             if key.startswith("OP_SESSION_"):
-                parts.append(f"{key}={os.environ[key]}")
+                parts.append(f"{key}={source_env[key]}")
     if auth_env:
         for key in sorted(auth_env):
             parts.append(f"profile:{key}={auth_env[key]}")
@@ -257,7 +259,10 @@ def find_op(binary_path: str = "") -> Optional[Path]:
 
 def _scrub(text: str) -> str:
     """Remove ANSI control sequences and trim, for safe message surfacing."""
-    return _ANSI_CSI_RE.sub("", text).replace("\x1b", "").strip()
+    from tools.ansi_strip import strip_ansi
+
+    # strip_ansi removes well-formed sequences; drop any stray lone ESC too.
+    return strip_ansi(text).replace("\x1b", "").strip()
 
 
 def _op_child_env(
@@ -268,6 +273,7 @@ def _op_child_env(
     isolated_home: Optional[Path] = None,
 ) -> Dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
+    source_env = get_source_environment()
     env: Dict[str, str] = {}
     auth_path_vars = {
         "HOME",
@@ -278,17 +284,20 @@ def _op_child_env(
         "XDG_RUNTIME_DIR",
     }
     for key in _OP_ENV_ALLOWLIST:
+        # A named multiplexed profile (include_process_auth=False) must not
+        # inherit the process owner's 1Password identity: neither OP_* vars nor
+        # the auth PATH vars that point `op` at a desktop/session config dir.
         if not include_process_auth and (
             key.startswith("OP_") or key in auth_path_vars
         ):
             continue
-        val = os.environ.get(key)
+        val = source_env.get(key)
         if val is not None:
             env[key] = val
     # Desktop / interactive session credentials belong to the process profile.
     # A named multiplexed profile must not inherit them.
     if include_process_auth:
-        for key, val in os.environ.items():
+        for key, val in source_env.items():
             if key.startswith("OP_SESSION_"):
                 env[key] = val
     if isolated_home is not None:
@@ -407,7 +416,9 @@ def fetch_onepassword_secrets(
         return {}, warnings
 
     resolved_token_value = (
-        os.environ.get(token_env, "") if token_value is None else token_value
+        get_source_environment().get(token_env, "")
+        if token_value is None
+        else token_value
     ).strip()
     cache_key: _CacheKey = (
         _auth_fingerprint(

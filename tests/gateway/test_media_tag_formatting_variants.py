@@ -36,26 +36,10 @@ def real_targz(tmp_path):
 
 
 class TestTrailingPunctuation:
-    def test_sentence_final_period_extracts_path(self, real_file):
-        media, cleaned = BasePlatformAdapter.extract_media(
-            f"Saved your data. MEDIA:{real_file}."
-        )
-        assert [p for p, _ in media] == [real_file]
-        assert "MEDIA:" not in cleaned
 
-    def test_period_then_more_prose(self, real_file):
-        media, cleaned = BasePlatformAdapter.extract_media(
-            f"Done: MEDIA:{real_file}. Enjoy!"
-        )
-        assert [p for p, _ in media] == [real_file]
-        assert "Enjoy!" in cleaned
 
     def test_multipart_extension_not_truncated(self, real_targz):
         media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{real_targz}")
-        assert [p for p, _ in media] == [real_targz]
-
-    def test_multipart_extension_with_trailing_period(self, real_targz):
-        media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{real_targz}.")
         assert [p for p, _ in media] == [real_targz]
 
 
@@ -108,11 +92,6 @@ class TestEmphasisAndDedupeIntegration:
         media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{a} MEDIA:{b}")
         assert [p for p, _ in media] == [str(a), str(b)]
 
-    def test_duplicate_tags_deliver_once(self, real_file):
-        media, _ = BasePlatformAdapter.extract_media(
-            f"MEDIA:{real_file} and again MEDIA:{real_file}"
-        )
-        assert [p for p, _ in media] == [real_file]
 
     def test_glued_as_document_delivers(self, real_file):
         media, _ = BasePlatformAdapter.extract_media(

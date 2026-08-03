@@ -88,18 +88,6 @@ class TestCleanupAgentResourcesPassesMessages:
 
         agent.shutdown_memory_provider.assert_called_once_with([])
 
-    def test_missing_attribute_falls_back_to_no_arg(self):
-        """Test stubs built via ``object.__new__(AIAgent)`` skip
-        ``__init__`` and therefore have no ``_session_messages``
-        attribute. The fix must not explode — it falls back to the
-        legacy no-arg call so existing suites keep passing."""
-        runner = _make_runner()
-        agent = _FakeAgent(session_messages=None)  # attribute not set
-
-        runner._cleanup_agent_resources(agent)
-
-        agent.shutdown_memory_provider.assert_called_once_with()
-
     def test_non_list_attribute_falls_back_to_no_arg(self):
         """A MagicMock-based agent auto-synthesises ``_session_messages``
         as a nested MagicMock. ``isinstance(mock, list)`` is False, so

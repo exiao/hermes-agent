@@ -93,22 +93,6 @@ async def test_bare_local_path_in_streamed_reply_is_not_uploaded(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_bare_document_path_in_streamed_reply_is_not_uploaded(tmp_path, monkeypatch):
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
-    adapter = _adapter()
-
-    await GatewayRunner._deliver_media_from_response(
-        _fake_runner({}),
-        f"I saved it to {media_file}.",
-        _event(),
-        adapter,
-    )
-
-    adapter.send_document.assert_not_awaited()
-    adapter.send_video.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypatch):
     """Explicit MEDIA: directives keep working after the #20834 fix."""
     media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")

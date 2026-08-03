@@ -382,7 +382,7 @@ class GatewaySlashCommandsMixin:
         reports the active profile and default home, byte-identical to before.
         """
         from hermes_constants import display_hermes_home
-        from hermes_cli.profiles import get_active_profile_name
+        from hermes_cli.slash_exec import CommandContext, execute_command
 
         multiplexed = getattr(
             getattr(self, "config", None), "multiplex_profiles", False
@@ -390,11 +390,9 @@ class GatewaySlashCommandsMixin:
         source = getattr(event, "source", None)
 
         profile_name = ""
+        display = ""
         if multiplexed:
             profile_name = (getattr(source, "profile", "") or "").strip()
-        profile_name = profile_name or get_active_profile_name()
-
-        if multiplexed:
             try:
                 from gateway.run import _profile_runtime_scope
 
@@ -403,12 +401,20 @@ class GatewaySlashCommandsMixin:
                     display = display_hermes_home()
             except Exception:
                 display = display_hermes_home()
-        else:
-            display = display_hermes_home()
+
+        # Shared executor resolves process-level fallbacks; the multiplexed
+        # per-source overrides (when any) ride in via options.
+        reply = execute_command(
+            "profile",
+            CommandContext(
+                surface="gateway",
+                options={"profile_name": profile_name, "home_display": display},
+            ),
+        )
 
         lines = [
-            t("gateway.profile.header", profile=profile_name),
-            t("gateway.profile.home", home=display),
+            t("gateway.profile.header", profile=reply.data["profile"]),
+            t("gateway.profile.home", home=reply.data["home"]),
         ]
 
         return "\n".join(lines)
@@ -1651,10 +1657,13 @@ class GatewaySlashCommandsMixin:
         # Native supervisor markers cover direct systemd/launchd starts. The
         # explicit marker covers wrappers such as ``sudo env -i`` that strip
         # those markers before execing the foreground gateway.
-        from gateway.restart import is_gateway_supervisor_process
+        from gateway.restart import (
+            is_container_restart_context,
+            is_gateway_supervisor_process,
+        )
 
         _under_service = is_gateway_supervisor_process()
-        _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+        _in_container = is_container_restart_context()
         if _under_service or _in_container:
             self.request_restart(detached=False, via_service=True)
         else:
@@ -1665,89 +1674,38 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_version_command(self, event: MessageEvent) -> str:
         """Handle /version — show the running Hermes Agent version."""
-        from hermes_cli.banner import format_banner_version_label
+        from hermes_cli.slash_exec import CommandContext, execute_command
 
-        return format_banner_version_label()
+        return execute_command("version", CommandContext(surface="gateway")).text
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         from gateway.run import _telegramize_command_mentions
-        from hermes_cli.commands import gateway_help_lines
-        lines = [
-            t("gateway.help.header"),
-            *gateway_help_lines(),
-        ]
-        try:
-            from agent.skill_commands import get_skill_commands
-            skill_cmds = get_skill_commands()
-            if skill_cmds:
-                lines.append(t("gateway.help.skill_header", count=len(skill_cmds)))
-                # Show first 10, then point to /commands for the rest
-                sorted_cmds = sorted(skill_cmds)
-                for cmd in sorted_cmds[:10]:
-                    lines.append(f"`{cmd}` — {skill_cmds[cmd]['description']}")
-                if len(sorted_cmds) > 10:
-                    lines.append(t("gateway.help.more_use_commands", count=len(sorted_cmds) - 10))
-        except Exception:
-            pass
+        from hermes_cli.slash_exec import CommandContext, execute_command
+
+        reply = execute_command("help", CommandContext(surface="gateway"))
         return _telegramize_command_mentions(
-            "\n".join(lines),
+            reply.text,
             getattr(getattr(event, "source", None), "platform", None),
         )
 
     async def _handle_commands_command(self, event: MessageEvent) -> str:
         from gateway.run import _telegramize_command_mentions
-        from hermes_cli.commands import gateway_help_lines
-
-        raw_args = event.get_command_args().strip()
-        if raw_args:
-            try:
-                requested_page = int(raw_args)
-            except ValueError:
-                return t("gateway.commands.usage")
-        else:
-            requested_page = 1
-
-        # Build combined entry list: built-in commands + skill commands
-        entries = list(gateway_help_lines())
-        try:
-            from agent.skill_commands import get_skill_commands
-            skill_cmds = get_skill_commands()
-            if skill_cmds:
-                entries.append("")
-                entries.append(t("gateway.commands.skill_header"))
-                for cmd in sorted(skill_cmds):
-                    desc = skill_cmds[cmd].get("description", "").strip() or t("gateway.commands.default_desc")
-                    entries.append(f"`{cmd}` — {desc}")
-        except Exception:
-            pass
-
-        if not entries:
-            return t("gateway.commands.none")
-
+        from hermes_cli.slash_exec import CommandContext, execute_command
         from gateway.config import Platform
-        page_size = 15 if event.source.platform == Platform.TELEGRAM else 20
-        total_pages = max(1, (len(entries) + page_size - 1) // page_size)
-        page = max(1, min(requested_page, total_pages))
-        start = (page - 1) * page_size
-        page_entries = entries[start:start + page_size]
 
-        lines = [
-            t("gateway.commands.header", total=len(entries), page=page, total_pages=total_pages),
-            "",
-            *page_entries,
-        ]
-        if total_pages > 1:
-            nav_parts = []
-            if page > 1:
-                nav_parts.append(t("gateway.commands.nav_prev", page=page - 1))
-            if page < total_pages:
-                nav_parts.append(t("gateway.commands.nav_next", page=page + 1))
-            lines.extend(["", " | ".join(nav_parts)])
-        if page != requested_page:
-            lines.append(t("gateway.commands.out_of_range", requested=requested_page, page=page))
+        # Page size is a surface parameter (Telegram messages are shorter).
+        page_size = 15 if event.source.platform == Platform.TELEGRAM else 20
+        reply = execute_command(
+            "commands",
+            CommandContext(
+                surface="gateway",
+                args=event.get_command_args(),
+                options={"page_size": page_size},
+            ),
+        )
         return _telegramize_command_mentions(
-            "\n".join(lines),
+            reply.text,
             getattr(getattr(event, "source", None), "platform", None),
         )
 
@@ -1764,9 +1722,8 @@ class GatewaySlashCommandsMixin:
           /model --provider <provider>        — switch to provider, auto-detect model
         """
         from gateway.run import _hermes_home, _load_gateway_config
-        import yaml
         from hermes_cli.model_switch import (
-            switch_model as _switch_model, parse_model_flags_detailed,
+            switch_model as _switch_model, parse_model_switch_args,
             resolve_persist_behavior,
             list_authenticated_providers,
             list_picker_providers,
@@ -1784,17 +1741,17 @@ class GatewaySlashCommandsMixin:
         source = event.source
 
         # Parse --provider, --global, --session, --once, and --refresh flags
-        parsed_flags = parse_model_flags_detailed(raw_args)
-        model_input = parsed_flags.model_input
-        explicit_provider = parsed_flags.explicit_provider
-        is_global_flag = parsed_flags.is_global
-        force_refresh = parsed_flags.force_refresh
-        is_session = parsed_flags.is_session
-        one_turn = parsed_flags.is_once
-        if is_global_flag and one_turn:
-            return "❌ /model --once cannot be combined with --global"
-        if one_turn and not model_input and not explicit_provider:
-            return "❌ /model --once requires a model or provider."
+        # via the shared single-owner parser (hermes_cli.model_switch).
+        request = parse_model_switch_args(raw_args)
+        model_input = request.target
+        explicit_provider = request.explicit_provider
+        is_global_flag = request.is_global
+        force_refresh = request.force_refresh
+        is_session = request.is_session
+        one_turn = request.is_once
+        if request.errors:
+            # Gateway decoration: "❌ " prefix over the canonical error copy.
+            return f"❌ {request.error_messages()[0]}"
         persist_global = resolve_persist_behavior(
             is_global_flag,
             is_session,
@@ -2099,7 +2056,11 @@ class GatewaySlashCommandsMixin:
                                 enrich_model_switch_warnings_for_gateway,
                             )
 
-                            enrich_model_switch_warnings_for_gateway(
+                            # Offload: merge_preflight_compression_warning()
+                            # calls the sync resolve_display_context_length()
+                            # provider probe ladder — must not run on the loop.
+                            await asyncio.to_thread(
+                                enrich_model_switch_warnings_for_gateway,
                                 result,
                                 _self,
                                 session_key=_session_key,
@@ -2211,7 +2172,60 @@ class GatewaySlashCommandsMixin:
                         # secondary profile's switch doesn't rewrite the default
                         # profile's config.yaml (see _persist_switched_model).
                         if persist_global:
-                            _persist_switched_model(result)
+                            try:
+                                # Write-back round-trip: raw read is correct
+                                # (merged defaults must not be persisted).
+                                from hermes_cli.config import read_user_config_raw
+                                _persist_cfg = read_user_config_raw(config_path)
+                                _raw_model = _persist_cfg.get("model")
+                                if isinstance(_raw_model, dict):
+                                    _persist_model_cfg = _raw_model
+                                elif isinstance(_raw_model, str) and _raw_model.strip():
+                                    _persist_model_cfg = {"default": _raw_model.strip()}
+                                    _persist_cfg["model"] = _persist_model_cfg
+                                else:
+                                    _persist_model_cfg = {}
+                                    _persist_cfg["model"] = _persist_model_cfg
+                                try:
+                                    from hermes_cli.route_identity import should_clear_context_pin_async
+
+                                    if await should_clear_context_pin_async(
+                                        _persist_model_cfg.get("default")
+                                        or _persist_model_cfg.get("model"),
+                                        result.new_model,
+                                        _persist_model_cfg.get("base_url"),
+                                        result.base_url,
+                                        _persist_model_cfg.get("provider"),
+                                        result.target_provider,
+                                    ):
+                                        _persist_model_cfg.pop("context_length", None)
+                                except Exception:
+                                    _persist_model_cfg.pop("context_length", None)
+                                _persist_model_cfg["default"] = result.new_model
+                                _persist_model_cfg["provider"] = result.target_provider
+                                # Named providers always resolve base_url/api_mode fresh,
+                                # so any leftover is cleared unconditionally below. Custom
+                                # providers have no registry entry to re-derive from, so
+                                # they need an explicit set-or-clear here — the previous
+                                # lone `if result.base_url:` left a stale base_url behind
+                                # when switching to a custom provider whose resolver
+                                # returned an empty base_url (#25107).
+                                _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
+                                if result.base_url:
+                                    _persist_model_cfg["base_url"] = result.base_url
+                                elif _is_custom_target:
+                                    _persist_model_cfg.pop("base_url", None)
+                                if _is_custom_target:
+                                    if result.api_mode:
+                                        _persist_model_cfg["api_mode"] = result.api_mode
+                                    else:
+                                        _persist_model_cfg.pop("api_mode", None)
+                                else:
+                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
+                                from hermes_cli.config import save_config
+                                save_config(_persist_cfg)
+                            except Exception as e:
+                                logger.warning("Failed to persist model switch: %s", e)
 
                         # Build confirmation text.  Use display form so opaque
                         # Palantir IDs (ri.language-model-service..*) get
@@ -2220,7 +2234,7 @@ class GatewaySlashCommandsMixin:
                         lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
                         lines.append(t("gateway.model.provider_label", provider=plabel))
                         mi = result.model_info
-                        from hermes_cli.model_switch import resolve_display_context_length
+                        from hermes_cli.model_switch import resolve_display_context_length_async
                         _sw_config_ctx = None
                         _sw_model_cfg = {}
                         try:
@@ -2234,7 +2248,7 @@ class GatewaySlashCommandsMixin:
                             pass
                         if not isinstance(_sw_model_cfg, dict):
                             _sw_model_cfg = {}
-                        ctx = resolve_display_context_length(
+                        ctx = await resolve_display_context_length_async(
                             result.new_model,
                             result.target_provider,
                             base_url=result.base_url or current_base_url or "",
@@ -2355,7 +2369,11 @@ class GatewaySlashCommandsMixin:
                 enrich_model_switch_warnings_for_gateway,
             )
 
-            enrich_model_switch_warnings_for_gateway(
+            # Offload: merge_preflight_compression_warning() calls the sync
+            # resolve_display_context_length() provider probe ladder — must
+            # not run on the loop.
+            await asyncio.to_thread(
+                enrich_model_switch_warnings_for_gateway,
                 result,
                 self,
                 session_key=session_key,
@@ -2483,7 +2501,60 @@ class GatewaySlashCommandsMixin:
             # switch doesn't rewrite the default profile's config.yaml (see
             # _persist_switched_model).
             if persist_global:
-                _persist_switched_model(result)
+                try:
+                    # Write-back round-trip: raw read is correct (merged
+                    # defaults must not be persisted back to the user's file).
+                    from hermes_cli.config import read_user_config_raw
+                    cfg = read_user_config_raw(config_path)
+                    # Coerce scalar/None ``model:`` into a dict before mutation —
+                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
+                    # scalar and the next assignment raises
+                    # ``TypeError: 'str' object does not support item assignment``.
+                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
+                    # string) instead of the proper nested ``model: {default: ...}``.
+                    raw_model = cfg.get("model")
+                    if isinstance(raw_model, dict):
+                        model_cfg = raw_model
+                    elif isinstance(raw_model, str) and raw_model.strip():
+                        model_cfg = {"default": raw_model.strip()}
+                        cfg["model"] = model_cfg
+                    else:
+                        model_cfg = {}
+                        cfg["model"] = model_cfg
+                    try:
+                        from hermes_cli.route_identity import should_clear_context_pin_async
+
+                        if await should_clear_context_pin_async(
+                            model_cfg.get("default") or model_cfg.get("model"),
+                            result.new_model,
+                            model_cfg.get("base_url"),
+                            result.base_url,
+                            model_cfg.get("provider"),
+                            result.target_provider,
+                        ):
+                            model_cfg.pop("context_length", None)
+                    except Exception:
+                        model_cfg.pop("context_length", None)
+                    model_cfg["default"] = result.new_model
+                    model_cfg["provider"] = result.target_provider
+                    # See the picker handler above for why custom providers need an
+                    # explicit set-or-clear instead of the old lone truthy check (#25107).
+                    _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
+                    if result.base_url:
+                        model_cfg["base_url"] = result.base_url
+                    elif _is_custom_target:
+                        model_cfg.pop("base_url", None)
+                    if _is_custom_target:
+                        if result.api_mode:
+                            model_cfg["api_mode"] = result.api_mode
+                        else:
+                            model_cfg.pop("api_mode", None)
+                    else:
+                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
+                    from hermes_cli.config import save_config
+                    save_config(cfg)
+                except Exception as e:
+                    logger.warning("Failed to persist model switch: %s", e)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
@@ -2493,7 +2564,7 @@ class GatewaySlashCommandsMixin:
             # Context: always resolve via the provider-aware chain so Codex OAuth,
             # Copilot, and Nous-enforced caps win over the raw models.dev entry.
             mi = result.model_info
-            from hermes_cli.model_switch import resolve_display_context_length
+            from hermes_cli.model_switch import resolve_display_context_length_async
             _sw2_config_ctx = None
             _sw2_model_cfg = {}
             try:
@@ -2507,7 +2578,7 @@ class GatewaySlashCommandsMixin:
                 pass
             if not isinstance(_sw2_model_cfg, dict):
                 _sw2_model_cfg = {}
-            ctx = resolve_display_context_length(
+            ctx = await resolve_display_context_length_async(
                 result.new_model,
                 result.target_provider,
                 base_url=result.base_url or current_base_url or "",
@@ -3342,14 +3413,13 @@ class GatewaySlashCommandsMixin:
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
         and their interactive pickers)."""
-        import yaml
         from gateway.run import _hermes_home
+        from hermes_cli.config import read_user_config_raw
         config_path = _hermes_home / "config.yaml"
         try:
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
+            # Write-back round-trip: raw read is correct (merged defaults must
+            # not be persisted back to the user's file).
+            user_config = read_user_config_raw(config_path)
             keys = key_path.split(".")
             current = user_config
             for k in keys[:-1]:
@@ -3598,11 +3668,10 @@ class GatewaySlashCommandsMixin:
         config_path = _hermes_home / "config.yaml"
 
         def _set_approval(enabled: bool):
-            import yaml
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
+            # Write-back round-trip: raw read is correct (merged defaults must
+            # not be persisted back to the user's file).
+            from hermes_cli.config import read_user_config_raw
+            user_config = read_user_config_raw(config_path)
             user_config.setdefault("memory", {})["write_approval"] = bool(enabled)
             atomic_config_write(config_path, user_config)
             # New setting must take effect next message → drop cached agent.
@@ -3654,11 +3723,10 @@ class GatewaySlashCommandsMixin:
                     "writes here with /skills pending.")
 
         def _set_approval(enabled: bool):
-            import yaml
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
+            # Write-back round-trip: raw read is correct (merged defaults must
+            # not be persisted back to the user's file).
+            from hermes_cli.config import read_user_config_raw
+            user_config = read_user_config_raw(config_path)
             user_config.setdefault("skills", {})["write_approval"] = bool(enabled)
             atomic_config_write(config_path, user_config)
             # New setting must take effect next message → drop cached agent.
@@ -3968,6 +4036,28 @@ class GatewaySlashCommandsMixin:
         return t("gateway.footer.saved", state=state, example=example)
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
+        """Profile-scoping wrapper around manual /compress.
+
+        Multiplexed gateways resolve credentials through the fail-closed
+        per-profile secret scope (``agent.secret_scope``, Workstream A). The
+        agent turn installs it via ``_run_agent``'s wrapper, but slash-command
+        dispatch does not — so manual /compress reached the compressor's
+        provider resolution unscoped and died with ``UnscopedSecretError``
+        (``get_secret('OPENROUTER_BASE_URL') called with no profile secret
+        scope active``). Install the source profile's scope around the whole
+        handler, mirroring ``_run_agent``. Single-profile gateways skip this
+        — zero behavior change.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._handle_compress_command_inner(event)
+
+        from gateway.run import _profile_runtime_scope
+
+        profile_home = self._resolve_profile_home_for_source(event.source)
+        with _profile_runtime_scope(profile_home):
+            return await self._handle_compress_command_inner(event)
+
+    async def _handle_compress_command_inner(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context.
 
         Accepts an optional focus topic: ``/compress <focus>`` guides the
@@ -4163,9 +4253,13 @@ class GatewaySlashCommandsMixin:
                 if not compressor.has_content_to_compress(head):
                     return t("gateway.compress.nothing_to_do")
 
-                loop = asyncio.get_running_loop()
-                compressed, _ = await loop.run_in_executor(
-                    None,
+                # _run_in_executor_with_context (not a bare run_in_executor):
+                # the profile secret scope installed by the wrapper is a
+                # contextvar, and the default-executor hop would drop it —
+                # the compressor's aux-client provider resolution would then
+                # read credentials unscoped and fail closed under
+                # multiplexing.
+                compressed, _ = await self._run_in_executor_with_context(
                     lambda: tmp_agent._compress_context(
                         head,
                         "",
@@ -4520,7 +4614,9 @@ class GatewaySlashCommandsMixin:
             from hermes_state import format_session_db_unavailable
             return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
 
-        source = event.source
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
         session_key = self._session_key_for_source(source)
         raw_args = event.get_command_args().strip()
         try:
@@ -4543,7 +4639,12 @@ class GatewaySlashCommandsMixin:
 
         async def _list_titled_sessions() -> list[dict]:
             user_source = source.platform.value if source.platform else None
-            sessions = await self._session_db.list_sessions_rich(source=user_source, limit=10)
+            widen = allow_all and self._resume_caller_is_admin(source)
+            sessions = await self._session_db.list_sessions_rich(
+                source=user_source,
+                session_key=None if widen else session_key,
+                limit=10,
+            )
             return [s for s in sessions if s.get("title")][:10]
 
         if not name:
@@ -4687,7 +4788,6 @@ class GatewaySlashCommandsMixin:
             query_session_listing,
         )
 
-        source = event.source
         raw_args = event.get_command_args().strip()
         try:
             include_all, include_unnamed, target, search_query = (
@@ -4703,6 +4803,11 @@ class GatewaySlashCommandsMixin:
             resume_event = dataclasses.replace(event, text=f"/resume {target}")
             return await self._handle_resume_command(resume_event)
 
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(source)
+
         # A cross-origin listing (`/sessions all`) is honored only for an
         # admin, mirroring the `/resume --all` override. `all` is just a parsed
         # user argument, so without this gate any caller could run
@@ -4714,6 +4819,7 @@ class GatewaySlashCommandsMixin:
             query_session_listing,
             getattr(self._session_db, "_db", self._session_db),
             source=source.platform.value if source.platform else None,
+            session_key=None if cross_origin else session_key,
             current_session_id=current_entry.session_id,
             include_all_sources=cross_origin,
             include_unnamed=include_unnamed,
@@ -4799,30 +4905,39 @@ class GatewaySlashCommandsMixin:
             logger.error("Failed to create branch session: %s", e)
             return t("gateway.branch.create_failed", error=e)
 
-        # Copy conversation history to the new session
-        for msg in history:
-            try:
-                await self._session_db.append_message(
-                    session_id=new_session_id,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    tool_name=msg.get("tool_name") or msg.get("name"),
-                    tool_calls=msg.get("tool_calls"),
-                    tool_call_id=msg.get("tool_call_id"),
-                    finish_reason=msg.get("finish_reason"),
-                    reasoning=msg.get("reasoning"),
-                    reasoning_content=msg.get("reasoning_content"),
-                    reasoning_details=msg.get("reasoning_details"),
-                    codex_reasoning_items=msg.get("codex_reasoning_items"),
-                    codex_message_items=msg.get("codex_message_items"),
-                    # Keep the api_content sidecar so the branch's first turn
-                    # replays the parent's exact wire bytes (warm provider
-                    # prompt cache) instead of a full cold prefill.
-                    api_content=extract_api_content_sidecar(msg),
-                    timestamp=msg.get("timestamp"),
-                )
-            except Exception:
-                pass  # Best-effort copy
+        # Copy conversation history to the new session in bounded-chunk
+        # transactions (see #23254): one txn per row was the removed
+        # write-amplification pattern, and a history can be hundreds of rows.
+        # Best-effort like the old loop — a failed copy still yields a
+        # usable (partial) branch.
+        try:
+            await self._session_db.append_messages_batch(
+                new_session_id,
+                [
+                    {
+                        "role": msg.get("role", "user"),
+                        "content": msg.get("content"),
+                        "tool_name": msg.get("tool_name") or msg.get("name"),
+                        "tool_calls": msg.get("tool_calls"),
+                        "tool_call_id": msg.get("tool_call_id"),
+                        "finish_reason": msg.get("finish_reason"),
+                        "reasoning": msg.get("reasoning"),
+                        "reasoning_content": msg.get("reasoning_content"),
+                        "reasoning_details": msg.get("reasoning_details"),
+                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                        "codex_message_items": msg.get("codex_message_items"),
+                        # Keep the api_content sidecar so the branch's first turn
+                        # replays the parent's exact wire bytes (warm provider
+                        # prompt cache) instead of a full cold prefill.
+                        "api_content": extract_api_content_sidecar(msg),
+                        "timestamp": msg.get("timestamp"),
+                    }
+                    for msg in history
+                ],
+                chunk_rows=500,
+            )
+        except Exception:
+            pass  # Best-effort copy
 
         # Set title
         try:
@@ -5354,19 +5469,20 @@ class GatewaySlashCommandsMixin:
         message suitable for any gateway adapter; bundles are loaded by
         invoking the bundle's own ``/<slug>`` command, not by this one.
         """
-        try:
-            from agent.skill_bundles import list_bundles, _bundles_dir
-        except Exception as exc:
-            logger.warning("Bundles command unavailable: %s", exc)
-            return f"Bundles subsystem unavailable: {exc}"
+        from hermes_cli.slash_exec import CommandContext, execute_command
 
-        bundles = list_bundles()
+        reply = execute_command("bundles", CommandContext(surface="gateway"))
+        if "error" in reply.data:
+            logger.warning("Bundles command unavailable: %s", reply.data["error"])
+            return reply.text
+
+        bundles = reply.data["bundles"]
         if not bundles:
             return (
                 "No skill bundles installed.\n"
                 "Create one on the host with:\n"
                 "  `hermes bundles create <name> --skill <s1> --skill <s2>`\n"
-                f"Directory: `{_bundles_dir()}`"
+                f"Directory: `{reply.data['dir']}`"
             )
 
         lines = [f"**Skill Bundles** ({len(bundles)} installed):", ""]
