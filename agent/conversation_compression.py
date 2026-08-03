@@ -3057,7 +3057,7 @@ def compress_context(
                 )
         else:
             # No hard failure — but did the configured aux model error out
-            # and get recovered by retrying on main? Surface that so users
+            # and get recovered by retrying on main?  Surface that so users
             # know their auxiliary.compression.model setting is broken even
             # though compression succeeded.
             _aux_fail_model = getattr(agent.context_compressor, "_last_aux_model_failure_model", None)
