@@ -363,13 +363,8 @@ class ModalEnvironment(BaseEnvironment):
         credential_mounts = []
         initial_credential_remote_paths: set[str] = set()
         late_credential_remote_paths: set[str] = set()
-        sync_mounts = []
         try:
-            from tools.credential_files import (
-                get_credential_file_mounts,
-                iter_skills_files,
-                iter_cache_files,
-            )
+            from tools.credential_files import get_credential_file_mounts
 
             for mount_entry in get_credential_file_mounts():
                 remote_path = mount_entry["container_path"]
@@ -394,21 +389,6 @@ class ModalEnvironment(BaseEnvironment):
                     )
                 )
                 initial_credential_remote_paths.add(remote_path)
-            for entry in iter_skills_files():
-                sync_mounts.append(
-                    _modal.Mount.from_local_file(
-                        entry["host_path"],
-                        remote_path=entry["container_path"],
-                    )
-                )
-            cache_files = iter_cache_files()
-            for entry in cache_files:
-                sync_mounts.append(
-                    _modal.Mount.from_local_file(
-                        entry["host_path"],
-                        remote_path=entry["container_path"],
-                    )
-                )
         except Exception as e:
             logger.debug("Modal: could not load credential file mounts: %s", e)
 
@@ -419,14 +399,14 @@ class ModalEnvironment(BaseEnvironment):
         async def _create_sandbox(image_spec: Any):
             app = await _modal.App.lookup.aio("hermes-agent", create_if_missing=True)
             create_kwargs = dict(sandbox_kwargs)
-            # A restored snapshot may already contain files under these paths,
-            # while Modal mounts are read-only. Let reconciliation purge the
-            # snapshot first and let the forced sync restore current host files.
-            if credential_mounts or sync_mounts:
+            # Only credentials are mounted. Skills, plans and caches arrive via
+            # the forced sync below, which runs on every construction and is the
+            # single source of truth for those paths -- mounting them here too
+            # would upload the same files twice and, being read-only, would also
+            # block the restore purge.
+            if credential_mounts:
                 existing_mounts = list(create_kwargs.pop("mounts", []))
                 existing_mounts.extend(credential_mounts)
-                if not restored_snapshot_id:
-                    existing_mounts.extend(sync_mounts)
                 create_kwargs["mounts"] = existing_mounts
             sandbox = await _modal.Sandbox.create.aio(
                 "sleep", "infinity",

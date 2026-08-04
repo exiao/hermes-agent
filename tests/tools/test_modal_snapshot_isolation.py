@@ -279,8 +279,16 @@ def test_restored_sandbox_purges_sync_owned_subtrees_before_first_sync(tmp_path)
         env.cleanup()
 
 
-def test_restored_sandbox_keeps_credentials_but_not_sync_mounts(tmp_path):
-    """Restored snapshots keep credential mounts while sync paths stay writable."""
+@pytest.mark.parametrize("restored", [True, False])
+def test_only_credentials_are_mounted(tmp_path, restored):
+    """Sync-owned paths are never mounted, restored or not.
+
+    Mounting them at create time duplicates the forced sync that follows, and
+    a read-only mount under a purge root would break restore reconciliation.
+    Making this unconditional also removes the fallback-path hazard: a
+    base-image retry after a failed restore cannot end up with a different
+    mount set than the attempt it replaced.
+    """
     state = _install_modal_test_modules(
         tmp_path,
         credential_mounts=[
@@ -290,9 +298,10 @@ def test_restored_sandbox_keeps_credentials_but_not_sync_mounts(tmp_path):
             {"host_path": "/host/skill.md", "container_path": "/root/.hermes/skills/skill.md"}
         ],
     )
-    snapshot_store = state["snapshot_store"]
-    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_store.write_text(json.dumps({"direct:task-mounted": "im-restore123"}))
+    if restored:
+        snapshot_store = state["snapshot_store"]
+        snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_store.write_text(json.dumps({"direct:task-mounted": "im-restore123"}))
 
     modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
     env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-mounted")
