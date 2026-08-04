@@ -56,6 +56,10 @@ def _install_modal_test_modules(
     *,
     fail_on_snapshot_ids: set[str] | None = None,
     snapshot_id: str = "im-fresh",
+    purge_exit_code: int = 0,
+    purge_raises: bool = False,
+    credential_mounts: list[dict[str, str]] | None = None,
+    sync_mounts: list[dict[str, str]] | None = None,
 ):
     _reset_modules(("tools", "hermes_cli", "modal"))
 
@@ -123,15 +127,18 @@ def _install_modal_test_modules(
     )
     sys.modules["tools.interrupt"] = types.SimpleNamespace(is_interrupted=lambda: False)
     sys.modules["tools.credential_files"] = types.SimpleNamespace(
-        get_credential_file_mounts=lambda: [],
-        iter_skills_files=lambda **kw: [],
+        get_credential_file_mounts=lambda: credential_mounts or [],
+        iter_skills_files=lambda **kw: sync_mounts or [],
         iter_plans_files=lambda **kw: [],
         iter_cache_files=lambda **kw: [],
+        _CACHE_DIRS=[("cache/documents", "document_cache")],
     )
 
     from_id_calls: list[str] = []
     registry_calls: list[tuple[str, list[str] | None]] = []
     create_calls: list[dict] = []
+    exec_calls: list[tuple] = []
+    sandbox_instances: list = []
 
     class _FakeImage:
         @staticmethod
@@ -150,15 +157,30 @@ def _install_modal_test_modules(
     class _FakeSandboxInstance:
         def __init__(self, image):
             self.image = image
+            self.terminated = False
 
             async def _snapshot_aio():
                 return types.SimpleNamespace(object_id=snapshot_id)
 
             async def _terminate_aio():
+                self.terminated = True
                 return None
 
+            async def _exec_aio(*cmd):
+                exec_calls.append(cmd)
+                is_purge = any("rm -rf" in str(a) for a in cmd)
+                if is_purge and purge_raises:
+                    raise RuntimeError("exec transport failed")
+
+                async def _wait_aio():
+                    return purge_exit_code if is_purge else 0
+
+                return types.SimpleNamespace(wait=types.SimpleNamespace(aio=_wait_aio))
+
+            self.exec = types.SimpleNamespace(aio=_exec_aio)
             self.snapshot_filesystem = types.SimpleNamespace(aio=_snapshot_aio)
             self.terminate = types.SimpleNamespace(aio=_terminate_aio)
+            sandbox_instances.append(self)
 
     async def _create_aio(*_args, image=None, app=None, timeout=None, **kwargs):
         create_calls.append({
@@ -195,6 +217,8 @@ def _install_modal_test_modules(
         "create_calls": create_calls,
         "from_id_calls": from_id_calls,
         "registry_calls": registry_calls,
+        "exec_calls": exec_calls,
+        "sandbox_instances": sandbox_instances,
     }
 
 
@@ -227,3 +251,236 @@ def test_resolve_modal_image_uses_snapshot_ids_and_registry_images(tmp_path):
     assert state["from_id_calls"] == ["im-snapshot123"]
     assert state["registry_calls"][0][0] == "python:3.11"
     assert "ensurepip" in state["registry_calls"][0][1][0]
+
+
+def test_restored_sandbox_purges_sync_owned_subtrees_before_first_sync(tmp_path):
+    """A fresh FileSyncManager issues no deletes for the prior instance's uploads.
+
+    Without the purge, a plan/skill/cache file removed from the host survives in
+    the restored sandbox for that sandbox's whole lifetime.
+    """
+    state = _install_modal_test_modules(tmp_path)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-restore": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-restore")
+
+    try:
+        purges = [c for c in state["exec_calls"] if any("rm -rf" in str(a) for a in c)]
+        assert len(purges) == 1, state["exec_calls"]
+        cmd = purges[0][-1]
+        for root in ("/root/.hermes/plans", "/root/.hermes/skills",
+                     "/root/.hermes/external_skills", "/root/.hermes/cache/documents"):
+            assert root in cmd
+        assert "rm -rf /root/.hermes " not in cmd
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.parametrize("restored", [True, False])
+def test_only_credentials_are_mounted(tmp_path, restored):
+    """Sync-owned paths are never mounted, restored or not.
+
+    Mounting them at create time duplicates the forced sync that follows, and
+    a read-only mount under a purge root would break restore reconciliation.
+    Making this unconditional also removes the fallback-path hazard: a
+    base-image retry after a failed restore cannot end up with a different
+    mount set than the attempt it replaced.
+    """
+    state = _install_modal_test_modules(
+        tmp_path,
+        credential_mounts=[
+            {"host_path": "/host/token.json", "container_path": "/root/.hermes/token.json"}
+        ],
+        sync_mounts=[
+            {"host_path": "/host/skill.md", "container_path": "/root/.hermes/skills/skill.md"}
+        ],
+    )
+    if restored:
+        snapshot_store = state["snapshot_store"]
+        snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_store.write_text(json.dumps({"direct:task-mounted": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-mounted")
+
+    try:
+        assert state["create_calls"][0]["mounts"] == [
+            {"host_path": "/host/token.json", "remote_path": "/root/.hermes/token.json"}
+        ]
+    finally:
+        env.cleanup()
+
+
+def test_restored_sandbox_does_not_mount_credentials_below_sync_roots(tmp_path):
+    """Credentials below purge roots use sync and are scrubbed before snapshot."""
+    state = _install_modal_test_modules(
+        tmp_path,
+        credential_mounts=[
+            {"host_path": "/host/token.json", "container_path": "/root/.hermes/token.json"},
+            {
+                "host_path": "/host/skill-token.json",
+                "container_path": "/root/.hermes/skills/skill-token.json",
+            },
+        ],
+    )
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-nested-credential": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-nested-credential")
+    env._sync_manager.sync_back = lambda: None
+    env.cleanup()
+
+    assert state["create_calls"][0]["mounts"] == [
+        {"host_path": "/host/token.json", "remote_path": "/root/.hermes/token.json"}
+    ]
+    removals = [
+        call for call in state["exec_calls"]
+        if any("rm -f" in str(arg) for arg in call)
+    ]
+    assert removals[-1][-1] == "rm -f /root/.hermes/skills/skill-token.json"
+
+
+def test_fresh_sandbox_does_not_purge(tmp_path):
+    """No snapshot means nothing stale; purging would be wasted work."""
+    state = _install_modal_test_modules(tmp_path)
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-fresh")
+
+    try:
+        assert not [c for c in state["exec_calls"] if any("rm -rf" in str(a) for a in c)]
+    finally:
+        env.cleanup()
+
+
+def test_forced_reconciliation_sync_failure_terminates_sandbox(tmp_path, monkeypatch):
+    """A restored sandbox must not run after its initial sync fails."""
+    state = _install_modal_test_modules(tmp_path)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-sync-failure": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+
+    def fail_sync(_manager, **kwargs):
+        assert kwargs == {"force": True, "raise_on_error": True}
+        raise RuntimeError("sync failed")
+
+    monkeypatch.setattr(modal_module.FileSyncManager, "sync", fail_sync)
+    with pytest.raises(RuntimeError, match="sync failed"):
+        modal_module.ModalEnvironment(image="python:3.11", task_id="task-sync-failure")
+
+    assert state["sandbox_instances"], "no sandbox was created"
+    assert all(s.terminated for s in state["sandbox_instances"])
+
+
+def test_failed_restore_falls_back_to_base_image_without_purge(tmp_path):
+    """The retry sandbox is a clean base image, so there is nothing to reconcile."""
+    state = _install_modal_test_modules(tmp_path, fail_on_snapshot_ids={"im-stale123"})
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-stale2": "im-stale123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-stale2")
+
+    try:
+        assert not [c for c in state["exec_calls"] if any("rm -rf" in str(a) for a in c)]
+    finally:
+        env.cleanup()
+
+
+def test_failed_purge_aborts_instead_of_running_on_stale_state(tmp_path):
+    """A nonzero purge must not be swallowed.
+
+    `sync(force=True)` only uploads files still on the host; it can never
+    discover remote paths the previous instance left behind. So if the purge
+    silently fails, the sandbox keeps serving exactly the deleted plans and
+    skills this PR exists to remove -- and nothing downstream can detect it.
+    Failing loudly is the only safe outcome.
+    """
+    state = _install_modal_test_modules(tmp_path, purge_exit_code=1)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-badpurge": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+
+    with pytest.raises(RuntimeError, match="purge"):
+        modal_module.ModalEnvironment(image="python:3.11", task_id="task-badpurge")
+
+    # The half-built sandbox must not be leaked when construction aborts.
+    assert state["sandbox_instances"], "no sandbox was created"
+    assert all(s.terminated for s in state["sandbox_instances"])
+
+
+def test_purge_transport_error_does_not_leak_the_sandbox(tmp_path):
+    """An exception from exec.aio escapes outside the constructor's cleanup.
+
+    The purge runs after the create try/except that stops the worker, so a
+    transport failure would otherwise leave a live sandbox and a running
+    worker thread behind for the sandbox's full timeout.
+    """
+    state = _install_modal_test_modules(tmp_path, purge_raises=True)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"direct:task-purgeboom": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+
+    with pytest.raises(RuntimeError):
+        modal_module.ModalEnvironment(image="python:3.11", task_id="task-purgeboom")
+
+    assert state["sandbox_instances"], "no sandbox was created"
+    assert all(s.terminated for s in state["sandbox_instances"])
+
+
+def test_legacy_snapshot_store_error_does_not_leak_the_sandbox(tmp_path, monkeypatch):
+    """Legacy-key migration errors must clean up the already-created sandbox."""
+    state = _install_modal_test_modules(tmp_path)
+    snapshot_store = state["snapshot_store"]
+    snapshot_store.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_store.write_text(json.dumps({"task-legacy-store": "im-restore123"}))
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+
+    def fail_store(*_args):
+        raise RuntimeError("snapshot store failed")
+
+    monkeypatch.setattr(modal_module, "_store_direct_snapshot", fail_store)
+    with pytest.raises(RuntimeError, match="snapshot store failed"):
+        modal_module.ModalEnvironment(image="python:3.11", task_id="task-legacy-store")
+
+    assert state["sandbox_instances"], "no sandbox was created"
+    assert all(s.terminated for s in state["sandbox_instances"])
+
+
+def test_late_synced_credentials_are_removed_before_snapshot(tmp_path):
+    """Credentials registered after construction must not enter snapshots."""
+    late_mounts: list[dict[str, str]] = []
+    state = _install_modal_test_modules(tmp_path, credential_mounts=late_mounts)
+    late_host_path = tmp_path / "late-token.json"
+    late_host_path.write_text("secret")
+
+    modal_module = _load_module("tools.environments.modal", TOOLS_DIR / "environments" / "modal.py")
+    env = modal_module.ModalEnvironment(image="python:3.11", task_id="task-late-credential")
+
+    late_mounts.append({
+        "host_path": str(late_host_path),
+        "container_path": "/root/.hermes/late-token.json",
+    })
+    env._before_execute()
+    env._sync_manager.sync_back = lambda: None
+    env.cleanup()
+
+    removals = [
+        call for call in state["exec_calls"]
+        if any("rm -f" in str(arg) for arg in call)
+    ]
+    assert len(removals) == 1, state["exec_calls"]
+    assert removals[0][-1] == "rm -f /root/.hermes/late-token.json"

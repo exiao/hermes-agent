@@ -27,6 +27,8 @@ from tools.environments.file_sync import (
     iter_sync_files,
     quoted_mkdir_command,
     quoted_rm_command,
+    quoted_purge_command,
+    synced_subtree_roots,
     unique_parent_dirs,
 )
 
@@ -358,47 +360,53 @@ class ModalEnvironment(BaseEnvironment):
         _ensure_modal_sdk()
         import modal as _modal
 
-        cred_mounts = []
+        credential_mounts = []
+        initial_credential_remote_paths: set[str] = set()
+        late_credential_remote_paths: set[str] = set()
         try:
-            from tools.credential_files import (
-                get_credential_file_mounts,
-                iter_skills_files,
-                iter_cache_files,
-            )
+            from tools.credential_files import get_credential_file_mounts
 
             for mount_entry in get_credential_file_mounts():
-                cred_mounts.append(
+                remote_path = mount_entry["container_path"]
+                if any(
+                    remote_path == root or remote_path.startswith(root + "/")
+                    for root in synced_subtree_roots("/root/.hermes")
+                ):
+                    # Modal mounts are read-only. A recursive purge of a
+                    # sync-owned root would therefore fail if a credential
+                    # mount lived below it. Keep this credential writable via
+                    # the normal sync path and scrub it before snapshotting.
+                    late_credential_remote_paths.add(remote_path)
+                    logger.warning(
+                        "Modal: not mounting credential below sync root: %s",
+                        remote_path,
+                    )
+                    continue
+                credential_mounts.append(
                     _modal.Mount.from_local_file(
                         mount_entry["host_path"],
-                        remote_path=mount_entry["container_path"],
+                        remote_path=remote_path,
                     )
                 )
-            for entry in iter_skills_files():
-                cred_mounts.append(
-                    _modal.Mount.from_local_file(
-                        entry["host_path"],
-                        remote_path=entry["container_path"],
-                    )
-                )
-            cache_files = iter_cache_files()
-            for entry in cache_files:
-                cred_mounts.append(
-                    _modal.Mount.from_local_file(
-                        entry["host_path"],
-                        remote_path=entry["container_path"],
-                    )
-                )
+                initial_credential_remote_paths.add(remote_path)
         except Exception as e:
             logger.debug("Modal: could not load credential file mounts: %s", e)
 
         self._worker.start()
+        self._initial_credential_remote_paths = initial_credential_remote_paths
+        self._late_credential_remote_paths = late_credential_remote_paths
 
         async def _create_sandbox(image_spec: Any):
             app = await _modal.App.lookup.aio("hermes-agent", create_if_missing=True)
             create_kwargs = dict(sandbox_kwargs)
-            if cred_mounts:
+            # Only credentials are mounted. Skills, plans and caches arrive via
+            # the forced sync below, which runs on every construction and is the
+            # single source of truth for those paths -- mounting them here too
+            # would upload the same files twice and, being read-only, would also
+            # block the restore purge.
+            if credential_mounts:
                 existing_mounts = list(create_kwargs.pop("mounts", []))
-                existing_mounts.extend(cred_mounts)
+                existing_mounts.extend(credential_mounts)
                 create_kwargs["mounts"] = existing_mounts
             sandbox = await _modal.Sandbox.create.aio(
                 "sleep", "infinity",
@@ -428,24 +436,42 @@ class ModalEnvironment(BaseEnvironment):
                 self._app, self._sandbox = self._worker.run_coroutine(
                     _create_sandbox(base_image), timeout=300,
                 )
-            else:
-                if restored_snapshot_id and restored_from_legacy_key:
-                    _store_direct_snapshot(self._task_id, restored_snapshot_id)
+                # The fallback sandbox is a pristine base image, so there is no
+                # prior-instance state to reconcile.
+                restored_snapshot_id = None
         except Exception:
             self._worker.stop()
             raise
 
         logger.info("Modal: sandbox created (task=%s)", self._task_id)
 
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files("/root/.hermes"),
-            upload_fn=self._modal_upload,
-            delete_fn=self._modal_delete,
-            bulk_upload_fn=self._modal_bulk_upload,
-            bulk_download_fn=self._modal_bulk_download,
-        )
-        self._sync_manager.sync(force=True)
-        self.init_session()
+        try:
+            if restored_snapshot_id and restored_from_legacy_key:
+                _store_direct_snapshot(self._task_id, restored_snapshot_id)
+            if restored_snapshot_id:
+                # A restored snapshot still holds the previous instance's synced
+                # files, but the fresh FileSyncManager below starts with an empty
+                # map and so computes no deletions for them.  Clear the sync-owned
+                # subtrees; the forced sync re-uploads everything still on the host.
+                self._purge_synced_subtrees()
+
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files("/root/.hermes"),
+                upload_fn=self._modal_upload,
+                delete_fn=self._modal_delete,
+                bulk_upload_fn=self._modal_bulk_upload,
+                bulk_download_fn=self._modal_bulk_download,
+            )
+            self._sync_manager.sync(force=True, raise_on_error=True)
+            self.init_session()
+        except Exception:
+            # The sandbox is live by now, so it outlives the constructor unless
+            # we tear it down here. Without this the caller sees an exception
+            # while a paid sandbox and its worker thread keep running until the
+            # sandbox timeout.
+            self._terminate_sandbox_quietly()
+            self._worker.stop()
+            raise
 
     def _modal_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via base64 piped through stdin."""
@@ -557,6 +583,43 @@ class ModalEnvironment(BaseEnvironment):
             tar_bytes = tar_bytes.encode()
         dest.write_bytes(tar_bytes)
 
+    def _terminate_sandbox_quietly(self) -> None:
+        """Best-effort sandbox teardown for a failed construction path."""
+        sandbox = self._sandbox
+        if sandbox is None:
+            return
+        try:
+            async def _terminate():
+                await sandbox.terminate.aio()
+
+            self._worker.run_coroutine(_terminate(), timeout=30)
+        except Exception as exc:
+            logger.warning("Modal: could not terminate sandbox after failure: %s", exc)
+        finally:
+            self._sandbox = None
+
+    def _purge_synced_subtrees(self) -> None:
+        """Clear sync-owned directories in a restored sandbox.
+
+        Raises on a nonzero exit. ``sync(force=True)`` only uploads files that
+        still exist on the host, so it cannot discover -- let alone delete --
+        remote paths a previous instance left behind. A silently failed purge
+        therefore leaves the sandbox serving the very files this reconciliation
+        exists to remove, with nothing downstream able to notice.
+        """
+        cmd = quoted_purge_command("/root/.hermes")
+
+        async def _purge():
+            proc = await self._sandbox.exec.aio("bash", "-c", cmd)
+            return await proc.wait.aio()
+
+        exit_code = self._worker.run_coroutine(_purge(), timeout=30)
+        if exit_code != 0:
+            raise RuntimeError(
+                f"Modal: failed to purge sync-owned subtrees (exit {exit_code}); "
+                "refusing to run on unreconciled snapshot state"
+            )
+
     def _modal_delete(self, remote_paths: list[str]) -> None:
         """Batch-delete remote files via exec."""
         rm_cmd = quoted_rm_command(remote_paths)
@@ -567,8 +630,42 @@ class ModalEnvironment(BaseEnvironment):
 
         self._worker.run_coroutine(_rm(), timeout=15)
 
+    def _remove_late_credential_files(self) -> None:
+        """Remove credentials uploaded after construction before snapshotting.
+
+        Credential mounts are excluded from the restored-subtree purge because
+        Modal mounts remain available without being copied into snapshots.  A
+        credential registered after sandbox creation has no such mount, so the
+        recurring sync would otherwise copy it into the filesystem snapshot.
+        """
+        if not self._late_credential_remote_paths:
+            return
+
+        cmd = quoted_rm_command(sorted(self._late_credential_remote_paths))
+
+        async def _remove():
+            proc = await self._sandbox.exec.aio("bash", "-c", cmd)
+            return await proc.wait.aio()
+
+        exit_code = self._worker.run_coroutine(_remove(), timeout=30)
+        if exit_code != 0:
+            raise RuntimeError(
+                "Modal: failed to remove late-synced credentials before snapshot "
+                f"(exit {exit_code})"
+            )
+
     def _before_execute(self) -> None:
         """Sync files to sandbox via FileSyncManager (rate-limited internally)."""
+        try:
+            from tools.credential_files import get_credential_file_mounts
+
+            self._late_credential_remote_paths.update(
+                entry["container_path"]
+                for entry in get_credential_file_mounts()
+                if entry["container_path"] not in self._initial_credential_remote_paths
+            )
+        except Exception as exc:
+            logger.debug("Modal: could not track late credential mounts: %s", exc)
         self._sync_manager.sync()
 
     # ------------------------------------------------------------------
@@ -689,6 +786,8 @@ class ModalEnvironment(BaseEnvironment):
 
         if self._persistent:
             try:
+                self._remove_late_credential_files()
+
                 async def _snapshot():
                     img = await self._sandbox.snapshot_filesystem.aio()
                     return img.object_id
