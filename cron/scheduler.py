@@ -3429,9 +3429,17 @@ def run_job(
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        reasoning_config = resolve_reasoning_config(
-            _cfg if isinstance(_cfg, dict) else {}, str(model)
-        )
+        # Per-job override wins over agent.reasoning_overrides / the global
+        # agent.reasoning_effort: a job pinned to a model shared with other
+        # surfaces (e.g. a 10-minute PR watcher on the same model as a chat
+        # session) needs its own effort without moving everyone else.
+        from hermes_constants import parse_reasoning_effort
+
+        reasoning_config = parse_reasoning_effort(job.get("reasoning_effort"))
+        if reasoning_config is None:
+            reasoning_config = resolve_reasoning_config(
+                _cfg if isinstance(_cfg, dict) else {}, str(model)
+            )
 
         # Provider/model-drift fail-closed guard (#44585).
         #
