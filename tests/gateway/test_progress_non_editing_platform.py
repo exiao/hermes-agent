@@ -56,6 +56,22 @@ class _EditableAdapter(_NoEditAdapter):
         return type("R", (), {"success": True, "message_id": "m1", "error": None})()
 
 
+class _BlockingSendAdapter(_NoEditAdapter):
+    """Block the first send so cancellation can interrupt it in flight."""
+
+    def __init__(self):
+        super().__init__()
+        self.send_started = asyncio.Event()
+        self.block_next = True
+
+    async def send(self, chat_id=None, content=None, **kwargs):
+        if self.block_next:
+            self.block_next = False
+            self.send_started.set()
+            await asyncio.Event().wait()
+        return await super().send(chat_id, content, **kwargs)
+
+
 def _runner_for(adapter, ctx):
     from gateway.run import TurnRunner
 
@@ -147,6 +163,49 @@ def test_separate_grouping_flushes_queued_editable_progress_on_cancel():
 
     assert q.empty(), "queue must be drained"
     assert adapter.sent == ["🔧 terminal", "🔍 web_search"]
+
+
+def test_cancelled_inflight_separate_send_retries_dequeued_line():
+    adapter = _BlockingSendAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    runner = _runner_for(adapter, ctx)
+
+    async def _cancel_inflight_send():
+        task = asyncio.create_task(runner.send_progress_messages())
+        await asyncio.wait_for(adapter.send_started.wait(), 5)
+        assert adapter.sent == []
+        task.cancel()
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(_cancel_inflight_send())
+
+    assert q.empty(), "queue must be drained"
+    assert adapter.sent == ["🔧 terminal", "🔍 web_search"]
+
+
+def test_cancelled_stale_turn_drops_queued_separate_progress():
+    adapter = _NoEditAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    current = [True]
+    ctx._run_still_current = lambda: current[0]
+    runner = _runner_for(adapter, ctx)
+
+    async def _cancel_after_run_replaced():
+        task = asyncio.create_task(runner.send_progress_messages())
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if adapter.sent:
+                break
+        else:
+            raise AssertionError("sender did not send the first progress line")
+        current[0] = False
+        task.cancel()
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(_cancel_after_run_replaced())
+
+    assert q.empty(), "stale queued progress must be discarded"
+    assert adapter.sent == ["🔧 terminal"]
 
 
 def test_cancelled_interrupted_turn_drops_queued_progress():
