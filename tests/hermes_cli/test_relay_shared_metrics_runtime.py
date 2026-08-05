@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import asyncio
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -538,6 +539,7 @@ def test_execution_adapters_do_not_create_relay_host_without_a_consumer(
 
 
 def test_core_runtime_is_fail_open_without_a_published_binding(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
     relay_shared_metrics._reset_for_tests()
     relay_runtime._reset_for_tests()
 
@@ -558,7 +560,7 @@ def test_core_runtime_is_fail_open_without_a_published_binding(monkeypatch, capl
         args={"command": "true"},
     ) == {"command": "true"}
     assert not relay_runtime.emit_mark("hermes.probe", session_id="s1")
-    assert "Hermes Relay runtime initialization failed" in caplog.text
+    assert "Hermes Relay unavailable" in caplog.text
     relay_runtime._reset_for_tests()
 
 
