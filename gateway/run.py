@@ -4068,8 +4068,15 @@ class TurnRunner:
         # getattr, not attribute access: duck-typed adapters (test fakes,
         # minimal plugin adapters) may not define edit_message at all —
         # "missing" means the same thing as "base no-op": can't edit.
+        # Opt-out: tool_progress_grouping="separate" means the user has
+        # explicitly accepted one message per tool, which is the only shape
+        # a non-editing platform (Signal, iMessage) can render at all. In
+        # that case keep the progress lines instead of dropping them.
         _adapter_edit = getattr(type(adapter), "edit_message", None)
-        if _adapter_edit is None or _adapter_edit is BasePlatformAdapter.edit_message:
+        _can_edit_platform = not (
+            _adapter_edit is None or _adapter_edit is BasePlatformAdapter.edit_message
+        )
+        if not _can_edit_platform and ctx.progress_grouping != "separate":
             while not ctx.progress_queue.empty():
                 try:
                     ctx.progress_queue.get_nowait()
@@ -4281,14 +4288,15 @@ class TurnRunner:
                 # API calls to avoid hitting Telegram flood control.
                 # (grammY auto-retry pattern: proactively rate-limit
                 # instead of reacting to 429s.)
-                _now = time.monotonic()
-                _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
-                if _remaining > 0:
-                    # Wait out the throttle interval, then loop back to
-                    # drain any additional queued messages before sending
-                    # a single batched edit.
-                    await asyncio.sleep(_remaining)
-                    continue
+                if can_edit:
+                    _now = time.monotonic()
+                    _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                    if _remaining > 0:
+                        # Wait out the throttle interval, then loop back to
+                        # drain any additional queued messages before sending
+                        # a single batched edit.
+                        await asyncio.sleep(_remaining)
+                        continue
 
                 if not ctx._run_still_current():
                     return
