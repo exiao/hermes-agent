@@ -633,8 +633,14 @@ class SignalAdapter(BasePlatformAdapter):
                     self._force_reconnect()
 
     def _force_reconnect(self) -> None:
-        """Force SSE reconnection by closing the current response."""
-        if self._sse_response and not self._sse_response.is_stream_consumed:
+        """Force SSE reconnection by closing the current response.
+
+        Guard on is_closed, NOT is_stream_consumed: httpx sets
+        is_stream_consumed=True when iteration *begins*, so an actively
+        streaming response — the only kind we ever need to reconnect — always
+        reports True and would be skipped, making this a silent no-op.
+        """
+        if self._sse_response is not None and not self._sse_response.is_closed:
             try:
                 task = asyncio.create_task(self._sse_response.aclose())
                 self._background_tasks.add(task)
