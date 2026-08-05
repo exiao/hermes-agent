@@ -15,6 +15,7 @@ can render, so the lines must be SENT.
 
 import asyncio
 import queue as queue_mod
+import time
 
 import pytest
 
@@ -36,6 +37,39 @@ class _NoEditAdapter:
 
     async def send_typing(self, chat_id=None, **kwargs):
         pass
+
+
+class _EditableAdapter(_NoEditAdapter):
+    """Stand-in for Telegram: send and edit are both available."""
+
+    def __init__(self):
+        super().__init__()
+        self.send_times = []
+        self.edited = []
+
+    async def send(self, chat_id=None, content=None, **kwargs):
+        self.send_times.append(time.monotonic())
+        return await super().send(chat_id, content, **kwargs)
+
+    async def edit_message(self, **kwargs):
+        self.edited.append(kwargs["content"])
+        return type("R", (), {"success": True, "message_id": "m1", "error": None})()
+
+
+class _BlockingSendAdapter(_NoEditAdapter):
+    """Block the first send so cancellation can interrupt it in flight."""
+
+    def __init__(self):
+        super().__init__()
+        self.send_started = asyncio.Event()
+        self.block_next = True
+
+    async def send(self, chat_id=None, content=None, **kwargs):
+        if self.block_next:
+            self.block_next = False
+            self.send_started.set()
+            await asyncio.Event().wait()
+        return await super().send(chat_id, content, **kwargs)
 
 
 def _runner_for(adapter, ctx):
@@ -93,3 +127,178 @@ def test_separate_grouping_sends_lines_on_non_editing_platform():
     assert len(adapter.sent) == 2, "both progress messages must be sent"
     assert any("terminal" in s for s in adapter.sent)
     assert any("web_search" in s for s in adapter.sent)
+
+
+def test_separate_grouping_paces_editable_platform():
+    adapter = _EditableAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    runner = _runner_for(adapter, ctx)
+
+    asyncio.run(asyncio.wait_for(runner.send_progress_messages(), 10))
+
+    assert q.empty(), "queue must be drained"
+    assert adapter.sent == ["🔧 terminal", "🔍 web_search"]
+    assert len(adapter.send_times) == 2
+    assert adapter.send_times[1] - adapter.send_times[0] >= 1.4
+
+
+def test_separate_grouping_flushes_queued_editable_progress_on_cancel():
+    adapter = _EditableAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    runner = _runner_for(adapter, ctx)
+
+    async def _cancel_after_first_send():
+        task = asyncio.create_task(runner.send_progress_messages())
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if adapter.sent:
+                break
+        else:
+            raise AssertionError("sender did not send the first progress line")
+        assert not task.done()
+        task.cancel()
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(_cancel_after_first_send())
+
+    assert q.empty(), "queue must be drained"
+    assert adapter.sent == ["🔧 terminal", "🔍 web_search"]
+
+
+def test_cancelled_inflight_separate_send_retries_dequeued_line():
+    adapter = _BlockingSendAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    runner = _runner_for(adapter, ctx)
+
+    async def _cancel_inflight_send():
+        task = asyncio.create_task(runner.send_progress_messages())
+        await asyncio.wait_for(adapter.send_started.wait(), 5)
+        assert adapter.sent == []
+        task.cancel()
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(_cancel_inflight_send())
+
+    assert q.empty(), "queue must be drained"
+    assert adapter.sent == ["🔧 terminal", "🔍 web_search"]
+
+
+def test_cancelled_stale_turn_drops_queued_separate_progress():
+    adapter = _NoEditAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    current = [True]
+    ctx._run_still_current = lambda: current[0]
+    runner = _runner_for(adapter, ctx)
+
+    async def _cancel_after_run_replaced():
+        task = asyncio.create_task(runner.send_progress_messages())
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if adapter.sent:
+                break
+        else:
+            raise AssertionError("sender did not send the first progress line")
+        current[0] = False
+        task.cancel()
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(_cancel_after_run_replaced())
+
+    assert q.empty(), "stale queued progress must be discarded"
+    assert adapter.sent == ["🔧 terminal"]
+
+
+def test_cancelled_stale_turn_drops_line_if_replaced_during_drain_pacing():
+    adapter = _EditableAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    current = [True]
+    drain_check_started = asyncio.Event()
+    checks = {"n": 0}
+
+    def _still_current():
+        checks["n"] += 1
+        if checks["n"] == 3:
+            drain_check_started.set()
+        return current[0]
+
+    ctx._run_still_current = _still_current
+    runner = _runner_for(adapter, ctx)
+
+    async def _cancel_while_drain_is_pacing():
+        task = asyncio.create_task(runner.send_progress_messages())
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if adapter.sent:
+                break
+        else:
+            raise AssertionError("sender did not send the first progress line")
+        task.cancel()
+        await asyncio.wait_for(drain_check_started.wait(), 5)
+        current[0] = False
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(_cancel_while_drain_is_pacing())
+
+    assert q.empty(), "stale queued progress must be discarded"
+    assert adapter.sent == ["🔧 terminal"]
+
+
+def test_cancelled_interrupted_turn_drops_queued_progress():
+    adapter = _EditableAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    agent = type("A", (), {"is_interrupted": False})()
+    ctx.agent_holder[0] = agent
+    runner = _runner_for(adapter, ctx)
+
+    async def _cancel_after_first_send():
+        task = asyncio.create_task(runner.send_progress_messages())
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if adapter.sent:
+                break
+        else:
+            raise AssertionError("sender did not send the first progress line")
+        agent.is_interrupted = True
+        task.cancel()
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(_cancel_after_first_send())
+
+    assert q.empty(), "queue must be drained"
+    assert adapter.sent == ["🔧 terminal"]
+
+
+def test_cancelled_interrupted_turn_drops_line_if_interrupted_during_drain_pacing():
+    adapter = _EditableAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    agent = type("A", (), {"is_interrupted": False})()
+    ctx.agent_holder[0] = agent
+    drain_check_started = asyncio.Event()
+    checks = {"n": 0}
+
+    def _still_current():
+        checks["n"] += 1
+        if checks["n"] == 3:
+            drain_check_started.set()
+        return True
+
+    ctx._run_still_current = _still_current
+    runner = _runner_for(adapter, ctx)
+
+    async def _cancel_while_drain_is_pacing():
+        task = asyncio.create_task(runner.send_progress_messages())
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if adapter.sent:
+                break
+        else:
+            raise AssertionError("sender did not send the first progress line")
+        task.cancel()
+        await asyncio.wait_for(drain_check_started.wait(), 5)
+        agent.is_interrupted = True
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(_cancel_while_drain_is_pacing())
+
+    assert q.empty(), "interrupted queued progress must be discarded"
+    assert adapter.sent == ["🔧 terminal"]

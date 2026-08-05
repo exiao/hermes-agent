@@ -4089,6 +4089,8 @@ class TurnRunner:
         can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
         _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
         _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+        _NO_PENDING_RAW = object()
+        pending_raw = _NO_PENDING_RAW
 
         _progress_len_fn = (
             adapter.message_len_fn
@@ -4181,6 +4183,25 @@ class TurnRunner:
             _track_progress_result(result)
             return result
 
+        async def _send_separate_progress_line(text):
+            """Flush one queued separate line without losing it on cancellation."""
+            nonlocal _last_edit_ts
+            if _can_edit_platform:
+                _now = time.monotonic()
+                _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                if _remaining > 0:
+                    await asyncio.sleep(_remaining)
+            if not ctx._run_still_current():
+                return False
+            _agent_for_interrupt = ctx.agent_holder[0] if ctx.agent_holder else None
+            if _agent_for_interrupt is not None and getattr(
+                _agent_for_interrupt, "is_interrupted", False
+            ):
+                return False
+            result = await _send_progress_text(text)
+            _last_edit_ts = time.monotonic()
+            return result
+
         async def _roll_progress_overflow_if_needed() -> bool:
             """Start fresh editable progress bubbles before a bubble exceeds limit.
 
@@ -4235,7 +4256,18 @@ class TurnRunner:
                             break
                     return
 
+                # Throttle progress sends on adapters that can edit messages.
+                # This applies to separate grouping too: editable platforms
+                # still need the same flood-control pacing even when each tool
+                # gets its own message.
+                if _can_edit_platform and ctx.progress_grouping == "separate":
+                    _now = time.monotonic()
+                    _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                    if _remaining > 0:
+                        await asyncio.sleep(_remaining)
+
                 raw = ctx.progress_queue.get_nowait()
+                pending_raw = raw
 
                 # Drain silently when interrupted: events queued in the
                 # window between tool parse and interrupt processing
@@ -4249,6 +4281,7 @@ class TurnRunner:
                     ):
                         # Drop this event and continue draining.
                         await asyncio.sleep(0)
+                        pending_raw = _NO_PENDING_RAW
                         continue
                 except Exception:
                     pass
@@ -4272,10 +4305,17 @@ class TurnRunner:
                     progress_lines = []
                     ctx.last_progress_msg[0] = None
                     ctx.repeat_count[0] = 0
+                    pending_raw = _NO_PENDING_RAW
                     continue
                 else:
                     msg = raw
                     progress_lines.append(msg)
+
+                # Accumulated progress is retained in progress_lines, so only
+                # separate messages need to remain available for cancellation
+                # recovery while their send is in flight.
+                if ctx.progress_grouping != "separate":
+                    pending_raw = _NO_PENDING_RAW
 
                 if await _roll_progress_overflow_if_needed():
                     _last_edit_ts = time.monotonic()
@@ -4298,7 +4338,9 @@ class TurnRunner:
                         await asyncio.sleep(_remaining)
                         continue
 
+                # Send/edit the current progress message.
                 if not ctx._run_still_current():
+                    pending_raw = _NO_PENDING_RAW
                     return
 
                 if can_edit and progress_msg_id is not None:
@@ -4364,6 +4406,7 @@ class TurnRunner:
                             ctx._cleanup_msg_ids.append(str(result.message_id))
 
                 _last_edit_ts = time.monotonic()
+                pending_raw = _NO_PENDING_RAW
 
                 # Restore typing indicator
                 await asyncio.sleep(0.3)
@@ -4373,13 +4416,48 @@ class TurnRunner:
             except queue.Empty:
                 await asyncio.sleep(0.3)
             except asyncio.CancelledError:
-                # Drain remaining queued messages
-                while not ctx.progress_queue.empty():
+                _agent_for_interrupt = ctx.agent_holder[0] if ctx.agent_holder else None
+                if _agent_for_interrupt is not None and getattr(
+                    _agent_for_interrupt, "is_interrupted", False
+                ):
+                    pending_raw = _NO_PENDING_RAW
+                    while not ctx.progress_queue.empty():
+                        try:
+                            ctx.progress_queue.get_nowait()
+                        except Exception:
+                            break
+                    return
+                # Drain remaining queued messages, starting with a line whose
+                # send was cancelled after it left the queue.
+                _pending_raw = pending_raw
+                pending_raw = _NO_PENDING_RAW
+                while _pending_raw is not _NO_PENDING_RAW or not ctx.progress_queue.empty():
                     try:
-                        raw = ctx.progress_queue.get_nowait()
+                        if not ctx._run_still_current():
+                            while not ctx.progress_queue.empty():
+                                try:
+                                    ctx.progress_queue.get_nowait()
+                                except Exception:
+                                    break
+                            return
+                        if _pending_raw is not _NO_PENDING_RAW:
+                            raw = _pending_raw
+                            _pending_raw = _NO_PENDING_RAW
+                        else:
+                            raw = ctx.progress_queue.get_nowait()
                         if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                             _, base_msg, count = raw
-                            if progress_lines:
+                            if ctx.progress_grouping == "separate":
+                                if not await _send_separate_progress_line(
+                                    f"{base_msg} (×{count + 1})"
+                                ):
+                                    while not ctx.progress_queue.empty():
+                                        try:
+                                            ctx.progress_queue.get_nowait()
+                                        except Exception:
+                                            break
+                                    return
+                            elif progress_lines:
                                 progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                 await _roll_progress_overflow_if_needed()
                         elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
@@ -4397,6 +4475,14 @@ class TurnRunner:
                             progress_lines = []
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
+                        elif ctx.progress_grouping == "separate":
+                            if not await _send_separate_progress_line(raw):
+                                while not ctx.progress_queue.empty():
+                                    try:
+                                        ctx.progress_queue.get_nowait()
+                                    except Exception:
+                                        break
+                                return
                         else:
                             progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
