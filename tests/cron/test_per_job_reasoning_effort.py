@@ -68,6 +68,24 @@ class TestPerJobReasoningEffort:
             "effort": "high",
         }
 
+    def test_resolved_fallback_reaches_scheduler_agent(self, tmp_path):
+        (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: low\n")
+        result, mock_agent_cls = _run_job_with_agent_capture(
+            {
+                "id": "reasoning-fallback",
+                "name": "reasoning fallback",
+                "prompt": "hello",
+                "model": "gpt-5.6-luna",
+            },
+            tmp_path,
+        )
+
+        assert result[0] is True
+        assert mock_agent_cls.call_args.kwargs["reasoning_config"] == {
+            "enabled": True,
+            "effort": "low",
+        }
+
     def test_job_override_beats_global(self):
         cfg = {"agent": {"reasoning_effort": "low"}}
         job = {"reasoning_effort": "high"}
