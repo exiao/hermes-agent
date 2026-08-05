@@ -4191,6 +4191,13 @@ class TurnRunner:
                 _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
                 if _remaining > 0:
                     await asyncio.sleep(_remaining)
+            if not ctx._run_still_current():
+                return False
+            _agent_for_interrupt = ctx.agent_holder[0] if ctx.agent_holder else None
+            if _agent_for_interrupt is not None and getattr(
+                _agent_for_interrupt, "is_interrupted", False
+            ):
+                return False
             result = await _send_progress_text(text)
             _last_edit_ts = time.monotonic()
             return result
@@ -4441,9 +4448,15 @@ class TurnRunner:
                         if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                             _, base_msg, count = raw
                             if ctx.progress_grouping == "separate":
-                                await _send_separate_progress_line(
+                                if not await _send_separate_progress_line(
                                     f"{base_msg} (×{count + 1})"
-                                )
+                                ):
+                                    while not ctx.progress_queue.empty():
+                                        try:
+                                            ctx.progress_queue.get_nowait()
+                                        except Exception:
+                                            break
+                                    return
                             elif progress_lines:
                                 progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                 await _roll_progress_overflow_if_needed()
@@ -4463,7 +4476,13 @@ class TurnRunner:
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
                         elif ctx.progress_grouping == "separate":
-                            await _send_separate_progress_line(raw)
+                            if not await _send_separate_progress_line(raw):
+                                while not ctx.progress_queue.empty():
+                                    try:
+                                        ctx.progress_queue.get_nowait()
+                                    except Exception:
+                                        break
+                                return
                         else:
                             progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
