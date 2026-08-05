@@ -4068,8 +4068,15 @@ class TurnRunner:
         # getattr, not attribute access: duck-typed adapters (test fakes,
         # minimal plugin adapters) may not define edit_message at all —
         # "missing" means the same thing as "base no-op": can't edit.
+        # Opt-out: tool_progress_grouping="separate" means the user has
+        # explicitly accepted one message per tool, which is the only shape
+        # a non-editing platform (Signal, iMessage) can render at all. In
+        # that case keep the progress lines instead of dropping them.
         _adapter_edit = getattr(type(adapter), "edit_message", None)
-        if _adapter_edit is None or _adapter_edit is BasePlatformAdapter.edit_message:
+        _can_edit_platform = not (
+            _adapter_edit is None or _adapter_edit is BasePlatformAdapter.edit_message
+        )
+        if not _can_edit_platform and ctx.progress_grouping != "separate":
             while not ctx.progress_queue.empty():
                 try:
                     ctx.progress_queue.get_nowait()
