@@ -4251,7 +4251,7 @@ class TurnRunner:
                 # This applies to separate grouping too: editable platforms
                 # still need the same flood-control pacing even when each tool
                 # gets its own message.
-                if _can_edit_platform:
+                if _can_edit_platform and ctx.progress_grouping == "separate":
                     _now = time.monotonic()
                     _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
                     if _remaining > 0:
@@ -4305,6 +4305,20 @@ class TurnRunner:
                     if ctx._run_still_current():
                         await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
                     continue
+
+                # Throttle edits: batch rapid tool updates into fewer
+                # API calls to avoid hitting Telegram flood control.
+                # (grammY auto-retry pattern: proactively rate-limit
+                # instead of reacting to 429s.)
+                if can_edit:
+                    _now = time.monotonic()
+                    _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                    if _remaining > 0:
+                        # Wait out the throttle interval, then loop back to
+                        # drain any additional queued messages before sending
+                        # a single batched edit.
+                        await asyncio.sleep(_remaining)
+                        continue
 
                 # Send/edit the current progress message.
                 if not ctx._run_still_current():
@@ -4382,6 +4396,16 @@ class TurnRunner:
             except queue.Empty:
                 await asyncio.sleep(0.3)
             except asyncio.CancelledError:
+                _agent_for_interrupt = ctx.agent_holder[0] if ctx.agent_holder else None
+                if _agent_for_interrupt is not None and getattr(
+                    _agent_for_interrupt, "is_interrupted", False
+                ):
+                    while not ctx.progress_queue.empty():
+                        try:
+                            ctx.progress_queue.get_nowait()
+                        except Exception:
+                            break
+                    return
                 # Drain remaining queued messages
                 while not ctx.progress_queue.empty():
                     try:
