@@ -122,3 +122,26 @@ def test_separate_grouping_paces_editable_platform():
     assert adapter.sent == ["🔧 terminal", "🔍 web_search"]
     assert len(adapter.send_times) == 2
     assert adapter.send_times[1] - adapter.send_times[0] >= 1.4
+
+
+def test_separate_grouping_flushes_queued_editable_progress_on_cancel():
+    adapter = _EditableAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    runner = _runner_for(adapter, ctx)
+
+    async def _cancel_after_first_send():
+        task = asyncio.create_task(runner.send_progress_messages())
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if adapter.sent:
+                break
+        else:
+            raise AssertionError("sender did not send the first progress line")
+        assert not task.done()
+        task.cancel()
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(_cancel_after_first_send())
+
+    assert q.empty(), "queue must be drained"
+    assert adapter.sent == ["🔧 terminal", "🔍 web_search"]

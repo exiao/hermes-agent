@@ -4181,6 +4181,18 @@ class TurnRunner:
             _track_progress_result(result)
             return result
 
+        async def _send_separate_progress_line(text):
+            """Flush one queued separate line without losing it on cancellation."""
+            nonlocal _last_edit_ts
+            if _can_edit_platform:
+                _now = time.monotonic()
+                _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                if _remaining > 0:
+                    await asyncio.sleep(_remaining)
+            result = await _send_progress_text(text)
+            _last_edit_ts = time.monotonic()
+            return result
+
         async def _roll_progress_overflow_if_needed() -> bool:
             """Start fresh editable progress bubbles before a bubble exceeds limit.
 
@@ -4376,7 +4388,11 @@ class TurnRunner:
                         raw = ctx.progress_queue.get_nowait()
                         if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                             _, base_msg, count = raw
-                            if progress_lines:
+                            if ctx.progress_grouping == "separate":
+                                await _send_separate_progress_line(
+                                    f"{base_msg} (×{count + 1})"
+                                )
+                            elif progress_lines:
                                 progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                 await _roll_progress_overflow_if_needed()
                         elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
@@ -4394,6 +4410,8 @@ class TurnRunner:
                             progress_lines = []
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
+                        elif ctx.progress_grouping == "separate":
+                            await _send_separate_progress_line(raw)
                         else:
                             progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
