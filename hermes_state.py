@@ -6608,12 +6608,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # not a distinct message: new messages always get a fresh
             # timestamp. Runs inside the caller's BEGIN IMMEDIATE, so
             # check+insert stays atomic under the single writer.
+            #
+            # The match must NOT filter on ``active``. ``active`` is mutable
+            # lifecycle state (compaction sets 0/compacted=1, rewind sets
+            # 0/compacted=0, undo flips it back to 1 by id) — it is not part of
+            # a message's identity. Filtering on it made every re-persist that
+            # arrived after compaction miss its own deactivated original and
+            # insert a fresh copy, once per rotation flush. ``append_message``
+            # (single-row) correctly omits it; this path diverged.
             _stored_content = self._encode_content(msg.get("content"))
             _dup = conn.execute(
                 """SELECT id FROM messages
                    WHERE session_id = ? AND role = ? AND timestamp = ?
                      AND content IS ? AND tool_call_id IS ? AND tool_calls IS ?
-                     AND active = 1
                    LIMIT 1""",
                 (session_id, role, message_timestamp, _stored_content,
                  msg.get("tool_call_id"), tool_calls_json),
