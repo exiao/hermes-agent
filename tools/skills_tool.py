@@ -1130,13 +1130,20 @@ def skill_view(
             # at the top of the dir).
             direct_path = search_dir / name
             if (
-                not _is_skill_support_path(direct_path)
-                and direct_path.is_dir()
+                direct_path.is_dir()
                 and (direct_path / "SKILL.md").exists()
+                and not _is_excluded_skill_path(
+                    direct_path / "SKILL.md", root=search_dir
+                )
+                and not _is_skill_support_path(direct_path)
             ):
                 _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
-                direct_path.with_suffix(".md")
+            elif (
+                direct_path.with_suffix(".md").exists()
+                and not _is_excluded_skill_path(
+                    direct_path.with_suffix(".md"), root=search_dir
+                )
+                and not _is_skill_support_path(direct_path.with_suffix(".md"))
             ):
                 _record(None, direct_path.with_suffix(".md"))
 
@@ -1146,15 +1153,20 @@ def skill_view(
             if local_category_name:
                 categorized_path = search_dir / local_category_name
                 if (
-                    not _is_skill_support_path(categorized_path)
-                    and categorized_path.is_dir()
+                    categorized_path.is_dir()
                     and (categorized_path / "SKILL.md").exists()
+                    and not _is_excluded_skill_path(
+                        categorized_path / "SKILL.md", root=search_dir
+                    )
+                    and not _is_skill_support_path(categorized_path)
                 ):
                     _record(categorized_path, categorized_path / "SKILL.md")
-                elif categorized_path.with_suffix(
-                    ".md"
-                ).exists() and not _is_skill_support_path(
-                    categorized_path.with_suffix(".md")
+                elif (
+                    categorized_path.with_suffix(".md").exists()
+                    and not _is_excluded_skill_path(
+                        categorized_path.with_suffix(".md"), root=search_dir
+                    )
+                    and not _is_skill_support_path(categorized_path.with_suffix(".md"))
                 ):
                     _record(None, categorized_path.with_suffix(".md"))
 

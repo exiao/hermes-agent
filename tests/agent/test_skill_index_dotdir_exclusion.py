@@ -177,3 +177,27 @@ def test_skill_view_skips_legacy_flat_files_in_backup_dirs(tmp_path):
 
     assert result["success"] is False
     assert result["error"] == "Skill 'ghost' not found."
+
+
+def test_skill_view_rejects_direct_symlink_alias_into_backup(tmp_path):
+    """Explicit directory, flat, and categorized paths obey the boundary."""
+    skills_dir = tmp_path / "skills"
+    hidden = skills_dir / ".restore-backups" / "old"
+    skill = hidden / "ghost"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: ghost\ndescription: stale backup\n---\nbackup\n"
+    )
+    (hidden / "flat.md").write_text("# stale flat skill\n")
+    try:
+        (skills_dir / "visible").symlink_to(
+            skills_dir / ".restore-backups", target_is_directory=True
+        )
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+    with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+        for name in ("visible/old/ghost", "visible/old/flat", "visible:old/ghost"):
+            result = json.loads(skill_view(name))
+            assert result["success"] is False, f"{name} loaded a backup skill"
+            assert result["error"] == f"Skill '{name}' not found."
