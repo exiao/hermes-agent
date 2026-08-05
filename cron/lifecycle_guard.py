@@ -258,7 +258,15 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: the tokenizer can hand us a path containing a NUL byte
+        # (decoded binary, or a quoted argument that split badly). os.open
+        # raises ValueError, not OSError, for embedded NULs — catching only
+        # OSError let that escape all the way out of terminal_tool and abort
+        # the user's command with
+        # "Failed to execute command: open: embedded null character in path".
+        # A path we cannot even open is not a referenced shell script, so
+        # treat it the same as a missing file: nothing to scan, not unsafe.
         return None, False
     try:
         metadata = os.fstat(descriptor)
