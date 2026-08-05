@@ -367,7 +367,7 @@ _TOOL_STUBS = {
     "terminal": (
         "terminal",
         "command: str, timeout: int = None, workdir: str = None",
-        '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
+        '"""Run a shell command (foreground only).\n\n    Returns a dict. Always present: "output" (str) and "exit_code" (int).\n    Sometimes present: "error", "traceback", "status", "cwd".\n\n    ALWAYS CHECK exit_code, NOT just output. When a command is rejected\n    BEFORE it runs (shell guard, lifecycle guard, unavailable backend),\n    "output" is an EMPTY STRING, exit_code is -1, and the real reason is in\n    "error"/"traceback". Reading only "output" makes a hard failure look\n    like a command that succeeded and printed nothing."""',
         '{"command": command, "timeout": timeout, "workdir": workdir}',
     ),
 }
