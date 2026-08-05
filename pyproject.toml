@@ -253,7 +253,11 @@ mistral = ["mistralai==2.4.8"]
 # OTLP/HTTP exporter for monitoring.gateway_health_export. Lazy-installed via
 # tools/lazy_deps.py on first use; never a core dependency and deliberately
 # NOT in [all].
-otlp = ["opentelemetry-sdk==1.39.1", "opentelemetry-exporter-otlp-proto-http==1.39.1"]
+# NOTE: the SDK hard-pins opentelemetry-api and -semantic-conventions to its own
+# release (sdk 1.44.0 -> api==1.44.0, semconv==0.65b0). Bump all of these together;
+# a partial upgrade leaves the SDK calling TraceFlags.RANDOM_TRACE_ID against an
+# older api that lacks it, which silently kills the pre_llm_call tracing hook.
+otlp = ["opentelemetry-sdk==1.44.0", "opentelemetry-exporter-otlp-proto-http==1.44.0"]
 bedrock = ["boto3==1.42.89"]
 vertex = ["google-auth==2.55.1"]
 azure-identity = ["azure-identity==1.25.3"]
