@@ -4288,14 +4288,15 @@ class TurnRunner:
                 # API calls to avoid hitting Telegram flood control.
                 # (grammY auto-retry pattern: proactively rate-limit
                 # instead of reacting to 429s.)
-                _now = time.monotonic()
-                _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
-                if _remaining > 0:
-                    # Wait out the throttle interval, then loop back to
-                    # drain any additional queued messages before sending
-                    # a single batched edit.
-                    await asyncio.sleep(_remaining)
-                    continue
+                if can_edit:
+                    _now = time.monotonic()
+                    _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                    if _remaining > 0:
+                        # Wait out the throttle interval, then loop back to
+                        # drain any additional queued messages before sending
+                        # a single batched edit.
+                        await asyncio.sleep(_remaining)
+                        continue
 
                 if not ctx._run_still_current():
                     return

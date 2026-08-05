@@ -34,6 +34,9 @@ class _NoEditAdapter:
         self.sent.append(content)
         return type("R", (), {"success": True, "message_id": "m1", "error": None})()
 
+    async def send_typing(self, chat_id=None, **kwargs):
+        pass
+
 
 def _runner_for(adapter, ctx):
     from gateway.run import TurnRunner
@@ -52,10 +55,11 @@ def _ctx_with(grouping, lines):
     calls = {"n": 0}
 
     def _still_current():
-        # True while draining, False once the queue is empty so the
-        # sender loop terminates instead of blocking forever.
+        # Keep the turn current while the sender processes both queued lines;
+        # the sender checks this callback after dequeuing a line as well as
+        # before its next iteration.
         calls["n"] += 1
-        return not q.empty()
+        return calls["n"] <= 6
 
     return TurnContext(
         source=type("S", (), {"chat_id": "c1", "platform": None})(),
@@ -86,8 +90,6 @@ def test_separate_grouping_sends_lines_on_non_editing_platform():
 
     asyncio.run(asyncio.wait_for(runner.send_progress_messages(), 10))
 
-    assert adapter.sent, (
-        "tool_progress_grouping=separate must deliver progress lines even "
-        "when the adapter cannot edit messages"
-    )
+    assert len(adapter.sent) == 2, "both progress messages must be sent"
     assert any("terminal" in s for s in adapter.sent)
+    assert any("web_search" in s for s in adapter.sent)
