@@ -4062,23 +4062,26 @@ class TurnRunner:
         if not adapter:
             return
 
-        # Skip tool progress for platforms that don't support message
-        # editing (e.g. iMessage/BlueBubbles) — each progress update
-        # would become a separate message bubble, which is noisy.
-        # getattr, not attribute access: duck-typed adapters (test fakes,
-        # minimal plugin adapters) may not define edit_message at all —
-        # "missing" means the same thing as "base no-op": can't edit.
-        # Platforms with no edit_message (Signal, iMessage) can still show
-        # progress — the can_edit=False branch below already sends each line
-        # as its own message. So don't drop the queue here; just record that
-        # editing is unavailable and let the normal path handle it. These
-        # platforms default to tool_progress "off" (_TIER_LOW), so nothing
-        # reaches this queue unless the user opted in.
-        # getattr, not attribute access: duck-typed adapters (test fakes,
-        # minimal plugin adapters) may not define edit_message at all —
-        # "missing" means the same thing as "base no-op": can't edit.
+        # Platforms with no usable edit_message (Signal, iMessage, WeCom)
+        # can still show progress — the can_edit=False branch below already
+        # sends each line as its own message. So don't drop the queue here;
+        # just record that editing is unavailable and let the normal path
+        # handle it. These platforms default to tool_progress "off"
+        # (_TIER_LOW), so nothing reaches this queue unless the user opted in.
+        #
+        # Two independent signals, both required:
+        #  - SUPPORTS_MESSAGE_EDITING: the adapter's own declaration, which
+        #    the streaming path (_build_stream_consumer_config) already
+        #    trusts. DingTalk implements edit_message but returns False from
+        #    this property when AI Cards aren't configured, so the method
+        #    check alone would wrongly conclude "can edit".
+        #  - the method check: duck-typed adapters (test fakes, minimal
+        #    plugin adapters) may not define edit_message at all — "missing"
+        #    means the same thing as "base no-op": can't edit. getattr, not
+        #    attribute access, so a missing attribute isn't an AttributeError.
         _adapter_edit = getattr(type(adapter), "edit_message", None)
-        _platform_can_edit = not (
+        _declares_edit = bool(getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True))
+        _platform_can_edit = _declares_edit and not (
             _adapter_edit is None or _adapter_edit is BasePlatformAdapter.edit_message
         )
 
