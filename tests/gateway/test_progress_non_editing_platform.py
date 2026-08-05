@@ -15,6 +15,7 @@ can render, so the lines must be SENT.
 
 import asyncio
 import queue as queue_mod
+import time
 
 import pytest
 
@@ -36,6 +37,21 @@ class _NoEditAdapter:
 
     async def send_typing(self, chat_id=None, **kwargs):
         pass
+
+
+class _EditableAdapter(_NoEditAdapter):
+    """Stand-in for Telegram: send and edit are both available."""
+
+    def __init__(self):
+        super().__init__()
+        self.send_times = []
+
+    async def send(self, chat_id=None, content=None, **kwargs):
+        self.send_times.append(time.monotonic())
+        return await super().send(chat_id, content, **kwargs)
+
+    async def edit_message(self, **kwargs):
+        return type("R", (), {"success": True, "message_id": "m1", "error": None})()
 
 
 def _runner_for(adapter, ctx):
@@ -93,3 +109,16 @@ def test_separate_grouping_sends_lines_on_non_editing_platform():
     assert len(adapter.sent) == 2, "both progress messages must be sent"
     assert any("terminal" in s for s in adapter.sent)
     assert any("web_search" in s for s in adapter.sent)
+
+
+def test_separate_grouping_paces_editable_platform():
+    adapter = _EditableAdapter()
+    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    runner = _runner_for(adapter, ctx)
+
+    asyncio.run(asyncio.wait_for(runner.send_progress_messages(), 10))
+
+    assert q.empty(), "queue must be drained"
+    assert adapter.sent == ["🔧 terminal", "🔍 web_search"]
+    assert len(adapter.send_times) == 2
+    assert adapter.send_times[1] - adapter.send_times[0] >= 1.4

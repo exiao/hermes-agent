@@ -4235,6 +4235,16 @@ class TurnRunner:
                             break
                     return
 
+                # Throttle progress sends on adapters that can edit messages.
+                # This applies to separate grouping too: editable platforms
+                # still need the same flood-control pacing even when each tool
+                # gets its own message.
+                if _can_edit_platform:
+                    _now = time.monotonic()
+                    _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                    if _remaining > 0:
+                        await asyncio.sleep(_remaining)
+
                 raw = ctx.progress_queue.get_nowait()
 
                 # Drain silently when interrupted: events queued in the
@@ -4284,20 +4294,7 @@ class TurnRunner:
                         await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
                     continue
 
-                # Throttle edits: batch rapid tool updates into fewer
-                # API calls to avoid hitting Telegram flood control.
-                # (grammY auto-retry pattern: proactively rate-limit
-                # instead of reacting to 429s.)
-                if can_edit:
-                    _now = time.monotonic()
-                    _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
-                    if _remaining > 0:
-                        # Wait out the throttle interval, then loop back to
-                        # drain any additional queued messages before sending
-                        # a single batched edit.
-                        await asyncio.sleep(_remaining)
-                        continue
-
+                # Send/edit the current progress message.
                 if not ctx._run_still_current():
                     return
 
