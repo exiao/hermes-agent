@@ -6,11 +6,13 @@ dropped every queued progress line whenever the adapter did not override
 unreachable on Signal at ANY ``tool_progress`` setting: the user saw a
 long silence and then the final answer.
 
-Contract now: the drop only happens in the default "accumulate" grouping
-(where one editable bubble is the point).  With
-``tool_progress_grouping: separate`` the user has explicitly asked for
-one message per tool, which is exactly the shape a non-editing platform
-can render, so the lines must be SENT.
+Contract now: a missing ``edit_message`` only forces ``can_edit=False``,
+which is the already-existing one-message-per-tool path.  The lines are
+delivered regardless of grouping.  Nothing is dropped.
+
+This is safe by default because non-editing platforms sit in
+``_TIER_LOW``, whose ``tool_progress`` default is ``"off"`` — no line
+reaches this queue unless the user opted in.
 """
 
 import asyncio
@@ -29,10 +31,21 @@ class _NoEditAdapter:
 
     def __init__(self):
         self.sent = []
+        self.edits = []
 
     async def send(self, chat_id=None, content=None, **kwargs):
         self.sent.append(content)
         return type("R", (), {"success": True, "message_id": "m1", "error": None})()
+
+
+class _EditAdapter(_NoEditAdapter):
+    """Telegram-like: editing supported, so lines accumulate in one bubble."""
+
+    name = "telegram"
+
+    async def edit_message(self, chat_id, message_id, content, **kwargs):
+        self.edits.append(content)
+        return type("R", (), {"success": True, "message_id": message_id, "error": None})()
 
 
 def _runner_for(adapter, ctx):
@@ -49,12 +62,10 @@ def _ctx_with(grouping, lines):
     q = queue_mod.Queue()
     for line in lines:
         q.put(line)
-    calls = {"n": 0}
 
     def _still_current():
         # True while draining, False once the queue is empty so the
         # sender loop terminates instead of blocking forever.
-        calls["n"] += 1
         return not q.empty()
 
     return TurnContext(
@@ -67,27 +78,29 @@ def _ctx_with(grouping, lines):
     ), q
 
 
-@pytest.mark.parametrize("grouping", ["accumulate", "grouped"])
-def test_editable_grouping_drops_lines_on_non_editing_platform(grouping):
+@pytest.mark.parametrize("grouping", ["accumulate", "separate"])
+def test_non_editing_platform_still_delivers_progress(grouping):
+    """The regression: these lines used to be silently dropped."""
     adapter = _NoEditAdapter()
-    ctx, q = _ctx_with(grouping, ["🔧 terminal", "🔍 web_search"])
-    runner = _runner_for(adapter, ctx)
-
-    asyncio.run(asyncio.wait_for(runner.send_progress_messages(), 5))
-
-    assert q.empty(), "queue must be drained"
-    assert adapter.sent == [], "no bubbles when the bubble can't be edited"
-
-
-def test_separate_grouping_sends_lines_on_non_editing_platform():
-    adapter = _NoEditAdapter()
-    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    ctx, _q = _ctx_with(grouping, ["🔧 terminal", "🔍 web_search"])
     runner = _runner_for(adapter, ctx)
 
     asyncio.run(asyncio.wait_for(runner.send_progress_messages(), 10))
 
     assert adapter.sent, (
-        "tool_progress_grouping=separate must deliver progress lines even "
-        "when the adapter cannot edit messages"
+        f"grouping={grouping}: progress must reach a platform that cannot "
+        "edit messages, one message per line"
     )
     assert any("terminal" in s for s in adapter.sent)
+
+
+def test_editing_platform_still_accumulates_into_one_bubble():
+    """Guard the unchanged Telegram/Discord path: edit, don't spam."""
+    adapter = _EditAdapter()
+    ctx, _q = _ctx_with("accumulate", ["🔧 terminal", "🔍 web_search"])
+    runner = _runner_for(adapter, ctx)
+
+    asyncio.run(asyncio.wait_for(runner.send_progress_messages(), 10))
+
+    # First line is a send; subsequent lines edit that same message.
+    assert len(adapter.sent) == 1, "editable platform must not send a second bubble"

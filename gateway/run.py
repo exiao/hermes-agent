@@ -4068,25 +4068,25 @@ class TurnRunner:
         # getattr, not attribute access: duck-typed adapters (test fakes,
         # minimal plugin adapters) may not define edit_message at all —
         # "missing" means the same thing as "base no-op": can't edit.
-        # Opt-out: tool_progress_grouping="separate" means the user has
-        # explicitly accepted one message per tool, which is the only shape
-        # a non-editing platform (Signal, iMessage) can render at all. In
-        # that case keep the progress lines instead of dropping them.
+        # Platforms with no edit_message (Signal, iMessage) can still show
+        # progress — the can_edit=False branch below already sends each line
+        # as its own message. So don't drop the queue here; just record that
+        # editing is unavailable and let the normal path handle it. These
+        # platforms default to tool_progress "off" (_TIER_LOW), so nothing
+        # reaches this queue unless the user opted in.
+        # getattr, not attribute access: duck-typed adapters (test fakes,
+        # minimal plugin adapters) may not define edit_message at all —
+        # "missing" means the same thing as "base no-op": can't edit.
         _adapter_edit = getattr(type(adapter), "edit_message", None)
-        _can_edit_platform = not (
+        _platform_can_edit = not (
             _adapter_edit is None or _adapter_edit is BasePlatformAdapter.edit_message
         )
-        if not _can_edit_platform and ctx.progress_grouping != "separate":
-            while not ctx.progress_queue.empty():
-                try:
-                    ctx.progress_queue.get_nowait()
-                except Exception:
-                    break
-            return
 
         progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
         progress_msg_id = None   # ID of the current progress message to edit
-        can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
+        # "separate" = one message per tool (pre-v0.9 behavior). A platform
+        # that cannot edit is forced onto the same one-message-per-tool path.
+        can_edit = _platform_can_edit and ctx.progress_grouping != "separate"
         _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
         _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
