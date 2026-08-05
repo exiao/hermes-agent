@@ -1,6 +1,7 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
 import base64
+import httpx
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -261,6 +262,81 @@ class TestSignalSSEUrlEncoding:
         """The + in E.164 phone numbers must be percent-encoded in the SSE query string."""
         encoded = quote("+31612345678", safe="")
         assert encoded == "%2B31612345678"
+
+    @pytest.mark.asyncio
+    async def test_force_reconnect_closes_consumed_stream_and_retries(self, monkeypatch):
+        """Closing an active consumed response must release the listener context."""
+        adapter = _make_signal_adapter(monkeypatch)
+        monkeypatch.setattr("gateway.platforms.signal.SSE_RETRY_DELAY_INITIAL", 0)
+
+        class BlockingSSEStream(httpx.AsyncByteStream):
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.closed = asyncio.Event()
+                self.close_calls = 0
+
+            async def __aiter__(self):
+                self.started.set()
+                yield b": active\\n\\n"
+                await self.closed.wait()
+
+            async def aclose(self):
+                self.close_calls += 1
+                self.closed.set()
+
+        class StreamContext:
+            def __init__(self, response, entered, exited):
+                self.response = response
+                self.entered = entered
+                self.exited = exited
+
+            async def __aenter__(self):
+                self.entered.set()
+                return self.response
+
+            async def __aexit__(self, *_):
+                self.exited.set()
+                await self.response.aclose()
+
+        class StreamingClient:
+            def __init__(self, contexts):
+                self.contexts = iter(contexts)
+
+            def stream(self, *_args, **_kwargs):
+                return next(self.contexts)
+
+        request = httpx.Request("GET", "http://localhost:8080/api/v1/events")
+        first_stream = BlockingSSEStream()
+        first_response = httpx.Response(200, request=request, stream=first_stream)
+        first_entered = asyncio.Event()
+        first_exited = asyncio.Event()
+        second_stream = BlockingSSEStream()
+        second_response = httpx.Response(200, request=request, stream=second_stream)
+        second_entered = asyncio.Event()
+        second_exited = asyncio.Event()
+        adapter.client = StreamingClient([
+            StreamContext(first_response, first_entered, first_exited),
+            StreamContext(second_response, second_entered, second_exited),
+        ])
+        adapter._running = True
+        listener_task = asyncio.create_task(adapter._sse_listener())
+
+        try:
+            await asyncio.wait_for(first_stream.started.wait(), timeout=1)
+            assert first_response.is_stream_consumed is True
+
+            adapter._force_reconnect()
+
+            await asyncio.wait_for(first_stream.closed.wait(), timeout=1)
+            await asyncio.wait_for(first_exited.wait(), timeout=1)
+            await asyncio.wait_for(second_entered.wait(), timeout=1)
+            assert first_stream.close_calls == 1
+        finally:
+            adapter._running = False
+            await second_response.aclose()
+            await listener_task
+
+        assert second_exited.is_set()
 
 
 # ---------------------------------------------------------------------------
