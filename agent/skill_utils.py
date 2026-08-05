@@ -144,19 +144,64 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
         return True
 
     rel_parts = None
-    if root is not None:
+    scan_root = Path(root) if root is not None else None
+    if scan_root is not None:
         try:
-            rel_parts = PurePath(str(path)).relative_to(PurePath(str(root))).parts
+            rel_parts = PurePath(str(path)).relative_to(PurePath(str(scan_root))).parts
         except ValueError:
             rel_parts = None
+    elif not PurePath(str(path)).is_absolute():
+        rel_parts = PurePath(str(path)).parts
+    else:
+        # Most callers hand us an absolute path from a direct rglob without the
+        # scan root. Recover the configured root first, then fall back to the
+        # conventional skills/optional-skills anchor used by profile and repo
+        # scans. This deliberately ignores dot-segments above that anchor, such
+        # as the legitimate ~/.hermes parent.
+        try:
+            candidate_roots = get_all_skills_dirs()
+        except Exception:
+            candidate_roots = []
+        for candidate_root in candidate_roots:
+            try:
+                rel_parts = PurePath(str(path)).relative_to(
+                    PurePath(str(candidate_root))
+                ).parts
+                scan_root = Path(candidate_root)
+                break
+            except ValueError:
+                continue
+        if rel_parts is None:
+            anchor_indexes = [
+                idx
+                for idx, part in enumerate(parts[:-1])
+                if part in {"skills", "optional-skills"}
+            ]
+            if anchor_indexes:
+                anchor_idx = anchor_indexes[0]
+                rel_parts = parts[anchor_idx + 1 :]
+                scan_root = Path(*parts[: anchor_idx + 1])
     if rel_parts is None:
-        # No root to anchor against: only judge the immediate parent chain that
-        # a scanner would have walked, never the absolute prefix.
+        # No safe root to anchor against: do not inspect an absolute prefix,
+        # which may legitimately contain dot-directories.
         rel_parts = ()
 
     # Directory segments only — a dotfile leaf (".hidden.md") is not a category.
     if any(part.startswith(".") for part in rel_parts[:-1]):
         return True
+
+    # A visible symlink category may point back into a hidden backup below the
+    # scan root. Preserve symlinks to external category trees, but reject a
+    # target that resolves through an in-tree dot-directory.
+    if scan_root is not None:
+        try:
+            resolved_parts = (
+                Path(str(path)).resolve().relative_to(scan_root.resolve()).parts
+            )
+        except (OSError, RuntimeError, ValueError):
+            resolved_parts = ()
+        if any(part.startswith(".") for part in resolved_parts[:-1]):
+            return True
 
     return is_skill_support_path(path, root=root)
 
@@ -956,7 +1001,9 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
         if filename in files:
-            matches.append(os.path.join(root, filename))
+            candidate = Path(root) / filename
+            if not is_excluded_skill_path(candidate, root=skills_dir):
+                matches.append(str(candidate))
     for path in sorted(matches):
         yield Path(path)
 

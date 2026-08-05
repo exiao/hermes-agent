@@ -17,18 +17,20 @@ copy instead of the current skill.
 These tests encode the RULE (no dot-directory is a skill category) rather than
 the literals, so the next backup convention cannot re-open the hole.
 """
+import json
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agent.skill_utils import (
-    EXCLUDED_SKILL_DIRS,
     is_excluded_skill_path,
     iter_skill_index_files,
 )
+from tools.skills_tool import skill_view
 
 # Known writers of dot-dirs inside skills/, and the shape of what they store.
 BACKUP_DIRS = (
@@ -106,7 +108,72 @@ def test_index_walk_skips_backup_dirs_end_to_end(tmp_path):
     )
 
 
-def test_denylist_still_covers_historical_entries():
+@pytest.mark.parametrize(
+    "name",
+    (".git", ".github", ".hub", ".archive", "__pycache__", "node_modules"),
+)
+def test_historical_exclusions_remain_behavioral(tmp_path, name):
     """Whatever the mechanism, the previously-fixed cases stay fixed."""
-    for name in (".git", ".github", ".hub", ".archive", "__pycache__", "node_modules"):
-        assert name in EXCLUDED_SKILL_DIRS
+    candidate = tmp_path / name / "old" / "SKILL.md"
+    assert is_excluded_skill_path(candidate, root=tmp_path)
+
+
+def test_unrooted_absolute_scan_excludes_skill_backup(tmp_path):
+    """Documented rootless calls still reject backups below a skills root."""
+    candidate = (
+        tmp_path
+        / ".hermes"
+        / "skills"
+        / ".restore-backups"
+        / "old"
+        / "nested"
+        / "skills"
+        / "ghost"
+        / "SKILL.md"
+    )
+    assert is_excluded_skill_path(candidate)
+
+    live = tmp_path / ".hermes" / "skills" / "coding" / "real" / "SKILL.md"
+    assert not is_excluded_skill_path(live)
+
+
+def test_unrooted_external_scan_uses_configured_root(tmp_path):
+    """External skill roots need not use the conventional 'skills' name."""
+    external_root = tmp_path / ".team-library"
+    candidate = external_root / ".snapshots" / "old" / "ghost" / "SKILL.md"
+
+    with patch(
+        "agent.skill_utils.get_all_skills_dirs", return_value=[external_root]
+    ):
+        assert is_excluded_skill_path(candidate)
+
+
+def test_index_walk_rejects_visible_symlink_into_backup(tmp_path):
+    """A visible category alias must not revive an in-tree hidden backup."""
+    hidden = tmp_path / ".restore-backups" / "old" / "ghost"
+    hidden.mkdir(parents=True)
+    (hidden / "SKILL.md").write_text(
+        "---\nname: ghost\ndescription: stale backup\n---\n"
+    )
+    try:
+        (tmp_path / "visible-alias").symlink_to(
+            tmp_path / ".restore-backups", target_is_directory=True
+        )
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+    assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == []
+
+
+def test_skill_view_skips_legacy_flat_files_in_backup_dirs(tmp_path):
+    """Legacy <name>.md lookup must obey the same active-tree boundary."""
+    skills_dir = tmp_path / "skills"
+    hidden = skills_dir / ".restore-backups" / "old"
+    hidden.mkdir(parents=True)
+    (hidden / "ghost.md").write_text("# stale flat skill\n")
+
+    with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+        result = json.loads(skill_view("ghost"))
+
+    assert result["success"] is False
+    assert result["error"] == "Skill 'ghost' not found."

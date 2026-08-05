@@ -84,6 +84,7 @@ from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_excluded_skill_dir_name as _is_excluded_skill_dir_name,
+    is_excluded_skill_path as _is_excluded_skill_path,
     is_skill_support_path as _is_skill_support_path,
 )
 
@@ -1179,8 +1180,10 @@ def skill_view(
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
+                if (
+                    found_md.name != "SKILL.md"
+                    and not _is_excluded_skill_path(found_md, root=search_dir)
+                    and not _is_skill_support_path(found_md, root=search_dir)
                 ):
                     _record(None, found_md)
 
