@@ -6276,8 +6276,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
+            # ``"all"``: a re-persist of reloaded history may arrive after an
+            # earlier compaction deactivated its original row. That original is
+            # NOT this call's own output, so matching it is correct and is what
+            # stops the once-per-rotation-flush duplicate growth (#218).
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, messages
+                conn, session_id, messages, dedupe_scope="all"
             )
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
@@ -6540,7 +6544,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        dedupe_scope: str = "active",
+    ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
@@ -6548,7 +6558,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         caller's write transaction (takes the live ``conn``). Returns
         ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
+
+        ``dedupe_scope`` selects which existing rows the re-persist idempotency
+        guard may match, because the four callers of this helper disagree about
+        what counts as a duplicate:
+
+        - ``"active"`` (default): match only live rows. What a caller wants when
+          it inserts alongside history it did NOT just deactivate — notably
+          :meth:`archive_and_compact`, which soft-archives the live turns and
+          then re-inserts the retained tail. Those archived rows are this call's
+          own output, so matching them would make compaction insert nothing.
+        - ``"all"``: match regardless of ``active``. What
+          :meth:`append_messages_batch` wants (#218): a re-persist arriving after
+          its original was deactivated by an EARLIER, unrelated compaction must
+          still recognize its own original instead of inserting a fresh copy.
+
+        The distinction is "did *this* call deactivate the row I am matching
+        against", which only the caller knows — hence a parameter rather than a
+        single global rule.
         """
+        if dedupe_scope not in ("active", "all"):
+            raise ValueError(f"invalid dedupe_scope: {dedupe_scope!r}")
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
@@ -6609,21 +6639,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # timestamp. Runs inside the caller's BEGIN IMMEDIATE, so
             # check+insert stays atomic under the single writer.
             #
-            # The match must NOT filter on ``active``. ``active`` is mutable
-            # lifecycle state (compaction sets 0/compacted=1, rewind sets
-            # 0/compacted=0, undo flips it back to 1 by id) — it is not part of
-            # a message's identity. Filtering on it made every re-persist that
-            # arrived after compaction miss its own deactivated original and
-            # insert a fresh copy, once per rotation flush. ``append_message``
-            # (single-row) correctly omits it; this path diverged.
+            # Whether the match may see ``active = 0`` rows is the caller's
+            # call, via ``dedupe_scope`` (see this method's docstring). #218
+            # needs the batch re-persist path to match its own deactivated
+            # original, so that path passes ``"all"``. Compaction must NOT,
+            # because the archived rows it would match are the ones it just
+            # created (#207).
             _stored_content = self._encode_content(msg.get("content"))
             _dup = conn.execute(
                 """SELECT id FROM messages
                    WHERE session_id = ? AND role = ? AND timestamp = ?
                      AND content IS ? AND tool_call_id IS ? AND tool_calls IS ?
+                     AND (? = 'all' OR active = 1)
                    LIMIT 1""",
                 (session_id, role, message_timestamp, _stored_content,
-                 msg.get("tool_call_id"), tool_calls_json),
+                 msg.get("tool_call_id"), tool_calls_json, dedupe_scope),
             ).fetchone()
             if _dup is not None:
                 continue
