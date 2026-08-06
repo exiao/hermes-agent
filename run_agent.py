@@ -3656,8 +3656,9 @@ class AIAgent:
                 + "the turn was stopped because session storage could not be "
                 "written (the transcript would have been lost on restart). "
                 "Usually the state DB write lock was held too long by another "
-                "Hermes process; a full disk or bad state.db permissions can "
-                "also cause it. Send your message again."
+                "Hermes process; a drive that is out of free space or bad "
+                "state.db permissions can also cause it. Send your message "
+                "again."
             )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.
