@@ -372,3 +372,53 @@ async def test_busy_steer_without_quote_stays_plain_text():
     result = await runner._prepare_busy_steer_text(event)
 
     assert result == "keep going"
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_failed_stt_quote_reply_stays_falsy():
+    """A voice quote-reply whose STT failed must NOT become a steerable payload.
+
+    Regression: the busy-steer gate reads the return value of
+    ``_prepare_busy_steer_text``. When that value was the *formatted pointer*
+    rather than the user body, an empty transcript still produced a truthy
+    ``[Replying to: "..."]\\n\\n`` prefix — ``can_steer`` passed, ``steer()``
+    succeeded with no message content, and the ``if not steered`` requeue was
+    skipped. The user's voice note was neither steered nor queued: it was lost.
+    """
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="",
+        source=source,
+        reply_to_message_id="9",
+        reply_to_text="the earlier note",
+    )
+
+    runner._pending_event_audio_paths = lambda _event: ["/tmp/voice.ogg"]
+    runner._adapter_for_source = lambda _source: None
+
+    async def _failed_stt(event, adapter, source, text, log_context=""):
+        return (text, [])
+
+    runner._transcribe_and_echo_pending_voice = _failed_stt
+
+    result = await runner._prepare_busy_steer_text(event)
+
+    assert not result
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_empty_text_quote_reply_stays_falsy():
+    """A text-less quote-reply must stay falsy so the caller queues it."""
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="",
+        source=source,
+        reply_to_message_id="9",
+        reply_to_text=None,
+    )
+
+    result = await runner._prepare_busy_steer_text(event)
+
+    assert not result

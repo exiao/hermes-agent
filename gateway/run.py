@@ -9003,7 +9003,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         text = (event.text or "").strip()
         if not self._pending_event_audio_paths(event):
-            return format_reply_pointer(event, text)
+            # Gate on the USER payload, never on the formatted pointer: an
+            # empty body must stay falsy so the caller falls back to queue
+            # mode instead of steering a pointer with no message in it.
+            return format_reply_pointer(event, text) if text else ""
 
         adapter = self._adapter_for_source(event.source)
         enriched_text, successful_transcripts = await self._transcribe_and_echo_pending_voice(
@@ -9014,8 +9017,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             log_context="Busy-steer",
         )
         if not successful_transcripts:
-            return format_reply_pointer(event, text)
-        return format_reply_pointer(event, (enriched_text or text).strip())
+            return format_reply_pointer(event, text) if text else ""
+        body = (enriched_text or text).strip()
+        return format_reply_pointer(event, body) if body else ""
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -15225,8 +15229,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent.steer().  Falls back to queue semantics if the payload
                 # is empty, the agent lacks steer(), or steer() rejects.
                 # Use the same reply-pointer formatting as the cold path so a
-                # mid-turn quote-reply does not drop the quoted body.
-                steer_text = format_reply_pointer(event, (event.text or "").strip())
+                # mid-turn quote-reply does not drop the quoted body. Gate on
+                # the user payload, not the formatted pointer, so an empty
+                # body still falls back to queue mode below.
+                steer_body = (event.text or "").strip()
+                steer_text = format_reply_pointer(event, steer_body) if steer_body else ""
                 steered = False
                 if (
                     event.message_type == MessageType.TEXT
