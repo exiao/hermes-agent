@@ -1,235 +1,139 @@
 """Modal sandbox ``idle_timeout`` plumbing.
 
-Regression cover for leaked sandboxes: a kanban worker exits (often via
-``os._exit``, skipping cleanup), the sandbox keeps running ``sleep infinity``,
-and nothing reaps it until the hard ``timeout`` lifetime expires -- up to an
-hour of billed idle time per leaked worker.
+A kanban worker exits (often via ``os._exit``, skipping cleanup), the sandbox
+keeps running ``sleep infinity``, and nothing reaps it until the hard
+``timeout`` lifetime expires -- up to an hour of billed idle time per leak.
 
 ``timeout`` is a MAXIMUM LIFETIME and kills mid-command, so it cannot be
-lowered to fix this. ``idle_timeout`` is the inactivity reaper. These tests
-assert the config value actually reaches ``Sandbox.create`` and that the two
-knobs stay distinct.
+lowered to fix this. ``idle_timeout`` is the inactivity reaper.
 """
-
-import inspect
 
 import pytest
 
 from tools import terminal_tool
 
 
-def _container_config(**overrides):
-    cfg = {
-        "container_cpu": 1,
-        "container_memory": 1024,
-        "container_disk": 0,
-        "container_persistent": False,
-        "modal_mode": "direct",
-    }
-    cfg.update(overrides)
-    return cfg
-
-
-def _modal_sandbox_kwargs(monkeypatch, container_config):
-    """Return the sandbox_kwargs _create_environment builds for modal."""
+def _sandbox_kwargs(monkeypatch, **cfg):
+    """Return the modal sandbox_kwargs _create_environment builds."""
     captured = {}
 
-    class _StubModalEnv:
-        def __init__(self, *args, **kwargs):
-            captured.update(kwargs)
+    class _Stub:
+        def __init__(self, *a, **kw):
+            captured.update(kw)
 
     monkeypatch.setattr(
         terminal_tool, "_get_modal_backend_state",
-        lambda _mode: {
-            "selected_backend": "direct",
-            "mode": "direct",
-            "managed_mode_blocked": False,
-        },
+        lambda _m: {"selected_backend": "direct", "mode": "direct",
+                    "managed_mode_blocked": False},
     )
-    monkeypatch.setattr(terminal_tool, "_ModalEnvironment", _StubModalEnv, raising=False)
+    monkeypatch.setattr(terminal_tool, "_ModalEnvironment", _Stub, raising=False)
 
+    container_config = {
+        "container_cpu": 1, "container_memory": 1024, "container_disk": 0,
+        "container_persistent": False, "modal_mode": "direct", **cfg,
+    }
     terminal_tool._create_environment(
-        env_type="modal",
-        image="debian",
-        cwd="/root",
-        timeout=120,
-        ssh_config={},
-        container_config=container_config,
-        local_config={},
-        task_id="t_idle",
-        host_cwd="/root",
+        env_type="modal", image="debian", cwd="/root", timeout=3600,
+        ssh_config={}, container_config=container_config, local_config={},
+        task_id="t_idle", host_cwd="/root",
     )
     return captured.get("modal_sandbox_kwargs", {})
 
 
 class TestIdleTimeoutPlumbing:
-    def test_idle_timeout_forwarded_when_configured(self, monkeypatch):
-        kwargs = _modal_sandbox_kwargs(
-            monkeypatch, _container_config(container_idle_timeout=300)
-        )
-        assert kwargs.get("idle_timeout") == 300
+    def test_forwarded_when_configured(self, monkeypatch):
+        kwargs = _sandbox_kwargs(monkeypatch, container_idle_timeout=900)
+        assert kwargs.get("idle_timeout") == 900
 
-    def test_absent_when_disabled(self, monkeypatch):
-        """0 must preserve the pre-change behavior: no kwarg at all."""
-        kwargs = _modal_sandbox_kwargs(
-            monkeypatch, _container_config(container_idle_timeout=0)
-        )
+    @pytest.mark.parametrize("value", [0, None, "soon"])
+    def test_absent_unless_valid(self, monkeypatch, value):
+        """0/unset/garbage must all preserve pre-change behavior: no kwarg."""
+        kwargs = _sandbox_kwargs(monkeypatch, container_idle_timeout=value)
         assert "idle_timeout" not in kwargs
 
-    def test_absent_when_unset(self, monkeypatch):
-        kwargs = _modal_sandbox_kwargs(monkeypatch, _container_config())
-        assert "idle_timeout" not in kwargs
-
-    def test_non_numeric_is_ignored_not_fatal(self, monkeypatch):
-        """A bad config value must not break sandbox creation."""
-        kwargs = _modal_sandbox_kwargs(
-            monkeypatch, _container_config(container_idle_timeout="soon")
+    def test_raised_above_local_reaper(self, monkeypatch):
+        """Modal must not delete a sandbox Hermes still holds in its cache."""
+        kwargs = _sandbox_kwargs(
+            monkeypatch, container_idle_timeout=60, lifetime_seconds=300
         )
-        assert "idle_timeout" not in kwargs
+        assert kwargs["idle_timeout"] == 600
+
+    def test_never_exceeds_hard_lifetime(self, monkeypatch):
+        kwargs = _sandbox_kwargs(monkeypatch, container_idle_timeout=99999)
+        assert kwargs["idle_timeout"] == 3600
 
 
 class TestMalformedEnvIsNonFatal:
     """A bad value must disable the feature, never block the terminal.
 
-    Exercised through the real ``_get_env_config()`` rather than by hand-building
-    container_config: the original bug was that parsing raised *inside* that
-    function, so a test that skipped it reported success while
-    TERMINAL_ENV=modal + a typo made every environment creation fail.
+    Exercised through the real ``_get_env_config()``: the failure mode is a
+    raise *inside* that function, which breaks every environment creation.
     """
 
-    @pytest.mark.parametrize("bad", ["soon", "5m", "", "1.5", "-30"])
-    def test_bad_value_disables_instead_of_raising(self, monkeypatch, bad):
+    @pytest.mark.parametrize("raw,expected", [
+        ("soon", 0), ("5m", 0), ("", 0), ("1.5", 0), ("-30", 0), ("300", 300),
+    ])
+    def test_parsing(self, monkeypatch, raw, expected):
         monkeypatch.setenv("TERMINAL_ENV", "modal")
-        monkeypatch.setenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", bad)
-        cfg = terminal_tool._get_env_config()
-        assert cfg["container_idle_timeout"] == 0
-
-    def test_valid_value_still_parsed(self, monkeypatch):
-        monkeypatch.setenv("TERMINAL_ENV", "modal")
-        monkeypatch.setenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", "300")
-        assert terminal_tool._get_env_config()["container_idle_timeout"] == 300
+        monkeypatch.setenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", raw)
+        assert terminal_tool._get_env_config()["container_idle_timeout"] == expected
 
     def test_unset_defaults_to_disabled(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "modal")
         monkeypatch.delenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", raising=False)
-        assert terminal_tool._get_env_config()["container_idle_timeout"] == 0
-
-
-class TestGatewayEnvMapParity:
-    """The gateway keeps its OWN terminal env map; drift silently disables keys.
-
-    The gateway is how kanban workers run, so a key missing there disables the
-    setting for exactly the workload that leaks sandboxes -- with config.yaml
-    still showing it as configured. Asserted as a parity invariant rather than
-    a fixed key list so the next added key is caught too.
-    """
-
-    def _gateway_map(self):
-        import re
-        from pathlib import Path
-        import gateway.run as gw
-
-        src = Path(gw.__file__).read_text()
-        block = re.search(
-            r'_terminal_env_map\s*=\s*\{(.*?)\n\s*\}', src, re.S
-        )
-        assert block, "could not locate _terminal_env_map in gateway/run.py"
-        return set(re.findall(r'"(\w+)":\s*"TERMINAL_', block.group(1)))
-
-    def test_idle_timeout_is_bridged(self):
-        assert "container_idle_timeout" in self._gateway_map()
-
-    def test_no_container_key_is_dropped(self):
-        """Every container_* key the CLI bridges must exist in the gateway too."""
-        from hermes_cli import config as config_mod
-
-        cli_maps = [
-            v for v in vars(config_mod).values()
-            if isinstance(v, dict) and "container_persistent" in v
-        ]
-        assert cli_maps
-        cli_keys = {
-            k for m in cli_maps for k in m if k.startswith("container_")
-        }
-        missing = cli_keys - self._gateway_map()
-        assert not missing, f"gateway env map is missing: {sorted(missing)}"
-
-
-class TestIdleTimeoutOutlivesLocalReaper:
-    """The clamp is what removes the need for eviction machinery.
-
-    Hermes caches a ModalEnvironment and reaps it locally after
-    ``terminal.lifetime_seconds`` of inactivity. If Modal's idle timeout were
-    SHORTER, the provider could delete a sandbox that Hermes still holds in
-    ``_active_environments``, and the next command would reuse a dead sandbox.
-    Keeping the provider window strictly larger makes that state unreachable,
-    so no eviction/recovery path has to exist.
-    """
-
-    def test_short_value_is_raised_above_the_local_reaper(self, monkeypatch):
-        kwargs = _modal_sandbox_kwargs(
-            monkeypatch,
-            _container_config(container_idle_timeout=60, lifetime_seconds=300),
-        )
-        assert kwargs["idle_timeout"] >= 600
-
-    def test_generous_value_is_left_alone(self, monkeypatch):
-        kwargs = _modal_sandbox_kwargs(
-            monkeypatch,
-            _container_config(container_idle_timeout=1800, lifetime_seconds=300),
-        )
-        assert kwargs["idle_timeout"] == 1800
-
-    def test_clamp_reads_the_real_config_default(self, monkeypatch):
-        """lifetime_seconds must reach container_config or the clamp no-ops."""
-        monkeypatch.setenv("TERMINAL_ENV", "modal")
-        monkeypatch.setenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", "60")
         cfg = terminal_tool._get_env_config()
+        assert cfg["container_idle_timeout"] == 0
+        # The clamp silently no-ops if lifetime_seconds never reaches the tool.
         assert cfg.get("lifetime_seconds", 0) > 0
 
 
 class TestConfigSurface:
+    """Every hop the value must survive: default -> env bridge -> gateway."""
+
+    def _cli_maps(self):
+        from hermes_cli import config as config_mod
+        maps = [v for v in vars(config_mod).values()
+                if isinstance(v, dict) and "container_persistent" in v]
+        assert maps, "expected a terminal env-var mapping dict"
+        return maps
+
     def test_default_is_registered_and_disabled(self):
         from hermes_cli.config_defaults import DEFAULT_CONFIG
-
-        terminal_defaults = DEFAULT_CONFIG["terminal"]
-        assert "container_idle_timeout" in terminal_defaults
-        assert terminal_defaults["container_idle_timeout"] == 0
+        assert DEFAULT_CONFIG["terminal"]["container_idle_timeout"] == 0
 
     def test_env_var_bridge_exists(self):
         """Without the bridge the config.yaml key never reaches the tool."""
-        from hermes_cli import config as config_mod
-
-        found = [
-            v for k, v in vars(config_mod).items()
-            if isinstance(v, dict) and "container_persistent" in v
-        ]
-        assert found, "expected a terminal env-var mapping dict"
         assert any(
             m.get("container_idle_timeout") == "TERMINAL_CONTAINER_IDLE_TIMEOUT"
-            for m in found
+            for m in self._cli_maps()
         )
 
+    def test_no_container_key_is_dropped_by_the_gateway(self):
+        """The gateway keeps its OWN map; drift silently disables keys there.
 
-class TestSemanticsAreDistinct:
-    def test_timeout_and_idle_timeout_are_separate_sdk_params(self):
-        """Guards the misreading that caused the original bug.
-
-        ``timeout`` is a hard lifetime; ``idle_timeout`` is inactivity. If a
-        future SDK collapses them, capping idle at the lifetime (below) and the
-        whole fix would need rethinking.
+        Kanban workers run through the gateway, so a key missing here disables
+        the setting for exactly the workload that leaks. Asserted as a parity
+        invariant so the next added key is caught too.
         """
-        modal = pytest.importorskip("modal")
-        params = inspect.signature(modal.Sandbox.create).parameters
-        assert "timeout" in params
-        assert "idle_timeout" in params
-        assert params["idle_timeout"].default is None
+        import re
+        from pathlib import Path
+        import gateway.run as gw
 
-    def test_idle_never_exceeds_hard_lifetime(self):
-        """An idle window longer than the lifetime is meaningless; clamp it."""
-        from tools.environments.modal import _clamp_idle_timeout
+        block = re.search(r"_terminal_env_map\s*=\s*\{(.*?)\n\s*\}",
+                          Path(gw.__file__).read_text(), re.S)
+        assert block, "could not locate _terminal_env_map in gateway/run.py"
+        gateway_keys = set(re.findall(r'"(\w+)":\s*"TERMINAL_', block.group(1)))
 
-        assert _clamp_idle_timeout(9999, 100) == 100
-        assert _clamp_idle_timeout(60, 3600) == 60
-        assert _clamp_idle_timeout(0, 3600) == 0
-        assert _clamp_idle_timeout(None, 3600) == 0
+        cli_keys = {k for m in self._cli_maps() for k in m
+                    if k.startswith("container_")}
+        assert "container_idle_timeout" in gateway_keys
+        assert not (cli_keys - gateway_keys), \
+            f"gateway env map is missing: {sorted(cli_keys - gateway_keys)}"
+
+
+def test_timeout_and_idle_timeout_are_separate_sdk_params():
+    """Guards the misreading that caused the original bug."""
+    import inspect
+    modal = pytest.importorskip("modal")
+    params = inspect.signature(modal.Sandbox.create).parameters
+    assert "timeout" in params and "idle_timeout" in params

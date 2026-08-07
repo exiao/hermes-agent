@@ -45,13 +45,6 @@ def _sandbox_supports(param: str) -> bool:
         return False
 
 
-def _clamp_idle_timeout(idle_timeout: Any, hard_timeout: int) -> int:
-    """Idle window, never above the hard lifetime. 0 = disabled."""
-    if not idle_timeout:
-        return 0
-    return max(1, min(int(idle_timeout), hard_timeout))
-
-
 _SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
 _DIRECT_SNAPSHOT_NAMESPACE = "direct"
 
@@ -428,19 +421,14 @@ class ModalEnvironment(BaseEnvironment):
                 create_kwargs["mounts"] = existing_mounts
             # ``timeout`` is a hard max lifetime (kills mid-command), so it
             # can't be lowered to reap leaks. ``idle_timeout`` is the separate
-            # inactivity reaper: the backstop when the owning process dies
-            # before cleanup() runs. Clamped to the hard lifetime, and only
-            # passed when the installed SDK supports it.
-            create_timeout = int(create_kwargs.pop("timeout", 3600))
-            idle_timeout = create_kwargs.pop("idle_timeout", None)
-            idle_seconds = _clamp_idle_timeout(idle_timeout, create_timeout)
-            if idle_seconds and _sandbox_supports("idle_timeout"):
-                create_kwargs["idle_timeout"] = idle_seconds
+            # inactivity reaper, already bounded by the caller.
+            if create_kwargs.get("idle_timeout") and not _sandbox_supports("idle_timeout"):
+                create_kwargs.pop("idle_timeout")
             sandbox = await _modal.Sandbox.create.aio(
                 "sleep", "infinity",
                 image=image_spec,
                 app=app,
-                timeout=create_timeout,
+                timeout=int(create_kwargs.pop("timeout", 3600)),
                 **create_kwargs,
             )
             return app, sandbox
