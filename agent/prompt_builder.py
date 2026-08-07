@@ -1082,6 +1082,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),
                 "container_persistent": config.get("container_persistent", True),
+                "container_idle_timeout": config.get("container_idle_timeout", 0),
                 "modal_mode": config.get("modal_mode", "auto"),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),

@@ -1344,6 +1344,22 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
         )
 
 
+def _coerce_int(raw: Any, label: str) -> int:
+    """Non-negative int, or 0 with a warning. Never raises.
+
+    Unlike ``_parse_env_var`` this cannot raise: it guards a cost knob, and a
+    typo there must not block every environment creation.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = -1
+    if value < 0:
+        logger.warning("Invalid %s %r; disabled.", label, raw)
+        return 0
+    return value
+
+
 def _safe_getcwd() -> str:
     """Return the current working directory, tolerating a deleted CWD.
 
@@ -1565,6 +1581,12 @@ def _get_env_config() -> Dict[str, Any]:
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
         "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
+        # Seconds a remote sandbox may sit idle before the provider reaps it.
+        # 0 disables (previous behavior). Modal-only today.
+        "container_idle_timeout": _coerce_int(
+            os.getenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", "0"),
+            "TERMINAL_CONTAINER_IDLE_TIMEOUT",
+        ),
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
@@ -1672,6 +1694,15 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             sandbox_kwargs["cpu"] = cpu
         if memory > 0:
             sandbox_kwargs["memory"] = memory
+        # Inactivity reaper for sandboxes leaked by a hard-exited owner.
+        # Distinct from ``timeout``, a hard max lifetime that kills mid-command.
+        # Bounded below by 2x the local reaper (so Hermes drops a cached env
+        # before Modal deletes the sandbox) and above by the hard lifetime.
+        idle = _coerce_int(cc.get("container_idle_timeout"), "container_idle_timeout")
+        if idle > 0:
+            sandbox_kwargs["idle_timeout"] = min(
+                max(idle, int(cc.get("lifetime_seconds") or 0) * 2), timeout
+            )
         if disk > 0:
             try:
                 import inspect, modal
@@ -2439,6 +2470,11 @@ def terminal_tool(
                                 "container_memory": config.get("container_memory", 5120),
                                 "container_disk": config.get("container_disk", 51200),
                                 "container_persistent": config.get("container_persistent", True),
+                                "container_idle_timeout": config.get("container_idle_timeout", 0),
+                                # Needed to clamp container_idle_timeout above
+                                # the local idle reaper; without it the clamp
+                                # silently reads 0 and never applies.
+                                "lifetime_seconds": config.get("lifetime_seconds", 300),
                                 "modal_mode": config.get("modal_mode", "auto"),
                                 "vercel_runtime": config.get("vercel_runtime", ""),
                                 "docker_volumes": config.get("docker_volumes", []),

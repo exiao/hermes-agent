@@ -34,6 +34,17 @@ from tools.environments.file_sync import (
 
 logger = logging.getLogger(__name__)
 
+
+def _sandbox_supports(param: str) -> bool:
+    """True if the installed modal SDK's Sandbox.create accepts ``param``."""
+    try:
+        import inspect
+        import modal
+        return param in inspect.signature(modal.Sandbox.create).parameters
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 _SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
 _DIRECT_SNAPSHOT_NAMESPACE = "direct"
 
@@ -408,6 +419,11 @@ class ModalEnvironment(BaseEnvironment):
                 existing_mounts = list(create_kwargs.pop("mounts", []))
                 existing_mounts.extend(credential_mounts)
                 create_kwargs["mounts"] = existing_mounts
+            # ``timeout`` is a hard max lifetime (kills mid-command), so it
+            # can't be lowered to reap leaks. ``idle_timeout`` is the separate
+            # inactivity reaper, already bounded by the caller.
+            if create_kwargs.get("idle_timeout") and not _sandbox_supports("idle_timeout"):
+                create_kwargs.pop("idle_timeout")
             sandbox = await _modal.Sandbox.create.aio(
                 "sleep", "infinity",
                 image=image_spec,

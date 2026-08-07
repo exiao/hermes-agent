@@ -323,6 +323,9 @@ DEFAULT_CONFIG = {
         "container_memory": 5120,       # MB (default 5GB)
         "container_disk": 51200,        # MB (default 50GB)
         "container_persistent": True,   # Persist filesystem across sessions
+        # Seconds a remote sandbox may idle before the provider reaps it.
+        # 0 = disabled. Backstop for sandboxes leaked by a hard-exited owner.
+        "container_idle_timeout": 0,
         # Docker volume mounts — share host directories with the container.
         # Each entry is "host_path:container_path" (standard Docker -v syntax).
         # Example:
