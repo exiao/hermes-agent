@@ -112,6 +112,32 @@ class TestConfigSurface:
 
 
 class TestSemanticsAreDistinct:
+    def test_provider_reap_evicts_cached_environment(self, monkeypatch):
+        from tools.environments import modal as modal_env
+
+        env = object.__new__(modal_env.ModalEnvironment)
+        env._task_id = "reaped-task"
+        env._sandbox = object()
+        env._worker = type("Worker", (), {"stop": lambda self: None})()
+        evicted = []
+        monkeypatch.setattr(
+            "tools.terminal_tool._evict_cached_environment",
+            lambda value: evicted.append(value),
+        )
+        monkeypatch.setattr(
+            modal_env.BaseEnvironment,
+            "execute",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("Modal sandbox was not found")
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="not found"):
+            env.execute("printf ok")
+
+        assert evicted == [env]
+        assert env._sandbox is None
+
     def test_timeout_and_idle_timeout_are_separate_sdk_params(self):
         """Guards the misreading that caused the original bug.
 

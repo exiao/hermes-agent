@@ -1093,6 +1093,28 @@ _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
 
 
+def _evict_cached_environment(env: Any) -> None:
+    """Drop every cache entry that points at a provider-reaped environment."""
+    removed_keys = []
+    with _env_lock:
+        for task_id, cached in list(_active_environments.items()):
+            if cached is env:
+                _active_environments.pop(task_id, None)
+                _last_activity.pop(task_id, None)
+                removed_keys.append(task_id)
+    with _creation_locks_lock:
+        for task_id in removed_keys:
+            _creation_locks.pop(task_id, None)
+    for task_id in removed_keys:
+        try:
+            from tools.file_tools import clear_file_ops_cache
+            clear_file_ops_cache(task_id)
+        except ImportError:
+            pass
+    if removed_keys:
+        logger.info("Evicted provider-reaped environment for task(s): %s", removed_keys)
+
+
 def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     """Run the docker orphan reaper once per process, if enabled.
 

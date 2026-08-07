@@ -843,6 +843,7 @@ def _get_or_create_env(task_id: str):
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),
                 "container_persistent": config.get("container_persistent", True),
+                "container_idle_timeout": config.get("container_idle_timeout", 0),
                 "vercel_runtime": config.get("vercel_runtime", ""),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),

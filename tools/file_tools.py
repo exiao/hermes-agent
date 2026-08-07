@@ -1202,6 +1202,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
                     "container_persistent": config.get("container_persistent", True),
+                    "container_idle_timeout": config.get("container_idle_timeout", 0),
                     "vercel_runtime": config.get("vercel_runtime", ""),
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
