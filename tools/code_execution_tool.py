@@ -795,6 +795,7 @@ def _get_or_create_env(task_id: str):
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
+        build_container_config,
         _creation_locks, _creation_locks_lock, _task_env_overrides,
         _resolve_container_task_id,
     )
@@ -836,19 +837,7 @@ def _get_or_create_env(task_id: str):
 
         cwd = overrides.get("cwd") or config["cwd"]
 
-        container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
-            container_config = {
-                "container_cpu": config.get("container_cpu", 1),
-                "container_memory": config.get("container_memory", 5120),
-                "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
-                "container_idle_timeout": config.get("container_idle_timeout", 0),
-                "vercel_runtime": config.get("vercel_runtime", ""),
-                "docker_volumes": config.get("docker_volumes", []),
-                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                "docker_network": config.get("docker_network", True),
-            }
+        container_config = build_container_config(env_type, config)
 
         ssh_config = None
         if env_type == "ssh":
