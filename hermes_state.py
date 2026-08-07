@@ -6540,7 +6540,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        dedupe: bool = True,
+    ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
@@ -6548,6 +6554,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         caller's write transaction (takes the live ``conn``). Returns
         ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
+
+        *dedupe* controls the re-persist idempotency guard below. Callers that
+        have just deactivated the rows they are about to re-insert (compaction's
+        retained tail) MUST pass ``dedupe=False``: for them a byte-identical
+        existing row is the thing being replaced, not a duplicate to skip.
         """
         now_ts = time.time()
         inserted = 0
@@ -6617,14 +6628,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # insert a fresh copy, once per rotation flush. ``append_message``
             # (single-row) correctly omits it; this path diverged.
             _stored_content = self._encode_content(msg.get("content"))
-            _dup = conn.execute(
-                """SELECT id FROM messages
-                   WHERE session_id = ? AND role = ? AND timestamp = ?
-                     AND content IS ? AND tool_call_id IS ? AND tool_calls IS ?
-                   LIMIT 1""",
-                (session_id, role, message_timestamp, _stored_content,
-                 msg.get("tool_call_id"), tool_calls_json),
-            ).fetchone()
+            _dup = None
+            if dedupe:
+                _dup = conn.execute(
+                    """SELECT id FROM messages
+                       WHERE session_id = ? AND role = ? AND timestamp = ?
+                         AND content IS ? AND tool_call_id IS ? AND tool_calls IS ?
+                       LIMIT 1""",
+                    (session_id, role, message_timestamp, _stored_content,
+                     msg.get("tool_call_id"), tool_calls_json),
+                ).fetchone()
             if _dup is not None:
                 continue
 
@@ -6778,7 +6791,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
+                conn, session_id, compacted_messages, dedupe=False
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
