@@ -1734,15 +1734,35 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         # cleanup() ran. Distinct from ``timeout`` (a hard max lifetime that
         # kills mid-command); see _ModalEnvironment._create_sandbox. 0/None
         # disables, preserving the previous behavior.
+        # Seconds a remote sandbox may sit idle before Modal reaps it.
+        #
+        # Kept STRICTLY ABOVE the local idle reaper (terminal.lifetime_seconds,
+        # default 300s) so Hermes always drops a cached environment before Modal
+        # can delete its sandbox. That ordering is what makes a stale cache
+        # entry unreachable, so no eviction//recovery machinery is needed: the
+        # provider timeout is purely a backstop for the case the local reaper
+        # cannot cover -- a hard-exited owner (os._exit kills its daemon
+        # cleanup thread), where nothing local is left running to reap anything.
         _idle = cc.get("container_idle_timeout")
         if _idle:
             try:
-                if int(_idle) > 0:
-                    sandbox_kwargs["idle_timeout"] = int(_idle)
+                idle_seconds = int(_idle)
             except (TypeError, ValueError):
                 logger.warning(
                     "Ignoring non-numeric container_idle_timeout: %r", _idle
                 )
+            else:
+                if idle_seconds > 0:
+                    floor = int(cc.get("lifetime_seconds") or 0) * 2
+                    if floor and idle_seconds < floor:
+                        logger.warning(
+                            "container_idle_timeout=%ss is below the local idle "
+                            "reaper window (2x lifetime_seconds=%ss); raising it "
+                            "so Modal cannot reap a sandbox Hermes still caches.",
+                            idle_seconds, floor,
+                        )
+                        idle_seconds = floor
+                    sandbox_kwargs["idle_timeout"] = idle_seconds
         if disk > 0:
             try:
                 import inspect, modal
@@ -2511,6 +2531,10 @@ def terminal_tool(
                                 "container_disk": config.get("container_disk", 51200),
                                 "container_persistent": config.get("container_persistent", True),
                                 "container_idle_timeout": config.get("container_idle_timeout", 0),
+                                # Needed to clamp container_idle_timeout above
+                                # the local idle reaper; without it the clamp
+                                # silently reads 0 and never applies.
+                                "lifetime_seconds": config.get("lifetime_seconds", 300),
                                 "modal_mode": config.get("modal_mode", "auto"),
                                 "vercel_runtime": config.get("vercel_runtime", ""),
                                 "docker_volumes": config.get("docker_volumes", []),

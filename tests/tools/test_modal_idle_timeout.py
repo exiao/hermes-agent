@@ -155,58 +155,37 @@ class TestGatewayEnvMapParity:
         assert not missing, f"gateway env map is missing: {sorted(missing)}"
 
 
-class TestEvictionRequiresBackendProvenance:
-    """A command that merely PRINTS reaper-ish words must not evict the sandbox.
+class TestIdleTimeoutOutlivesLocalReaper:
+    """The clamp is what removes the need for eviction machinery.
 
-    The eviction check scans command output. Without a provenance marker,
-    `echo "sandbox stopped"; exit 1` looks identical to a real SDK failure and
-    tears down a live sandbox mid-session.
+    Hermes caches a ModalEnvironment and reaps it locally after
+    ``terminal.lifetime_seconds`` of inactivity. If Modal's idle timeout were
+    SHORTER, the provider could delete a sandbox that Hermes still holds in
+    ``_active_environments``, and the next command would reuse a dead sandbox.
+    Keeping the provider window strictly larger makes that state unreachable,
+    so no eviction/recovery path has to exist.
     """
 
-    def _env_with_result(self, monkeypatch, result):
-        from tools.environments import modal as modal_env
-
-        env = object.__new__(modal_env.ModalEnvironment)
-        env._sandbox = object()
-        env._worker = type("W", (), {"stop": lambda self: None})()
-        monkeypatch.setattr(
-            modal_env.BaseEnvironment, "execute",
-            lambda self, *a, **k: result, raising=False,
-        )
-        evicted = []
-        import tools.terminal_tool as tt
-        monkeypatch.setattr(
-            tt, "_evict_cached_environment",
-            lambda e: evicted.append(e), raising=False,
-        )
-        return env, evicted
-
-    def test_plain_output_does_not_evict(self, monkeypatch):
-        env, evicted = self._env_with_result(
-            monkeypatch, {"returncode": 1, "output": "sandbox stopped"}
-        )
-        env.execute("echo hi")
-        assert evicted == []
-        assert env._sandbox is not None
-
-    def test_embedded_backend_marker_does_not_evict(self, monkeypatch):
-        env, evicted = self._env_with_result(
+    def test_short_value_is_raised_above_the_local_reaper(self, monkeypatch):
+        kwargs = _modal_sandbox_kwargs(
             monkeypatch,
-            {"returncode": 1, "output": "expected [backend error] ModuleNotFoundError"},
+            _container_config(container_idle_timeout=60, lifetime_seconds=300),
         )
-        env.execute("pytest")
-        assert evicted == []
-        assert env._sandbox is not None
+        assert kwargs["idle_timeout"] >= 600
 
-    def test_real_backend_error_evicts(self, monkeypatch):
-        env, evicted = self._env_with_result(
+    def test_generous_value_is_left_alone(self, monkeypatch):
+        kwargs = _modal_sandbox_kwargs(
             monkeypatch,
-            {"returncode": 1,
-             "output": "[backend error] NotFoundError: sandbox not found"},
+            _container_config(container_idle_timeout=1800, lifetime_seconds=300),
         )
-        env.execute("echo hi")
-        assert evicted == [env]
-        assert env._sandbox is None
+        assert kwargs["idle_timeout"] == 1800
+
+    def test_clamp_reads_the_real_config_default(self, monkeypatch):
+        """lifetime_seconds must reach container_config or the clamp no-ops."""
+        monkeypatch.setenv("TERMINAL_ENV", "modal")
+        monkeypatch.setenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", "60")
+        cfg = terminal_tool._get_env_config()
+        assert cfg.get("lifetime_seconds", 0) > 0
 
 
 class TestConfigSurface:
@@ -233,32 +212,6 @@ class TestConfigSurface:
 
 
 class TestSemanticsAreDistinct:
-    def test_provider_reap_evicts_cached_environment(self, monkeypatch):
-        from tools.environments import modal as modal_env
-
-        env = object.__new__(modal_env.ModalEnvironment)
-        env._task_id = "reaped-task"
-        env._sandbox = object()
-        env._worker = type("Worker", (), {"stop": lambda self: None})()
-        evicted = []
-        monkeypatch.setattr(
-            "tools.terminal_tool._evict_cached_environment",
-            lambda value: evicted.append(value),
-        )
-        monkeypatch.setattr(
-            modal_env.BaseEnvironment,
-            "execute",
-            lambda *args, **kwargs: {
-                "output": "[backend error] NotFoundError: Modal sandbox was not found",
-                "returncode": 1,
-            },
-        )
-
-        assert env.execute("printf ok")["returncode"] == 1
-
-        assert evicted == [env]
-        assert env._sandbox is None
-
     def test_timeout_and_idle_timeout_are_separate_sdk_params(self):
         """Guards the misreading that caused the original bug.
 

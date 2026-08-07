@@ -62,24 +62,6 @@ _cancel_id_counter = itertools.count()
 # Age after which a PID file cannot belong to a live command and is swept.
 _PIDFILE_MAX_AGE_MINUTES = 720
 
-
-# Marker _ThreadedProcessHandle stamps on output when the SDK itself raised
-# (see environments/base.py). Its presence is what separates a real backend
-# failure from a command that merely printed similar words.
-_BACKEND_ERROR_PREFIX = "[backend error]"
-
-
-def _is_provider_reaped_error(exc: BaseException | str) -> bool:
-    """Identify Modal errors that mean the cached sandbox no longer exists."""
-    error_type = type(exc).__name__.lower().replace("_", "") if isinstance(exc, BaseException) else ""
-    message = str(exc).lower()
-    if "notfounderror" in error_type or "notfounderror" in message.replace("_", ""):
-        return True
-    return "sandbox" in message and any(
-        marker in message
-        for marker in ("not found", "terminated", "does not exist", "stopped")
-    )
-
 # TERM the process group first so the command can run traps, then KILL
 # whatever ignored it. The KILL escalation is NOT conditional on the recorded
 # PID still existing: a descendant that traps TERM outlives the wrapper bash,
@@ -714,41 +696,6 @@ class ModalEnvironment(BaseEnvironment):
         except Exception as exc:
             logger.debug("Modal: could not track late credential mounts: %s", exc)
         self._sync_manager.sync()
-
-    def execute(self, *args: Any, **kwargs: Any) -> dict:
-        """Evict this instance when Modal has already reaped its sandbox."""
-        try:
-            result = super().execute(*args, **kwargs)
-        except Exception as exc:
-            if _is_provider_reaped_error(exc):
-                try:
-                    from tools.terminal_tool import _evict_cached_environment
-                    _evict_cached_environment(self)
-                except ImportError:
-                    pass
-                self._sandbox = None
-                self._worker.stop()
-            raise
-        # Only a SDK-raised failure means the sandbox is gone. _ThreadedProcessHandle
-        # converts real exceptions into output prefixed "[backend error]"
-        # (environments/base.py), so require that provenance marker before
-        # evicting: a legitimate command that exits 1 while printing text like
-        # "sandbox stopped" is ordinary program output, and evicting on it would
-        # tear down a perfectly live sandbox mid-session.
-        output = result.get("output", "") or ""
-        if (
-            result.get("returncode") == 1
-            and output.startswith(_BACKEND_ERROR_PREFIX)
-            and _is_provider_reaped_error(output)
-        ):
-            try:
-                from tools.terminal_tool import _evict_cached_environment
-                _evict_cached_environment(self)
-            except ImportError:
-                pass
-            self._sandbox = None
-            self._worker.stop()
-        return result
 
     # ------------------------------------------------------------------
     # Execution
