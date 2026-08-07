@@ -738,7 +738,7 @@ class ModalEnvironment(BaseEnvironment):
         output = result.get("output", "") or ""
         if (
             result.get("returncode") == 1
-            and _BACKEND_ERROR_PREFIX in output
+            and output.startswith(_BACKEND_ERROR_PREFIX)
             and _is_provider_reaped_error(output)
         ):
             try:

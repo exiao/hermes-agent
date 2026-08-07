@@ -189,6 +189,15 @@ class TestEvictionRequiresBackendProvenance:
         assert evicted == []
         assert env._sandbox is not None
 
+    def test_embedded_backend_marker_does_not_evict(self, monkeypatch):
+        env, evicted = self._env_with_result(
+            monkeypatch,
+            {"returncode": 1, "output": "expected [backend error] ModuleNotFoundError"},
+        )
+        env.execute("pytest")
+        assert evicted == []
+        assert env._sandbox is not None
+
     def test_real_backend_error_evicts(self, monkeypatch):
         env, evicted = self._env_with_result(
             monkeypatch,
