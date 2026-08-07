@@ -33,6 +33,7 @@ Usage:
     result = terminal_tool("python server.py", background=True)
 """
 
+import copy
 import importlib.util
 import json
 import logging
@@ -1344,6 +1345,47 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
         )
 
 
+CONTAINER_ENV_TYPES = {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
+
+# Every key _create_environment may read out of container_config, with the
+# default it falls back to. Single source of truth: the four call sites used to
+# hand-copy their own subset, so a key added to one silently never reached the
+# others and the same config.yaml produced different containers depending on
+# which tool created the environment first.
+_CONTAINER_CONFIG_DEFAULTS: Dict[str, Any] = {
+    "container_cpu": 1,
+    "container_memory": 5120,
+    "container_disk": 51200,
+    "container_persistent": True,
+    "container_idle_timeout": 0,
+    "lifetime_seconds": 300,
+    "modal_mode": "auto",
+    "vercel_runtime": "",
+    "docker_volumes": [],
+    "docker_mount_cwd_to_workspace": False,
+    "docker_forward_env": [],
+    "docker_env": {},
+    "docker_run_as_host_user": False,
+    "docker_extra_args": [],
+    "docker_shm_size": "1g",
+    "docker_network": True,
+    "docker_persist_across_processes": True,
+    "docker_orphan_reaper": True,
+}
+
+
+def build_container_config(env_type: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Container settings for ``_create_environment``, or None for other backends."""
+    if env_type not in CONTAINER_ENV_TYPES:
+        return None
+    # deepcopy: the list/dict defaults would otherwise be shared across every
+    # environment, so one caller mutating docker_volumes would affect the rest.
+    return {
+        k: config.get(k, copy.deepcopy(d))
+        for k, d in _CONTAINER_CONFIG_DEFAULTS.items()
+    }
+
+
 def _coerce_int(raw: Any, label: str) -> int:
     """Non-negative int, or 0 with a warning. Never raises.
 
@@ -2463,31 +2505,7 @@ def terminal_tool(
                                 "persistent": config.get("ssh_persistent", False),
                             }
 
-                        container_config = None
-                        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
-                            container_config = {
-                                "container_cpu": config.get("container_cpu", 1),
-                                "container_memory": config.get("container_memory", 5120),
-                                "container_disk": config.get("container_disk", 51200),
-                                "container_persistent": config.get("container_persistent", True),
-                                "container_idle_timeout": config.get("container_idle_timeout", 0),
-                                # Needed to clamp container_idle_timeout above
-                                # the local idle reaper; without it the clamp
-                                # silently reads 0 and never applies.
-                                "lifetime_seconds": config.get("lifetime_seconds", 300),
-                                "modal_mode": config.get("modal_mode", "auto"),
-                                "vercel_runtime": config.get("vercel_runtime", ""),
-                                "docker_volumes": config.get("docker_volumes", []),
-                                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                                "docker_forward_env": config.get("docker_forward_env", []),
-                                "docker_env": config.get("docker_env", {}),
-                                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                                "docker_extra_args": config.get("docker_extra_args", []),
-                                "docker_shm_size": config.get("docker_shm_size", "1g"),
-                                "docker_network": config.get("docker_network", True),
-                                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                            }
+                        container_config = build_container_config(env_type, config)
 
                         local_config = None
                         if env_type == "local":
