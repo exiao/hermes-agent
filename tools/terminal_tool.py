@@ -1093,28 +1093,6 @@ _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
 
 
-def _evict_cached_environment(env: Any) -> None:
-    """Drop every cache entry that points at a provider-reaped environment."""
-    removed_keys = []
-    with _env_lock:
-        for task_id, cached in list(_active_environments.items()):
-            if cached is env:
-                _active_environments.pop(task_id, None)
-                _last_activity.pop(task_id, None)
-                removed_keys.append(task_id)
-    with _creation_locks_lock:
-        for task_id in removed_keys:
-            _creation_locks.pop(task_id, None)
-    for task_id in removed_keys:
-        try:
-            from tools.file_tools import clear_file_ops_cache
-            clear_file_ops_cache(task_id)
-        except ImportError:
-            pass
-    if removed_keys:
-        logger.info("Evicted provider-reaped environment for task(s): %s", removed_keys)
-
-
 def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     """Run the docker orphan reaper once per process, if enabled.
 
@@ -1367,28 +1345,19 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
 
 
 def _parse_idle_timeout_env() -> int:
-    """Parse TERMINAL_CONTAINER_IDLE_TIMEOUT, disabling on a bad value.
+    """Parse TERMINAL_CONTAINER_IDLE_TIMEOUT; a bad value disables, never raises.
 
-    Deliberately NOT ``_parse_env_var``. That helper raises, and a raise here
-    propagates out of ``_get_env_config()`` and blocks *every* environment
-    creation -- so a typo in a knob whose only job is to bound idle sandbox
-    cost would take the terminal down entirely. The safety net must never be
-    more dangerous than the leak it prevents, so a malformed value warns and
-    falls back to 0 (feature off, previous behavior).
+    Not ``_parse_env_var``: that raises, and a raise here would block every
+    environment creation. A typo in a cost knob must not take the terminal down.
     """
     raw = os.getenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", "0")
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        logger.warning(
-            "Invalid TERMINAL_CONTAINER_IDLE_TIMEOUT %r (expected integer "
-            "seconds); idle sandbox reaping disabled.", raw,
-        )
-        return 0
+        value = -1
     if value < 0:
         logger.warning(
-            "Negative TERMINAL_CONTAINER_IDLE_TIMEOUT %r; idle sandbox "
-            "reaping disabled.", raw,
+            "Invalid TERMINAL_CONTAINER_IDLE_TIMEOUT %r; idle reaping disabled.", raw,
         )
         return 0
     return value
@@ -1617,11 +1586,6 @@ def _get_env_config() -> Dict[str, Any]:
         "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
         # Seconds a remote sandbox may sit idle before the provider reaps it.
         # 0 disables (previous behavior). Modal-only today.
-        #
-        # Parsed leniently on purpose: this is a billing SAFETY NET, and a
-        # typo here must not make the terminal unusable. _parse_env_var would
-        # raise, taking down every environment creation for a value whose only
-        # job is to bound idle cost, so a bad value warns and disables instead.
         "container_idle_timeout": _parse_idle_timeout_env(),
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
@@ -1730,39 +1694,25 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             sandbox_kwargs["cpu"] = cpu
         if memory > 0:
             sandbox_kwargs["memory"] = memory
-        # Inactivity reaper for sandboxes whose owning process died before
-        # cleanup() ran. Distinct from ``timeout`` (a hard max lifetime that
-        # kills mid-command); see _ModalEnvironment._create_sandbox. 0/None
-        # disables, preserving the previous behavior.
-        # Seconds a remote sandbox may sit idle before Modal reaps it.
-        #
-        # Kept STRICTLY ABOVE the local idle reaper (terminal.lifetime_seconds,
-        # default 300s) so Hermes always drops a cached environment before Modal
-        # can delete its sandbox. That ordering is what makes a stale cache
-        # entry unreachable, so no eviction//recovery machinery is needed: the
-        # provider timeout is purely a backstop for the case the local reaper
-        # cannot cover -- a hard-exited owner (os._exit kills its daemon
-        # cleanup thread), where nothing local is left running to reap anything.
-        _idle = cc.get("container_idle_timeout")
-        if _idle:
-            try:
-                idle_seconds = int(_idle)
-            except (TypeError, ValueError):
+        # Inactivity reaper for sandboxes leaked by a hard-exited owner.
+        # Distinct from ``timeout``, a hard max lifetime that kills mid-command.
+        # Floored at 2x the local idle reaper (lifetime_seconds) so Hermes always
+        # drops a cached env before Modal can delete the sandbox behind it.
+        try:
+            idle_seconds = int(cc.get("container_idle_timeout") or 0)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring non-numeric container_idle_timeout: %r",
+                           cc.get("container_idle_timeout"))
+            idle_seconds = 0
+        if idle_seconds > 0:
+            floor = int(cc.get("lifetime_seconds") or 0) * 2
+            if idle_seconds < floor:
                 logger.warning(
-                    "Ignoring non-numeric container_idle_timeout: %r", _idle
+                    "Raising container_idle_timeout %ss to %ss (2x lifetime_seconds).",
+                    idle_seconds, floor,
                 )
-            else:
-                if idle_seconds > 0:
-                    floor = int(cc.get("lifetime_seconds") or 0) * 2
-                    if floor and idle_seconds < floor:
-                        logger.warning(
-                            "container_idle_timeout=%ss is below the local idle "
-                            "reaper window (2x lifetime_seconds=%ss); raising it "
-                            "so Modal cannot reap a sandbox Hermes still caches.",
-                            idle_seconds, floor,
-                        )
-                        idle_seconds = floor
-                    sandbox_kwargs["idle_timeout"] = idle_seconds
+                idle_seconds = floor
+            sandbox_kwargs["idle_timeout"] = idle_seconds
         if disk > 0:
             try:
                 import inspect, modal

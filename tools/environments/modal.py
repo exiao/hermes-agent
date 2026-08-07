@@ -34,6 +34,24 @@ from tools.environments.file_sync import (
 
 logger = logging.getLogger(__name__)
 
+
+def _sandbox_supports(param: str) -> bool:
+    """True if the installed modal SDK's Sandbox.create accepts ``param``."""
+    try:
+        import inspect
+        import modal
+        return param in inspect.signature(modal.Sandbox.create).parameters
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _clamp_idle_timeout(idle_timeout: Any, hard_timeout: int) -> int:
+    """Idle window, never above the hard lifetime. 0 = disabled."""
+    if not idle_timeout:
+        return 0
+    return max(1, min(int(idle_timeout), hard_timeout))
+
+
 _SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
 _DIRECT_SNAPSHOT_NAMESPACE = "direct"
 
@@ -408,40 +426,21 @@ class ModalEnvironment(BaseEnvironment):
                 existing_mounts = list(create_kwargs.pop("mounts", []))
                 existing_mounts.extend(credential_mounts)
                 create_kwargs["mounts"] = existing_mounts
-            # ``timeout`` is a hard MAXIMUM LIFETIME, not an inactivity window:
-            # it kills the sandbox mid-command, so it cannot be lowered to reap
-            # leaked sandboxes without truncating legitimate long builds.
-            # ``idle_timeout`` is the inactivity reaper, and it is the backstop
-            # for a sandbox whose owning process died before ``cleanup()`` ran
-            # (SIGKILL, OOM, ``os._exit`` past the cleanup hook). Without it a
-            # leaked sandbox bills for the full ``timeout`` window.
+            # ``timeout`` is a hard max lifetime (kills mid-command), so it
+            # can't be lowered to reap leaks. ``idle_timeout`` is the separate
+            # inactivity reaper: the backstop when the owning process dies
+            # before cleanup() runs. Clamped to the hard lifetime, and only
+            # passed when the installed SDK supports it.
             create_timeout = int(create_kwargs.pop("timeout", 3600))
             idle_timeout = create_kwargs.pop("idle_timeout", None)
-            extra: dict[str, Any] = {}
-            if idle_timeout:
-                # Never exceed the hard lifetime, and only pass the kwarg when
-                # the installed modal SDK actually supports it.
-                idle_seconds = max(1, min(int(idle_timeout), create_timeout))
-                try:
-                    import inspect as _inspect
-                    if "idle_timeout" in _inspect.signature(
-                        _modal.Sandbox.create
-                    ).parameters:
-                        extra["idle_timeout"] = idle_seconds
-                    else:
-                        logger.debug(
-                            "Modal: installed SDK has no idle_timeout support; "
-                            "leaked sandboxes will reap at timeout=%ss",
-                            create_timeout,
-                        )
-                except Exception:  # pragma: no cover - defensive
-                    pass
+            idle_seconds = _clamp_idle_timeout(idle_timeout, create_timeout)
+            if idle_seconds and _sandbox_supports("idle_timeout"):
+                create_kwargs["idle_timeout"] = idle_seconds
             sandbox = await _modal.Sandbox.create.aio(
                 "sleep", "infinity",
                 image=image_spec,
                 app=app,
                 timeout=create_timeout,
-                **extra,
                 **create_kwargs,
             )
             return app, sandbox
