@@ -115,6 +115,91 @@ class TestMalformedEnvIsNonFatal:
         assert terminal_tool._get_env_config()["container_idle_timeout"] == 0
 
 
+class TestGatewayEnvMapParity:
+    """The gateway keeps its OWN terminal env map; drift silently disables keys.
+
+    The gateway is how kanban workers run, so a key missing there disables the
+    setting for exactly the workload that leaks sandboxes -- with config.yaml
+    still showing it as configured. Asserted as a parity invariant rather than
+    a fixed key list so the next added key is caught too.
+    """
+
+    def _gateway_map(self):
+        import re
+        from pathlib import Path
+        import gateway.run as gw
+
+        src = Path(gw.__file__).read_text()
+        block = re.search(
+            r'_terminal_env_map\s*=\s*\{(.*?)\n\s*\}', src, re.S
+        )
+        assert block, "could not locate _terminal_env_map in gateway/run.py"
+        return set(re.findall(r'"(\w+)":\s*"TERMINAL_', block.group(1)))
+
+    def test_idle_timeout_is_bridged(self):
+        assert "container_idle_timeout" in self._gateway_map()
+
+    def test_no_container_key_is_dropped(self):
+        """Every container_* key the CLI bridges must exist in the gateway too."""
+        from hermes_cli import config as config_mod
+
+        cli_maps = [
+            v for v in vars(config_mod).values()
+            if isinstance(v, dict) and "container_persistent" in v
+        ]
+        assert cli_maps
+        cli_keys = {
+            k for m in cli_maps for k in m if k.startswith("container_")
+        }
+        missing = cli_keys - self._gateway_map()
+        assert not missing, f"gateway env map is missing: {sorted(missing)}"
+
+
+class TestEvictionRequiresBackendProvenance:
+    """A command that merely PRINTS reaper-ish words must not evict the sandbox.
+
+    The eviction check scans command output. Without a provenance marker,
+    `echo "sandbox stopped"; exit 1` looks identical to a real SDK failure and
+    tears down a live sandbox mid-session.
+    """
+
+    def _env_with_result(self, monkeypatch, result):
+        from tools.environments import modal as modal_env
+
+        env = object.__new__(modal_env.ModalEnvironment)
+        env._sandbox = object()
+        env._worker = type("W", (), {"stop": lambda self: None})()
+        monkeypatch.setattr(
+            modal_env.BaseEnvironment, "execute",
+            lambda self, *a, **k: result, raising=False,
+        )
+        evicted = []
+        import tools.terminal_tool as tt
+        monkeypatch.setattr(
+            tt, "_evict_cached_environment",
+            lambda e: evicted.append(e), raising=False,
+        )
+        return env, evicted
+
+    def test_plain_output_does_not_evict(self, monkeypatch):
+        env, evicted = self._env_with_result(
+            monkeypatch, {"returncode": 1, "output": "sandbox stopped"}
+        )
+        env.execute("echo hi")
+        assert evicted == []
+        assert env._sandbox is not None
+
+    def test_real_backend_error_evicts(self, monkeypatch):
+        env, evicted = self._env_with_result(
+            monkeypatch,
+            {"returncode": 1,
+             "output": "[backend error] NotFoundError: sandbox not found"},
+        )
+        env.execute("echo hi")
+        assert evicted == [env]
+        assert env._sandbox is None
+
+
 class TestConfigSurface:
     def test_default_is_registered_and_disabled(self):
         from hermes_cli.config_defaults import DEFAULT_CONFIG

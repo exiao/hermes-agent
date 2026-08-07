@@ -2137,6 +2137,10 @@ if _config_path.exists():
                 "container_memory": "TERMINAL_CONTAINER_MEMORY",
                 "container_disk": "TERMINAL_CONTAINER_DISK",
                 "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+                # Must stay in sync with hermes_cli/config.py's map: the
+                # gateway is how kanban workers run, so omitting a key here
+                # silently disables it for exactly the workload that leaks.
+                "container_idle_timeout": "TERMINAL_CONTAINER_IDLE_TIMEOUT",
                 "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
                 "docker_env": "TERMINAL_DOCKER_ENV",
                 "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
