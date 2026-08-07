@@ -43,6 +43,25 @@ EXCLUDED_SKILL_DIRS = frozenset(
     )
 )
 
+
+def is_excluded_skill_dir_name(name: str) -> bool:
+    """True if a directory name must never be walked as a skill category.
+
+    A denylist alone kept re-opening the same hole. ``.archive`` was added
+    after archived skills surfaced in ``<available_skills>`` under a fake
+    '.archive' category; the identical bug then returned via
+    ``.curator_backups/`` (skills curator) and ``.restore-backups/`` (written
+    by core itself in ``tools/skills_sync.py``), which resurfaced deleted
+    skills as live, addressable entries.
+
+    Dot-prefixed directories are metadata/backup/scratch by convention and are
+    never skill categories, so exclude them as a RULE. New backup conventions
+    are then handled without anyone remembering to update a list. The explicit
+    set is kept for non-dot names (``venv``, ``node_modules``, ...).
+    """
+    return name.startswith(".") or name in EXCLUDED_SKILL_DIRS
+
+
 # Supporting files live inside a skill package and are loaded explicitly via
 # skill_view(skill, file_path=...). They are not standalone skills and must not
 # be scanned for active SKILL.md/DESCRIPTION.md entries, even if a Curator or
@@ -108,15 +127,38 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     skill-scanning site in sync with the shared exclusion set.
 
     Accepts a Path or string.
+
+    The dot-directory rule is applied only to segments BELOW *root* when it is
+    given. Absolute paths routinely contain dot-segments that are not skill
+    metadata (``~/.hermes/skills/...`` itself, ``/private/var/...`` temp dirs),
+    so applying it to every part would exclude every real skill.
     """
+    from pathlib import PurePath
+
     try:
         parts = path.parts  # Path
     except AttributeError:
-        from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
-        path, root=root
-    )
+
+    if any(part in EXCLUDED_SKILL_DIRS for part in parts):
+        return True
+
+    rel_parts = None
+    if root is not None:
+        try:
+            rel_parts = PurePath(str(path)).relative_to(PurePath(str(root))).parts
+        except ValueError:
+            rel_parts = None
+    if rel_parts is None:
+        # No root to anchor against: only judge the immediate parent chain that
+        # a scanner would have walked, never the absolute prefix.
+        rel_parts = ()
+
+    # Directory segments only — a dotfile leaf (".hidden.md") is not a category.
+    if any(part.startswith(".") for part in rel_parts[:-1]):
+        return True
+
+    return is_skill_support_path(path, root=root)
 
 
 def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
@@ -910,7 +952,7 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
         dirs[:] = [
             d
             for d in dirs
-            if d not in EXCLUDED_SKILL_DIRS
+            if not is_excluded_skill_dir_name(d)
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
         if filename in files:

@@ -19,6 +19,7 @@ from typing import Optional
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
+    is_excluded_skill_dir_name,
     ORG_ACTIVE_MARKER,
     ORG_MIRROR_DIR_NAME,
     ORG_PROVENANCE_FILE,
@@ -1402,7 +1403,7 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
         dirs[:] = [
             d
             for d in dirs
-            if d not in EXCLUDED_SKILL_DIRS
+            if not is_excluded_skill_dir_name(d)
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
         for filename in ("SKILL.md", "DESCRIPTION.md"):
