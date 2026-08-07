@@ -88,6 +88,33 @@ class TestIdleTimeoutPlumbing:
         assert "idle_timeout" not in kwargs
 
 
+class TestMalformedEnvIsNonFatal:
+    """A bad value must disable the feature, never block the terminal.
+
+    Exercised through the real ``_get_env_config()`` rather than by hand-building
+    container_config: the original bug was that parsing raised *inside* that
+    function, so a test that skipped it reported success while
+    TERMINAL_ENV=modal + a typo made every environment creation fail.
+    """
+
+    @pytest.mark.parametrize("bad", ["soon", "5m", "", "1.5", "-30"])
+    def test_bad_value_disables_instead_of_raising(self, monkeypatch, bad):
+        monkeypatch.setenv("TERMINAL_ENV", "modal")
+        monkeypatch.setenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", bad)
+        cfg = terminal_tool._get_env_config()
+        assert cfg["container_idle_timeout"] == 0
+
+    def test_valid_value_still_parsed(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "modal")
+        monkeypatch.setenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", "300")
+        assert terminal_tool._get_env_config()["container_idle_timeout"] == 300
+
+    def test_unset_defaults_to_disabled(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "modal")
+        monkeypatch.delenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", raising=False)
+        assert terminal_tool._get_env_config()["container_idle_timeout"] == 0
+
+
 class TestConfigSurface:
     def test_default_is_registered_and_disabled(self):
         from hermes_cli.config_defaults import DEFAULT_CONFIG

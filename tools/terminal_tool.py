@@ -1366,6 +1366,34 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
         )
 
 
+def _parse_idle_timeout_env() -> int:
+    """Parse TERMINAL_CONTAINER_IDLE_TIMEOUT, disabling on a bad value.
+
+    Deliberately NOT ``_parse_env_var``. That helper raises, and a raise here
+    propagates out of ``_get_env_config()`` and blocks *every* environment
+    creation -- so a typo in a knob whose only job is to bound idle sandbox
+    cost would take the terminal down entirely. The safety net must never be
+    more dangerous than the leak it prevents, so a malformed value warns and
+    falls back to 0 (feature off, previous behavior).
+    """
+    raw = os.getenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", "0")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid TERMINAL_CONTAINER_IDLE_TIMEOUT %r (expected integer "
+            "seconds); idle sandbox reaping disabled.", raw,
+        )
+        return 0
+    if value < 0:
+        logger.warning(
+            "Negative TERMINAL_CONTAINER_IDLE_TIMEOUT %r; idle sandbox "
+            "reaping disabled.", raw,
+        )
+        return 0
+    return value
+
+
 def _safe_getcwd() -> str:
     """Return the current working directory, tolerating a deleted CWD.
 
@@ -1589,9 +1617,12 @@ def _get_env_config() -> Dict[str, Any]:
         "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
         # Seconds a remote sandbox may sit idle before the provider reaps it.
         # 0 disables (previous behavior). Modal-only today.
-        "container_idle_timeout": _parse_env_var(
-            "TERMINAL_CONTAINER_IDLE_TIMEOUT", "0", int, "integer"
-        ),
+        #
+        # Parsed leniently on purpose: this is a billing SAFETY NET, and a
+        # typo here must not make the terminal unusable. _parse_env_var would
+        # raise, taking down every environment creation for a value whose only
+        # job is to bound idle cost, so a bad value warns and disables instead.
+        "container_idle_timeout": _parse_idle_timeout_env(),
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
