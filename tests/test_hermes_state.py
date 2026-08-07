@@ -686,6 +686,30 @@ class TestMessageStorage:
         assert messages[0]["content"] == "Hello"
         assert messages[1]["role"] == "assistant"
 
+    def test_active_only_replace_reinserts_compacted_history(self, db):
+        """An ACP restore must not lose the live transcript after compaction.
+
+        ``archive_and_compact`` keeps the original rows inactive and inserts
+        byte-identical active rows.  An active-only rewrite deletes the latter;
+        its reinsert must not dedupe against the archived originals.
+        """
+        session_id = "acp-rewrite"
+        db.create_session(session_id=session_id, source="acp")
+        db.append_message(session_id, role="user", content="Hello", timestamp=100.0)
+
+        compacted = db.get_messages(session_id)
+        db.archive_and_compact(session_id, compacted)
+        reloaded = db.get_messages_as_conversation(session_id)
+
+        db.replace_messages(session_id, reloaded, active_only=True)
+
+        active = db.get_messages(session_id)
+        assert [(m["role"], m["content"], m["timestamp"]) for m in active] == [
+            (m["role"], m["content"], m["timestamp"]) for m in reloaded
+        ]
+        assert db.get_session(session_id)["message_count"] == len(reloaded)
+        assert len(db.get_messages(session_id, include_inactive=True)) == 2 * len(reloaded)
+
 
 
     def test_startup_heals_null_active_rows(self, tmp_path):
