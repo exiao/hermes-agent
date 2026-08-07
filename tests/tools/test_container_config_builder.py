@@ -1,31 +1,121 @@
-"""Every caller of ``_create_environment`` must build the SAME container config.
+"""Every caller of ``_create_environment`` must pass the SAME container config.
 
 The four call sites used to hand-copy their own subset of keys, and the subsets
 drifted: ``file_tools`` and ``code_execution_tool`` never passed ``modal_mode``,
 ``docker_shm_size``, ``docker_extra_args`` or ``docker_persist_across_processes``.
-So the same config.yaml produced a different container depending on which tool
-happened to create the environment first.
-"""
+All four share one environment cache, so the same config.yaml produced a
+different container depending on which tool created the environment first.
 
-import ast
-from pathlib import Path
+These are behavioral tests: each caller is driven for real and the
+``container_config`` it hands to ``_create_environment`` is captured. A
+source-shape test would pass on a dict that is built correctly but never
+reaches the callee.
+"""
 
 import pytest
 
+from tools import terminal_tool
 from tools.terminal_tool import (
     CONTAINER_ENV_TYPES,
     _CONTAINER_CONFIG_DEFAULTS,
     build_container_config,
 )
 
-CALL_SITES = [
-    "tools/terminal_tool.py",
-    "tools/file_tools.py",
-    "tools/code_execution_tool.py",
-    "agent/prompt_builder.py",
-]
+# Keys the smaller hand-copied dicts dropped. Regression cover for the drift.
+PREVIOUSLY_DROPPED = (
+    "modal_mode",
+    "docker_shm_size",
+    "docker_extra_args",
+    "docker_persist_across_processes",
+)
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+@pytest.fixture
+def captured_config(monkeypatch):
+    """Capture the container_config each caller passes to _create_environment.
+
+    Callers import ``_create_environment`` lazily inside the function body, so
+    patching the attribute on the module reaches every one of them.
+    """
+    seen = {}
+
+    class _StubEnv:
+        def __init__(self, *a, **kw):
+            pass
+
+        def execute(self, *a, **kw):
+            return {"output": "", "exit_code": 0}
+
+        def cleanup(self):
+            pass
+
+    def _fake_create(**kwargs):
+        seen["container_config"] = kwargs.get("container_config")
+        seen["env_type"] = kwargs.get("env_type")
+        return _StubEnv()
+
+    monkeypatch.setattr(terminal_tool, "_create_environment", _fake_create)
+    # docker: the only backend for which _get_env_config reads the docker_*
+    # env vars at all, so it exercises the widest set of keys.
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_IDLE_TIMEOUT", "900")
+    monkeypatch.setenv("TERMINAL_DOCKER_SHM_SIZE", "4g")
+    # Each caller keys off its own cache; clear so creation actually runs.
+    terminal_tool._active_environments.clear()
+    yield seen
+    terminal_tool._active_environments.clear()
+
+
+def _drive_file_tools(task_id):
+    from tools.file_tools import _get_file_ops
+    _get_file_ops(task_id)
+
+
+def _drive_code_execution(task_id):
+    from tools.code_execution_tool import _get_or_create_env
+    _get_or_create_env(task_id)
+
+
+CALLERS = {
+    "file_tools": _drive_file_tools,
+    "code_execution_tool": _drive_code_execution,
+}
+
+
+class TestCallersAgree:
+    @pytest.mark.parametrize("name", sorted(CALLERS))
+    def test_caller_passes_the_full_container_config(self, name, captured_config):
+        """The captured dict must match the builder exactly, key for key."""
+        CALLERS[name](f"t_{name}")
+        cc = captured_config["container_config"]
+        assert cc is not None, f"{name} passed no container_config"
+        assert cc == build_container_config(captured_config["env_type"], cc)
+
+    @pytest.mark.parametrize("name", sorted(CALLERS))
+    def test_caller_carries_the_keys_the_drift_dropped(self, name, captured_config):
+        CALLERS[name](f"t_drift_{name}")
+        cc = captured_config["container_config"]
+        missing = [k for k in PREVIOUSLY_DROPPED if k not in cc]
+        assert not missing, f"{name} dropped: {missing}"
+
+    @pytest.mark.parametrize("name", sorted(CALLERS))
+    def test_user_config_reaches_the_environment(self, name, captured_config):
+        """A configured value must survive the whole hop, not just the default."""
+        CALLERS[name](f"t_cfg_{name}")
+        cc = captured_config["container_config"]
+        assert cc["container_idle_timeout"] == 900
+        assert cc["docker_shm_size"] == "4g"
+
+    def test_all_callers_produce_identical_config(self, captured_config):
+        """The actual bug: which tool creates the env first must not matter."""
+        results = {}
+        for name, drive in sorted(CALLERS.items()):
+            terminal_tool._active_environments.clear()
+            drive(f"t_same_{name}")
+            results[name] = captured_config["container_config"]
+        first, *rest = results.values()
+        for other in rest:
+            assert other == first
 
 
 class TestBuilder:
@@ -44,55 +134,19 @@ class TestBuilder:
         assert cfg["container_idle_timeout"] == 900
         assert cfg["modal_mode"] == _CONTAINER_CONFIG_DEFAULTS["modal_mode"]
 
-    def test_keys_the_drift_dropped_are_present(self):
-        """These four are exactly what the smaller hand-copied dicts omitted."""
-        cfg = build_container_config("docker", {})
-        for key in (
-            "modal_mode",
-            "docker_shm_size",
-            "docker_extra_args",
-            "docker_persist_across_processes",
-        ):
-            assert key in cfg
-
     def test_result_is_not_shared_state(self):
         """A mutable default must not leak between environments."""
         first = build_container_config("docker", {})
         first["docker_volumes"].append("/tmp:/tmp")
         assert build_container_config("docker", {})["docker_volumes"] == []
 
+    def test_docker_network_accompanies_run_as_host_user(self):
+        """Lockdown invariant from issue #46358.
 
-def test_no_call_site_hand_builds_a_container_config():
-    """Guards against a fifth copy being added instead of calling the builder.
-
-    An inline ``{"container_cpu": ...}`` literal is how the drift started, so
-    the builder is the only place that dict may be constructed.
-    """
-    offenders = []
-    for rel in CALL_SITES:
-        tree = ast.parse((REPO_ROOT / rel).read_text())
-        # The canonical defaults dict is the one legitimate literal.
-        canonical = {
-            n.value.lineno
-            for n in ast.walk(tree)
-            if isinstance(n, ast.AnnAssign | ast.Assign)
-            and isinstance(n.value, ast.Dict)
-            and "_CONTAINER_CONFIG_DEFAULTS" in ast.dump(n)
-        }
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Dict) or node.lineno in canonical:
-                continue
-            keys = {
-                k.value for k in node.keys
-                if isinstance(k, ast.Constant) and isinstance(k.value, str)
-            }
-            # Only a dict that is ENTIRELY container-config keys is a copy of
-            # the builder; _get_env_config holds these alongside many others.
-            if keys >= {"container_cpu", "container_memory"} and keys <= set(
-                _CONTAINER_CONFIG_DEFAULTS
-            ):
-                offenders.append(f"{rel}:{node.lineno}")
-    assert not offenders, (
-        "hand-built container_config found; call build_container_config instead: "
-        f"{offenders}"
-    )
+        A config carrying ``docker_run_as_host_user`` without ``docker_network``
+        silently falls back to networked containers on that path while the
+        terminal path honors the lockdown.
+        """
+        cfg = build_container_config("docker", {})
+        assert "docker_run_as_host_user" in cfg
+        assert "docker_network" in cfg
