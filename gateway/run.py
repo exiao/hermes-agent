@@ -3680,6 +3680,74 @@ def _quoted_media_path_valid_on_backend(host_path: str) -> bool:
     return False
 
 
+
+
+def format_reply_pointer(event, message_text: str) -> str:
+    """Prefix message_text with a reply-to pointer when the event is a quote-reply.
+
+    Shared by the cold inbound path and the busy-steer path so a mid-turn
+    quote-reply cannot drop the quoted body. The prefix is a disambiguation
+    pointer, not deduplication: it tells the agent WHICH prior message the
+    user is referencing even when the same text already appears in history.
+    """
+    if not getattr(event, "reply_to_message_id", None):
+        return message_text
+
+    reply_to_text = getattr(event, "reply_to_text", None)
+    if reply_to_text:
+        # Always inject the reply-to pointer — even when the quoted text
+        # already appears in history. The prefix isn't deduplication, it's
+        # disambiguation: it tells the agent *which* prior message the user
+        # is referencing. History can contain the same or similar text
+        # multiple times, and without an explicit pointer the agent has to
+        # guess (or answer for both subjects). Token overhead is minimal.
+        reply_snippet = reply_to_text[:2000]
+        if getattr(event, "reply_to_is_own_message", False):
+            return (
+                f'[Replying to your previous message: "{reply_snippet}"]\n\n'
+                f"{message_text}"
+            )
+        return f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+
+    # The quoted message had no text (e.g. image-only, voice-only).
+    # Prefer a concrete description of the quoted media when the adapter
+    # could parse it — "an image (image/png, chart.png)" tells the agent
+    # WHICH message is meant, where the generic fallback forces a guess.
+    media_summary = getattr(event, "reply_to_media_summary", None)
+    from tools.credential_files import to_agent_visible_cache_path
+
+    # Only advertise a path the agent can actually open. Docker gets
+    # a translated container path; other remote backends (Modal,
+    # SSH, Daytona) upload cache files to a remote base that often
+    # EQUALS the host path, in which case the untranslated path is
+    # genuinely valid there. So test the individual path rather than
+    # discarding everything because the backend is remote.
+    media_paths = []
+    for path in (getattr(event, "reply_to_media_paths", None) or []):
+        if not path:
+            continue
+        visible = to_agent_visible_cache_path(path)
+        if visible != path:
+            # Translated: the backend told us where it really lives.
+            media_paths.append(visible)
+        elif _quoted_media_path_valid_on_backend(path):
+            media_paths.append(visible)
+    if media_summary:
+        pointer = f"[Replying to {media_summary}"
+        if media_paths:
+            # We still have the file (we sent it): hand over the path so
+            # the agent can look at it instead of only naming it.
+            pointer += f" — local copy: {', '.join(media_paths[:4])}"
+        pointer += "]"
+        return f"{pointer}\n\n{message_text}"
+    return (
+        "[Replying to a previous message "
+        "(no text — may have been an image or file)]\n\n"
+        f"{message_text}"
+    )
+
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -8935,7 +9003,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         text = (event.text or "").strip()
         if not self._pending_event_audio_paths(event):
-            return text
+            # Gate on the USER payload, never on the formatted pointer: an
+            # empty body must stay falsy so the caller falls back to queue
+            # mode instead of steering a pointer with no message in it.
+            return format_reply_pointer(event, text) if text else ""
 
         adapter = self._adapter_for_source(event.source)
         enriched_text, successful_transcripts = await self._transcribe_and_echo_pending_voice(
@@ -8946,8 +9017,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             log_context="Busy-steer",
         )
         if not successful_transcripts:
-            return text
-        return (enriched_text or text).strip()
+            return format_reply_pointer(event, text) if text else ""
+        body = (enriched_text or text).strip()
+        return format_reply_pointer(event, body) if body else ""
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -15156,7 +15228,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
                 # is empty, the agent lacks steer(), or steer() rejects.
-                steer_text = (event.text or "").strip()
+                # Use the same reply-pointer formatting as the cold path so a
+                # mid-turn quote-reply does not drop the quoted body. Gate on
+                # the user payload, not the formatted pointer, so an empty
+                # body still falls back to queue mode below.
+                steer_body = (event.text or "").strip()
+                steer_text = format_reply_pointer(event, steer_body) if steer_body else ""
                 steered = False
                 if (
                     event.message_type == MessageType.TEXT
@@ -16346,57 +16423,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message_text}"
                 )
 
-        if getattr(event, "reply_to_message_id", None):
-            reply_to_text = getattr(event, "reply_to_text", None)
-            if reply_to_text:
-                # Always inject the reply-to pointer — even when the quoted text
-                # already appears in history. The prefix isn't deduplication, it's
-                # disambiguation: it tells the agent *which* prior message the user
-                # is referencing. History can contain the same or similar text
-                # multiple times, and without an explicit pointer the agent has to
-                # guess (or answer for both subjects). Token overhead is minimal.
-                reply_snippet = reply_to_text[:2000]
-                if getattr(event, "reply_to_is_own_message", False):
-                    message_text = (
-                        f'[Replying to your previous message: "{reply_snippet}"]\n\n'
-                        f"{message_text}"
-                    )
-                else:
-                    message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
-            else:
-                # The quoted message had no text (e.g. image-only, voice-only).
-                # Prefer a concrete description of the quoted media when the adapter
-                # could parse it — "an image (image/png, chart.png)" tells the agent
-                # WHICH message is meant, where the generic fallback forces a guess.
-                media_summary = getattr(event, "reply_to_media_summary", None)
-                from tools.credential_files import to_agent_visible_cache_path
-
-                # Only advertise a path the agent can actually open. Docker gets
-                # a translated container path; other remote backends (Modal,
-                # SSH, Daytona) upload cache files to a remote base that often
-                # EQUALS the host path, in which case the untranslated path is
-                # genuinely valid there. So test the individual path rather than
-                # discarding everything because the backend is remote.
-                media_paths = []
-                for p in (getattr(event, "reply_to_media_paths", None) or []):
-                    if not p:
-                        continue
-                    visible = to_agent_visible_cache_path(p)
-                    if visible != p:
-                        # Translated: the backend told us where it really lives.
-                        media_paths.append(visible)
-                    elif _quoted_media_path_valid_on_backend(p):
-                        media_paths.append(visible)
-                if media_summary:
-                    pointer = f"[Replying to {media_summary}"
-                    if media_paths:
-                        # We still have the file (we sent it): hand over the path so
-                        # the agent can look at it instead of only naming it.
-                        pointer += f" — local copy: {', '.join(media_paths[:4])}"
-                    pointer += "]"
-                    message_text = f"{pointer}\n\n{message_text}"
-                else:
-                    message_text = f'[Replying to a previous message (no text — may have been an image or file)]\n\n{message_text}'
+        message_text = format_reply_pointer(event, message_text)
 
         if "@" in message_text:
             try:

@@ -313,3 +313,112 @@ async def test_quoted_text_still_wins_over_media_summary():
     assert result is not None
     assert result.startswith('[Replying to: "the original message"]')
     assert "ignored.png" not in result
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_keeps_quoted_text():
+    """A mid-turn quote-reply must still tell the agent WHICH message was quoted.
+
+    Cold path (``_prepare_inbound_message_text``) has always injected
+    ``[Replying to: "..."]``. The busy path that steers a follow-up into a
+    running agent used to return only ``event.text``, so a Signal quote-reply
+    like "and this" arrived as bare text with the quoted body discarded. The
+    agent then had no idea which prior message the user was pointing at.
+    """
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="and this",
+        source=source,
+        reply_to_message_id="1785980000000",
+        reply_to_text="PR #679 open: https://github.com/cpe-research/cpe/pull/679",
+        reply_to_is_own_message=True,
+    )
+
+    result = await runner._prepare_busy_steer_text(event)
+
+    assert result.startswith(
+        '[Replying to your previous message: "PR #679 open: https://github.com/cpe-research/cpe/pull/679"]'
+    )
+    assert result.endswith("and this")
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_keeps_media_only_quote_summary():
+    """Media-only quotes on the busy path must still name the attachment."""
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="this",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=None,
+        reply_to_media_summary="an image (image/png, coach_cards.png)",
+    )
+
+    result = await runner._prepare_busy_steer_text(event)
+
+    assert result.startswith("[Replying to an image (image/png, coach_cards.png)]")
+    assert result.endswith("this")
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_without_quote_stays_plain_text():
+    """No reply context → busy path still returns bare text, nothing invented."""
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(text="keep going", source=source)
+
+    result = await runner._prepare_busy_steer_text(event)
+
+    assert result == "keep going"
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_failed_stt_quote_reply_stays_falsy():
+    """A voice quote-reply whose STT failed must NOT become a steerable payload.
+
+    Regression: the busy-steer gate reads the return value of
+    ``_prepare_busy_steer_text``. When that value was the *formatted pointer*
+    rather than the user body, an empty transcript still produced a truthy
+    ``[Replying to: "..."]\\n\\n`` prefix — ``can_steer`` passed, ``steer()``
+    succeeded with no message content, and the ``if not steered`` requeue was
+    skipped. The user's voice note was neither steered nor queued: it was lost.
+    """
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="",
+        source=source,
+        reply_to_message_id="9",
+        reply_to_text="the earlier note",
+    )
+
+    runner._pending_event_audio_paths = lambda _event: ["/tmp/voice.ogg"]
+    runner._adapter_for_source = lambda _source: None
+
+    async def _failed_stt(event, adapter, source, text, log_context=""):
+        return (text, [])
+
+    runner._transcribe_and_echo_pending_voice = _failed_stt
+
+    result = await runner._prepare_busy_steer_text(event)
+
+    assert not result
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_empty_text_quote_reply_stays_falsy():
+    """A text-less quote-reply must stay falsy so the caller queues it."""
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="",
+        source=source,
+        reply_to_message_id="9",
+        reply_to_text=None,
+    )
+
+    result = await runner._prepare_busy_steer_text(event)
+
+    assert not result
