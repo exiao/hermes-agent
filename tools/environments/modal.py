@@ -408,11 +408,40 @@ class ModalEnvironment(BaseEnvironment):
                 existing_mounts = list(create_kwargs.pop("mounts", []))
                 existing_mounts.extend(credential_mounts)
                 create_kwargs["mounts"] = existing_mounts
+            # ``timeout`` is a hard MAXIMUM LIFETIME, not an inactivity window:
+            # it kills the sandbox mid-command, so it cannot be lowered to reap
+            # leaked sandboxes without truncating legitimate long builds.
+            # ``idle_timeout`` is the inactivity reaper, and it is the backstop
+            # for a sandbox whose owning process died before ``cleanup()`` ran
+            # (SIGKILL, OOM, ``os._exit`` past the cleanup hook). Without it a
+            # leaked sandbox bills for the full ``timeout`` window.
+            create_timeout = int(create_kwargs.pop("timeout", 3600))
+            idle_timeout = create_kwargs.pop("idle_timeout", None)
+            extra: dict[str, Any] = {}
+            if idle_timeout:
+                # Never exceed the hard lifetime, and only pass the kwarg when
+                # the installed modal SDK actually supports it.
+                idle_seconds = max(1, min(int(idle_timeout), create_timeout))
+                try:
+                    import inspect as _inspect
+                    if "idle_timeout" in _inspect.signature(
+                        _modal.Sandbox.create
+                    ).parameters:
+                        extra["idle_timeout"] = idle_seconds
+                    else:
+                        logger.debug(
+                            "Modal: installed SDK has no idle_timeout support; "
+                            "leaked sandboxes will reap at timeout=%ss",
+                            create_timeout,
+                        )
+                except Exception:  # pragma: no cover - defensive
+                    pass
             sandbox = await _modal.Sandbox.create.aio(
                 "sleep", "infinity",
                 image=image_spec,
                 app=app,
-                timeout=int(create_kwargs.pop("timeout", 3600)),
+                timeout=create_timeout,
+                **extra,
                 **create_kwargs,
             )
             return app, sandbox

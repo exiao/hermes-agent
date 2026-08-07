@@ -1565,6 +1565,11 @@ def _get_env_config() -> Dict[str, Any]:
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
         "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
+        # Seconds a remote sandbox may sit idle before the provider reaps it.
+        # 0 disables (previous behavior). Modal-only today.
+        "container_idle_timeout": _parse_env_var(
+            "TERMINAL_CONTAINER_IDLE_TIMEOUT", "0", int, "integer"
+        ),
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
@@ -1672,6 +1677,19 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             sandbox_kwargs["cpu"] = cpu
         if memory > 0:
             sandbox_kwargs["memory"] = memory
+        # Inactivity reaper for sandboxes whose owning process died before
+        # cleanup() ran. Distinct from ``timeout`` (a hard max lifetime that
+        # kills mid-command); see _ModalEnvironment._create_sandbox. 0/None
+        # disables, preserving the previous behavior.
+        _idle = cc.get("container_idle_timeout")
+        if _idle:
+            try:
+                if int(_idle) > 0:
+                    sandbox_kwargs["idle_timeout"] = int(_idle)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring non-numeric container_idle_timeout: %r", _idle
+                )
         if disk > 0:
             try:
                 import inspect, modal
@@ -2439,6 +2457,7 @@ def terminal_tool(
                                 "container_memory": config.get("container_memory", 5120),
                                 "container_disk": config.get("container_disk", 51200),
                                 "container_persistent": config.get("container_persistent", True),
+                                "container_idle_timeout": config.get("container_idle_timeout", 0),
                                 "modal_mode": config.get("modal_mode", "auto"),
                                 "vercel_runtime": config.get("vercel_runtime", ""),
                                 "docker_volumes": config.get("docker_volumes", []),

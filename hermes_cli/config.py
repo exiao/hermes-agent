@@ -3200,6 +3200,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "container_memory": "TERMINAL_CONTAINER_MEMORY",
     "container_disk": "TERMINAL_CONTAINER_DISK",
     "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+    "container_idle_timeout": "TERMINAL_CONTAINER_IDLE_TIMEOUT",
     "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
     "docker_env": "TERMINAL_DOCKER_ENV",
     "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
