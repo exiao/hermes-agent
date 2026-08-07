@@ -127,13 +127,13 @@ class TestSemanticsAreDistinct:
         monkeypatch.setattr(
             modal_env.BaseEnvironment,
             "execute",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                RuntimeError("Modal sandbox was not found")
-            ),
+            lambda *args, **kwargs: {
+                "output": "[backend error] NotFoundError: Modal sandbox was not found",
+                "returncode": 1,
+            },
         )
 
-        with pytest.raises(RuntimeError, match="not found"):
-            env.execute("printf ok")
+        assert env.execute("printf ok")["returncode"] == 1
 
         assert evicted == [env]
         assert env._sandbox is None

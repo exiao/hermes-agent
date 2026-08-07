@@ -63,9 +63,9 @@ _cancel_id_counter = itertools.count()
 _PIDFILE_MAX_AGE_MINUTES = 720
 
 
-def _is_provider_reaped_error(exc: BaseException) -> bool:
+def _is_provider_reaped_error(exc: BaseException | str) -> bool:
     """Identify Modal errors that mean the cached sandbox no longer exists."""
-    error_type = type(exc).__name__.lower().replace("_", "")
+    error_type = type(exc).__name__.lower().replace("_", "") if isinstance(exc, BaseException) else ""
     message = str(exc).lower()
     if "notfounderror" in error_type or "notfounderror" in message.replace("_", ""):
         return True
@@ -712,7 +712,7 @@ class ModalEnvironment(BaseEnvironment):
     def execute(self, *args: Any, **kwargs: Any) -> dict:
         """Evict this instance when Modal has already reaped its sandbox."""
         try:
-            return super().execute(*args, **kwargs)
+            result = super().execute(*args, **kwargs)
         except Exception as exc:
             if _is_provider_reaped_error(exc):
                 try:
@@ -723,6 +723,17 @@ class ModalEnvironment(BaseEnvironment):
                 self._sandbox = None
                 self._worker.stop()
             raise
+        if result.get("returncode") == 1 and _is_provider_reaped_error(
+            result.get("output", "")
+        ):
+            try:
+                from tools.terminal_tool import _evict_cached_environment
+                _evict_cached_environment(self)
+            except ImportError:
+                pass
+            self._sandbox = None
+            self._worker.stop()
+        return result
 
     # ------------------------------------------------------------------
     # Execution
