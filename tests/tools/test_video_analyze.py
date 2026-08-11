@@ -2,7 +2,9 @@
 import pytest
 
 import asyncio
+import base64
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -206,6 +208,60 @@ class TestVideoAnalyzeTool:
         assert "video_url" in content[1]
         assert content[1]["video_url"]["url"].startswith("data:video/mp4;base64,")
 
+    def test_non_local_backend_reads_video_from_terminal_backend(self, tmp_path, monkeypatch):
+        """Non-local terminal backends must not read local host video paths.
+
+        The read routes through the shared media resolver
+        (tools.image_source, ``permitted=("video",)``) which exec-reads the
+        bytes inside the sandbox — so the analyzed video is the container's
+        file, never the host's.
+        """
+        host_video = tmp_path / "clip.mp4"
+        host_video.write_bytes(b"HOST-VIDEO")
+        remote_bytes = b"REMOTE-SANDBOX-VIDEO"
+        remote_b64 = base64.b64encode(remote_bytes).decode("ascii")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+        import tools.image_source as isrc
+        import tools.terminal_tool as tt
+
+        env_lookups = []
+
+        def fake_get_active(task_id):
+            env_lookups.append(task_id)
+            return SimpleNamespace(
+                execute=lambda cmd, **kw: {"returncode": 0, "output": remote_b64}
+            )
+
+        monkeypatch.setattr(tt, "ensure_task_env", lambda *a, **k: None)
+        monkeypatch.setattr(isrc, "_get_active_env", fake_get_active)
+
+        captured_kwargs = {}
+
+        async def capture_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock()]
+            mock_response.choices[0].message.content = "sandbox video"
+            return mock_response
+
+        with (
+            patch("tools.vision_tools.async_call_llm", side_effect=capture_llm),
+            patch("tools.vision_tools.extract_content_or_reasoning", return_value="sandbox video"),
+        ):
+            result = self._run(
+                video_analyze_tool(str(host_video), "Describe this", task_id="task-123")
+            )
+
+        data = json.loads(result)
+        assert data["success"] is True
+        assert env_lookups == ["task-123"]
+        video_url = captured_kwargs["messages"][0]["content"][1]["video_url"]["url"]
+        uploaded_bytes = base64.b64decode(video_url.split(",", 1)[1])
+        assert uploaded_bytes == remote_bytes
+        assert uploaded_bytes != host_video.read_bytes()
+
 
 # ---------------------------------------------------------------------------
 # Toolset registration
@@ -334,7 +390,29 @@ class TestDownloadVideoRejectsNonVideo:
         return resp
 
     def _patch_client(self, resp):
+        """Mock the streaming download API (`client.stream("GET", ...)`).
+
+        Upstream moved _download_video off `client.get` onto a chunked
+        `client.stream` context manager (bounded memory + running size cap);
+        the non-video payload rejection this class pins is unchanged, so the
+        mock follows the new shape.
+        """
+        body = resp.content
+
+        async def _aiter_bytes():
+            yield body
+
+        resp.aiter_bytes = _aiter_bytes
+
+        class _StreamCM:
+            async def __aenter__(self_inner):
+                return resp
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
         client = AsyncMock()
+        client.stream = MagicMock(return_value=_StreamCM())
         client.get = AsyncMock(return_value=resp)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
@@ -344,7 +422,7 @@ class TestDownloadVideoRejectsNonVideo:
         resp = self._mk_response(
             content=b"<!DOCTYPE html><html>...</html>", content_type="text/html")
         dest = tmp_path / "out.mp4"
-        with patch("tools.vision_tools.httpx.AsyncClient", return_value=self._patch_client(resp)), \
+        with patch("tools.url_safety.create_ssrf_safe_async_client", return_value=self._patch_client(resp)), \
              patch("tools.vision_tools.check_website_access", return_value=None):
             with pytest.raises(Exception) as exc:
                 asyncio.run(_download_video("https://example.com/page", dest, max_retries=1))
@@ -356,7 +434,7 @@ class TestDownloadVideoRejectsNonVideo:
         resp = self._mk_response(
             content=b"<html><head><title>YouTube</title></head>", content_type="")
         dest = tmp_path / "out.mp4"
-        with patch("tools.vision_tools.httpx.AsyncClient", return_value=self._patch_client(resp)), \
+        with patch("tools.url_safety.create_ssrf_safe_async_client", return_value=self._patch_client(resp)), \
              patch("tools.vision_tools.check_website_access", return_value=None):
             with pytest.raises(Exception) as exc:
                 asyncio.run(_download_video("https://example.com/page", dest, max_retries=1))
@@ -367,7 +445,7 @@ class TestDownloadVideoRejectsNonVideo:
         body = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 256
         resp = self._mk_response(content=body, content_type="video/mp4")
         dest = tmp_path / "out.mp4"
-        with patch("tools.vision_tools.httpx.AsyncClient", return_value=self._patch_client(resp)), \
+        with patch("tools.url_safety.create_ssrf_safe_async_client", return_value=self._patch_client(resp)), \
              patch("tools.vision_tools.check_website_access", return_value=None):
             result = asyncio.run(_download_video("https://example.com/clip.mp4", dest, max_retries=1))
             assert result == dest
