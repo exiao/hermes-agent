@@ -102,6 +102,26 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    def _profile_secret_scope_for_source(self, source):
+        """Return a context manager scoping secrets/home to ``source``'s profile.
+
+        Slash-command dispatch runs OUTSIDE the per-turn agent scope the
+        multiplexer installs, so account/credit reads that resolve
+        ``get_hermes_home()`` (auth.json) or ``get_secret``-backed provider
+        keys would otherwise read the DEFAULT profile's values — showing a
+        secondary profile its own empty/partial balance instead of its real
+        account. Under ``multiplex_profiles`` this installs
+        ``_profile_runtime_scope`` for the requesting profile; single-profile
+        gateways get a no-op ``nullcontext`` so their behavior is unchanged.
+        """
+        from contextlib import nullcontext
+
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return nullcontext()
+        from gateway.run import _profile_runtime_scope
+
+        return _profile_runtime_scope(self._resolve_profile_home_for_source(source))
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
@@ -1422,6 +1442,8 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
 
+        source = event.source
+
         # Parse --provider, --global, --session, and --refresh flags
         (
             model_input,
@@ -1430,7 +1452,6 @@ class GatewaySlashCommandsMixin:
             force_refresh,
             is_session,
         ) = parse_model_flags(raw_args)
-        persist_global = resolve_persist_behavior(is_global_flag, is_session)
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -1440,26 +1461,29 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 pass
 
-        # Read current model/provider from config. Under profile multiplexing
-        # this MUST run in the requesting profile's scope: current_provider /
-        # current_base_url / user_provs / custom_provs feed switch_model's
-        # resolution, and _load_gateway_config reads via get_hermes_home(). An
-        # unscoped read here would resolve a secondary profile's /model <name>
-        # against the DEFAULT profile's provider/custom-provider map (wrong
-        # endpoint, or missing the profile's own configured provider) even
-        # though the resolver + persist are already scoped. Scope is a no-op
+        # Read current model/provider from config AND resolve the persist
+        # default. Under profile multiplexing both MUST run in the requesting
+        # profile's scope: current_provider / current_base_url / user_provs /
+        # custom_provs feed switch_model's resolution, and
+        # resolve_persist_behavior reads ``model.persist_switch_by_default`` —
+        # all via get_hermes_home(). An unscoped read here would resolve a
+        # secondary profile's /model <name> against the DEFAULT profile's
+        # provider/custom-provider map (wrong endpoint) and apply the default
+        # profile's persist-by-default decision to the requesting profile (e.g.
+        # persisting when the secondary profile opted out). Scope is a no-op
         # when multiplexing is off — single-profile gateways are unchanged.
-        source = event.source
         current_model = ""
         current_provider = "openrouter"
         current_base_url = ""
         current_api_key = ""
         user_provs = None
         custom_provs = None
+        persist_global = resolve_persist_behavior(is_global_flag, is_session)
 
         def _read_current_config() -> None:
             nonlocal current_model, current_provider, current_base_url
-            nonlocal user_provs, custom_provs
+            nonlocal user_provs, custom_provs, persist_global
+            persist_global = resolve_persist_behavior(is_global_flag, is_session)
             cfg = _load_gateway_config()
             if cfg:
                 model_cfg = cfg.get("model", {})
@@ -3928,7 +3952,8 @@ class GatewaySlashCommandsMixin:
         from agent.account_usage import build_credits_view
 
         try:
-            view = await asyncio.to_thread(build_credits_view, markdown=True)
+            with self._profile_secret_scope_for_source(event.source):
+                view = await asyncio.to_thread(build_credits_view, markdown=True)
         except Exception:
             view = None
 
@@ -4034,12 +4059,13 @@ class GatewaySlashCommandsMixin:
         credits_lines: list[str] = []
         if provider:
             try:
-                account_snapshot = await asyncio.to_thread(
-                    fetch_account_usage,
-                    provider,
-                    base_url=base_url,
-                    api_key=api_key,
-                )
+                with self._profile_secret_scope_for_source(source):
+                    account_snapshot = await asyncio.to_thread(
+                        fetch_account_usage,
+                        provider,
+                        base_url=base_url,
+                        api_key=api_key,
+                    )
             except Exception:
                 account_snapshot = None
             if account_snapshot:
@@ -4056,7 +4082,8 @@ class GatewaySlashCommandsMixin:
         try:
             from agent.account_usage import nous_credits_lines
 
-            credits_lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
+            with self._profile_secret_scope_for_source(source):
+                credits_lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
         except Exception:
             credits_lines = []  # fail-open: never break /usage
 
