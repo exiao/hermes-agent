@@ -1982,6 +1982,18 @@ def prompt_caching_disabled_from_config() -> bool:
     return cache_ttl_means_disabled(ttl)
 
 
+def prompt_cache_ttl_from_config() -> str:
+    """Return the operator's ``prompt_caching.cache_ttl`` tier ("5m"/"1h")."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        pc_cfg = load_config_readonly().get("prompt_caching", {}) or {}
+        ttl = pc_cfg.get("cache_ttl", "5m")
+    except Exception:
+        return "5m"
+    return ttl if ttl in {"5m", "1h"} else "5m"
+
+
 def blank_cache_policy_stub(cache_disabled: Optional[bool] = None):
     """Build the destination-identity-blank stub for ``anthropic_prompt_cache_policy``.
 
@@ -2054,6 +2066,7 @@ def plan_cache_sections_for_destination(
     plan = build_prompt_cache_plan(
         messages,
         tools,
+        cache_ttl=prompt_cache_ttl_from_config(),
         native_anthropic=native_layout,
         direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(
             stub,
