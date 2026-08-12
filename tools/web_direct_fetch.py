@@ -160,13 +160,35 @@ async def fetch_direct(
     every failure path is a ``None`` so the fallback always gets its turn.
     """
     try:
-        import httpx
+        import httpx  # noqa: F401
     except ImportError:  # pragma: no cover - httpx is a hard runtime dep
         return None
 
+    from tools.url_safety import (
+        async_is_safe_url,
+        create_ssrf_safe_async_client,
+        redirect_target_from_response,
+    )
+    from tools.website_policy import check_website_access
+
+    if check_website_access(url):
+        logger.debug("direct-fetch miss (blocked by website policy): %s", url)
+        return None
+
+    async def _ssrf_redirect_guard(response: Any) -> None:
+        """Re-validate every redirect target: a public URL can 302 to 127.0.0.1."""
+        redirect_url = redirect_target_from_response(response)
+        if not redirect_url:
+            return
+        if not await async_is_safe_url(redirect_url):
+            raise ValueError(f"Blocked redirect to private address: {redirect_url}")
+        if check_website_access(redirect_url):
+            raise ValueError(f"Blocked redirect by website policy: {redirect_url}")
+
     try:
-        async with httpx.AsyncClient(
+        async with create_ssrf_safe_async_client(
             follow_redirects=True,
+            event_hooks={"response": [_ssrf_redirect_guard]},
             timeout=timeout_s,
             headers={
                 # Some sites 403 an unknown agent. Identify honestly but in a

@@ -262,3 +262,53 @@ def test_disabling_restores_backend_only_behavior(wired, monkeypatch):
     assert calls == [], "direct fetch ran while disabled"
     assert provider.seen == [["https://x.test/a"]]
     assert results[0]["content"] == "backend:https://x.test/a"
+
+
+# ── security gates: a redirect and the blocklist must both produce a miss ────
+
+class _RedirectingClient(_FakeClient):
+    """Fake client that runs the response event hooks, like httpx does."""
+
+    def __init__(self, responses, calls, hooks):
+        super().__init__(responses, calls)
+        self._hooks = hooks
+
+    async def get(self, url: str) -> Any:
+        response = await super().get(url)
+        for hook in self._hooks:
+            await hook(response)
+        return response
+
+
+def test_redirect_to_private_address_is_a_miss(monkeypatch):
+    """A public URL that 302s to loopback must never return a body."""
+    calls: List[str] = []
+    redirect = _FakeResponse(status_code=302, text="")
+    redirect.is_redirect = True
+    redirect.headers = {"location": "http://127.0.0.1/internal"}
+    redirect.url = "https://x.test/redir"
+    responses = {"https://x.test/redir": redirect}
+
+    def _factory(*args: object, **kwargs: object) -> _RedirectingClient:
+        hooks = (kwargs.get("event_hooks") or {}).get("response", [])
+        return _RedirectingClient(responses, calls, hooks)
+
+    monkeypatch.setattr(
+        "tools.url_safety.create_ssrf_safe_async_client", _factory
+    )
+
+    assert asyncio.run(dfetch.fetch_direct("https://x.test/redir")) is None
+    assert calls == ["https://x.test/redir"]
+
+
+def test_blocklisted_host_is_a_miss(fake_http, monkeypatch):
+    """A policy-blocked host must not be fetched at all."""
+    responses, calls = fake_http
+    responses["https://blocked.test/a"] = _FakeResponse(text=ARTICLE)
+    monkeypatch.setattr(
+        "tools.website_policy.check_website_access",
+        lambda url, *a, **k: {"host": "blocked.test", "message": "blocked"},
+    )
+
+    assert asyncio.run(dfetch.fetch_direct("https://blocked.test/a")) is None
+    assert calls == [], "blocked URL was fetched anyway"
