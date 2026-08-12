@@ -23,13 +23,17 @@ from agent.prompt_cache_boundary import (
     register_stable_prefix,
 )
 from agent.prompt_caching import (
+    CACHE_TTL,
     apply_anthropic_cache_control,
     build_prompt_cache_plan,
+    make_cache_marker,
     strip_anthropic_cache_control,
 )
 from agent.skill_commands import _SINGLE_SKILL_INSTRUCTION
 
-MARKER = {"type": "ephemeral"}
+# Derive from the single source of truth (agent.prompt_caching.CACHE_TTL) so a
+# TTL tier change does not silently break these layout assertions.
+MARKER = make_cache_marker()
 
 SKILL_BODY = "Inspect the report carefully and preserve the stable instructions."
 
@@ -186,7 +190,9 @@ class TestRequestLocalSplit:
         original = scaffold + "volatile"
         messages = [{"role": "user", "content": original}]
 
-        plan = build_prompt_cache_plan(messages, [], native_anthropic=True)
+        plan = build_prompt_cache_plan(
+            messages, [], cache_ttl=CACHE_TTL, native_anthropic=True
+        )
 
         assert messages == [{"role": "user", "content": original}]
         assert isinstance(plan.messages[0]["content"], list)
