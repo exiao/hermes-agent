@@ -4822,29 +4822,30 @@ def task_graph_contexts(
     if not ordered_ids:
         return contexts
 
-    placeholders = ",".join("?" for _ in ordered_ids)
-    for row in conn.execute(
-        "SELECT l.child_id AS owner_id, t.id, t.title, t.status "
-        "FROM task_links l JOIN tasks t ON t.id = l.parent_id "
-        f"WHERE l.child_id IN ({placeholders}) ORDER BY l.child_id, t.id",
-        tuple(ordered_ids),
-    ).fetchall():
-        contexts[row["owner_id"]]["parents"].append({
-            "id": row["id"],
-            "title": row["title"],
-            "status": row["status"],
-        })
-    for row in conn.execute(
-        "SELECT l.parent_id AS owner_id, t.id, t.title, t.status "
-        "FROM task_links l JOIN tasks t ON t.id = l.child_id "
-        f"WHERE l.parent_id IN ({placeholders}) ORDER BY l.parent_id, t.id",
-        tuple(ordered_ids),
-    ).fetchall():
-        contexts[row["owner_id"]]["children"].append({
-            "id": row["id"],
-            "title": row["title"],
-            "status": row["status"],
-        })
+    for chunk in _sqlite_chunks(ordered_ids, _SQLITE_IN_CHUNK_SIZE):
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            "SELECT l.child_id AS owner_id, t.id, t.title, t.status "
+            "FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+            f"WHERE l.child_id IN ({placeholders}) ORDER BY l.child_id, t.id",
+            tuple(chunk),
+        ).fetchall():
+            contexts[row["owner_id"]]["parents"].append({
+                "id": row["id"],
+                "title": row["title"],
+                "status": row["status"],
+            })
+        for row in conn.execute(
+            "SELECT l.parent_id AS owner_id, t.id, t.title, t.status "
+            "FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            f"WHERE l.parent_id IN ({placeholders}) ORDER BY l.parent_id, t.id",
+            tuple(chunk),
+        ).fetchall():
+            contexts[row["owner_id"]]["children"].append({
+                "id": row["id"],
+                "title": row["title"],
+                "status": row["status"],
+            })
     return contexts
 
 

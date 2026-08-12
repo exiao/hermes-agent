@@ -25,11 +25,14 @@ from agent.prompt_cache_boundary import (
 from agent.prompt_caching import (
     apply_anthropic_cache_control,
     build_prompt_cache_plan,
+    make_cache_marker,
     strip_anthropic_cache_control,
 )
 from agent.skill_commands import _SINGLE_SKILL_INSTRUCTION
 
-MARKER = {"type": "ephemeral"}
+# Derived from the single source of truth (agent.prompt_caching.CACHE_TTL) so a
+# TTL change propagates instead of freezing the 5m-implicit shape here.
+MARKER = make_cache_marker()
 
 SKILL_BODY = "Inspect the report carefully and preserve the stable instructions."
 
@@ -190,7 +193,9 @@ class TestRequestLocalSplit:
 
         assert messages == [{"role": "user", "content": original}]
         assert isinstance(plan.messages[0]["content"], list)
-        assert plan.messages[0]["content"][0]["cache_control"] == MARKER
+        # build_prompt_cache_plan defaults to the 5m TTL, unlike
+        # apply_anthropic_cache_control which defaults to CACHE_TTL.
+        assert plan.messages[0]["content"][0]["cache_control"] == make_cache_marker("5m")
         assert "cache_control" not in plan.messages[0]["content"][1]
 
     def test_strip_reconstructs_exact_string_and_redecorates_identically(self):
