@@ -308,6 +308,41 @@ def _get_capability_backend(capability: str) -> str:
     return _get_backend()
 
 
+def _direct_fetch_enabled() -> bool:
+    """Whether to try a plain GET before spending an extract-backend credit.
+
+    Defaults to ON: the direct path only ever RETURNS content it is confident
+    about, and every miss falls through to the configured backend, so the
+    worst case is one cheap local request before the same paid call that
+    would have happened anyway. Set ``web.direct_fetch_first: false`` to
+    restore backend-only behavior.
+    """
+    cfg = _load_web_config()
+    value = cfg.get("direct_fetch_first")
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off")
+    return bool(value)
+
+
+def _direct_fetch_timeout() -> float:
+    """Per-URL wall clock for the direct fetch (``web.direct_fetch_timeout_s``).
+
+    Kept short on purpose: this path exists to be faster AND cheaper than the
+    paid backend, so a slow direct read should give up early rather than add
+    its own latency on top of the fallback's.
+    """
+    from tools.web_direct_fetch import DEFAULT_TIMEOUT_S
+
+    cfg = _load_web_config()
+    try:
+        timeout = float(cfg.get("direct_fetch_timeout_s") or DEFAULT_TIMEOUT_S)
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT_S
+    return timeout if timeout > 0 else DEFAULT_TIMEOUT_S
+
+
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable.
 
@@ -850,8 +885,37 @@ async def web_extract_tool(
                 safe_urls.append(url)
                 safe_indices.append(index)
 
+        # ── Free direct fetch first, paid backend only for what it misses ──
+        # Most pages are plain server-rendered HTML that a single GET plus a
+        # tag strip reads perfectly well, so spending a metered Firecrawl /
+        # Tavily / Exa credit on them is pure waste. Try HTTP directly, then
+        # send ONLY the URLs it could not handle to the configured backend.
+        # The helper is deliberately conservative (see web_direct_fetch): a
+        # PDF, a JS shell, a thin page, or any error is a miss, and a miss
+        # falls through to the paid path exactly as before. Off => unchanged
+        # behavior, so this cannot silently degrade an existing install.
+        direct_hits: Dict[str, Dict[str, Any]] = {}
+        if safe_urls and _direct_fetch_enabled():
+            from tools.web_direct_fetch import fetch_many_direct
+
+            direct_hits = await fetch_many_direct(
+                safe_urls, timeout_s=_direct_fetch_timeout()
+            )
+            if direct_hits:
+                logger.info(
+                    "Direct fetch handled %d/%d URL(s); %d left for the extract backend",
+                    len(direct_hits),
+                    len(safe_urls),
+                    len(safe_urls) - len(direct_hits),
+                )
+
+        backend_urls = [u for u in safe_urls if u not in direct_hits]
+        backend_indices = [
+            i for u, i in zip(safe_urls, safe_indices) if u not in direct_hits
+        ]
+
         # Dispatch only safe URLs to the configured backend
-        if not safe_urls:
+        if not backend_urls:
             results = []
         else:
             backend = _get_extract_backend()
@@ -927,39 +991,54 @@ async def web_extract_tool(
                     )
 
             logger.info(
-                "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
+                "Web extract via %s: %d URL(s)", provider.name, len(backend_urls)
             )
 
             # Async-or-sync dispatch: parallel + firecrawl have async
             # extract(); exa + tavily are sync.
             import inspect
             if inspect.iscoroutinefunction(provider.extract):
-                results = await provider.extract(safe_urls, format=format)
+                results = await provider.extract(backend_urls, format=format)
             else:
                 # Run sync extract() in a thread so we don't block the
                 # event loop on network I/O.
                 results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
+                    provider.extract, backend_urls, format=format
                 )
 
-        # Reconstruct the original input order across invalid, blocked, and
-        # provider-processed entries. Providers are expected to preserve the
-        # order of the safe URL list they receive.
-        if invalid_urls or ssrf_blocked:
-            safe_results = {
+        # Reconstruct the original input order across invalid, blocked,
+        # direct-fetched, and provider-processed entries. Providers are
+        # expected to preserve the order of the URL list they receive.
+        #
+        # This runs unconditionally once a direct fetch has claimed any URL:
+        # ``results`` then covers only the BACKEND subset, so returning it
+        # as-is would silently drop the directly-fetched pages and misalign
+        # the rest against the caller's input order.
+        if invalid_urls or ssrf_blocked or direct_hits:
+            backend_results = {
                 index: (
                     results[position]
                     if position < len(results)
                     else {
-                        "url": safe_urls[position],
+                        "url": backend_urls[position],
                         "title": "",
                         "content": "",
                         "error": "Extract backend returned no result for this URL",
                     }
                 )
-                for position, index in enumerate(safe_indices)
+                for position, index in enumerate(backend_indices)
             }
-            by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
+            direct_results = {
+                index: direct_hits[url]
+                for url, index in zip(safe_urls, safe_indices)
+                if url in direct_hits
+            }
+            by_index = {
+                **backend_results,
+                **direct_results,
+                **ssrf_blocked,
+                **invalid_urls,
+            }
             results = [by_index[index] for index in range(len(urls))]
 
         response = {"results": results}
