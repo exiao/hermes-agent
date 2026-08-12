@@ -208,9 +208,11 @@ class FileSyncManager:
         On failure, state rolls back so the next cycle retries everything.
         """
         with self._transaction_lock:
-            self._sync_transaction(force=force)
+            self._sync_transaction(force=force, raise_on_error=raise_on_error)
 
-    def _sync_transaction(self, *, force: bool = False) -> None:
+    def _sync_transaction(
+        self, *, force: bool = False, raise_on_error: bool = False
+    ) -> None:
         """Execute one sync cycle while holding the per-manager lock."""
         if not force and not os.environ.get(_FORCE_SYNC_ENV):
             now = _monotonic()
