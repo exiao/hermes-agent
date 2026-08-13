@@ -553,8 +553,9 @@ def test_board_aggregate_queries_are_scoped_to_returned_cards(kanban_home, monke
 
     progress_queries = [q for q in queries if "FROM task_links l JOIN tasks t" in q]
     assert progress_queries
-    # Progress rollups scope by parent; graph-context loads scope by whichever
-    # side owns the row. Both must be bounded to the returned working set.
+    # Both link directions are loaded and each must be scoped to returned ids,
+    # not a full scan.
+
     assert all(
         "WHERE l.parent_id IN" in q or "WHERE l.child_id IN" in q
         for q in progress_queries

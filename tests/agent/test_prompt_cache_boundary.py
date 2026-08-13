@@ -30,8 +30,8 @@ from agent.prompt_caching import (
 )
 from agent.skill_commands import _SINGLE_SKILL_INSTRUCTION
 
-# Derived from the single source of truth (agent.prompt_caching.CACHE_TTL) so a
-# TTL change propagates instead of freezing the 5m-implicit shape here.
+# Derive from the shipped TTL rather than freezing the 5m shape: a CACHE_TTL
+# change is a caching decision, not a reason for these boundary tests to fail.
 MARKER = make_cache_marker()
 
 SKILL_BODY = "Inspect the report carefully and preserve the stable instructions."
@@ -193,8 +193,8 @@ class TestRequestLocalSplit:
 
         assert messages == [{"role": "user", "content": original}]
         assert isinstance(plan.messages[0]["content"], list)
-        # build_prompt_cache_plan defaults to the 5m TTL, unlike
-        # apply_anthropic_cache_control which defaults to CACHE_TTL.
+        # build_prompt_cache_plan's own cache_ttl default is "5m", unlike
+        # apply_anthropic_cache_control which follows CACHE_TTL.
         assert plan.messages[0]["content"][0]["cache_control"] == make_cache_marker("5m")
         assert "cache_control" not in plan.messages[0]["content"][1]
 
