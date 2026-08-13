@@ -1460,7 +1460,7 @@ def _handle_create(args: dict, **kw) -> str:
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
-    idempotency_key = args.get("idempotency_key")
+    idempotency_key = args.get("dedupe_key") or args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -2287,12 +2287,14 @@ KANBAN_CREATE_SCHEMA = {
                     "the body before work starts."
                 ),
             },
-            "idempotency_key": {
+            "dedupe_key": {
                 "type": "string",
                 "description": (
                     "If a non-archived task with this key already "
                     "exists, return that task's id instead of creating "
-                    "a duplicate. Useful for retry-safe automation."
+                    "a duplicate. Pass one whenever a cron, sweep, or "
+                    "retry could file the same card twice. Also accepted "
+                    "as 'idempotency_key' (old name)."
                 ),
             },
             "max_runtime_seconds": {

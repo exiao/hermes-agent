@@ -354,9 +354,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
-    p_create.add_argument("--idempotency-key", default=None,
+    p_create.add_argument("--dedupe-key", "--idempotency-key",
+                          dest="dedupe_key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
-                               "its id is returned instead of creating a duplicate.")
+                               "its id is returned instead of creating a duplicate. "
+                               "(--idempotency-key is the old name and still works.)")
     p_create.add_argument("--max-runtime", default=None,
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
@@ -431,7 +433,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_swarm.add_argument("--tenant", default=None, help="Tenant namespace")
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
-    p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
+    p_swarm.add_argument("--dedupe-key", "--idempotency-key",
+                         dest="dedupe_key", default=None,
+                         help="Dedup key for the root card "
+                              "(--idempotency-key is the old name and still works)")
     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- list ---
@@ -1578,7 +1583,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             priority=args.priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
+            idempotency_key=getattr(args, "dedupe_key", None)
+            or getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
@@ -1627,7 +1633,8 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             tenant=args.tenant,
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
-            idempotency_key=getattr(args, "idempotency_key", None),
+            idempotency_key=getattr(args, "dedupe_key", None)
+            or getattr(args, "idempotency_key", None),
         )
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
