@@ -45,7 +45,7 @@ def test_container_base_is_honoured(hermes_home):
     assert entries[0]["container_path"] == "/home/daytona/.hermes/plans/task.md"
 
 
-def test_archived_and_binary_plans_are_skipped(hermes_home):
+def test_archived_and_loose_binary_plans_are_skipped(hermes_home):
     """~4.5k files / 44MB of dead weight would otherwise ship every start."""
     from tools.credential_files import iter_plans_files
 
@@ -53,11 +53,60 @@ def test_archived_and_binary_plans_are_skipped(hermes_home):
     (plans / "keep.md").write_text("# keep\n")
     (plans / "archive").mkdir()
     (plans / "archive" / "old.md").write_text("# old\n")
+    (plans / "archive" / "diagrams").mkdir()
+    (plans / "archive" / "diagrams" / "old.png").write_bytes(b"\x89PNG")
     (plans / "screenshot.png").write_bytes(b"\x89PNG")
 
     names = {Path(e["host_path"]).name for e in iter_plans_files()}
 
     assert names == {"keep.md"}
+
+
+def test_cited_diagram_images_reach_the_sandbox(hermes_home):
+    """A card's ``Diagram:`` path must resolve on a remote lane, not just its
+    ``Plan:`` path. Cards cite a rendered PNG next to the plan; a text-only
+    sync left every one of those paths dead."""
+    from tools.credential_files import iter_plans_files
+
+    diagram = hermes_home / "plans" / "diagrams" / "slimdown" / "out.png"
+    diagram.parent.mkdir(parents=True)
+    diagram.write_bytes(b"\x89PNG")
+
+    entries = {e["host_path"]: e["container_path"] for e in iter_plans_files()}
+
+    assert entries[str(diagram)] == (
+        "/root/.hermes/plans/diagrams/slimdown/out.png"
+    )
+
+
+def test_oversized_diagrams_are_skipped(hermes_home):
+    """The diagrams tree also collects full-page screenshots; a size cap keeps
+    the per-start sync from regrowing into the 44MB it was trimmed from."""
+    from tools.credential_files import _DIAGRAM_MAX_BYTES, iter_plans_files
+
+    diagrams = hermes_home / "plans" / "diagrams" / "big"
+    diagrams.mkdir(parents=True)
+    (diagrams / "small.png").write_bytes(b"\x89PNG")
+    (diagrams / "huge.png").write_bytes(b"\x00" * (_DIAGRAM_MAX_BYTES + 1))
+
+    names = {Path(e["host_path"]).name for e in iter_plans_files()}
+
+    assert names == {"small.png"}
+
+
+def test_non_image_diagram_artifacts_are_still_skipped(hermes_home):
+    """Diagram dirs hold an index.html + rendered image; only the image is
+    worth a sandbox upload."""
+    from tools.credential_files import iter_plans_files
+
+    diagrams = hermes_home / "plans" / "diagrams" / "chart"
+    diagrams.mkdir(parents=True)
+    (diagrams / "out.png").write_bytes(b"\x89PNG")
+    (diagrams / "index.html").write_text("<html></html>")
+
+    names = {Path(e["host_path"]).name for e in iter_plans_files()}
+
+    assert names == {"out.png"}
 
 
 def test_symlinks_are_not_followed(hermes_home, tmp_path):

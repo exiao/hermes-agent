@@ -532,6 +532,27 @@ def to_agent_visible_cache_path(
     return mapped if mapped is not None else host_path
 
 
+# Raster diagrams a card cites with a ``Diagram:`` line.  Restricted to the
+# ``diagrams/`` subtree and size-capped: the plans root also accumulates
+# full-page screenshots and run artifacts, and shipping those is what the
+# markdown-only filter was protecting against.
+_DIAGRAM_ROOT = "diagrams"
+_DIAGRAM_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+_DIAGRAM_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _is_synced_diagram(item: Path, rel: Path) -> bool:
+    """Whether a non-text plan file is a card-citable diagram worth syncing."""
+    if not rel.parts or rel.parts[0] != _DIAGRAM_ROOT:
+        return False
+    if item.suffix.lower() not in _DIAGRAM_SUFFIXES:
+        return False
+    try:
+        return item.stat().st_size <= _DIAGRAM_MAX_BYTES
+    except OSError:
+        return False
+
+
 def iter_plans_files(
     container_base: str = "/root/.hermes",
 ) -> List[Dict[str, str]]:
@@ -540,8 +561,12 @@ def iter_plans_files(
     Kanban card briefs routinely link a plan by host path
     (``~/.hermes/plans/<task>.md``), so a worker on a remote backend could not
     read the plan it was told to follow and blocked instead.  Skips symlinks;
-    markdown/text only, and skips archived subtrees, so a stray artifact in
-    plans/ can't bloat every sandbox.
+    markdown/text plus size-capped ``diagrams/`` images, and skips archived
+    subtrees, so a stray artifact in plans/ can't bloat every sandbox.
+
+    Cards cite a rendered diagram alongside the plan (``Diagram:
+    ~/.hermes/plans/diagrams/<name>/out.png``).  Text-only sync left every one
+    of those paths dead on a remote lane.
     """
     result: List[Dict[str, str]] = []
 
@@ -561,10 +586,12 @@ def iter_plans_files(
     for item in plans_dir.rglob("*"):
         if item.is_symlink() or not item.is_file():
             continue
-        if item.suffix.lower() not in allowed_suffixes:
-            continue
         rel = item.relative_to(plans_dir)
         if rel.parts and rel.parts[0] in skip_roots:
+            continue
+        if item.suffix.lower() not in allowed_suffixes and not _is_synced_diagram(
+            item, rel
+        ):
             continue
         result.append({
             "host_path": str(item),
