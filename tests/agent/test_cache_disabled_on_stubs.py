@@ -136,6 +136,40 @@ class TestPlanCacheSectionsHonorsDisable:
             "receive cache_control breakpoints."
         )
 
+    def test_configured_1h_ttl_reaches_markers(self):
+        """MoA/aux path must emit the operator's 1h tier, not implicit 5m."""
+        from agent.agent_runtime_helpers import plan_cache_sections_for_destination
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "again"},
+        ]
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"prompt_caching": {"cache_ttl": "1h"}},
+        ):
+            out_msgs, _ = plan_cache_sections_for_destination(
+                messages,
+                None,
+                provider="anthropic",
+                base_url="https://api.anthropic.com",
+                api_mode="anthropic_messages",
+                model="claude-opus-4.8",
+                cache_disabled=False,
+            )
+        ttls = [
+            block["cache_control"].get("ttl")
+            for msg in out_msgs
+            for block in (
+                msg["content"] if isinstance(msg.get("content"), list) else []
+            )
+            if isinstance(block, dict) and isinstance(block.get("cache_control"), dict)
+        ]
+        assert ttls, "expected cache_control markers on the native Anthropic path"
+        assert all(t == "1h" for t in ttls), ttls
+
 
 class TestMoASlotDecorationHonorsDisable:
     def test_maybe_apply_skips_markers_when_disabled(self):
