@@ -438,6 +438,10 @@ def test_every_dispatcher_kanban_var_is_identity_gated():
         "HERMES_KANBAN_BRANCH",
         "HERMES_KANBAN_GOAL_MODE",
         "HERMES_KANBAN_GOAL_MAX_TURNS",
+        # SQLite fd-headroom tuning knob (kanban_db._resolve_fd_headroom).
+        # Carries no board or task identity, so scrubbing it from a
+        # delegate_task subprocess would change nothing about ownership.
+        "HERMES_KANBAN_FD_HEADROOM",
     }
     uncovered = injected - set(KANBAN_ENV_KEYS) - behaviour_only
     assert not uncovered, (
