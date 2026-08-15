@@ -98,6 +98,17 @@ def test_crash_exit_details_are_reported(payload: dict, expected: str) -> None:
     assert expected in _failure_detail(payload)
 
 
+@pytest.mark.parametrize("exit_kind", ["nonzero_exit", "signaled"])
+def test_crash_exit_details_omit_missing_pid(exit_kind: str) -> None:
+    detail = _failure_detail({"exit_kind": exit_kind, "exit_code": 1})
+
+    assert "pid None" not in detail
+
+
+def test_invalid_failure_count_does_not_crash() -> None:
+    assert _failure_detail({"failures": "not-a-number", "effective_limit": 3}) == ""
+
+
 def test_an_empty_payload_adds_nothing() -> None:
     """No payload must not mean an empty line or a stray separator."""
     assert _failure_detail(None) == ""

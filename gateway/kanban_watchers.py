@@ -124,10 +124,11 @@ def _failure_detail(
         pid = payload.get("pid")
         exit_kind = payload["exit_kind"]
         exit_code = payload["exit_code"]
+        pid_prefix = f"pid {pid} " if pid is not None else ""
         if exit_kind == "nonzero_exit":
-            lines.append(f"pid {pid} exited with code {exit_code}")
+            lines.append(f"{pid_prefix}exited with code {exit_code}")
         elif exit_kind == "signaled":
-            lines.append(f"pid {pid} killed by signal {exit_code}")
+            lines.append(f"{pid_prefix}killed by signal {exit_code}")
 
     facts: list[str] = []
 
@@ -148,15 +149,27 @@ def _failure_detail(
     # How many attempts, and against what ceiling.
     failures = payload.get("failures")
     if failures:
-        ceiling = payload.get("effective_limit")
-        source = payload.get("limit_source")
-        if ceiling:
-            attempt = f"attempt {int(failures)} of {int(ceiling)}"
-            if source:
-                attempt += f" ({source} limit)"
-            facts.append(attempt)
-        else:
-            facts.append(f"{int(failures)} failure(s)")
+        try:
+            failures_value = int(failures)
+        except (TypeError, ValueError):
+            failures_value = 0
+        if failures_value:
+            ceiling = payload.get("effective_limit")
+            source = payload.get("limit_source")
+            if ceiling:
+                try:
+                    ceiling_value = int(ceiling)
+                except (TypeError, ValueError):
+                    ceiling_value = 0
+                if ceiling_value:
+                    attempt = f"attempt {failures_value} of {ceiling_value}"
+                    if source:
+                        attempt += f" ({source} limit)"
+                    facts.append(attempt)
+                else:
+                    facts.append(f"{failures_value} failure(s)")
+            else:
+                facts.append(f"{failures_value} failure(s)")
 
     # Whether anything happens next. "will retry" was previously asserted
     # unconditionally, which was a guess; retry_status is the real answer.
