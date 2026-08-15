@@ -693,6 +693,20 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
 
+    # Bare mode emits none of the fields below — the prompt is the user's
+    # identity slot and nothing else. Scanning it would read the USER's prose
+    # as runtime state: a SOUL.md line starting with "Model:" or "Platform:"
+    # would never match the live values, so the stored prompt would be
+    # rejected on EVERY turn, rebuilding the system prompt each message and
+    # destroying the prefix cache for the whole session. With no emitted
+    # fields there is nothing to drift, so accept the stored prompt.
+    # ``is True`` rather than a truthiness check: agent_init stores a real
+    # bool, and a bare truthiness test would treat any Mock/stub agent (whose
+    # attributes auto-create as truthy) as bare, silently skipping the drift
+    # scan for every mocked caller.
+    if getattr(agent, "_bare_system_prompt", False) is True:
+        return True
+
     def line_value(label: str) -> str:
         """Last matching line wins.
 

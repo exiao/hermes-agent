@@ -81,6 +81,10 @@ Use it less for:
 
 Those belong in `AGENTS.md`, not `SOUL.md`.
 
+:::tip Want SOUL.md to be the ONLY thing in the system prompt?
+By default `SOUL.md` is slot #1 and Hermes appends its own blocks after it (docs pointer, tool guidance, environment hints, skills index, memory, timestamp). Set `agent.bare_system_prompt: true` to skip all of them and make `SOUL.md` the entire prompt. See [Bare System Prompt](/user-guide/configuration#bare-system-prompt).
+:::
+
 ## Good SOUL.md content
 
 A good SOUL file is:
