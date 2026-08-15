@@ -89,7 +89,11 @@ def _clip_notify_detail(text: str, limit: int = _NOTIFY_DETAIL_MAX) -> str:
     return text[:limit] + f"… ({len(text) - limit} more chars; see board)"
 
 
-def _failure_detail(payload: dict[str, Any] | None) -> str:
+def _failure_detail(
+    payload: dict[str, Any] | None,
+    *,
+    terminal: bool = False,
+) -> str:
     """Explain a gave_up / crashed / timed_out ping.
 
     These three cases used to send only their headline. A ``timed_out`` ping
@@ -116,6 +120,14 @@ def _failure_detail(payload: dict[str, Any] | None) -> str:
     error = payload.get("error")
     if error:
         lines.append(_clip_notify_detail(str(error)))
+    elif payload.get("exit_kind") and payload.get("exit_code") is not None:
+        pid = payload.get("pid")
+        exit_kind = payload["exit_kind"]
+        exit_code = payload["exit_code"]
+        if exit_kind == "nonzero_exit":
+            lines.append(f"pid {pid} exited with code {exit_code}")
+        elif exit_kind == "signaled":
+            lines.append(f"pid {pid} killed by signal {exit_code}")
 
     facts: list[str] = []
 
@@ -123,10 +135,15 @@ def _failure_detail(payload: dict[str, Any] | None) -> str:
     # never carried one, and printing "max_runtime=0s" invents a fact.
     elapsed = payload.get("elapsed_seconds")
     limit = payload.get("limit_seconds")
-    if elapsed and limit:
-        facts.append(f"ran {int(elapsed)}s of {int(limit)}s")
-    elif limit:
-        facts.append(f"limit {int(limit)}s")
+    try:
+        elapsed_value = int(elapsed) if elapsed else 0
+        limit_value = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        elapsed_value = limit_value = 0
+    if elapsed_value and limit_value:
+        facts.append(f"ran {elapsed_value}s of {limit_value}s")
+    elif limit_value:
+        facts.append(f"limit {limit_value}s")
 
     # How many attempts, and against what ceiling.
     failures = payload.get("failures")
@@ -144,7 +161,9 @@ def _failure_detail(payload: dict[str, Any] | None) -> str:
     # Whether anything happens next. "will retry" was previously asserted
     # unconditionally, which was a guess; retry_status is the real answer.
     retry = payload.get("retry_status")
-    if retry:
+    if terminal:
+        facts.append("not retrying (blocked)")
+    elif retry:
         facts.append(
             "will retry" if retry == "ready" else f"not retrying ({retry})"
         )
@@ -896,7 +915,7 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures — {title}"
-                                f"{_failure_detail(ev.payload)}"
+                                f"{_failure_detail(ev.payload, terminal=True)}"
                             )
                         elif kind == "crashed":
                             msg = (

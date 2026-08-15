@@ -77,6 +77,27 @@ def test_whether_it_retries_is_read_not_assumed(
     assert expected in _failure_detail({"retry_status": retry_status})
 
 
+def test_gave_up_is_terminal_even_when_source_phase_says_ready() -> None:
+    detail = _failure_detail(
+        {"retry_status": "ready"},
+        terminal=True,
+    )
+
+    assert "not retrying (blocked)" in detail
+    assert "will retry" not in detail
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"pid": 18342, "exit_kind": "nonzero_exit", "exit_code": 1}, "exited with code 1"),
+        ({"pid": 18342, "exit_kind": "signaled", "exit_code": 9}, "killed by signal 9"),
+    ],
+)
+def test_crash_exit_details_are_reported(payload: dict, expected: str) -> None:
+    assert expected in _failure_detail(payload)
+
+
 def test_an_empty_payload_adds_nothing() -> None:
     """No payload must not mean an empty line or a stray separator."""
     assert _failure_detail(None) == ""
