@@ -49,7 +49,7 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -199,6 +199,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Bare mode (config.yaml ``agent.bare_system_prompt``, default False):
+    # the identity slot IS the whole system prompt. Everything Hermes normally
+    # appends — docs pointer, steering note, tool guidance, environment hints,
+    # profile hint, platform hint, context files, skills index, memory,
+    # timestamp — is skipped, so a user who wants to author the prompt verbatim
+    # gets exactly the bytes in their SOUL.md plus any caller-supplied
+    # system_message. Tool SCHEMAS are unaffected; drop toolsets to shrink those.
+    if getattr(agent, "_bare_system_prompt", False):
+        return {
+            "stable": "\n\n".join(p for p in stable_parts if p),
+            "context": system_message or "",
+            "volatile": "",
+        }
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
@@ -416,11 +430,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             "you to."
         )
     else:
+        # Under a named profile HERMES_HOME already points at
+        # <root>/profiles/<name>, so re-appending "/profiles/<name>" doubled the
+        # segment, and "<home>/skills" named THIS profile's skills while calling
+        # them the default profile's. The default profile's data lives at the
+        # ROOT, which is what get_default_hermes_root() resolves.
+        _profile_home = get_hermes_home()
+        try:
+            _default_root = get_default_hermes_root()
+        except Exception:
+            _default_root = _profile_home
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+            f"and writes {_profile_home}/. The default "
+            f"profile's data lives at {_default_root}/skills/, {_default_root}/plugins/, "
+            f"{_default_root}/cron/, {_default_root}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "

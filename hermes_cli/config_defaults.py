@@ -134,6 +134,14 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Bare system prompt.  When True, the identity slot (SOUL.md, or the
+        # built-in identity when SOUL.md is absent) becomes the ENTIRE system
+        # prompt: no docs pointer, steering note, tool guidance, environment
+        # hints, profile hint, platform hint, context files, skills index,
+        # memory, or timestamp.  For users who want to author the prompt
+        # verbatim.  Tool schemas still ship — narrow `toolsets` to shrink
+        # those.  Default False.
+        "bare_system_prompt": False,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

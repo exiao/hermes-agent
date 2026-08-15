@@ -1831,6 +1831,12 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Bare system prompt.  Default False.  When True the identity slot
+    # (SOUL.md, or DEFAULT_AGENT_IDENTITY when absent) is the ENTIRE system
+    # prompt — every Hermes-authored block after it is skipped.  For users who
+    # want to write the prompt verbatim.  Tool schemas are unaffected.
+    agent._bare_system_prompt = bool(_agent_section.get("bare_system_prompt", False))
+
     # When True, fallback attempt/switch status lines emit live (CLI + gateway)
     # instead of being buffered and dropped on successful recovery.  Default
     # False preserves the quiet "only surface on terminal failure" behavior.
