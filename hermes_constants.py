@@ -139,6 +139,18 @@ def get_hermes_home() -> Path:
     return _hermes_home_from_env()
 
 
+def hermes_home_key(path: str | Path | None = None) -> str:
+    """Return a stable key for a Hermes home/profile directory.
+
+    Runtime registries use this key to isolate plugin-owned entries while
+    keeping built-in registrations process-global.  ``strict=False`` preserves
+    useful behavior for profiles whose directories have not been created yet.
+    """
+    candidate = Path(path) if path is not None else get_hermes_home()
+    resolved = candidate.expanduser().resolve(strict=False)
+    return os.path.normcase(str(resolved))
+
+
 def get_process_hermes_home() -> Path:
     """Return the Hermes home for the running process, ignoring task overrides.
 
@@ -156,6 +168,21 @@ def get_process_hermes_home() -> Path:
     provider config) — those should keep following the override.
     """
     return _hermes_home_from_env()
+
+
+# Process-level memo for get_default_hermes_root(). The function resolves
+# HERMES_HOME against the native home on every call (~80us of path
+# resolution), and it is called at 31+ sites — every _load_global_auth_store()
+# (per provider row in the /model picker), kanban, backup, gateway, update.
+# Its result depends only on (HERMES_HOME, platform native home), which are
+# compared for free on each call, so the memo is freshness-correct even if a
+# test or plugin mutates HERMES_HOME mid-process.
+#
+# Fork: the memo covers ONLY the env-driven call (``home is None``). An
+# explicit ``home=`` argument is a per-call override that must never read from
+# or write to the process-wide memo, or one caller's isolated home would be
+# served to the next caller asking about HERMES_HOME.
+_default_hermes_root_memo: "tuple[str, str, Path] | None" = None
 
 
 def get_default_hermes_root(home: str | os.PathLike | None = None) -> Path:
@@ -183,49 +210,66 @@ def get_default_hermes_root(home: str | os.PathLike | None = None) -> Path:
 
     Import-safe — no dependencies beyond stdlib.
     """
+    global _default_hermes_root_memo
     native_home = _get_platform_default_hermes_home()
     if home is not None:
         env_home = str(home)
+        use_memo = False
     else:
         env_home = os.environ.get("HERMES_HOME", "")
-    if not env_home:
-        return native_home
-    # Absolutize WITHOUT following symlinks: ``os.path.abspath`` anchors a
-    # relative ``home`` to cwd and normalizes ``..`` (gemini's note) while
-    # preserving the textual ``profiles/<name>`` segment for the shape check
-    # below. ``real_path`` is the symlink-resolved form, used for containment
-    # so the root decision tracks where the home physically lives.
-    abs_path = Path(os.path.abspath(env_home))
-    real_path = abs_path.resolve()
-    native_real = native_home.resolve()
+        use_memo = True
+    # Memo only the env-driven form (upstream #: ~80us x 31+ call sites).
+    # An explicit ``home=`` bypasses it entirely so a per-call override can
+    # never be cached into, or served from, the process-wide slot.
+    if use_memo and _default_hermes_root_memo is not None:
+        memo_native, memo_env, memo_result = _default_hermes_root_memo
+        if memo_native == str(native_home) and memo_env == env_home:
+            return memo_result
 
-    # Logical profile shape first: a profile dir ``<root>/profiles/<name>``
-    # that is itself a symlink to storage OUTSIDE the root still derives the
-    # real Hermes root from its logical path (the original P2 fix). Checking
-    # the un-resolved path is what preserves the ``profiles/<name>`` segment.
-    if abs_path.parent.name == "profiles":
-        return abs_path.parent.parent.resolve()
+    def _resolve() -> Path:
+        if not env_home:
+            return native_home
+        # Absolutize WITHOUT following symlinks: ``os.path.abspath`` anchors a
+        # relative ``home`` to cwd and normalizes ``..`` (gemini's note) while
+        # preserving the textual ``profiles/<name>`` segment for the shape check
+        # below. ``real_path`` is the symlink-resolved form, used for containment
+        # so the root decision tracks where the home physically lives.
+        abs_path = Path(os.path.abspath(env_home))
+        real_path = abs_path.resolve()
+        native_real = native_home.resolve()
 
-    # Containment on the RESOLVED path: a home whose physical location is under
-    # the native root is native (covers a normal home, a native profile, and an
-    # alias symlink pointing AT a native path). A home that is textually under
-    # ``~/.hermes`` but symlinks to storage OUTSIDE it resolves elsewhere and so
-    # is correctly treated as a custom deployment — no shared-secret inheritance.
-    try:
-        real_path.relative_to(native_real)
-        return native_home
-    except ValueError:
-        pass
+        # Logical profile shape first: a profile dir ``<root>/profiles/<name>``
+        # that is itself a symlink to storage OUTSIDE the root still derives the
+        # real Hermes root from its logical path (the original P2 fix). Checking
+        # the un-resolved path is what preserves the ``profiles/<name>`` segment.
+        if abs_path.parent.name == "profiles":
+            return abs_path.parent.parent.resolve()
 
-    # Docker / custom deployment.
-    # A resolved profile path ``<root>/profiles/<name>`` outside the native
-    # root returns its grandparent — covers Docker profiles correctly.
-    if real_path.parent.name == "profiles":
-        return real_path.parent.parent
+        # Containment on the RESOLVED path: a home whose physical location is under
+        # the native root is native (covers a normal home, a native profile, and an
+        # alias symlink pointing AT a native path). A home that is textually under
+        # ``~/.hermes`` but symlinks to storage OUTSIDE it resolves elsewhere and so
+        # is correctly treated as a custom deployment — no shared-secret inheritance.
+        try:
+            real_path.relative_to(native_real)
+            return native_home
+        except ValueError:
+            pass
 
-    # Not a profile path — the home itself is the root (resolved so the
-    # returned value is absolute and stable across cwd changes).
-    return real_path
+        # Docker / custom deployment.
+        # A resolved profile path ``<root>/profiles/<name>`` outside the native
+        # root returns its grandparent — covers Docker profiles correctly.
+        if real_path.parent.name == "profiles":
+            return real_path.parent.parent
+
+        # Not a profile path — the home itself is the root (resolved so the
+        # returned value is absolute and stable across cwd changes).
+        return real_path
+
+    result = _resolve()
+    if use_memo:
+        _default_hermes_root_memo = (str(native_home), env_home, result)
+    return result
 
 
 def get_optional_skills_dir(default: Path | None = None) -> Path:
@@ -406,11 +450,116 @@ def hermes_managed_node_tree_present(home: Path | None = None) -> bool:
     return False
 
 
-def _heal_managed_node_windows() -> bool:
-    """Redownload the portable Node zip into ``%HERMES_HOME%\\node`` on Windows."""
+def _path_under_any(path: str, roots: list[str]) -> bool:
+    """Return True when *path* sits inside one of *roots* (same drive).
+
+    Windows paths are case-insensitive and psutil / env vars can disagree on
+    drive-letter casing, so compare through ``normcase`` (a no-op on POSIX).
+    Each root is evaluated individually so disjoint roots both work.
+    """
+    path_norm = os.path.normcase(os.path.normpath(path))
+    for root in roots:
+        root_norm = os.path.normcase(os.path.normpath(root))
+        try:
+            if os.path.commonpath([path_norm, root_norm]) == root_norm:
+                return True
+        except ValueError:
+            # Different drives on Windows — commonpath raises.
+            continue
+    return False
+
+
+def managed_node_tree_in_use(home: Path | None = None) -> bool:
+    """Return True when any running process executes from the managed Node tree.
+
+    Windows locks executables and loaded scripts against deletion or
+    overwrite while a process runs them, so the updater must not rewrite
+    ``%HERMES_HOME%\\node`` while the desktop app's Node processes hold it —
+    ``PermissionError: [WinError 5]`` on ``npm.cmd`` is the classic symptom
+    (#80926). Always ``False`` on POSIX, which has no equivalent lock
+    semantics.
+
+    The scan is a fast pre-check that avoids pointless re-downloads in
+    long-lived processes; the rename-based swap in
+    :func:`_heal_managed_node_windows` is the authoritative in-use guard.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import psutil
+    except Exception:
+        return False
+    dirs: list[str] = []
+    for directory in iter_hermes_node_dirs(home):
+        try:
+            dirs.append(str(Path(directory).resolve()))
+        except OSError:
+            continue
+    if not dirs:
+        return False
+    try:
+        procs = psutil.process_iter(["exe", "cmdline"])
+    except Exception:
+        return False
+    for proc in procs:
+        try:
+            info = proc.info
+        except Exception:
+            continue
+        exe = info.get("exe")
+        if exe:
+            try:
+                exe_path = str(Path(exe).resolve())
+            except (OSError, ValueError):
+                exe_path = str(exe)
+            if _path_under_any(exe_path, dirs):
+                return True
+        for arg in info.get("cmdline") or []:
+            if _path_under_any(arg, dirs):
+                return True
+    return False
+
+
+_managed_node_in_use_notice_printed = False
+
+
+def _print_managed_node_in_use_notice() -> None:
+    """Print the managed-Node deferral notice once per process."""
+    global _managed_node_in_use_notice_printed
+    if _managed_node_in_use_notice_printed:
+        return
+    _managed_node_in_use_notice_printed = True
+    print(
+        "→ Hermes-managed Node.js is in use by a running app; deferring its "
+        "upgrade until the app is closed (re-run `hermes update` afterwards).",
+        flush=True,
+    )
+
+
+def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
+    """Redownload the portable Node zip into ``%HERMES_HOME%\\node`` on Windows.
+
+    Returns ``True`` on success, ``False`` on a genuine failure (offline,
+    download error, bad archive), and ``None`` when the tree is in use and the
+    heal is deferred — callers must not record the once-per-process attempt
+    for ``None`` so a later call can retry once the tree is free.
+
+    The replacement is staging-first: the new tree is fully downloaded and
+    extracted to a sibling ``node.new-*`` directory, then the live tree is
+    renamed aside (``node.old-*``) and the staged tree renamed into place.
+    The live tree is never deleted before its replacement is ready, so an
+    interrupted heal cannot gut the running installation. Windows allows
+    renaming a tree whose executables are running (images are mapped with
+    ``FILE_SHARE_DELETE`` — the same mechanism as the hermes.exe quarantine);
+    when the OS refuses the rename, that refusal *is* the in-use signal and
+    the heal defers instead of forcing the write and crashing with
+    ``PermissionError: [WinError 5]`` on ``npm.cmd`` (#80926).
+    """
     import re
     import tempfile
+    import time
     import urllib.request
+    import uuid
     import zipfile
 
     arch = (os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE", "")).lower()
@@ -423,7 +572,35 @@ def _heal_managed_node_windows() -> bool:
     else:
         return False
 
-    home = get_hermes_home()
+    home = home or get_hermes_home()
+    target = home / "node"
+
+    # Cheap pre-check: skip the download and staging work when the tree is
+    # already visibly in use.  The rename-based swap below is the
+    # authoritative guard — this scan only avoids pointless re-downloads for
+    # long-lived processes whose npm resolution retries.
+    if managed_node_tree_in_use(home):
+        _print_managed_node_in_use_notice()
+        return None
+
+    # Best-effort sweep of staging/backup litter from interrupted runs; a
+    # locked file simply stays for the next attempt.  Only dirs older than
+    # 10 minutes are removed so a concurrent heal's in-flight swap (whose
+    # staged/backup dirs are seconds old) is never disturbed.
+    cutoff = time.time() - 600
+    for stale in home.glob("node.old-*"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                shutil.rmtree(stale, ignore_errors=True)
+        except OSError:
+            continue
+    for stale in home.glob("node.new-*"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                shutil.rmtree(stale, ignore_errors=True)
+        except OSError:
+            continue
+
     index_url = f"https://nodejs.org/dist/latest-v{_HERMES_NODE_TARGET_MAJOR}.x/"
     try:
         with urllib.request.urlopen(index_url, timeout=60) as response:
@@ -446,6 +623,9 @@ def _heal_managed_node_windows() -> bool:
     except OSError:
         return False
 
+    token = uuid.uuid4().hex[:8]
+    staged = home / f"node.new-{token}"
+    backup = home / f"node.old-{token}"
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -458,12 +638,50 @@ def _heal_managed_node_windows() -> bool:
             extracted = next(extract_dir.glob("node-v*"), None)
             if extracted is None or not extracted.is_dir():
                 return False
-            target = home / "node"
-            if target.exists():
-                shutil.rmtree(target)
-            shutil.move(str(extracted), str(target))
+            # Move the fully-extracted tree to a sibling staging dir so the
+            # swap below is a same-volume rename.
+            shutil.move(str(extracted), str(staged))
     except OSError:
         return False
+
+    if target.exists():
+        try:
+            os.replace(str(target), str(backup))
+        except OSError:
+            # The OS refuses to move the live tree — a running process holds
+            # it.  Defer; the old tree is untouched and the next resolution
+            # (e.g. the next update after the app is closed) retries.
+            _print_managed_node_in_use_notice()
+            shutil.rmtree(staged, ignore_errors=True)
+            return None
+        # A rename preserves the directory's mtime, so a backup renamed from
+        # a long-lived tree would instantly look older than the litter-sweep
+        # cutoff to a concurrent heal.  Touch it (best-effort — a failure
+        # must not abort the swap, which already succeeded) so the in-flight
+        # backup is never swept mid-swap.
+        try:
+            os.utime(backup, None)
+        except OSError:
+            pass
+        try:
+            os.replace(str(staged), str(target))
+        except OSError:
+            # Roll the live tree back and report the failure.
+            try:
+                os.replace(str(backup), str(target))
+            except OSError:
+                pass
+            shutil.rmtree(staged, ignore_errors=True)
+            return False
+        # The old tree is no longer canonical; locked files may keep it on
+        # disk until the next heal attempt, which is safe.
+        shutil.rmtree(backup, ignore_errors=True)
+    else:
+        try:
+            os.replace(str(staged), str(target))
+        except OSError:
+            shutil.rmtree(staged, ignore_errors=True)
+            return False
 
     return node_tool_runnable(str(target / "node.exe"))
 
@@ -548,16 +766,26 @@ def heal_hermes_managed_node() -> bool:
     Runs at most once per process. POSIX installs shell out to
     ``heal_managed_node`` in ``scripts/lib/node-bootstrap.sh``; Windows
     downloads the portable zip directly (same source as ``install.ps1``).
+    A Windows deferral (the tree is in use by a running app) does NOT record
+    the attempt, so a later call — or the next process — can heal once the
+    tree is free (#80926).
     """
     global _managed_node_heal_attempted
     if _managed_node_heal_attempted:
         return False
     if not hermes_managed_node_tree_present():
         return False
-    _managed_node_heal_attempted = True
 
     if sys.platform == "win32":
-        return _heal_managed_node_windows()
+        result = _heal_managed_node_windows()
+        if result is None:
+            # In-use deferral: leave the attempt flag clear so a later call
+            # in this process can heal after the app releases the tree.
+            return False
+        _managed_node_heal_attempted = True
+        return bool(result)
+
+    _managed_node_heal_attempted = True
 
     if not _NODE_BOOTSTRAP_SCRIPT.is_file():
         return False
