@@ -622,7 +622,9 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ["gave_up", "crashed", "timed_out"])
-async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
+async def test_notifier_unsubs_after_abnormal_events_with_dispatcher_lock(
+    kind, kanban_home,
+):
     """
     Event kinds gave_up / crashed / timed_out send a notification but DO
     NOT delete the subscription. The dispatcher may respawn the task and
