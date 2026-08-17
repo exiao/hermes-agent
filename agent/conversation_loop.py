@@ -789,6 +789,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # (every non-Bot-Chat session) never take this branch, and the check
         # fails closed to "reuse" so a probe failure can't burn cache.
         _bot_stale = False
+        _bare_system_prompt = getattr(agent, "_bare_system_prompt", False) is True
         try:
             from tools.bot_mode_probe import (
                 BOT_CHAT_TITLE,
@@ -803,8 +804,15 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 _home_for_epoch = _agent_home(agent)
             except Exception:
                 pass
-            _bot_stale = stored_prompt_capability_stale(stored_prompt, _home_for_epoch)
-            if not _bot_stale and getattr(agent, "_bot_mode_protocol", True):
+            _bot_stale = (
+                not _bare_system_prompt
+                and stored_prompt_capability_stale(stored_prompt, _home_for_epoch)
+            )
+            if (
+                not _bot_stale
+                and not _bare_system_prompt
+                and getattr(agent, "_bot_mode_protocol", True)
+            ):
                 # Legacy upgrade: a Bot Chat whose prompt predates the epoch
                 # mechanism (no stamp, no protocol) gets ONE migration
                 # rebuild — otherwise pre-existing bots would never learn
