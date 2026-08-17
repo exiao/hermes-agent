@@ -458,7 +458,7 @@ class TestApplyAllForwardsRawEnviron:
     def test_default_path_forwards_none(self, tmp_path, monkeypatch):
         src, seen = self._recording_source()
         monkeypatch.setattr(
-            reg, "_ordered_enabled_sources", lambda cfg: [src]
+            reg, "_ordered_enabled_sources", lambda cfg, **_: [src]
         )
         # environ omitted → default load_hermes_dotenv path.
         reg.apply_all({"recorder": {"enabled": True}}, tmp_path)
@@ -467,7 +467,7 @@ class TestApplyAllForwardsRawEnviron:
     def test_scoped_path_forwards_the_dict(self, tmp_path, monkeypatch):
         src, seen = self._recording_source()
         monkeypatch.setattr(
-            reg, "_ordered_enabled_sources", lambda cfg: [src]
+            reg, "_ordered_enabled_sources", lambda cfg, **_: [src]
         )
         scoped = {"ANTHROPIC_API_KEY": "sk-scoped"}
         reg.apply_all({"recorder": {"enabled": True}}, tmp_path, environ=scoped)
@@ -517,7 +517,7 @@ class TestFetchInheritsProfileContext:
         )
 
         src, seen = self._home_recording_source()
-        monkeypatch.setattr(reg, "_ordered_enabled_sources", lambda cfg: [src])
+        monkeypatch.setattr(reg, "_ordered_enabled_sources", lambda cfg, **_: [src])
 
         profile_home = tmp_path / ".hermes" / "profiles" / "coder"
         profile_home.mkdir(parents=True)

@@ -50,11 +50,11 @@ def test_regular_file_is_still_read(tmp_path):
     assert unsafe is False
 
 
-def test_directory_is_reported_unsafe(tmp_path):
-    """Non-regular files must still fail closed."""
+def test_directory_is_ignored(tmp_path):
+    """Directories are not script candidates and should be ignored."""
     text, unsafe = lg._read_referenced_script(tmp_path)
     assert text is None
-    assert unsafe is True
+    assert unsafe is False
 
 
 def test_binary_is_skipped_not_unsafe(tmp_path):
