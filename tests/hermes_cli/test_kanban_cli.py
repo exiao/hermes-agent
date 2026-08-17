@@ -265,6 +265,19 @@ def test_run_slash_link_unlink(kanban_home):
     assert "Unlinked" in kc.run_slash(f"unlink {ta} {tb}")
 
 
+def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
+    with kb.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="parent task")
+        child_id = kb.create_task(conn, title="child task")
+        kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+
+    output = kc.run_slash(f"show {child_id}")
+
+    assert f"Task {child_id}: child task" in output
+    assert f"parents:   {parent_id}" in output
+    assert "Cannot operate on a closed database" not in output
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
