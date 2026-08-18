@@ -158,6 +158,7 @@ class TestPlanCacheSectionsHonorsDisable:
                 api_mode="anthropic_messages",
                 model="claude-opus-4.8",
                 cache_disabled=False,
+                cache_ttl="1h",
             )
         ttls = [
             block["cache_control"].get("ttl")

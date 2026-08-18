@@ -84,6 +84,7 @@ class TestCleanupStaleAsyncClients:
             _client_cache_lock,
             cleanup_stale_async_clients,
         )
+        import httpx
 
         # Create a loop, close it, make a cache entry
         loop = asyncio.new_event_loop()
@@ -91,8 +92,7 @@ class TestCleanupStaleAsyncClients:
 
         mock_client = MagicMock()
         # Give it _client attribute for _force_close_async_httpx
-        mock_client._client = MagicMock()
-        mock_client._client.is_closed = False
+        mock_client._client = httpx.AsyncClient()
 
         key = ("test_stale", True, "", "", "", (), False)
         with _client_cache_lock:

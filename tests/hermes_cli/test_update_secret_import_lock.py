@@ -39,7 +39,10 @@ secrets:
 
     dispatch = (
         "hermes_main.cmd_update = lambda _args: 0\n"
-        "hermes_main.main()\n"
+        "try:\n"
+        "    hermes_main.main()\n"
+        "except SystemExit as exc:\n"
+        "    assert exc.code in (None, 0), exc.code\n"
         if run_main
         else ""
     )

@@ -565,10 +565,8 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
 
 @pytest.mark.asyncio
-async def test_notifier_unsubs_after_completed_event(kanban_home):
-    """
-    Subscription should be remove after completed event
-    """
+async def test_notifier_keeps_sub_after_completed_event(kanban_home):
+    """A completed task can reopen, so its subscription remains active."""
     import hermes_cli.kanban_db as kb
     from gateway.run import GatewayRunner
     from gateway.config import Platform
@@ -617,12 +615,14 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
         subs = kb.list_notify_subs(conn, tid)
     finally:
         conn.close()
-    assert subs == [], "Subscription should be unsub after completed event"
+    assert len(subs) == 1, "Subscription should survive a reversible completion"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ["gave_up", "crashed", "timed_out"])
-async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
+async def test_notifier_unsubs_after_abnormal_events_with_dispatcher_lock(
+    kind, kanban_home,
+):
     """
     Event kinds gave_up / crashed / timed_out send a notification but DO
     NOT delete the subscription. The dispatcher may respawn the task and
@@ -972,7 +972,7 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
         user_id_alt="union-id",
     )
     event = SimpleNamespace(
-        text='/kanban create "hello" --assignee alice',
+        text='/kanban create "hello" --assignee none',
         source=source,
     )
 
