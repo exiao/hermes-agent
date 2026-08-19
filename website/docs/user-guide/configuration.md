@@ -1664,13 +1664,14 @@ Use this when you want to author the prompt verbatim and control every byte.
 
 ### What it does not remove
 
-Tool **schemas** are not part of the system prompt and still ship on every call. Narrow `toolsets` (or `platform_toolsets`) to shrink them:
+Tool **schemas** are not part of the system prompt and still ship on every call. Narrow them per platform with `platform_toolsets` (the key runtime resolution actually reads), or run `hermes tools`, which writes it for you:
 
 ```yaml
-toolsets:
-  - terminal
-  - file
-  - web
+platform_toolsets:
+  cli:
+    - terminal
+    - file
+    - web
 ```
 
 Memory and the skills index are already gated on their tools being loaded, so dropping the `memory` and `skills` toolsets removes them independently of this flag.
