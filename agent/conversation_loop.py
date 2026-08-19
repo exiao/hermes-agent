@@ -804,10 +804,28 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 _home_for_epoch = _agent_home(agent)
             except Exception:
                 pass
-            _bot_stale = (
-                not _bare_system_prompt
-                and stored_prompt_capability_stale(stored_prompt, _home_for_epoch)
-            )
+            if _bare_system_prompt:
+                # Bare prompts carry no epoch stamp, so the fingerprint probe
+                # above can never fire. The one capability that still MUST
+                # reach a long-lived bare Bot Chat is its own identity: edit
+                # SOUL.md and the old prompt would otherwise stay active
+                # forever. Compare the live SOUL bytes directly. Fails closed
+                # to "reuse" (empty/unreadable SOUL -> not stale) so a probe
+                # failure cannot rebuild every turn and burn the prefix cache.
+                _bot_stale = False
+                try:
+                    from agent.prompt_builder import load_soul_md
+                    from agent.system_prompt import _agent_home as _ah
+
+                    _live_soul = load_soul_md(None, home_override=_ah(agent))
+                    if _live_soul and _live_soul not in (stored_prompt or ""):
+                        _bot_stale = True
+                except Exception:
+                    _bot_stale = False
+            else:
+                _bot_stale = stored_prompt_capability_stale(
+                    stored_prompt, _home_for_epoch
+                )
             if (
                 not _bot_stale
                 and not _bare_system_prompt
