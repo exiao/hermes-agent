@@ -155,6 +155,10 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # When True, SOUL.md (or the built-in identity) is the ENTIRE system
+        # prompt — every Hermes-authored block after it is skipped.  Tool
+        # schemas still ship; narrow `toolsets` to shrink those.
+        "bare_system_prompt": False,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

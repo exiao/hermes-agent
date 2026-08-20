@@ -528,3 +528,46 @@ class TestStoredPromptCwdDrift:
             assert "Platform: cli" in parts["volatile"], (
                 "Built prompt missing 'Platform: cli' — drift detection cannot read it"
             )
+
+
+class TestBareSystemPromptRuntimeMatch:
+    """Bare mode emits no runtime-identity lines, so the staleness scan must
+    not read the user's own SOUL.md prose as runtime state."""
+
+    # A SOUL.md whose prose happens to start a line with a label the volatile
+    # tail also uses. In bare mode that line is the USER's text.
+    SOUL = "You are a trader.\nModel: your job is to model the market.\n"
+
+    def _agent(self, bare: bool):
+        class _Agent:
+            model = "claude-opus-5"
+            provider = "anthropic"
+            platform = "cli"
+
+        agent = _Agent()
+        agent._bare_system_prompt = bare
+        return agent
+
+    def test_bare_prompt_is_reused_but_normal_prompts_still_drift(self):
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        assert _stored_prompt_matches_runtime(self._agent(True), self.SOUL) is True, (
+            "Bare-mode prompt rejected — it would be rebuilt every turn, "
+            "destroying the prefix cache for the whole session"
+        )
+        assert _stored_prompt_matches_runtime(self._agent(False), self.SOUL) is False
+
+    def test_mock_agent_does_not_take_the_bare_path(self):
+        # A Mock's attributes auto-create as truthy, so a truthiness check on
+        # _bare_system_prompt would silently disable drift detection for every
+        # mocked caller in the suite.
+        from unittest.mock import MagicMock
+
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        agent = MagicMock()
+        agent.model = "claude-opus-5"
+        agent.provider = "anthropic"
+        agent.platform = "cli"
+        stale = "Model: some-other-model\nProvider: anthropic\n"
+        assert _stored_prompt_matches_runtime(agent, stale) is False

@@ -389,6 +389,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    # ``agent.bare_system_prompt``: the identity slot IS the whole prompt.
+    # Every Hermes-authored block after it is skipped, so the user gets
+    # exactly their SOUL.md plus any caller system_message.
+    if getattr(agent, "_bare_system_prompt", False):
+        return {
+            "stable": "\n\n".join(p for p in stable_parts if p),
+            "context": system_message or "",
+            "volatile": "",
+        }
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 

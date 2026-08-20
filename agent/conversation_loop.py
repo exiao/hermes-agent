@@ -789,6 +789,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # (every non-Bot-Chat session) never take this branch, and the check
         # fails closed to "reuse" so a probe failure can't burn cache.
         _bot_stale = False
+        # Bare prompts carry no capability stamp and no protocol block, so
+        # neither the epoch check nor the legacy upgrade applies — both would
+        # rebuild the prompt and burn the prefix cache. Reuse it as stored.
+        _bare = getattr(agent, "_bare_system_prompt", False) is True
         try:
             from tools.bot_mode_probe import (
                 BOT_CHAT_TITLE,
@@ -803,8 +807,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 _home_for_epoch = _agent_home(agent)
             except Exception:
                 pass
-            _bot_stale = stored_prompt_capability_stale(stored_prompt, _home_for_epoch)
-            if not _bot_stale and getattr(agent, "_bot_mode_protocol", True):
+            _bot_stale = not _bare and stored_prompt_capability_stale(
+                stored_prompt, _home_for_epoch
+            )
+            if not _bot_stale and not _bare and getattr(agent, "_bot_mode_protocol", True):
                 # Legacy upgrade: a Bot Chat whose prompt predates the epoch
                 # mechanism (no stamp, no protocol) gets ONE migration
                 # rebuild — otherwise pre-existing bots would never learn
@@ -954,6 +960,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
+
+    # Bare mode emits none of the fields below, so there is nothing to drift.
+    # Scanning would read the USER's prose as runtime state: a SOUL.md line
+    # starting with "Model:" never matches the live value, so the prompt would
+    # be rebuilt every turn and the prefix cache lost. ``is True`` (not
+    # truthiness) so a Mock agent's auto-truthy attribute can't skip the scan.
+    if getattr(agent, "_bare_system_prompt", False) is True:
+        return True
 
     def line_value(label: str) -> str:
         """Last matching line wins.

@@ -403,3 +403,86 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+class TestBareSystemPrompt:
+    """agent.bare_system_prompt=True makes the identity slot the whole prompt."""
+
+    def _build(self, agent, system_message=None, soul="MY SOUL"):
+        with (
+            patch("run_agent.load_soul_md", return_value=soul),
+            patch("run_agent.build_skills_system_prompt", return_value=_SKILLS),
+            patch("run_agent.build_context_files_prompt", return_value=_CONTEXT),
+            patch("run_agent.build_environment_hints", return_value="ENVHINTS"),
+        ):
+            return build_system_prompt_parts(agent, system_message=system_message)
+
+    def _bare_agent(self):
+        return _make_agent(valid_tool_names=["read_file"], _bare_system_prompt=True)
+
+    def test_bare_prompt_is_the_soul_and_nothing_hermes_authored(self):
+        parts = self._build(self._bare_agent(), system_message="FROM CALLER")
+
+        assert parts["stable"] == "MY SOUL"
+        assert parts["context"] == "FROM CALLER"  # caller message survives
+        assert parts["volatile"] == ""
+        full = "\n".join(parts.values())
+        for absent in (
+            "hermes-agent.nousresearch.com",
+            "OUT-OF-BAND USER MESSAGE",
+            "ENVHINTS",
+            "Active Hermes profile",
+            "Conversation started:",
+            _SKILLS,
+            _CONTEXT,
+        ):
+            assert absent not in full
+
+    def test_bare_prompt_falls_back_to_default_identity(self):
+        import agent.system_prompt as system_prompt
+
+        parts = self._build(self._bare_agent(), soul="")
+
+        assert parts["stable"] == system_prompt.DEFAULT_AGENT_IDENTITY
+
+    def test_default_off_still_renders_the_full_prompt(self):
+        # The guard must be opt-in: without the flag everything still renders.
+        full = "\n".join(
+            self._build(_make_agent(valid_tool_names=["read_file"])).values()
+        )
+
+        assert "OUT-OF-BAND USER MESSAGE" in full
+        assert "Conversation started:" in full
+
+
+class TestNamedProfileHintPaths:
+    """The named-profile hint must not double the /profiles/<name> segment."""
+
+    def _named_profile_prompt(self, monkeypatch, tmp_path):
+        # Drive this through the real HERMES_HOME resolution rather than
+        # patching module globals: other tests in the suite reload
+        # agent.system_prompt, which drops a monkeypatched attribute and made
+        # this test order-dependent.
+        root = tmp_path / "hermes"
+        home = root / "profiles" / "other"
+        home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _make_agent(valid_tool_names=["read_file"])
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_skills_system_prompt", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+        ):
+            return build_system_prompt(agent), root, home
+
+    def test_profile_home_segment_not_doubled(self, monkeypatch, tmp_path):
+        prompt, _root, home = self._named_profile_prompt(monkeypatch, tmp_path)
+        assert f"{home}/profiles/other" not in prompt
+        assert f"This session reads and writes {home}/." in prompt
+
+    def test_default_profile_paths_point_at_the_root(self, monkeypatch, tmp_path):
+        prompt, root, home = self._named_profile_prompt(monkeypatch, tmp_path)
+        for leaf in ("skills", "plugins", "cron", "memories"):
+            assert f"{root}/{leaf}/" in prompt
+            assert f"{home}/{leaf}/" not in prompt

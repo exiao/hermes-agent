@@ -16,7 +16,7 @@ instead of rebuilding).  Covers:
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -112,6 +112,36 @@ class TestStoredPromptReuse:
             agent.session_id, agent._cached_system_prompt
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+    def test_bare_prompt_skips_bot_capability_restore_checks(self):
+        """Bare prompts omit the protocol and epoch, so restore must reuse them."""
+        stored = "User-authored bare prompt"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session_title.return_value = "Bot Chat"
+        agent = _make_agent(session_db=db)
+        agent._bare_system_prompt = True
+        agent._bot_mode_protocol = True
+
+        with (
+            patch(
+                "tools.bot_mode_probe.stored_prompt_capability_stale",
+                return_value=False,
+            ) as capability_stale,
+            patch(
+                "tools.bot_mode_probe.stored_bot_chat_prompt_needs_upgrade",
+                return_value=True,
+            ) as legacy_upgrade,
+        ):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "continue"}]
+            )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
+        capability_stale.assert_not_called()
+        legacy_upgrade.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
