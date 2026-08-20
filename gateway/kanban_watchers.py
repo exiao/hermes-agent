@@ -96,20 +96,9 @@ def _failure_detail(
 ) -> str:
     """Explain a gave_up / crashed / timed_out ping.
 
-    These three cases used to send only their headline. A ``timed_out`` ping
-    read "timed out (max_runtime=0s); will retry" even when the payload
-    carried the actual cause:
-
-        error: "Iteration budget exhausted (200/200) — task could not
-                complete within the allowed iterations"
-
-    The reason was in the DB the whole time; the message just dropped it, so
-    the reader had to open the board (or query sqlite) to learn anything. The
-    0s was wrong too — that shape has no ``limit_seconds``, so the fallback
-    printed a limit that was never set.
-
-    Everything here is already in the event payload. Nothing is recomputed,
-    and a field that is absent is simply not mentioned.
+    These three used to send only a headline: "timed out (max_runtime=0s);
+    will retry", while the payload carried the real cause. Everything below is
+    already in the event payload; an absent field is simply not mentioned.
     """
     if not payload:
         return ""
@@ -118,17 +107,14 @@ def _failure_detail(
 
     # Why it stopped. This is the part a reader actually needs.
     error = payload.get("error")
+    exit_kind = payload.get("exit_kind")
     if error:
         lines.append(_clip_notify_detail(str(error)))
-    elif payload.get("exit_kind") and payload.get("exit_code") is not None:
+    elif exit_kind in ("nonzero_exit", "signaled") and payload.get("exit_code") is not None:
+        verb = "exited with code" if exit_kind == "nonzero_exit" else "killed by signal"
         pid = payload.get("pid")
-        exit_kind = payload["exit_kind"]
-        exit_code = payload["exit_code"]
         pid_prefix = f"pid {pid} " if pid is not None else ""
-        if exit_kind == "nonzero_exit":
-            lines.append(f"{pid_prefix}exited with code {exit_code}")
-        elif exit_kind == "signaled":
-            lines.append(f"{pid_prefix}killed by signal {exit_code}")
+        lines.append(f"{pid_prefix}{verb} {payload['exit_code']}")
 
     facts: list[str] = []
 
@@ -136,40 +122,16 @@ def _failure_detail(
     # never carried one, and printing "max_runtime=0s" invents a fact.
     elapsed = payload.get("elapsed_seconds")
     limit = payload.get("limit_seconds")
-    try:
-        elapsed_value = int(elapsed) if elapsed else 0
-        limit_value = int(limit) if limit else 0
-    except (TypeError, ValueError):
-        elapsed_value = limit_value = 0
-    if elapsed_value and limit_value:
-        facts.append(f"ran {elapsed_value}s of {limit_value}s")
-    elif limit_value:
-        facts.append(f"limit {limit_value}s")
+    if elapsed and limit:
+        facts.append(f"ran {elapsed}s of {limit}s")
 
     # How many attempts, and against what ceiling.
     failures = payload.get("failures")
-    if failures:
-        try:
-            failures_value = int(failures)
-        except (TypeError, ValueError):
-            failures_value = 0
-        if failures_value:
-            ceiling = payload.get("effective_limit")
-            source = payload.get("limit_source")
-            if ceiling:
-                try:
-                    ceiling_value = int(ceiling)
-                except (TypeError, ValueError):
-                    ceiling_value = 0
-                if ceiling_value:
-                    attempt = f"attempt {failures_value} of {ceiling_value}"
-                    if source:
-                        attempt += f" ({source} limit)"
-                    facts.append(attempt)
-                else:
-                    facts.append(f"{failures_value} failure(s)")
-            else:
-                facts.append(f"{failures_value} failure(s)")
+    ceiling = payload.get("effective_limit")
+    if failures and ceiling:
+        source = payload.get("limit_source")
+        suffix = f" ({source} limit)" if source else ""
+        facts.append(f"attempt {failures} of {ceiling}{suffix}")
 
     # Whether anything happens next. "will retry" was previously asserted
     # unconditionally, which was a guess; retry_status is the real answer.
@@ -177,9 +139,7 @@ def _failure_detail(
     if terminal:
         facts.append("not retrying (blocked)")
     elif retry:
-        facts.append(
-            "will retry" if retry == "ready" else f"not retrying ({retry})"
-        )
+        facts.append("will retry" if retry == "ready" else f"not retrying ({retry})")
 
     budget_used = payload.get("budget_used")
     budget_max = payload.get("budget_max")
@@ -192,9 +152,7 @@ def _failure_detail(
     if facts:
         lines.append(" · ".join(facts))
 
-    if not lines:
-        return ""
-    return "\n" + "\n".join(lines)
+    return "\n" + "\n".join(lines) if lines else ""
 
 
 # Self-labeling block notifications. The push leads with a header that says — at
