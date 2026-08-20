@@ -389,13 +389,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Bare mode (config.yaml ``agent.bare_system_prompt``, default False):
-    # the identity slot IS the whole system prompt. Everything Hermes normally
-    # appends — docs pointer, steering note, tool guidance, environment hints,
-    # profile hint, platform hint, context files, skills index, memory,
-    # timestamp — is skipped, so a user who wants to author the prompt verbatim
-    # gets exactly the bytes in their SOUL.md plus any caller-supplied
-    # system_message. Tool SCHEMAS are unaffected; drop toolsets to shrink those.
+    # ``agent.bare_system_prompt``: the identity slot IS the whole prompt.
+    # Every Hermes-authored block after it is skipped, so the user gets
+    # exactly their SOUL.md plus any caller system_message.
     if getattr(agent, "_bare_system_prompt", False):
         return {
             "stable": "\n\n".join(p for p in stable_parts if p),
@@ -687,10 +683,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # data sits at the ROOT (get_default_hermes_root()), which in ambient
         # profile mode is NOT get_hermes_home().
         profile_home = _home_str
-        try:
-            default_root = get_default_hermes_root()
-        except Exception:
-            default_root = _root_str
+        default_root = get_default_hermes_root()
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
             f"and writes {profile_home}/. The default "

@@ -534,35 +534,28 @@ class TestBareSystemPromptRuntimeMatch:
     """Bare mode emits no runtime-identity lines, so the staleness scan must
     not read the user's own SOUL.md prose as runtime state."""
 
-    def _make_agent(self, bare: bool):
+    # A SOUL.md whose prose happens to start a line with a label the volatile
+    # tail also uses. In bare mode that line is the USER's text.
+    SOUL = "You are a trader.\nModel: your job is to model the market.\n"
+
+    def _agent(self, bare: bool):
         class _Agent:
-            pass
+            model = "claude-opus-5"
+            provider = "anthropic"
+            platform = "cli"
 
         agent = _Agent()
-        agent.model = "claude-opus-5"
-        agent.provider = "anthropic"
-        agent.platform = "cli"
         agent._bare_system_prompt = bare
         return agent
 
-    # A SOUL.md whose prose happens to start lines with the same labels the
-    # volatile tail uses. In bare mode those lines are the USER's text.
-    SOUL = "You are a trader.\nModel: your job is to model the market.\n"
-
-    def test_bare_prompt_is_reused(self):
+    def test_bare_prompt_is_reused_but_normal_prompts_still_drift(self):
         from agent.conversation_loop import _stored_prompt_matches_runtime
 
-        assert _stored_prompt_matches_runtime(self._make_agent(True), self.SOUL) is True, (
+        assert _stored_prompt_matches_runtime(self._agent(True), self.SOUL) is True, (
             "Bare-mode prompt rejected — it would be rebuilt every turn, "
             "destroying the prefix cache for the whole session"
         )
-
-    def test_non_bare_still_detects_drift(self):
-        # The guard must be scoped to bare mode: normal prompts still get the
-        # full staleness scan.
-        from agent.conversation_loop import _stored_prompt_matches_runtime
-
-        assert _stored_prompt_matches_runtime(self._make_agent(False), self.SOUL) is False
+        assert _stored_prompt_matches_runtime(self._agent(False), self.SOUL) is False
 
     def test_mock_agent_does_not_take_the_bare_path(self):
         # A Mock's attributes auto-create as truthy, so a truthiness check on

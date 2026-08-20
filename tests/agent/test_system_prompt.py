@@ -408,30 +408,25 @@ class TestSkillsInVolatileBand:
 class TestBareSystemPrompt:
     """agent.bare_system_prompt=True makes the identity slot the whole prompt."""
 
-    def _bare_agent(self, **overrides):
-        return _make_agent(
-            valid_tool_names=["read_file"],
-            _bare_system_prompt=True,
-            **overrides,
-        )
-
-    def _build_bare(self, agent, system_message=None):
+    def _build(self, agent, system_message=None, soul="MY SOUL"):
         with (
-            patch("run_agent.load_soul_md", return_value="MY SOUL"),
+            patch("run_agent.load_soul_md", return_value=soul),
             patch("run_agent.build_skills_system_prompt", return_value=_SKILLS),
             patch("run_agent.build_context_files_prompt", return_value=_CONTEXT),
             patch("run_agent.build_environment_hints", return_value="ENVHINTS"),
         ):
             return build_system_prompt_parts(agent, system_message=system_message)
 
-    def test_bare_prompt_is_only_the_soul(self):
-        parts = self._build_bare(self._bare_agent())
-        assert parts["stable"] == "MY SOUL"
-        assert parts["context"] == ""
-        assert parts["volatile"] == ""
+    def _bare_agent(self):
+        return _make_agent(valid_tool_names=["read_file"], _bare_system_prompt=True)
 
-    def test_bare_prompt_drops_every_hermes_block(self):
-        full = "\n".join(self._build_bare(self._bare_agent()).values())
+    def test_bare_prompt_is_the_soul_and_nothing_hermes_authored(self):
+        parts = self._build(self._bare_agent(), system_message="FROM CALLER")
+
+        assert parts["stable"] == "MY SOUL"
+        assert parts["context"] == "FROM CALLER"  # caller message survives
+        assert parts["volatile"] == ""
+        full = "\n".join(parts.values())
         for absent in (
             "hermes-agent.nousresearch.com",
             "OUT-OF-BAND USER MESSAGE",
@@ -443,25 +438,19 @@ class TestBareSystemPrompt:
         ):
             assert absent not in full
 
-    def test_bare_prompt_keeps_caller_system_message(self):
-        parts = self._build_bare(self._bare_agent(), system_message="FROM CALLER")
-        assert parts["context"] == "FROM CALLER"
-
     def test_bare_prompt_falls_back_to_default_identity(self):
-        agent = self._bare_agent()
-        with (
-            patch("run_agent.load_soul_md", return_value=""),
-            patch("run_agent.build_skills_system_prompt", return_value=_SKILLS),
-        ):
-            parts = build_system_prompt_parts(agent)
         import agent.system_prompt as system_prompt
+
+        parts = self._build(self._bare_agent(), soul="")
+
         assert parts["stable"] == system_prompt.DEFAULT_AGENT_IDENTITY
 
     def test_default_off_still_renders_the_full_prompt(self):
-        # The guard must be opt-in: without the flag the docs pointer,
-        # steering note and timestamp all still render.
-        parts = self._build_bare(_make_agent(valid_tool_names=["read_file"]))
-        full = "\n".join(parts.values())
+        # The guard must be opt-in: without the flag everything still renders.
+        full = "\n".join(
+            self._build(_make_agent(valid_tool_names=["read_file"])).values()
+        )
+
         assert "OUT-OF-BAND USER MESSAGE" in full
         assert "Conversation started:" in full
 
