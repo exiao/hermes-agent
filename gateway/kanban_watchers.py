@@ -110,9 +110,11 @@ def _failure_detail(
     exit_kind = payload.get("exit_kind")
     if error:
         lines.append(_clip_notify_detail(str(error)))
-    elif exit_kind in ("nonzero_exit", "signaled"):
+    elif exit_kind in ("nonzero_exit", "signaled") and payload.get("exit_code") is not None:
         verb = "exited with code" if exit_kind == "nonzero_exit" else "killed by signal"
-        lines.append(f"pid {payload.get('pid')} {verb} {payload.get('exit_code')}")
+        pid = payload.get("pid")
+        pid_prefix = f"pid {pid} " if pid is not None else ""
+        lines.append(f"{pid_prefix}{verb} {payload['exit_code']}")
 
     facts: list[str] = []
 

@@ -55,6 +55,16 @@ def test_gave_up_is_terminal_even_when_the_payload_says_ready() -> None:
     assert "will retry" not in detail
 
 
+@pytest.mark.parametrize("exit_kind", ["nonzero_exit", "signaled"])
+def test_crash_details_omit_absent_fields(exit_kind: str) -> None:
+    without_pid = _failure_detail({"exit_kind": exit_kind, "exit_code": 1})
+    without_code = _failure_detail({"exit_kind": exit_kind})
+
+    assert "pid None" not in without_pid
+    assert "exited with code 1" in without_pid or "killed by signal 1" in without_pid
+    assert without_code == ""
+
+
 def test_a_field_that_is_absent_is_not_mentioned() -> None:
     detail = _failure_detail({"retry_status": "ready"})
 
