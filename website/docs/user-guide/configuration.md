@@ -1648,32 +1648,14 @@ agent:
 
 By default Hermes assembles the system prompt from many blocks: your `SOUL.md`, a docs pointer, task-completion and parallel-tool-call guidance, per-tool guidance, environment hints, the active-profile hint, a platform hint, project context files, the skills index, memory, and a timestamp.
 
-Set `bare_system_prompt: true` to make the identity slot the **entire** system prompt:
+Set `bare_system_prompt: true` to make the identity slot (`SOUL.md`, or the built-in identity when `SOUL.md` is absent) the **entire** system prompt, plus any caller-supplied system message. Everything else is skipped.
 
 ```yaml
 agent:
   bare_system_prompt: false   # true → SOUL.md is the whole system prompt
 ```
 
-| Value | Behavior |
-|-------|----------|
-| `false` (default) | Full assembly. Every applicable block is appended after the identity slot. |
-| `true` | Only the identity slot (`SOUL.md`, or the built-in identity when SOUL.md is absent), plus any caller-supplied system message. Everything else is skipped. |
-
-Use this when you want to author the prompt verbatim and control every byte.
-
-### What it does not remove
-
-Tool **schemas** are not part of the system prompt and still ship on every call. Narrow `toolsets` (or `platform_toolsets`) to shrink them:
-
-```yaml
-toolsets:
-  - terminal
-  - file
-  - web
-```
-
-Memory and the skills index are already gated on their tools being loaded, so dropping the `memory` and `skills` toolsets removes them independently of this flag.
+Tool **schemas** are not part of the system prompt and still ship on every call. Narrow `toolsets` (or `platform_toolsets`) to shrink those. Memory and the skills index are already gated on their tools being loaded, so dropping the `memory` and `skills` toolsets removes them independently of this flag.
 
 ### Caveats
 
