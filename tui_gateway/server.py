@@ -50,6 +50,7 @@ from tui_gateway.transport import (
     current_transport,
     reset_transport,
 )
+from gateway.kanban_watchers import _failure_detail
 
 logger = logging.getLogger(__name__)
 
@@ -9771,17 +9772,14 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
         return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
     if kind == "gave_up":
-        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
+        detail = _failure_detail(payload, terminal=True)
+        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures — {title}{detail}"
     if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
+        detail = _failure_detail(payload)
+        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone) — {title}{detail}"
     if kind == "timed_out":
-        limit = 0
-        try:
-            limit = int(payload.get("limit_seconds") or 0)
-        except (TypeError, ValueError):
-            pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+        detail = _failure_detail(payload)
+        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out — {title}{detail}"
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
     return None

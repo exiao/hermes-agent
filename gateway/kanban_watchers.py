@@ -89,6 +89,72 @@ def _clip_notify_detail(text: str, limit: int = _NOTIFY_DETAIL_MAX) -> str:
     return text[:limit] + f"… ({len(text) - limit} more chars; see board)"
 
 
+def _failure_detail(
+    payload: dict[str, Any] | None,
+    *,
+    terminal: bool = False,
+) -> str:
+    """Explain a gave_up / crashed / timed_out ping.
+
+    These three used to send only a headline: "timed out (max_runtime=0s);
+    will retry", while the payload carried the real cause. Everything below is
+    already in the event payload; an absent field is simply not mentioned.
+    """
+    if not payload:
+        return ""
+
+    lines: list[str] = []
+
+    # Why it stopped. This is the part a reader actually needs.
+    error = payload.get("error")
+    exit_kind = payload.get("exit_kind")
+    if error:
+        lines.append(_clip_notify_detail(str(error)))
+    elif exit_kind in ("nonzero_exit", "signaled") and payload.get("exit_code") is not None:
+        verb = "exited with code" if exit_kind == "nonzero_exit" else "killed by signal"
+        pid = payload.get("pid")
+        pid_prefix = f"pid {pid} " if pid is not None else ""
+        lines.append(f"{pid_prefix}{verb} {payload['exit_code']}")
+
+    facts: list[str] = []
+
+    # Runtime, only when both halves are real. A limit of 0 means the event
+    # never carried one, and printing "max_runtime=0s" invents a fact.
+    elapsed = payload.get("elapsed_seconds")
+    limit = payload.get("limit_seconds")
+    if elapsed and limit:
+        facts.append(f"ran {elapsed}s of {limit}s")
+
+    # How many attempts, and against what ceiling.
+    failures = payload.get("failures")
+    ceiling = payload.get("effective_limit")
+    if failures and ceiling:
+        source = payload.get("limit_source")
+        suffix = f" ({source} limit)" if source else ""
+        facts.append(f"attempt {failures} of {ceiling}{suffix}")
+
+    # Whether anything happens next. "will retry" was previously asserted
+    # unconditionally, which was a guess; retry_status is the real answer.
+    retry = payload.get("retry_status")
+    if terminal:
+        facts.append("not retrying (blocked)")
+    elif retry:
+        facts.append("will retry" if retry == "ready" else f"not retrying ({retry})")
+
+    budget_used = payload.get("budget_used")
+    budget_max = payload.get("budget_max")
+    if budget_used and budget_max:
+        facts.append(f"budget {budget_used}/{budget_max}")
+
+    if payload.get("sigkill"):
+        facts.append("killed with SIGKILL")
+
+    if facts:
+        lines.append(" · ".join(facts))
+
+    return "\n" + "\n".join(lines) if lines else ""
+
+
 # Self-labeling block notifications. The push leads with a header that says — at
 # a glance, before any reason text — whether the reader must ACT:
 #
@@ -917,25 +983,21 @@ class GatewayKanbanWatchersMixin:
                                 tag=f"{board_tag}{tag}",
                             )
                         elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{_clip_notify_detail(str(ev.payload['error']))}"
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                                f"after repeated spawn failures — {title}"
+                                f"{_failure_detail(ev.payload, terminal=True)}"
                             )
                         elif kind == "crashed":
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"(pid gone); dispatcher will retry — {title}"
+                                f"{_failure_detail(ev.payload)}"
                             )
                         elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out"
+                                f" — {title}{_failure_detail(ev.payload)}"
                             )
                         elif kind == "status":
                             new_status = ""

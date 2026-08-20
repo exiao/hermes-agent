@@ -262,6 +262,29 @@ class TestFormatKanbanEventText:
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
 
+    def test_failure_details_match_gateway_notifications(self):
+        events = [
+            ("gave_up", {"error": "budget exhausted", "retry_status": "ready"}),
+            ("crashed", {"pid": 12, "exit_kind": "nonzero_exit", "exit_code": 1}),
+            ("timed_out", {"elapsed_seconds": 12, "limit_seconds": 10, "retry_status": "ready"}),
+        ]
+
+        texts = [
+            _format_kanban_event_text(
+                self.SUB,
+                self.TASK,
+                SimpleNamespace(kind=kind, payload=payload),
+                "",
+            )
+            for kind, payload in events
+        ]
+
+        assert "budget exhausted" in texts[0]
+        assert "not retrying (blocked)" in texts[0]
+        assert "will retry" not in texts[0]
+        assert "exited with code 1" in texts[1]
+        assert "ran 12s of 10s" in texts[2]
+
 
 class TestNotificationPollerLoopKanbanWiring:
     """Drive a real TUI subscription through ``_notification_poller_loop``.
