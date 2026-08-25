@@ -65,6 +65,29 @@ from tools.computer_use.browser_route import CuaTypedBrowserRoute
 
 logger = logging.getLogger(__name__)
 
+_MISSING = object()
+
+
+def _mcp_field(obj, snake: str, camel: str, default=None):
+    """Read an MCP model field across the 1.x -> 2.x field rename.
+
+    mcp 2.0 renamed model fields to snake_case, keeping camelCase only as a
+    serialization alias that pydantic does not expose to attribute access. A
+    plain ``getattr(result, "isError", False)`` therefore reads False for
+    *every* result on 2.x — a denied or failed cua-driver call would be
+    treated as a success. Reading both spellings keeps this correct on either
+    SDK generation.
+
+    Deliberately duplicated from ``tools.mcp_tool.mcp_field`` rather than
+    imported: computer_use talks to cua-driver over its own stdio client and
+    does not otherwise load the (much larger) config-driven MCP client module.
+    """
+    value = getattr(obj, snake, _MISSING)
+    if value is not _MISSING:
+        return value
+    value = getattr(obj, camel, _MISSING)
+    return default if value is _MISSING else value
+
 
 def _action_result_from(
     name: str,
@@ -1672,7 +1695,7 @@ class _CuaDriverSession:
                     }
                 else:
                     self._capabilities[tool_name] = set()
-                schema = getattr(tool, "inputSchema", None)
+                schema = _mcp_field(tool, "input_schema", "inputSchema")
                 if schema is None:
                     schema = (getattr(tool, "model_extra", None) or {}).get(
                         "inputSchema"
@@ -1985,7 +2008,7 @@ class _CuaDriverSession:
         On macOS the ``cua-driver mcp`` bridge forwards calls to the CuaDriver
         daemon over a non-blocking unix socket. Heavier ops (notably
         ``get_window_state``, which walks the AX tree and captures a PNG) can
-        come back as an ``McpError`` carrying ``Resource temporarily
+        come back as an ``MCPError`` carrying ``Resource temporarily
         unavailable (os error 35)`` — POSIX EAGAIN — when the socket buffer is
         momentarily full. This is transient by definition: the same call
         succeeds when retried after a short pause (which is why spaced-out
@@ -2184,6 +2207,12 @@ class _CuaDriverSession:
         "list_windows",
     })
 
+    # Set when an MCP call timed out (#74799): a timed-out session is
+    # wedged for all later calls, so it is torn down and recreated before
+    # the next non-lifecycle call_tool. Class-level default so tests that
+    # bypass __init__ see a healthy (non-suspect) session.
+    _timeout_suspect = False
+
     @classmethod
     def _transport_replay_is_safe(cls, name: str) -> bool:
         return name in cls._TRANSPORT_REPLAY_SAFE_TOOLS
@@ -2210,7 +2239,53 @@ class _CuaDriverSession:
             "isError": True,
         }
 
+    @staticmethod
+    def _timeout_outcome(name: str, exc: Exception) -> Dict[str, Any]:
+        """Fail-closed result for an MCP call that hit its deadline (#74799).
+
+        The action MAY have taken effect on the remote screen before the
+        response was lost — the same effect_disposition=unknown principle as
+        ``_unknown_transport_outcome`` — so the timed-out call is never
+        silently replayed here; the caller decides after taking fresh state.
+        """
+        message = (
+            f"cua-driver MCP call {name} timed out; the action outcome is "
+            "unknown and may still have taken effect on the remote screen. "
+            "The session has been marked suspect and will be recreated before "
+            "the next computer-use call. Take fresh state before deciding "
+            "whether to act again."
+        )
+        return {
+            "data": message,
+            "images": [],
+            "image_mime_types": [],
+            "structuredContent": {
+                "ok": False,
+                "code": "timeout_outcome_unknown",
+                "message": message,
+                "operation": name,
+                "next_step": "fresh_state",
+                "detail": str(exc),
+            },
+            "isError": True,
+        }
+
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+        # A prior MCP timeout (#74799) marks the session suspect: it may be
+        # wedged for every later call. Recreate it before this call so a
+        # single timeout never poisons the rest of the computer-use session.
+        # Healthy sessions (flag clear) are never restarted here.
+        if self._timeout_suspect and name not in self._LIFECYCLE_CALLS:
+            logger.warning(
+                "cua-driver session suspect after earlier MCP timeout; "
+                "recreating before %s",
+                name,
+            )
+            with self._lock:
+                self._restart_session_locked()
+            self._timeout_suspect = False
+            self._restore_declared_session_after_transport_reset(timeout)
+
         # A prior session may have died (MCP drop / driver crash): its
         # lifecycle coro reset _started to False in its finally (#55048).
         if not self._started and name not in self._LIFECYCLE_CALLS:
@@ -2227,6 +2302,18 @@ class _CuaDriverSession:
                 timeout=timeout,
             )
         except Exception as e:
+            if isinstance(e, concurrent.futures.TimeoutError):
+                # MCP deadline hit (#74799): the session is suspect and must
+                # be recreated before the next call. Fail closed — the action
+                # may have taken effect on the remote screen, so never replay
+                # it here; surface the uncertainty instead (#74799).
+                self._timeout_suspect = True
+                logger.warning(
+                    "cua-driver MCP timed out on %s; marking session suspect "
+                    "for recreation before the next call",
+                    name,
+                )
+                return self._timeout_outcome(name, e)
             if self._is_transient_daemon_error(e):
                 if not self._transport_replay_is_safe(name):
                     self._notify_transport_reset()
@@ -2296,8 +2383,10 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
     image_mime_types: List[str] = []
     # Use identity, not truthiness: unittest mocks and proxy objects commonly
     # synthesize truthy attributes that were never present in the real result.
-    is_error = getattr(mcp_result, "isError", False) is True
-    structured: Optional[Dict] = getattr(mcp_result, "structuredContent", None) or None
+    is_error = _mcp_field(mcp_result, "is_error", "isError", False) is True
+    structured: Optional[Dict] = (
+        _mcp_field(mcp_result, "structured_content", "structuredContent") or None
+    )
     text_chunks: List[str] = []
     for part in getattr(mcp_result, "content", []) or []:
         ptype = getattr(part, "type", None)
@@ -2307,7 +2396,7 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
             b64 = getattr(part, "data", None)
             if b64:
                 images.append(b64)
-                mime = getattr(part, "mimeType", None) or ""
+                mime = _mcp_field(part, "mime_type", "mimeType") or ""
                 image_mime_types.append(mime)
     if text_chunks:
         joined = "\n".join(t for t in text_chunks if t)
@@ -3078,7 +3167,7 @@ class CuaDriverBackend(ComputerUseBackend):
             # 0x0 capture. Detect "no screenshot AND no parseable tree" and
             # force a one-shot CLI-transport re-fetch, which talks to the daemon
             # over a different socket and returns the full result. This is
-            # distinct from the EAGAIN McpError path (handled in call_tool);
+            # distinct from the EAGAIN MCPError path (handled in call_tool);
             # here the MCP call "succeeded" but gave us nothing usable.
             def _gws_is_empty(out: Dict[str, Any]) -> bool:
                 if out.get("images"):
