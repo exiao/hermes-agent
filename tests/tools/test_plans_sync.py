@@ -179,3 +179,44 @@ def test_plans_are_never_synced_back_to_the_host(hermes_home, tmp_path):
     assert plan.read_text() == "# the authoritative plan\n", (
         "a sandbox must never overwrite the host's plan"
     )
+
+
+def test_profile_home_still_reaches_the_root_plans_dir(tmp_path, monkeypatch):
+    """A kanban worker runs with HERMES_HOME=<root>/profiles/<lane>.
+
+    Card briefs cite ``~/.hermes/plans/...`` — the ROOT plans dir. Resolving
+    plans through the profile home uploaded ``<root>/profiles/<lane>/plans``
+    instead, so every Modal lane saw a plans dir that was mounted but did not
+    contain the plan its card named, and blocked.
+    """
+    from tools.credential_files import iter_plans_files
+
+    root = tmp_path / "hermes"
+    (root / "plans").mkdir(parents=True)
+    (root / "plans" / "card.md").write_text("# the plan the card cites\n")
+
+    profile = root / "profiles" / "dev"
+    (profile / "plans").mkdir(parents=True)
+    (profile / "plans" / "worker-written.md").write_text("# synced back\n")
+
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    remote = {e["container_path"] for e in iter_plans_files()}
+
+    assert "/root/.hermes/plans/card.md" in remote
+    # Plans a worker wrote and synced back into its own profile still ride along.
+    assert "/root/.hermes/plans/worker-written.md" in remote
+
+
+def test_root_and_profile_plans_are_not_duplicated(tmp_path, monkeypatch):
+    """Non-profile deployments resolve root == home; upload each file once."""
+    from tools.credential_files import iter_plans_files
+
+    root = tmp_path / "hermes"
+    (root / "plans").mkdir(parents=True)
+    (root / "plans" / "card.md").write_text("# the plan\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    entries = iter_plans_files()
+
+    assert len(entries) == 1
