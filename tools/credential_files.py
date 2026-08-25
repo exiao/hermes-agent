@@ -344,6 +344,97 @@ def _safe_skills_path(skills_dir: Path) -> str:
     return str(safe_dir)
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _skill_symlink_boundary(root: Path) -> List[Path]:
+    """Directories a skills symlink is allowed to resolve into.
+
+    A profile lane's links point OUT of its own skills dir and into the shared
+    root tree (``profiles/dev/skills/coding/pr-text -> ~/.hermes/skills/coding/
+    pr-text``), so the tree itself is too tight a boundary.  The Hermes root is
+    the correct one: it is the same trust domain the sync already uploads from,
+    and it still refuses a link to ``~/.ssh`` or anywhere else off it.
+    """
+    bounds: List[Path] = []
+    for candidate in (root, _resolve_hermes_home()):
+        try:
+            bounds.append(candidate.resolve())
+        except OSError:
+            continue
+    try:
+        from hermes_constants import get_default_hermes_root
+        bounds.append(get_default_hermes_root(_resolve_hermes_home()).resolve())
+    except Exception:
+        pass
+    return bounds
+
+
+def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
+    """Enumerate every regular file under *root*, following safe symlinks.
+
+    A profile lane does not copy shared skills, ``hermes profile`` symlinks
+    them into the root ``~/.hermes/skills`` tree (41 of the dev lane's 96
+    skills are links).  ``Path.rglob`` does not descend a symlinked directory,
+    so a blanket ``is_symlink()`` filter yielded one dead entry per linked
+    skill and uploaded none of its files.  A Modal worker told to "load the
+    pr-text skill" then found no such directory and improvised.
+
+    Symlinks are followed only while the target stays inside the Hermes home
+    (see :func:`_skill_symlink_boundary`): that containment is what the
+    original filter was protecting, and it still holds.  A link out of the
+    trust domain (``evil -> ~/.ssh``) is skipped, and ``visited`` on the
+    resolved real path bounds symlink loops.
+    """
+    entries: List[Dict[str, str]] = []
+    bounds = _skill_symlink_boundary(root)
+    if not bounds:
+        return entries
+
+    visited: set = set()
+
+    def walk(directory: Path, rel_prefix: str) -> None:
+        try:
+            real = directory.resolve()
+        except OSError:
+            return
+        if real in visited:
+            return
+        visited.add(real)
+        try:
+            children = sorted(directory.iterdir())
+        except OSError:
+            return
+        for item in children:
+            rel = f"{rel_prefix}{item.name}"
+            try:
+                item_real = item.resolve()
+            except OSError:
+                continue
+            if item.is_symlink() and not any(
+                _is_within(item_real, b) for b in bounds
+            ):
+                logger.warning(
+                    "skills sync: skipping symlink out of the Hermes home: %s", item,
+                )
+                continue
+            if item_real.is_dir():
+                walk(item, f"{rel}/")
+            elif item_real.is_file():
+                entries.append({
+                    "host_path": str(item),
+                    "container_path": f"{container_root}/{rel}",
+                })
+
+    walk(root, "")
+    return entries
+
+
 def iter_skills_files(
     container_base: str = "/root/.hermes",
 ) -> List[Dict[str, str]]:
@@ -360,42 +451,21 @@ def iter_skills_files(
     skills_dir = hermes_home / "skills"
     if skills_dir.is_dir():
         container_root = f"{container_base.rstrip('/')}/skills"
-        for item in skills_dir.rglob("*"):
-            if item.is_symlink() or not item.is_file():
-                continue
-            rel = item.relative_to(skills_dir)
-            result.append({
-                "host_path": str(item),
-                "container_path": f"{container_root}/{rel}",
-            })
+        result.extend(_walk_skill_tree(skills_dir, container_root))
 
-    # Include external skill dirs
+    # Include third-party skill dirs
     try:
         from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if not ext_dir.is_dir():
                 continue
             container_root = f"{container_base.rstrip('/')}/external_skills/{idx}"
-            for item in ext_dir.rglob("*"):
-                if item.is_symlink() or not item.is_file():
-                    continue
-                rel = item.relative_to(ext_dir)
-                result.append({
-                    "host_path": str(item),
-                    "container_path": f"{container_root}/{rel}",
-                })
+            result.extend(_walk_skill_tree(ext_dir, container_root))
         for idx, proj_dir in enumerate(get_project_skills_dirs()):
             if not proj_dir.is_dir():
                 continue
             container_root = f"{container_base.rstrip('/')}/project_skills/{idx}"
-            for item in proj_dir.rglob("*"):
-                if item.is_symlink() or not item.is_file():
-                    continue
-                rel = item.relative_to(proj_dir)
-                result.append({
-                    "host_path": str(item),
-                    "container_path": f"{container_root}/{rel}",
-                })
+            result.extend(_walk_skill_tree(proj_dir, container_root))
     except ImportError:
         pass
 

@@ -625,3 +625,74 @@ class TestMasterCredentialStoresAreNeverMountable:
             assert cf.get_credential_file_mounts() == []
         rec = next(r for r in caplog.records if "read guard raised" in r.message)
         assert rec.exc_info is not None, "traceback must be attached (logger.exception)"
+
+
+class TestSymlinkedSkillDirs:
+    """Profile lanes link shared skills instead of copying them.
+
+    ``hermes profile`` wires a lane's skills as symlinks into the root
+    ``~/.hermes/skills`` tree (41 of the dev lane's 96 skills are links). The
+    blanket symlink filter meant those skills were enumerated as a single
+    symlink entry, dropped, and never uploaded — so a Modal worker told to
+    "load the pr-text skill" found no such directory and improvised.
+    """
+
+    def test_symlinked_skill_dir_into_the_root_tree_is_uploaded(self, tmp_path):
+        root = tmp_path / ".hermes"
+        shared = root / "skills" / "coding" / "pr-text"
+        shared.mkdir(parents=True)
+        (shared / "SKILL.md").write_text("# pr-text")
+
+        profile = root / "profiles" / "dev"
+        (profile / "skills" / "coding").mkdir(parents=True)
+        (profile / "skills" / "coding" / "pr-text").symlink_to(shared)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            paths = {f["container_path"] for f in iter_skills_files()}
+
+        assert "/root/.hermes/skills/coding/pr-text/SKILL.md" in paths
+
+    def test_symlink_escaping_hermes_home_is_still_refused(self, tmp_path):
+        """The containment rule is the point of the original filter."""
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "ok").mkdir(parents=True)
+        (root / "skills" / "cat" / "ok" / "SKILL.md").write_text("# ok")
+
+        outside = tmp_path / "outside"
+        (outside / "evil").mkdir(parents=True)
+        (outside / "evil" / "id_rsa").write_text("PRIVATE KEY")
+        (root / "skills" / "cat" / "evil").symlink_to(outside / "evil")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            files = iter_skills_files()
+
+        assert not any("id_rsa" in f["container_path"] for f in files)
+        assert not any("id_rsa" in f["host_path"] for f in files)
+
+    def test_symlinked_file_inside_the_tree_is_uploaded(self, tmp_path):
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "a").mkdir(parents=True)
+        (root / "skills" / "cat" / "a" / "SKILL.md").write_text("# a")
+        (root / "skills" / "cat" / "b").mkdir(parents=True)
+        (root / "skills" / "cat" / "b" / "SKILL.md").symlink_to(
+            root / "skills" / "cat" / "a" / "SKILL.md"
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            paths = {f["container_path"] for f in iter_skills_files()}
+
+        assert "/root/.hermes/skills/cat/b/SKILL.md" in paths
+
+    def test_symlink_loop_does_not_hang(self, tmp_path):
+        root = tmp_path / ".hermes"
+        cat = root / "skills" / "cat"
+        cat.mkdir(parents=True)
+        (cat / "SKILL.md").write_text("# skill")
+        (cat / "loop").symlink_to(cat)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            files = iter_skills_files()
+
+        assert "/root/.hermes/skills/cat/SKILL.md" in {
+            f["container_path"] for f in files
+        }
