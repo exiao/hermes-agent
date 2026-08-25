@@ -344,37 +344,6 @@ def _safe_skills_path(skills_dir: Path) -> str:
     return str(safe_dir)
 
 
-def _is_within(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _skill_symlink_boundary(root: Path) -> List[Path]:
-    """Directories a skills symlink is allowed to resolve into.
-
-    A profile lane's links point OUT of its own skills dir and into the shared
-    root tree (``profiles/dev/skills/coding/pr-text -> ~/.hermes/skills/coding/
-    pr-text``), so the tree itself is too tight a boundary.  The Hermes root is
-    the correct one: it is the same trust domain the sync already uploads from,
-    and it still refuses a link to ``~/.ssh`` or anywhere else off it.
-    """
-    bounds: List[Path] = []
-    for candidate in (root, _resolve_hermes_home()):
-        try:
-            bounds.append(candidate.resolve())
-        except OSError:
-            continue
-    try:
-        from hermes_constants import get_default_hermes_root
-        bounds.append(get_default_hermes_root(_resolve_hermes_home()).resolve())
-    except Exception:
-        pass
-    return bounds
-
-
 def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
     """Enumerate every regular file under *root*, following safe symlinks.
 
@@ -385,27 +354,33 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
     skill and uploaded none of its files.  A Modal worker told to "load the
     pr-text skill" then found no such directory and improvised.
 
-    Symlinks are followed only while the target stays inside the Hermes home
-    (see :func:`_skill_symlink_boundary`): that containment is what the
-    original filter was protecting, and it still holds.  A link out of the
-    trust domain (``evil -> ~/.ssh``) is skipped, and ``visited`` on the
-    resolved real path bounds symlink loops.
+    Symlinks are followed only while the target stays inside the Hermes home:
+    that containment is what the original filter was protecting, and it still
+    holds.  A link out of the trust domain (``evil -> ~/.ssh``) is skipped,
+    and ``visited`` on the resolved real path bounds symlink loops.
     """
+    from hermes_constants import get_default_hermes_root
+
     entries: List[Dict[str, str]] = []
-    bounds = _skill_symlink_boundary(root)
-    if not bounds:
+    # A profile lane's links point OUT of its own skills dir and into the
+    # shared root tree, so the tree itself is too tight a boundary.  The
+    # Hermes root is the same trust domain the sync already uploads from.
+    try:
+        boundary = get_default_hermes_root(_resolve_hermes_home()).resolve()
+    except OSError:
         return entries
 
-    visited: set = set()
-
-    def walk(directory: Path, rel_prefix: str) -> None:
+    def walk(directory: Path, rel_prefix: str, ancestors: frozenset) -> None:
         try:
             real = directory.resolve()
         except OSError:
             return
-        if real in visited:
+        # Loop guard scoped to the CURRENT descent path, not the whole walk: a
+        # global visited-set would silently drop the second of two skills that
+        # link to the same shared target.
+        if real in ancestors:
             return
-        visited.add(real)
+        ancestors = ancestors | {real}
         try:
             children = sorted(directory.iterdir())
         except OSError:
@@ -416,22 +391,20 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
                 item_real = item.resolve()
             except OSError:
                 continue
-            if item.is_symlink() and not any(
-                _is_within(item_real, b) for b in bounds
-            ):
+            if item.is_symlink() and not item_real.is_relative_to(boundary):
                 logger.warning(
                     "skills sync: skipping symlink out of the Hermes home: %s", item,
                 )
                 continue
             if item_real.is_dir():
-                walk(item, f"{rel}/")
+                walk(item, f"{rel}/", ancestors)
             elif item_real.is_file():
                 entries.append({
                     "host_path": str(item),
                     "container_path": f"{container_root}/{rel}",
                 })
 
-    walk(root, "")
+    walk(root, "", frozenset())
     return entries
 
 

@@ -683,16 +683,26 @@ class TestSymlinkedSkillDirs:
 
         assert "/root/.hermes/skills/cat/b/SKILL.md" in paths
 
-    def test_symlink_loop_does_not_hang(self, tmp_path):
+    def test_symlink_loop_terminates_without_dropping_a_shared_target(self, tmp_path):
+        """The loop guard must be path-scoped, not global.
+
+        Two lanes' skills routinely link to the SAME shared directory. A
+        visited-set spanning the whole walk terminates the loop but also drops
+        the second link's files.
+        """
         root = tmp_path / ".hermes"
-        cat = root / "skills" / "cat"
-        cat.mkdir(parents=True)
-        (cat / "SKILL.md").write_text("# skill")
-        (cat / "loop").symlink_to(cat)
+        shared = root / "skills" / "coding" / "shared"
+        shared.mkdir(parents=True)
+        (shared / "SKILL.md").write_text("# shared")
+        (shared / "loop").symlink_to(shared)
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
-            files = iter_skills_files()
+        profile = root / "profiles" / "dev" / "skills" / "coding"
+        profile.mkdir(parents=True)
+        (profile / "alpha").symlink_to(shared)
+        (profile / "beta").symlink_to(shared)
 
-        assert "/root/.hermes/skills/cat/SKILL.md" in {
-            f["container_path"] for f in files
-        }
+        with patch.dict(os.environ, {"HERMES_HOME": str(root / "profiles" / "dev")}):
+            paths = {f["container_path"] for f in iter_skills_files()}
+
+        assert "/root/.hermes/skills/coding/alpha/SKILL.md" in paths
+        assert "/root/.hermes/skills/coding/beta/SKILL.md" in paths
