@@ -354,26 +354,33 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
     skill and uploaded none of its files.  A Modal worker told to "load the
     pr-text skill" then found no such directory and improvised.
 
-    Symlinks are followed only while the target stays inside the Hermes home:
-    that containment is what the original filter was protecting, and it still
-    holds.  A link out of the trust domain (``evil -> ~/.ssh``) is skipped,
-    and ``visited`` on the resolved real path bounds symlink loops.
+    Symlinks are followed only while the target stays inside a SKILLS tree:
+    the tree being walked, or the shared root ``~/.hermes/skills``.  The whole
+    Hermes home is too wide a boundary -- it also holds every other profile's
+    ``SOUL.md``, memories, state DBs and config, none of which a skill link
+    should be able to smuggle into a sandbox.  Loops are bounded by the
+    ancestor set on the current descent path.
     """
     from hermes_constants import get_default_hermes_root
 
     entries: List[Dict[str, str]] = []
     # A profile lane's links point OUT of its own skills dir and into the
-    # shared root tree, so the tree itself is too tight a boundary.  The
-    # Hermes root is the same trust domain the sync already uploads from.
-    try:
-        boundary = get_default_hermes_root(_resolve_hermes_home()).resolve()
-    except OSError:
+    # shared root skills tree, so the walked tree alone is too tight.  Both
+    # skills trees, and nothing else under the Hermes home.
+    boundaries: List[Path] = []
+    for candidate in (root, get_default_hermes_root(_resolve_hermes_home()) / "skills"):
+        try:
+            boundaries.append(candidate.resolve())
+        except (OSError, RuntimeError):
+            continue
+    if not boundaries:
         return entries
 
     def walk(directory: Path, rel_prefix: str, ancestors: frozenset) -> None:
         try:
             real = directory.resolve()
-        except OSError:
+        except (OSError, RuntimeError):
+            # RuntimeError: a true cyclic chain (a -> b -> a); OSError: dangling.
             return
         # Loop guard scoped to the CURRENT descent path, not the whole walk: a
         # global visited-set would silently drop the second of two skills that
@@ -389,11 +396,13 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
             rel = f"{rel_prefix}{item.name}"
             try:
                 item_real = item.resolve()
-            except OSError:
+            except (OSError, RuntimeError):
                 continue
-            if item.is_symlink() and not item_real.is_relative_to(boundary):
+            if item.is_symlink() and not any(
+                item_real.is_relative_to(b) for b in boundaries
+            ):
                 logger.warning(
-                    "skills sync: skipping symlink out of the Hermes home: %s", item,
+                    "skills sync: skipping symlink out of the skills trees: %s", item,
                 )
                 continue
             if item_real.is_dir():

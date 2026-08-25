@@ -738,3 +738,35 @@ class TestSymlinkedSkillDirs:
 
         assert not Path(entry["host_path"]).is_symlink()
         assert Path(entry["host_path"]).read_text() == "# a"
+
+    def test_symlink_to_another_profile_outside_skills_is_refused(self, tmp_path):
+        """The deny-list only covers secrets; a sibling profile's data is not on it."""
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "evil").mkdir(parents=True)
+        (root / "skills" / "cat" / "evil" / "SKILL.md").write_text("# evil")
+        other = root / "profiles" / "other"
+        other.mkdir(parents=True)
+        (other / "SOUL.md").write_text("another lane's private soul")
+        (root / "skills" / "cat" / "evil" / "reference.md").symlink_to(other / "SOUL.md")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            files = iter_skills_files()
+
+        assert not any(f["container_path"].endswith("reference.md") for f in files)
+        assert not any("SOUL.md" in f["host_path"] for f in files)
+
+    def test_cyclic_symlink_chain_does_not_abort_the_sync(self, tmp_path):
+        """A true a -> b -> a cycle raises RuntimeError from resolve(), not OSError."""
+        root = tmp_path / ".hermes"
+        cat = root / "skills" / "cat"
+        cat.mkdir(parents=True)
+        (cat / "SKILL.md").write_text("# skill")
+        (cat / "a").symlink_to(cat / "b")
+        (cat / "b").symlink_to(cat / "a")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            files = iter_skills_files()
+
+        assert "/root/.hermes/skills/cat/SKILL.md" in {
+            f["container_path"] for f in files
+        }
