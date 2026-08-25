@@ -399,8 +399,33 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
             if item_real.is_dir():
                 walk(item, f"{rel}/", ancestors)
             elif item_real.is_file():
+                # Containment is not enough: the Hermes home is exactly where
+                # the master credential stores live, so a skill holding
+                # ``reference.txt -> ~/.hermes/.env`` would pass the boundary
+                # check above and upload the secret under an innocent path.
+                # Same guard the mount surface uses; fails CLOSED.
+                if get_read_block_error is None:
+                    logger.error(
+                        "skills sync: refusing %s -- agent.file_safety could not "
+                        "be imported, so the deny-list cannot be consulted", item,
+                    )
+                    continue
+                try:
+                    denied = get_read_block_error(str(item_real))
+                except Exception:
+                    logger.exception("skills sync: deny-list check failed for %s", item)
+                    continue
+                if denied:
+                    logger.warning(
+                        "skills sync: skipping denied file %s (%s)", item, denied,
+                    )
+                    continue
                 entries.append({
-                    "host_path": str(item),
+                    # The RESOLVED path: the Modal uploader tars host_path, and
+                    # tar.add() archives a symlink rather than dereferencing it,
+                    # so a linked SKILL.md extracted as a dangling link to a
+                    # host-only target the container cannot read.
+                    "host_path": str(item_real),
                     "container_path": f"{container_root}/{rel}",
                 })
 

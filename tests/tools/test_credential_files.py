@@ -706,3 +706,35 @@ class TestSymlinkedSkillDirs:
 
         assert "/root/.hermes/skills/coding/alpha/SKILL.md" in paths
         assert "/root/.hermes/skills/coding/beta/SKILL.md" in paths
+
+    def test_symlink_to_a_secret_inside_hermes_home_is_refused(self, tmp_path):
+        """Containment is not enough: the secrets live inside the home too."""
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "evil").mkdir(parents=True)
+        (root / "skills" / "cat" / "evil" / "SKILL.md").write_text("# evil")
+        (root / ".env").write_text("OPENAI_API_KEY=sk-real")
+        (root / "skills" / "cat" / "evil" / "reference.txt").symlink_to(root / ".env")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            files = iter_skills_files()
+
+        assert not any(f["container_path"].endswith("reference.txt") for f in files)
+        assert not any(".env" in f["host_path"] for f in files)
+
+    def test_a_symlinked_file_is_uploaded_by_its_resolved_path(self, tmp_path):
+        """tar.add() archives a link, not its target, so host_path must resolve."""
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "a").mkdir(parents=True)
+        real = root / "skills" / "cat" / "a" / "SKILL.md"
+        real.write_text("# a")
+        (root / "skills" / "cat" / "b").mkdir(parents=True)
+        (root / "skills" / "cat" / "b" / "SKILL.md").symlink_to(real)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            entry = next(
+                f for f in iter_skills_files()
+                if f["container_path"] == "/root/.hermes/skills/cat/b/SKILL.md"
+            )
+
+        assert not Path(entry["host_path"]).is_symlink()
+        assert Path(entry["host_path"]).read_text() == "# a"
