@@ -208,15 +208,26 @@ def test_profile_home_still_reaches_the_root_plans_dir(tmp_path, monkeypatch):
     assert "/root/.hermes/plans/worker-written.md" in remote
 
 
-def test_root_and_profile_plans_are_not_duplicated(tmp_path, monkeypatch):
-    """Non-profile deployments resolve root == home; upload each file once."""
+def test_a_name_in_both_dirs_uploads_once_from_the_root(tmp_path, monkeypatch):
+    """One remote path can only hold one file, and the operator's copy wins.
+
+    A sync-back leftover in the profile dir must not shadow the plan the card
+    actually cites, and must not be uploaded to the same remote path twice.
+    """
     from tools.credential_files import iter_plans_files
 
     root = tmp_path / "hermes"
     (root / "plans").mkdir(parents=True)
-    (root / "plans" / "card.md").write_text("# the plan\n")
-    monkeypatch.setenv("HERMES_HOME", str(root))
+    (root / "plans" / "card.md").write_text("# the plan the card cites\n")
 
-    entries = iter_plans_files()
+    profile = root / "profiles" / "dev"
+    (profile / "plans").mkdir(parents=True)
+    (profile / "plans" / "card.md").write_text("# stale sync-back leftover\n")
+
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    entries = [e for e in iter_plans_files()
+               if e["container_path"] == "/root/.hermes/plans/card.md"]
 
     assert len(entries) == 1
+    assert "/profiles/" not in entries[0]["host_path"]
