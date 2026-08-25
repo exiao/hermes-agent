@@ -707,6 +707,29 @@ class TestSymlinkedSkillDirs:
         assert "/root/.hermes/skills/coding/alpha/SKILL.md" in paths
         assert "/root/.hermes/skills/coding/beta/SKILL.md" in paths
 
+    def test_followed_cross_profile_link_is_marked_upload_only(self, tmp_path):
+        """host_path resolves into ANOTHER profile, so sync-back must not write it."""
+        root = tmp_path / ".hermes"
+        shared = root / "skills" / "coding" / "pr-text"
+        shared.mkdir(parents=True)
+        (shared / "SKILL.md").write_text("# pr-text")
+
+        profile = root / "profiles" / "dev"
+        (profile / "skills" / "coding").mkdir(parents=True)
+        (profile / "skills" / "coding" / "pr-text").symlink_to(shared)
+        own = profile / "skills" / "coding" / "own"
+        own.mkdir()
+        (own / "SKILL.md").write_text("# own")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            files = iter_skills_files()
+
+        by_path = {f["container_path"]: f for f in files}
+        linked = by_path["/root/.hermes/skills/coding/pr-text/SKILL.md"]
+        assert linked["upload_only"] == "1"
+        # A file the profile actually owns stays writable by sync-back.
+        assert "upload_only" not in by_path["/root/.hermes/skills/coding/own/SKILL.md"]
+
     def test_symlink_to_a_secret_inside_hermes_home_is_refused(self, tmp_path):
         """Containment is not enough: the secrets live inside the home too."""
         root = tmp_path / ".hermes"

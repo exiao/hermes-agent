@@ -373,6 +373,10 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
             boundaries.append(candidate.resolve())
         except (OSError, RuntimeError):
             continue
+    try:
+        walk_root = root.resolve()
+    except (OSError, RuntimeError):
+        return entries
     if not boundaries:
         return entries
 
@@ -429,14 +433,23 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
                         "skills sync: skipping denied file %s (%s)", item, denied,
                     )
                     continue
-                entries.append({
+                entry = {
                     # The RESOLVED path: the Modal uploader tars host_path, and
                     # tar.add() archives a symlink rather than dereferencing it,
                     # so a linked SKILL.md extracted as a dangling link to a
                     # host-only target the container cannot read.
                     "host_path": str(item_real),
                     "container_path": f"{container_root}/{rel}",
-                })
+                }
+                # A followed link leaves the walked tree only when it points at
+                # the OTHER profile's skills tree.  Resolving host_path there
+                # makes sync_back's mapping land on that profile's file, so a
+                # remote worker editing its copy would silently rewrite another
+                # profile's skill.  Read-availability was the whole point of
+                # following the link: mark it upload-only.
+                if not item_real.is_relative_to(walk_root):
+                    entry["upload_only"] = "1"
+                entries.append(entry)
 
     walk(root, "", frozenset())
     return entries

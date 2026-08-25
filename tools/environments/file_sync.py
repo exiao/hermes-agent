@@ -86,25 +86,47 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
 
 
 def _credential_host_paths() -> set[str]:
-    """Return credential files that are upload-only for remote sandboxes."""
+    """Host paths that are upload-only for remote sandboxes.
+
+    Credential mounts, plus any skill file reached by following a link OUT of
+    the walked skills tree: its resolved host_path belongs to ANOTHER profile,
+    so applying a remote edit to it would be a silent cross-profile write.
+    """
     try:
-        from tools.credential_files import get_credential_file_mounts
+        from tools.credential_files import (
+            get_credential_file_mounts,
+            iter_skills_files,
+        )
     except Exception:
         return set()
 
     paths: set[str] = set()
+
+    def _add(host_path: str) -> None:
+        try:
+            paths.add(str(Path(host_path).expanduser().resolve()))
+        except OSError:
+            paths.add(str(Path(host_path).expanduser()))
+
     try:
         mounts = get_credential_file_mounts()
     except Exception:
         return set()
     for entry in mounts:
         host_path = entry.get("host_path") if isinstance(entry, dict) else None
-        if not host_path:
+        if host_path:
+            _add(host_path)
+
+    try:
+        skills = iter_skills_files()
+    except Exception:
+        skills = []
+    for entry in skills:
+        if not isinstance(entry, dict) or not entry.get("upload_only"):
             continue
-        try:
-            paths.add(str(Path(host_path).expanduser().resolve()))
-        except OSError:
-            paths.add(str(Path(host_path).expanduser()))
+        host_path = entry.get("host_path")
+        if host_path:
+            _add(host_path)
     return paths
 
 
