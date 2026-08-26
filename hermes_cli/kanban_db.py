@@ -4702,6 +4702,19 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if task_status == "blocked":
+                    # A park at creation must be STICKY. `_has_sticky_block`
+                    # reads events, not status, so a card parked with only a
+                    # status flip looks like circuit-breaker debris to
+                    # `recompute_ready`, which promotes it and hands a worker
+                    # a ticket nobody scheduled (t_7a8459f5: created and
+                    # claimed four seconds apart). `unblock_task` is still the
+                    # exit; it emits "unblocked" and flips the predicate back.
+                    _append_event(
+                        conn, task_id, "blocked",
+                        {"reason": "parked at creation "
+                                   "(initial_status=blocked)"},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
