@@ -344,6 +344,117 @@ def _safe_skills_path(skills_dir: Path) -> str:
     return str(safe_dir)
 
 
+def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
+    """Enumerate every regular file under *root*, following safe symlinks.
+
+    A profile lane does not copy shared skills, ``hermes profile`` symlinks
+    them into the root ``~/.hermes/skills`` tree (41 of the dev lane's 96
+    skills are links).  ``Path.rglob`` does not descend a symlinked directory,
+    so a blanket ``is_symlink()`` filter yielded one dead entry per linked
+    skill and uploaded none of its files.  A Modal worker told to "load the
+    pr-text skill" then found no such directory and improvised.
+
+    Symlinks are followed only while the target stays inside a SKILLS tree:
+    the tree being walked, or the shared root ``~/.hermes/skills``.  The whole
+    Hermes home is too wide a boundary -- it also holds every other profile's
+    ``SOUL.md``, memories, state DBs and config, none of which a skill link
+    should be able to smuggle into a sandbox.  Loops are bounded by the
+    ancestor set on the current descent path.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    entries: List[Dict[str, str]] = []
+    # A profile lane's links point OUT of its own skills dir and into the
+    # shared root skills tree, so the walked tree alone is too tight.  Both
+    # skills trees, and nothing else under the Hermes home.
+    boundaries: List[Path] = []
+    for candidate in (root, get_default_hermes_root(_resolve_hermes_home()) / "skills"):
+        try:
+            boundaries.append(candidate.resolve())
+        except (OSError, RuntimeError):
+            continue
+    try:
+        walk_root = root.resolve()
+    except (OSError, RuntimeError):
+        return entries
+    if not boundaries:
+        return entries
+
+    def walk(directory: Path, rel_prefix: str, ancestors: frozenset) -> None:
+        try:
+            real = directory.resolve()
+        except (OSError, RuntimeError):
+            # RuntimeError: a true cyclic chain (a -> b -> a); OSError: dangling.
+            return
+        # Loop guard scoped to the CURRENT descent path, not the whole walk: a
+        # global visited-set would silently drop the second of two skills that
+        # link to the same shared target.
+        if real in ancestors:
+            return
+        ancestors = ancestors | {real}
+        try:
+            children = sorted(directory.iterdir())
+        except OSError:
+            return
+        for item in children:
+            rel = f"{rel_prefix}{item.name}"
+            try:
+                item_real = item.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if item.is_symlink() and not any(
+                item_real.is_relative_to(b) for b in boundaries
+            ):
+                logger.warning(
+                    "skills sync: skipping symlink out of the skills trees: %s", item,
+                )
+                continue
+            if item_real.is_dir():
+                walk(item, f"{rel}/", ancestors)
+            elif item_real.is_file():
+                # Containment is not enough: the Hermes home is exactly where
+                # the master credential stores live, so a skill holding
+                # ``reference.txt -> ~/.hermes/.env`` would pass the boundary
+                # check above and upload the secret under an innocent path.
+                # Same guard the mount surface uses; fails CLOSED.
+                if get_read_block_error is None:
+                    logger.error(
+                        "skills sync: refusing %s -- agent.file_safety could not "
+                        "be imported, so the deny-list cannot be consulted", item,
+                    )
+                    continue
+                try:
+                    denied = get_read_block_error(str(item_real))
+                except Exception:
+                    logger.exception("skills sync: deny-list check failed for %s", item)
+                    continue
+                if denied:
+                    logger.warning(
+                        "skills sync: skipping denied file %s (%s)", item, denied,
+                    )
+                    continue
+                entry = {
+                    # The RESOLVED path: the Modal uploader tars host_path, and
+                    # tar.add() archives a symlink rather than dereferencing it,
+                    # so a linked SKILL.md extracted as a dangling link to a
+                    # host-only target the container cannot read.
+                    "host_path": str(item_real),
+                    "container_path": f"{container_root}/{rel}",
+                }
+                # A followed link leaves the walked tree only when it points at
+                # the OTHER profile's skills tree.  Resolving host_path there
+                # makes sync_back's mapping land on that profile's file, so a
+                # remote worker editing its copy would silently rewrite another
+                # profile's skill.  Read-availability was the whole point of
+                # following the link: mark it upload-only.
+                if not item_real.is_relative_to(walk_root):
+                    entry["upload_only"] = "1"
+                entries.append(entry)
+
+    walk(root, "", frozenset())
+    return entries
+
+
 def iter_skills_files(
     container_base: str = "/root/.hermes",
 ) -> List[Dict[str, str]]:
@@ -360,42 +471,21 @@ def iter_skills_files(
     skills_dir = hermes_home / "skills"
     if skills_dir.is_dir():
         container_root = f"{container_base.rstrip('/')}/skills"
-        for item in skills_dir.rglob("*"):
-            if item.is_symlink() or not item.is_file():
-                continue
-            rel = item.relative_to(skills_dir)
-            result.append({
-                "host_path": str(item),
-                "container_path": f"{container_root}/{rel}",
-            })
+        result.extend(_walk_skill_tree(skills_dir, container_root))
 
-    # Include external skill dirs
+    # Include third-party skill dirs
     try:
         from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if not ext_dir.is_dir():
                 continue
             container_root = f"{container_base.rstrip('/')}/external_skills/{idx}"
-            for item in ext_dir.rglob("*"):
-                if item.is_symlink() or not item.is_file():
-                    continue
-                rel = item.relative_to(ext_dir)
-                result.append({
-                    "host_path": str(item),
-                    "container_path": f"{container_root}/{rel}",
-                })
+            result.extend(_walk_skill_tree(ext_dir, container_root))
         for idx, proj_dir in enumerate(get_project_skills_dirs()):
             if not proj_dir.is_dir():
                 continue
             container_root = f"{container_base.rstrip('/')}/project_skills/{idx}"
-            for item in proj_dir.rglob("*"):
-                if item.is_symlink() or not item.is_file():
-                    continue
-                rel = item.relative_to(proj_dir)
-                result.append({
-                    "host_path": str(item),
-                    "container_path": f"{container_root}/{rel}",
-                })
+            result.extend(_walk_skill_tree(proj_dir, container_root))
     except ImportError:
         pass
 

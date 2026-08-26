@@ -625,3 +625,171 @@ class TestMasterCredentialStoresAreNeverMountable:
             assert cf.get_credential_file_mounts() == []
         rec = next(r for r in caplog.records if "read guard raised" in r.message)
         assert rec.exc_info is not None, "traceback must be attached (logger.exception)"
+
+
+class TestSymlinkedSkillDirs:
+    """Profile lanes link shared skills instead of copying them.
+
+    ``hermes profile`` wires a lane's skills as symlinks into the root
+    ``~/.hermes/skills`` tree (41 of the dev lane's 96 skills are links). The
+    blanket symlink filter meant those skills were enumerated as a single
+    symlink entry, dropped, and never uploaded — so a Modal worker told to
+    "load the pr-text skill" found no such directory and improvised.
+    """
+
+    def test_symlinked_skill_dir_into_the_root_tree_is_uploaded(self, tmp_path):
+        root = tmp_path / ".hermes"
+        shared = root / "skills" / "coding" / "pr-text"
+        shared.mkdir(parents=True)
+        (shared / "SKILL.md").write_text("# pr-text")
+
+        profile = root / "profiles" / "dev"
+        (profile / "skills" / "coding").mkdir(parents=True)
+        (profile / "skills" / "coding" / "pr-text").symlink_to(shared)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            paths = {f["container_path"] for f in iter_skills_files()}
+
+        assert "/root/.hermes/skills/coding/pr-text/SKILL.md" in paths
+
+    def test_symlink_escaping_hermes_home_is_still_refused(self, tmp_path):
+        """The containment rule is the point of the original filter."""
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "ok").mkdir(parents=True)
+        (root / "skills" / "cat" / "ok" / "SKILL.md").write_text("# ok")
+
+        outside = tmp_path / "outside"
+        (outside / "evil").mkdir(parents=True)
+        (outside / "evil" / "id_rsa").write_text("PRIVATE KEY")
+        (root / "skills" / "cat" / "evil").symlink_to(outside / "evil")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            files = iter_skills_files()
+
+        assert not any("id_rsa" in f["container_path"] for f in files)
+        assert not any("id_rsa" in f["host_path"] for f in files)
+
+    def test_symlinked_file_inside_the_tree_is_uploaded(self, tmp_path):
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "a").mkdir(parents=True)
+        (root / "skills" / "cat" / "a" / "SKILL.md").write_text("# a")
+        (root / "skills" / "cat" / "b").mkdir(parents=True)
+        (root / "skills" / "cat" / "b" / "SKILL.md").symlink_to(
+            root / "skills" / "cat" / "a" / "SKILL.md"
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            paths = {f["container_path"] for f in iter_skills_files()}
+
+        assert "/root/.hermes/skills/cat/b/SKILL.md" in paths
+
+    def test_symlink_loop_terminates_without_dropping_a_shared_target(self, tmp_path):
+        """The loop guard must be path-scoped, not global.
+
+        Two lanes' skills routinely link to the SAME shared directory. A
+        visited-set spanning the whole walk terminates the loop but also drops
+        the second link's files.
+        """
+        root = tmp_path / ".hermes"
+        shared = root / "skills" / "coding" / "shared"
+        shared.mkdir(parents=True)
+        (shared / "SKILL.md").write_text("# shared")
+        (shared / "loop").symlink_to(shared)
+
+        profile = root / "profiles" / "dev" / "skills" / "coding"
+        profile.mkdir(parents=True)
+        (profile / "alpha").symlink_to(shared)
+        (profile / "beta").symlink_to(shared)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root / "profiles" / "dev")}):
+            paths = {f["container_path"] for f in iter_skills_files()}
+
+        assert "/root/.hermes/skills/coding/alpha/SKILL.md" in paths
+        assert "/root/.hermes/skills/coding/beta/SKILL.md" in paths
+
+    def test_followed_cross_profile_link_is_marked_upload_only(self, tmp_path):
+        """host_path resolves into ANOTHER profile, so sync-back must not write it."""
+        root = tmp_path / ".hermes"
+        shared = root / "skills" / "coding" / "pr-text"
+        shared.mkdir(parents=True)
+        (shared / "SKILL.md").write_text("# pr-text")
+
+        profile = root / "profiles" / "dev"
+        (profile / "skills" / "coding").mkdir(parents=True)
+        (profile / "skills" / "coding" / "pr-text").symlink_to(shared)
+        own = profile / "skills" / "coding" / "own"
+        own.mkdir()
+        (own / "SKILL.md").write_text("# own")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            files = iter_skills_files()
+
+        by_path = {f["container_path"]: f for f in files}
+        linked = by_path["/root/.hermes/skills/coding/pr-text/SKILL.md"]
+        assert linked["upload_only"] == "1"
+        # A file the profile actually owns stays writable by sync-back.
+        assert "upload_only" not in by_path["/root/.hermes/skills/coding/own/SKILL.md"]
+
+    def test_symlink_to_a_secret_inside_hermes_home_is_refused(self, tmp_path):
+        """Containment is not enough: the secrets live inside the home too."""
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "evil").mkdir(parents=True)
+        (root / "skills" / "cat" / "evil" / "SKILL.md").write_text("# evil")
+        (root / ".env").write_text("OPENAI_API_KEY=sk-real")
+        (root / "skills" / "cat" / "evil" / "reference.txt").symlink_to(root / ".env")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            files = iter_skills_files()
+
+        assert not any(f["container_path"].endswith("reference.txt") for f in files)
+        assert not any(".env" in f["host_path"] for f in files)
+
+    def test_a_symlinked_file_is_uploaded_by_its_resolved_path(self, tmp_path):
+        """tar.add() archives a link, not its target, so host_path must resolve."""
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "a").mkdir(parents=True)
+        real = root / "skills" / "cat" / "a" / "SKILL.md"
+        real.write_text("# a")
+        (root / "skills" / "cat" / "b").mkdir(parents=True)
+        (root / "skills" / "cat" / "b" / "SKILL.md").symlink_to(real)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            entry = next(
+                f for f in iter_skills_files()
+                if f["container_path"] == "/root/.hermes/skills/cat/b/SKILL.md"
+            )
+
+        assert not Path(entry["host_path"]).is_symlink()
+        assert Path(entry["host_path"]).read_text() == "# a"
+
+    def test_symlink_to_another_profile_outside_skills_is_refused(self, tmp_path):
+        """The deny-list only covers secrets; a sibling profile's data is not on it."""
+        root = tmp_path / ".hermes"
+        (root / "skills" / "cat" / "evil").mkdir(parents=True)
+        (root / "skills" / "cat" / "evil" / "SKILL.md").write_text("# evil")
+        other = root / "profiles" / "other"
+        other.mkdir(parents=True)
+        (other / "SOUL.md").write_text("another lane's private soul")
+        (root / "skills" / "cat" / "evil" / "reference.md").symlink_to(other / "SOUL.md")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            files = iter_skills_files()
+
+        assert not any(f["container_path"].endswith("reference.md") for f in files)
+        assert not any("SOUL.md" in f["host_path"] for f in files)
+
+    def test_cyclic_symlink_chain_does_not_abort_the_sync(self, tmp_path):
+        """A true a -> b -> a cycle raises RuntimeError from resolve(), not OSError."""
+        root = tmp_path / ".hermes"
+        cat = root / "skills" / "cat"
+        cat.mkdir(parents=True)
+        (cat / "SKILL.md").write_text("# skill")
+        (cat / "a").symlink_to(cat / "b")
+        (cat / "b").symlink_to(cat / "a")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            files = iter_skills_files()
+
+        assert "/root/.hermes/skills/cat/SKILL.md" in {
+            f["container_path"] for f in files
+        }
