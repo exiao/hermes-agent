@@ -685,34 +685,51 @@ def iter_plans_files(
     of those paths dead on a remote lane.
     """
     result: List[Dict[str, str]] = []
+    seen: set[str] = set()
 
     hermes_home = _resolve_hermes_home()
-    plans_dir = hermes_home / "plans"
-    # Do not follow a symlinked plans root: the per-file symlink filter below
-    # cannot protect the tree once rglob() has followed the root out of
-    # HERMES_HOME.
-    if plans_dir.is_symlink() or not plans_dir.is_dir():
-        return result
+    from hermes_constants import get_default_hermes_root
+
+    # A kanban worker runs with HERMES_HOME=<root>/profiles/<lane>, but card
+    # briefs cite the ROOT plans dir (``~/.hermes/plans/...``) because that is
+    # where the operator writes them.  Resolving through the profile home alone
+    # uploaded ``<root>/profiles/<lane>/plans`` — usually a near-empty dir of
+    # sync-back leftovers — so the mount existed, the named plan did not, and
+    # the lane blocked.  Both dirs ship; the root wins on collision.
+    plans_dirs = [get_default_hermes_root(hermes_home) / "plans"]
+    profile_plans = hermes_home / "plans"
+    if profile_plans not in plans_dirs:
+        plans_dirs.append(profile_plans)
 
     container_root = f"{container_base.rstrip('/')}/plans"
     allowed_suffixes = {".md", ".txt", ".json", ".yaml", ".yml", ".svg"}
     # Subtrees a worker never needs: archived/superseded plans and rescued run
     # artifacts.  Without this the sync is ~4.5k files / 44MB on every start.
     skip_roots = {"archive", "wt-reaper-rescued", "shelved", "babysit-split-backup"}
-    for item in plans_dir.rglob("*"):
-        if item.is_symlink() or not item.is_file():
+    for plans_dir in plans_dirs:
+        # Do not follow a symlinked plans root: the per-file symlink filter
+        # below cannot protect the tree once rglob() has followed the root out
+        # of HERMES_HOME.
+        if plans_dir.is_symlink() or not plans_dir.is_dir():
             continue
-        rel = item.relative_to(plans_dir)
-        if rel.parts and rel.parts[0] in skip_roots:
-            continue
-        if item.suffix.lower() not in allowed_suffixes and not _is_synced_diagram(
-            item, rel
-        ):
-            continue
-        result.append({
-            "host_path": str(item),
-            "container_path": f"{container_root}/{rel.as_posix()}",
-        })
+        for item in plans_dir.rglob("*"):
+            if item.is_symlink() or not item.is_file():
+                continue
+            rel = item.relative_to(plans_dir)
+            if rel.parts and rel.parts[0] in skip_roots:
+                continue
+            if item.suffix.lower() not in allowed_suffixes and not _is_synced_diagram(
+                item, rel
+            ):
+                continue
+            container_path = f"{container_root}/{rel.as_posix()}"
+            if container_path in seen:
+                continue
+            seen.add(container_path)
+            result.append({
+                "host_path": str(item),
+                "container_path": container_path,
+            })
 
     return result
 

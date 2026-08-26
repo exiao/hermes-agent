@@ -179,3 +179,55 @@ def test_plans_are_never_synced_back_to_the_host(hermes_home, tmp_path):
     assert plan.read_text() == "# the authoritative plan\n", (
         "a sandbox must never overwrite the host's plan"
     )
+
+
+def test_profile_home_still_reaches_the_root_plans_dir(tmp_path, monkeypatch):
+    """A kanban worker runs with HERMES_HOME=<root>/profiles/<lane>.
+
+    Card briefs cite ``~/.hermes/plans/...`` — the ROOT plans dir. Resolving
+    plans through the profile home uploaded ``<root>/profiles/<lane>/plans``
+    instead, so every Modal lane saw a plans dir that was mounted but did not
+    contain the plan its card named, and blocked.
+    """
+    from tools.credential_files import iter_plans_files
+
+    root = tmp_path / "hermes"
+    (root / "plans").mkdir(parents=True)
+    (root / "plans" / "card.md").write_text("# the plan the card cites\n")
+
+    profile = root / "profiles" / "dev"
+    (profile / "plans").mkdir(parents=True)
+    (profile / "plans" / "worker-written.md").write_text("# synced back\n")
+
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    remote = {e["container_path"] for e in iter_plans_files()}
+
+    assert "/root/.hermes/plans/card.md" in remote
+    # Plans a worker wrote and synced back into its own profile still ride along.
+    assert "/root/.hermes/plans/worker-written.md" in remote
+
+
+def test_a_name_in_both_dirs_uploads_once_from_the_root(tmp_path, monkeypatch):
+    """One remote path can only hold one file, and the operator's copy wins.
+
+    A sync-back leftover in the profile dir must not shadow the plan the card
+    actually cites, and must not be uploaded to the same remote path twice.
+    """
+    from tools.credential_files import iter_plans_files
+
+    root = tmp_path / "hermes"
+    (root / "plans").mkdir(parents=True)
+    (root / "plans" / "card.md").write_text("# the plan the card cites\n")
+
+    profile = root / "profiles" / "dev"
+    (profile / "plans").mkdir(parents=True)
+    (profile / "plans" / "card.md").write_text("# stale sync-back leftover\n")
+
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    entries = [e for e in iter_plans_files()
+               if e["container_path"] == "/root/.hermes/plans/card.md"]
+
+    assert len(entries) == 1
+    assert "/profiles/" not in entries[0]["host_path"]
