@@ -1,21 +1,3 @@
-"""A recovered background process must not report a fabricated exit code.
-
-Hermes checkpoints running background processes so they survive a gateway
-restart. On restart they are re-registered as ``detached=True``: the pipe is
-gone, so only the host PID is known.
-
-When such a session's PID is no longer ours, ``_refresh_detached_session``
-marks it exited and sets ``exit_code = None`` because the real code is
-unrecoverable. That ``None`` then flows straight into the completion
-notification, which renders it as:
-
-    [IMPORTANT: Background process <id> exited (exit code None).
-
-"exited (exit code None)" reads as a finished process whose status is simply
-unknown-but-fine. In practice the user cannot tell that apart from a real
-completion, and a still-running job looks finished. The notification must say
-the exit code is unavailable, not print ``None``.
-"""
 from __future__ import annotations
 
 from tools.process_registry import format_process_notification
