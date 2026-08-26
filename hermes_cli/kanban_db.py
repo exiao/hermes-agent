@@ -5749,10 +5749,13 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       finish, transient infra error clears).
 
     The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    ``"blocked"`` / ``"unblocked"`` / ``"promoted_manual"`` event for the
+    task.  If the most recent one is ``"blocked"`` (or there is a
+    ``"blocked"`` event and no ``"unblocked"``/``"promoted_manual"`` event
+    has fired since), the task is sticky and ``recompute_ready`` must *not*
+    auto-promote it.  Legacy cards created with ``initial_status='blocked'``
+    have no ``"blocked"`` event, so their ``"created"`` payload is also a
+    sticky marker until an explicit release event supersedes it.
 
     Returns ``False`` when there is no such event at all (e.g. the task
     was set to ``status='blocked'`` by the circuit breaker or by direct
@@ -5760,12 +5763,23 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     for that path.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN "
+        "('created', 'blocked', 'unblocked', 'promoted_manual') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if row is None:
+        return False
+    if row["kind"] == "blocked":
+        return True
+    if row["kind"] != "created":
+        return False
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    return isinstance(payload, dict) and payload.get("status") == "blocked"
 
 
 def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool:

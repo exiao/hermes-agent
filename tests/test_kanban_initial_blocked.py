@@ -32,6 +32,41 @@ def _status(c, task_id):
     ).fetchone()["status"]
 
 
+def test_preexisting_initial_status_blocked_stays_parked(conn):
+    """Legacy cards have only their original ``created`` event."""
+    tid = kanban_db.create_task(
+        conn, title="legacy parked ticket", assignee="dev", initial_status="blocked",
+    )
+    # Simulate a board created before the sticky ``blocked`` event was added.
+    conn.execute(
+        "DELETE FROM task_events WHERE task_id = ? AND kind = 'blocked'", (tid,)
+    )
+    conn.commit()
+
+    assert kanban_db._has_sticky_block(conn, tid) is True
+    kanban_db.recompute_ready(conn)
+
+    assert _status(conn, tid) == "blocked"
+
+
+def test_manual_promotion_releases_creation_park(conn):
+    """A deliberate manual promotion must clear the legacy marker."""
+    tid = kanban_db.create_task(
+        conn, title="released ticket", assignee="dev", initial_status="blocked",
+    )
+    ok, reason = kanban_db.promote_task(conn, tid, actor="operator", force=True)
+
+    assert (ok, reason) == (True, None)
+    assert kanban_db._has_sticky_block(conn, tid) is False
+
+    # A later circuit-breaker block has no explicit ``blocked`` event and may
+    # recover because the operator already released the creation-time park.
+    conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+    conn.commit()
+    kanban_db.recompute_ready(conn)
+    assert _status(conn, tid) == "ready"
+
+
 def test_initial_status_blocked_survives_recompute_ready(conn):
     """The whole point of the flag: no lane picks the card up."""
     tid = kanban_db.create_task(
