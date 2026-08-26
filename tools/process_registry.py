@@ -3159,11 +3159,22 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "failed to start"
     elif _exit == 0:
         _status = "completed normally"
+    elif _exit is None:
+        # A recovered (detached) session has no waitable handle, so
+        # _refresh_detached_session sets exit_code=None on purpose. Printing
+        # "exit code None" reads like a finished process with an odd status;
+        # the agent cannot tell it from a real completion and has treated
+        # still-running jobs as done. Say the code is unavailable instead.
+        _status = "is no longer running, but its exit code is unavailable"
     else:
         _status = "exited"
     text = (
         f"[IMPORTANT: Background process {_sid} {_status} "
         f"(exit code {_exit}{_signal}).\n"
+    ) if _exit is not None else (
+        f"[IMPORTANT: Background process {_sid} {_status} "
+        f"(the process was recovered after a restart, so no exit status was "
+        f"captured — check its output or output file to confirm it finished).\n"
     )
     if _attribution:
         text += f"{_attribution}\n"
