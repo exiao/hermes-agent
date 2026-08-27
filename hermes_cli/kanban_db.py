@@ -5765,7 +5765,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     row = conn.execute(
         "SELECT kind, payload FROM task_events "
         "WHERE task_id = ? AND kind IN "
-        "('created', 'blocked', 'unblocked', 'promoted_manual') "
+        "('created', 'blocked', 'unblocked', 'promoted_manual', 'status') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -5773,12 +5773,15 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         return False
     if row["kind"] == "blocked":
         return True
-    if row["kind"] != "created":
+    if row["kind"] not in {"created", "status"}:
         return False
     try:
         payload = json.loads(row["payload"]) if row["payload"] else {}
     except (json.JSONDecodeError, TypeError):
         payload = {}
+    # A `status` event is an operator drag on the dashboard: moving a card OUT
+    # of `blocked` (to todo/triage/ready) releases the park exactly like
+    # `unblock_task`, and dragging one IN is a deliberate park.
     return isinstance(payload, dict) and payload.get("status") == "blocked"
 
 

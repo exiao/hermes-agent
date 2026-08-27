@@ -109,3 +109,29 @@ def test_a_normal_card_is_unaffected(conn):
 
     assert _status(conn, tid) == "ready"
     assert "blocked" not in _kinds(conn, tid)
+
+
+def test_dashboard_drag_out_of_blocked_releases_the_park(conn):
+    """Dragging blocked -> todo is a release, same as `unblock`.
+
+    The dashboard routes that move through `set_status_direct`, which writes a
+    `status` event, not `unblocked`. If the park survives it, a later
+    circuit-breaker `gave_up` looks like a deliberate park and the card never
+    auto-recovers.
+    """
+    tid = kanban_db.create_task(
+        conn, title="parked ticket", assignee="dev", initial_status="blocked",
+    )
+    assert kanban_db._has_sticky_block(conn, tid) is True
+
+    kanban_db.set_status_direct(conn, tid, "todo")
+
+    assert kanban_db._has_sticky_block(conn, tid) is False
+
+
+def test_dashboard_drag_into_blocked_is_a_park(conn):
+    """The other direction must still stick."""
+    tid = kanban_db.create_task(conn, title="normal", assignee="dev")
+    kanban_db.set_status_direct(conn, tid, "blocked")
+
+    assert kanban_db._has_sticky_block(conn, tid) is True
