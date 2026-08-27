@@ -12782,10 +12782,11 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 def _resolve_worker_terminal_config(
     hermes_home: Optional[str],
     inherited_backend: Optional[str] = None,
-) -> tuple[Optional[str], bool]:
-    """Return the assignee profile's backend and Docker cwd-mount setting."""
+    inherited_mount_cwd: Optional[str] = None,
+) -> tuple[Optional[str], bool, Optional[str]]:
+    """Return the assignee profile's backend, Docker cwd-mount and explicit cwd."""
     if not hermes_home:
-        return None, False
+        return None, False, None
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import apply_terminal_config_to_env
@@ -12799,6 +12800,8 @@ def _resolve_worker_terminal_config(
             probe_env = {}
             if inherited_backend:
                 probe_env["TERMINAL_ENV"] = inherited_backend
+            if inherited_mount_cwd is not None:
+                probe_env["TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE"] = inherited_mount_cwd
             apply_terminal_config_to_env(env=probe_env)
         finally:
             reset_hermes_home_override(token)
@@ -12806,7 +12809,8 @@ def _resolve_worker_terminal_config(
         mount_cwd = probe_env.get("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
         if isinstance(mount_cwd, str):
             mount_cwd = mount_cwd.strip().lower() in {"true", "1", "yes"}
-        return str(backend).strip().lower() or "local", bool(mount_cwd)
+        profile_cwd = probe_env.get("TERMINAL_CWD") or None
+        return str(backend).strip().lower() or "local", bool(mount_cwd), profile_cwd
     except Exception as exc:
         _log.warning(
             "kanban worker: could not resolve terminal backend for HERMES_HOME=%r (%s); "
@@ -12814,7 +12818,7 @@ def _resolve_worker_terminal_config(
             hermes_home,
             exc,
         )
-        return None, False
+        return None, False, None
 
 
 _retagged_workspace_roots: set[str] = set()
@@ -12949,14 +12953,22 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
-    worker_terminal_backend, docker_mount_cwd = _resolve_worker_terminal_config(
+    worker_terminal_backend, docker_mount_cwd, worker_profile_cwd = _resolve_worker_terminal_config(
         env.get("HERMES_HOME"),
         env.get("TERMINAL_ENV"),
+        env.get("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE"),
     )
     host_workspace_worker = worker_terminal_backend == "local" or (
         worker_terminal_backend == "docker" and docker_mount_cwd
     )
     remote_worker = not host_workspace_worker
+    # An SSH worker runs every command through `cd <cwd> || exit 126` on the
+    # REMOTE machine and, unlike the container backends, terminal_tool does not
+    # sanitize a host path out of TERMINAL_CWD. An inherited dispatcher cwd
+    # therefore breaks every command on a host whose directory layout differs.
+    # Drop it unless the assignee profile set a cwd of its own.
+    if worker_terminal_backend == "ssh" and not worker_profile_cwd:
+        env.pop("TERMINAL_CWD", None)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id

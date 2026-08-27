@@ -299,3 +299,80 @@ def test_explicit_terminal_env_preserved_when_root_has_no_terminal_section(monke
     # The explicit operator selection is preserved, not scrubbed.
     assert captured["env"]["TERMINAL_ENV"] == "modal"
     assert captured["env"]["TERMINAL_MODAL_IMAGE"] == "im-operatorExplicit123"
+
+
+def test_inherited_docker_mount_flag_keeps_workspace_pin(monkeypatch, tmp_path):
+    """An env-only docker+mount selection must still pin the task workspace.
+
+    When both configs omit ``terminal:`` and the gateway was launched with
+    TERMINAL_ENV=docker plus TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true, the
+    child inherits both. A probe that copies only the backend resolves
+    mount_cwd as false, leaves cwd unpinned, and Docker then bind-mounts the
+    dispatcher checkout at /workspace instead of the task workspace.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert captured["env"]["TERMINAL_CWD"] == str(workspace)
+    assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert captured["cwd"] == str(workspace)
+
+
+def test_ssh_worker_drops_inherited_host_cwd(monkeypatch, tmp_path):
+    """SSH runs `cd <cwd> || exit 126` remotely, so a host path must not survive."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "w"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nterminal:\n  backend: ssh\n", encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("TERMINAL_CWD", "/host/gateway")
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert "TERMINAL_CWD" not in captured["env"]
+    assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
+
+
+def test_ssh_worker_keeps_its_own_profile_cwd(monkeypatch, tmp_path):
+    """An explicit profile cwd is a real remote path and must be bridged."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "w"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nterminal:\n  backend: ssh\n  cwd: /srv/work\n",
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("TERMINAL_CWD", "/host/gateway")
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert captured["env"]["TERMINAL_CWD"] == "/host/gateway"
