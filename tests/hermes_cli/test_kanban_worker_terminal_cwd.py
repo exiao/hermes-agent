@@ -105,18 +105,19 @@ def test_remote_worker_does_not_receive_host_workspace_cwd(monkeypatch, tmp_path
     assert captured["cwd"] is None
 
 
-def test_docker_worker_with_cwd_mount_uses_task_workspace(monkeypatch, tmp_path):
-    """Docker's explicit cwd mount still needs the claimed workspace path."""
+def test_docker_worker_still_receives_host_workspace_cwd(monkeypatch, tmp_path):
+    """Docker bind-mounts host paths, so its workspace must stay pinned."""
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "w"
     profile.mkdir(parents=True)
     (profile / "config.yaml").write_text(
-        "toolsets:\n  - kanban\nterminal:\n"
-        "  backend: docker\n  docker_mount_cwd_to_workspace: true\n",
+        "toolsets:\n  - kanban\nterminal:\n  backend: docker\n"
+        "  docker_mount_cwd_to_workspace: true\n",
         encoding="utf-8",
     )
-    root.joinpath("config.yaml").write_text(
-        "toolsets:\n  - kanban\nterminal:\n  backend: local\n", encoding="utf-8"
+    (root / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nterminal:\n  backend: local\n",
+        encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setenv("TERMINAL_CWD", "/host/gateway")
