@@ -82,6 +82,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -890,6 +891,24 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "logs"
     return board_dir(slug) / "logs"
+
+
+def _remote_worker_spawn_dir(board: Optional[str] = None) -> Path:
+    """Return a neutral, host-independent cwd for a remote worker process.
+
+    A remote (Modal/Daytona/Vercel/Singularity) worker gets no TERMINAL_CWD, so
+    its context-file loader and ``file_tools._resolve_base_dir`` fall back to
+    the PROCESS cwd. Inheriting the dispatcher's checkout there would load the
+    gateway's ``AGENTS.md`` and anchor relative paths to a path that does not
+    exist in the sandbox. An empty, stable directory gives both a defined
+    answer with nothing to pick up.
+    """
+    path = worker_logs_dir(board=board).parent / "remote-cwd"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return Path(tempfile.gettempdir())
+    return path
 
 
 def board_metadata_path(board: Optional[str] = None) -> Path:
@@ -13165,10 +13184,22 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    # A remote worker must not inherit the dispatcher's process cwd either:
+    # with TERMINAL_CWD cleared, resolve_context_cwd() returns None and both
+    # the context-file loader and file_tools._resolve_base_dir fall back to
+    # os.getcwd(), so the worker would still load the gateway checkout's
+    # AGENTS.md and anchor relative paths there. Launch it in a neutral,
+    # empty directory instead.
+    if remote_worker:
+        spawn_cwd: Optional[str] = str(_remote_worker_spawn_dir(board))
+    elif os.path.isdir(workspace):
+        spawn_cwd = workspace
+    else:
+        spawn_cwd = None
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if not remote_worker and os.path.isdir(workspace) else None,
+            cwd=spawn_cwd,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,

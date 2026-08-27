@@ -13,7 +13,9 @@ Pinning ``TERMINAL_CWD`` to the workspace fixes both.
 
 from __future__ import annotations
 
+import os
 import subprocess
+from pathlib import Path
 
 
 def _make_task(kb, *, assignee: str = "w"):
@@ -102,7 +104,13 @@ def test_remote_worker_does_not_receive_host_workspace_cwd(monkeypatch, tmp_path
 
     assert "TERMINAL_CWD" not in captured["env"]
     assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
-    assert captured["cwd"] is None
+    # cwd=None would inherit the dispatcher's checkout, which is exactly what
+    # resolve_context_cwd()/_resolve_base_dir fall back to once TERMINAL_CWD is
+    # gone. The worker must be launched in a neutral empty dir instead.
+    assert captured["cwd"] is not None
+    assert captured["cwd"] != str(workspace)
+    assert captured["cwd"] != os.getcwd()
+    assert not any(Path(captured["cwd"]).iterdir())
 
 
 def test_docker_worker_still_receives_host_workspace_cwd(monkeypatch, tmp_path):
@@ -154,7 +162,7 @@ def test_inherited_terminal_backend_controls_remote_worker(monkeypatch, tmp_path
 
     assert captured["env"]["TERMINAL_ENV"] == "modal"
     assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
-    assert captured["cwd"] is None
+    assert captured["cwd"] not in (None, os.getcwd(), str(workspace))
 
 
 def test_non_docker_mount_flag_does_not_enable_host_workspace(monkeypatch, tmp_path):
@@ -178,7 +186,7 @@ def test_non_docker_mount_flag_does_not_enable_host_workspace(monkeypatch, tmp_p
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
     assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
-    assert captured["cwd"] is None
+    assert captured["cwd"] not in (None, os.getcwd(), str(workspace))
 
 
 def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path):
@@ -399,7 +407,7 @@ def test_environment_only_ssh_keeps_explicit_remote_cwd(monkeypatch, tmp_path):
 
     assert captured["env"]["TERMINAL_CWD"] == "/srv/work"
     assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
-    assert captured["cwd"] is None
+    assert captured["cwd"] not in (None, os.getcwd(), str(workspace))
 
 
 def test_remote_worker_drops_inherited_kanban_workspace(monkeypatch, tmp_path):
@@ -423,4 +431,4 @@ def test_remote_worker_drops_inherited_kanban_workspace(monkeypatch, tmp_path):
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
     assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
-    assert captured["cwd"] is None
+    assert captured["cwd"] not in (None, os.getcwd(), str(workspace))
