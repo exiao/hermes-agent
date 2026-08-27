@@ -74,15 +74,9 @@ def _builtin_gateway_liveness() -> Optional[bool]:
     nothing for them, so they report active. ``None`` = probe failed; callers
     must not claim either way.
 
-    ``find_gateway_pids()`` is written for *outside* callers: it drops the
-    calling PID and its entire ancestor chain so ``hermes gateway status`` can
-    never count itself. When this probe runs INSIDE the gateway -- the
-    ``cronjob`` model tool, a cron-run agent, or any terminal child of the
-    gateway -- that exclusion removes the one PID that proves the ticker is
-    alive, so the scheduler reports "gateway is not running" to a user whose
-    gateway is plainly running (it just answered them). Ask the PID file first;
-    ``get_running_pid()`` is self-inclusive and authoritative. Only fall back to
-    the ancestor-excluding process scan when the PID file says nothing.
+    Check the PID file before the process scan: ``find_gateway_pids()`` excludes
+    the caller and its ancestor chain (#13242), so when this probe runs INSIDE
+    the gateway it would hide the very PID that proves the ticker is alive.
     """
     try:
         if _active_cron_provider_name() != "builtin":
