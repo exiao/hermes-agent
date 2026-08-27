@@ -100,7 +100,7 @@ def test_remote_worker_does_not_receive_host_workspace_cwd(monkeypatch, tmp_path
 
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
-    assert captured["env"]["TERMINAL_CWD"] == "/host/gateway"
+    assert "TERMINAL_CWD" not in captured["env"]
     assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
     assert captured["cwd"] is None
 
@@ -375,4 +375,52 @@ def test_ssh_worker_keeps_its_own_profile_cwd(monkeypatch, tmp_path):
 
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
-    assert captured["env"]["TERMINAL_CWD"] == "/host/gateway"
+    assert captured["env"]["TERMINAL_CWD"] == "/srv/work"
+
+
+def test_environment_only_ssh_keeps_explicit_remote_cwd(monkeypatch, tmp_path):
+    """An env-only SSH selection may intentionally target a remote directory."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_CWD", "/srv/work")
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert captured["env"]["TERMINAL_CWD"] == "/srv/work"
+    assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
+    assert captured["cwd"] is None
+
+
+def test_remote_worker_drops_inherited_kanban_workspace(monkeypatch, tmp_path):
+    """Remote workers must not retain a parent's host workspace variable."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "w"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nterminal:\n  backend: modal\n",
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/host/parent-workspace")
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
+    assert captured["cwd"] is None

@@ -12783,13 +12783,13 @@ def _resolve_worker_terminal_config(
     hermes_home: Optional[str],
     inherited_backend: Optional[str] = None,
     inherited_mount_cwd: Optional[str] = None,
-) -> tuple[Optional[str], bool, Optional[str]]:
-    """Return the assignee profile's backend, Docker cwd-mount and explicit cwd."""
+) -> tuple[Optional[str], bool, Optional[str], bool]:
+    """Return the assignee profile's backend, mount, cwd and backend source."""
     if not hermes_home:
-        return None, False, None
+        return None, False, None, False
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from hermes_cli.config import apply_terminal_config_to_env
+        from hermes_cli.config import apply_terminal_config_to_env, read_raw_config
 
         token = set_hermes_home_override(hermes_home)
         try:
@@ -12803,6 +12803,11 @@ def _resolve_worker_terminal_config(
             if inherited_mount_cwd is not None:
                 probe_env["TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE"] = inherited_mount_cwd
             apply_terminal_config_to_env(env=probe_env)
+            raw_terminal_cfg = read_raw_config().get("terminal")
+            profile_backend_explicit = (
+                isinstance(raw_terminal_cfg, dict)
+                and "backend" in raw_terminal_cfg
+            )
         finally:
             reset_hermes_home_override(token)
         backend = probe_env.get("TERMINAL_ENV", "local")
@@ -12810,7 +12815,12 @@ def _resolve_worker_terminal_config(
         if isinstance(mount_cwd, str):
             mount_cwd = mount_cwd.strip().lower() in {"true", "1", "yes"}
         profile_cwd = probe_env.get("TERMINAL_CWD") or None
-        return str(backend).strip().lower() or "local", bool(mount_cwd), profile_cwd
+        return (
+            str(backend).strip().lower() or "local",
+            bool(mount_cwd),
+            profile_cwd,
+            profile_backend_explicit,
+        )
     except Exception as exc:
         _log.warning(
             "kanban worker: could not resolve terminal backend for HERMES_HOME=%r (%s); "
@@ -12818,7 +12828,7 @@ def _resolve_worker_terminal_config(
             hermes_home,
             exc,
         )
-        return None, False, None
+        return None, False, None, False
 
 
 _retagged_workspace_roots: set[str] = set()
@@ -12953,7 +12963,12 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
-    worker_terminal_backend, docker_mount_cwd, worker_profile_cwd = _resolve_worker_terminal_config(
+    (
+        worker_terminal_backend,
+        docker_mount_cwd,
+        worker_profile_cwd,
+        worker_backend_explicit,
+    ) = _resolve_worker_terminal_config(
         env.get("HERMES_HOME"),
         env.get("TERMINAL_ENV"),
         env.get("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE"),
@@ -12962,18 +12977,23 @@ def _default_spawn(
         worker_terminal_backend == "docker" and docker_mount_cwd
     )
     remote_worker = not host_workspace_worker
-    # An SSH worker runs every command through `cd <cwd> || exit 126` on the
-    # REMOTE machine and, unlike the container backends, terminal_tool does not
-    # sanitize a host path out of TERMINAL_CWD. An inherited dispatcher cwd
-    # therefore breaks every command on a host whose directory layout differs.
-    # Drop it unless the assignee profile set a cwd of its own.
-    if worker_terminal_backend == "ssh" and not worker_profile_cwd:
-        env.pop("TERMINAL_CWD", None)
+    # Remote workers must not inherit the dispatcher's host cwd: file_tools and
+    # context-file loading consume TERMINAL_CWD before a terminal backend can
+    # sanitize it. Preserve an explicitly configured profile cwd. Environment-
+    # only SSH keeps its explicitly inherited remote cwd, while profile-selected
+    # SSH and every other remote backend discard the inherited host value.
+    if remote_worker:
+        if worker_profile_cwd:
+            env["TERMINAL_CWD"] = worker_profile_cwd
+        elif worker_terminal_backend != "ssh" or worker_backend_explicit:
+            env.pop("TERMINAL_CWD", None)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     if not remote_worker:
         env["HERMES_KANBAN_WORKSPACE"] = workspace
+    else:
+        env.pop("HERMES_KANBAN_WORKSPACE", None)
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
