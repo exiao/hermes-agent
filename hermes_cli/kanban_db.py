@@ -12779,6 +12779,31 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_worker_terminal_backend(hermes_home: Optional[str]) -> Optional[str]:
+    """Return the assignee profile's terminal backend."""
+    if not hermes_home:
+        return None
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            cfg = load_config()
+        finally:
+            reset_hermes_home_override(token)
+        backend = cfg.get("terminal", {}).get("backend", "local")
+        return str(backend).strip().lower() or "local"
+    except Exception as exc:
+        _log.warning(
+            "kanban worker: could not resolve terminal backend for HERMES_HOME=%r (%s); "
+            "not pinning the host workspace",
+            hermes_home,
+            exc,
+        )
+        return None
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -12911,10 +12936,13 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    worker_terminal_backend = _resolve_worker_terminal_backend(env.get("HERMES_HOME"))
+    remote_worker = worker_terminal_backend != "local"
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
-    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    if not remote_worker:
+        env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -12935,7 +12963,7 @@ def _default_spawn(
     # Only pin a real, absolute directory — file_tools rejects relative /
     # sentinel TERMINAL_CWD values, so a non-dir workspace must NOT be set
     # here (leave the inherited value rather than write a meaningless one).
-    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+    if not remote_worker and workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
@@ -13089,7 +13117,7 @@ def _default_spawn(
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=workspace if not remote_worker and os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,

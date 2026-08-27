@@ -77,6 +77,34 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
+def test_remote_worker_does_not_receive_host_workspace_cwd(monkeypatch, tmp_path):
+    """Modal workers must start in their sandbox, not a host-only path."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "w"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nterminal:\n  backend: modal\n",
+        encoding="utf-8",
+    )
+    (root / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nterminal:\n  backend: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("TERMINAL_CWD", "/host/gateway")
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert captured["env"]["TERMINAL_CWD"] == "/host/gateway"
+    assert "HERMES_KANBAN_WORKSPACE" not in captured["env"]
+    assert captured["cwd"] is None
+
+
 def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path):
     """A non-directory workspace must NOT clobber the inherited TERMINAL_CWD.
 
