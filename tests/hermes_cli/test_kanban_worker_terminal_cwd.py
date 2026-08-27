@@ -105,6 +105,34 @@ def test_remote_worker_does_not_receive_host_workspace_cwd(monkeypatch, tmp_path
     assert captured["cwd"] is None
 
 
+def test_docker_worker_with_cwd_mount_uses_task_workspace(monkeypatch, tmp_path):
+    """Docker's explicit cwd mount still needs the claimed workspace path."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "w"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nterminal:\n"
+        "  backend: docker\n  docker_mount_cwd_to_workspace: true\n",
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\nterminal:\n  backend: local\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("TERMINAL_CWD", "/host/gateway")
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert captured["env"]["TERMINAL_CWD"] == str(workspace)
+    assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert captured["cwd"] == str(workspace)
+
+
 def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path):
     """A non-directory workspace must NOT clobber the inherited TERMINAL_CWD.
 

@@ -12779,10 +12779,12 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
-def _resolve_worker_terminal_backend(hermes_home: Optional[str]) -> Optional[str]:
-    """Return the assignee profile's terminal backend."""
+def _resolve_worker_terminal_config(
+    hermes_home: Optional[str],
+) -> tuple[Optional[str], bool]:
+    """Return the assignee profile's backend and Docker cwd-mount setting."""
     if not hermes_home:
-        return None
+        return None, False
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
@@ -12792,8 +12794,12 @@ def _resolve_worker_terminal_backend(hermes_home: Optional[str]) -> Optional[str
             cfg = load_config()
         finally:
             reset_hermes_home_override(token)
-        backend = cfg.get("terminal", {}).get("backend", "local")
-        return str(backend).strip().lower() or "local"
+        terminal_cfg = cfg.get("terminal", {})
+        backend = terminal_cfg.get("backend", "local")
+        mount_cwd = terminal_cfg.get("docker_mount_cwd_to_workspace", False)
+        if isinstance(mount_cwd, str):
+            mount_cwd = mount_cwd.strip().lower() in {"true", "1", "yes"}
+        return str(backend).strip().lower() or "local", bool(mount_cwd)
     except Exception as exc:
         _log.warning(
             "kanban worker: could not resolve terminal backend for HERMES_HOME=%r (%s); "
@@ -12801,7 +12807,7 @@ def _resolve_worker_terminal_backend(hermes_home: Optional[str]) -> Optional[str
             hermes_home,
             exc,
         )
-        return None
+        return None, False
 
 
 _retagged_workspace_roots: set[str] = set()
@@ -12936,8 +12942,10 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
-    worker_terminal_backend = _resolve_worker_terminal_backend(env.get("HERMES_HOME"))
-    remote_worker = worker_terminal_backend != "local"
+    worker_terminal_backend, docker_mount_cwd = _resolve_worker_terminal_config(
+        env.get("HERMES_HOME")
+    )
+    remote_worker = worker_terminal_backend != "local" and not docker_mount_cwd
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
