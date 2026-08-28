@@ -4702,6 +4702,19 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if task_status == "blocked":
+                    # A park at creation must be STICKY. `_has_sticky_block`
+                    # reads events, not status, so a card parked with only a
+                    # status flip looks like circuit-breaker debris to
+                    # `recompute_ready`, which promotes it and hands a worker
+                    # a ticket nobody scheduled (t_7a8459f5: created and
+                    # claimed four seconds apart). `unblock_task` is still the
+                    # exit; it emits "unblocked" and flips the predicate back.
+                    _append_event(
+                        conn, task_id, "blocked",
+                        {"reason": "parked at creation "
+                                   "(initial_status=blocked)"},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -5736,10 +5749,13 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       finish, transient infra error clears).
 
     The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    ``"blocked"`` / ``"unblocked"`` / ``"promoted_manual"`` event for the
+    task.  If the most recent one is ``"blocked"`` (or there is a
+    ``"blocked"`` event and no ``"unblocked"``/``"promoted_manual"`` event
+    has fired since), the task is sticky and ``recompute_ready`` must *not*
+    auto-promote it.  Legacy cards created with ``initial_status='blocked'``
+    have no ``"blocked"`` event, so their ``"created"`` payload is also a
+    sticky marker until an explicit release event supersedes it.
 
     Returns ``False`` when there is no such event at all (e.g. the task
     was set to ``status='blocked'`` by the circuit breaker or by direct
@@ -5747,12 +5763,26 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     for that path.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN "
+        "('created', 'blocked', 'unblocked', 'promoted_manual', 'status') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if row is None:
+        return False
+    if row["kind"] == "blocked":
+        return True
+    if row["kind"] not in {"created", "status"}:
+        return False
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    # A `status` event is an operator drag on the dashboard: moving a card OUT
+    # of `blocked` (to todo/triage/ready) releases the park exactly like
+    # `unblock_task`, and dragging one IN is a deliberate park.
+    return isinstance(payload, dict) and payload.get("status") == "blocked"
 
 
 def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool:
