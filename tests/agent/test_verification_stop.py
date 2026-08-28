@@ -279,6 +279,9 @@ def test_is_non_code_path_classification():
          {"verify_on_stop": False, "verify_on_stop_exclude_surfaces": ["cron"]}, False),
         ("empty list changes nothing", {"HERMES_SESSION_PLATFORM": "cron"},
          {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": []}, True),
+        # A mistyped config value must not crash the stop guard.
+        ("non-iterable value is ignored", {"HERMES_SESSION_PLATFORM": "cron"},
+         {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": 5}, True),
         # The documented top-precedence escape hatch still wins.
         ("env override beats exclusion",
          {"HERMES_SESSION_PLATFORM": "cron", "HERMES_VERIFY_ON_STOP": "1"},

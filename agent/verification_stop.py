@@ -104,7 +104,9 @@ def _surface_is_excluded(agent_cfg: Any) -> bool:
     if not isinstance(agent_cfg, dict):
         return False
     raw = agent_cfg.get("verify_on_stop_exclude_surfaces")
-    parts: Iterable[Any] = raw.split(",") if isinstance(raw, str) else (raw or ())
+    parts = raw.split(",") if isinstance(raw, str) else raw
+    if not isinstance(parts, (list, tuple, set, frozenset)):
+        return False
     excluded = {str(p or "").strip().lower() for p in parts} - {""}
     if not excluded:
         return False
@@ -112,7 +114,9 @@ def _surface_is_excluded(agent_cfg: Any) -> bool:
     try:
         from gateway.session_context import get_session_env
     except Exception:  # gateway package unreachable (CLI, tests)
-        get_session_env = lambda name, default="": os.environ.get(name, default)  # noqa: E731
+        def get_session_env(name: str, default: str = "") -> str:
+            return os.environ.get(name, default)
+
     platform = os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM", "")
     source = get_session_env("HERMES_SESSION_SOURCE", "")
     return any(str(i or "").strip().lower() in excluded for i in (platform, source))
