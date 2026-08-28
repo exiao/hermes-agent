@@ -18,7 +18,11 @@ dotenv the frozen copy, so no later pass can observe the deletion.
 
 from collections.abc import MutableMapping
 import os
+import subprocess
+import sys
 import threading
+
+import pytest
 
 from dotenv import load_dotenv as dotenv_load_dotenv
 
@@ -294,3 +298,42 @@ def test_load_dotenv_swap_is_serialized_by_process_lock(tmp_path, monkeypatch):
 
     assert not worker.is_alive()
     assert entered.is_set()
+
+
+def test_stable_environ_rejects_bytes_keys_like_real_environ():
+    """Regression: bytes keys must not alias str entries.
+
+    ``_encode_key`` used to swallow the ``TypeError`` from
+    ``os._Environ.encodekey`` and fall back to the raw key, so
+    ``stable[b'PATH']`` returned the value of the str key ``'PATH'``.
+    ``os.get_exec_path`` reads both spellings, saw two, and raised
+    ``ValueError: env cannot contain 'PATH' and b'PATH' keys`` -- every
+    subprocess spawned while the wrapper was installed died (observed
+    2026-08-28: kanban dispatcher ticks + the earnings-card cron).
+    """
+    stable = env_loader._StableEnviron(os.environ)
+
+    for probe in (
+        lambda m: m[b"PATH"],
+        lambda m: m.get(b"PATH"),
+        lambda m: b"PATH" in m,
+    ):
+        with pytest.raises(TypeError):
+            probe(os.environ)
+        with pytest.raises(TypeError):
+            probe(stable)
+
+    assert stable["PATH"] == os.environ["PATH"]
+
+
+def test_subprocess_works_while_stable_environ_is_installed(monkeypatch):
+    """The wrapper must survive os.get_exec_path / subprocess.run."""
+    stable = env_loader._StableEnviron(os.environ)
+    monkeypatch.setattr(os, "environ", stable)
+
+    assert os.get_exec_path()
+    proc = subprocess.run(
+        [sys.executable, "-c", "print('ok')"],
+        stdout=subprocess.PIPE, text=True, timeout=60, check=True,
+    )
+    assert proc.stdout.strip() == "ok"

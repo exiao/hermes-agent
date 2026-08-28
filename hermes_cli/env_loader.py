@@ -395,6 +395,15 @@ class _StableEnviron(MutableMapping[str, str]):
             return key
         try:
             return encode_key(key)
+        except TypeError:
+            # ``os._Environ.encodekey`` rejects the wrong key type (bytes on a
+            # str-keyed environ). Re-raise so this wrapper agrees with the real
+            # mapping instead of falling back to the raw key: that fallback made
+            # ``stable[b'PATH']`` alias the str ``'PATH'`` entry, so
+            # ``os.get_exec_path`` saw BOTH 'PATH' and b'PATH' and raised
+            # ``ValueError: env cannot contain 'PATH' and b'PATH' keys``,
+            # killing every subprocess spawned while the wrapper was installed.
+            raise
         except Exception:  # noqa: BLE001 - match os._Environ's fail-open reads
             return key
 
