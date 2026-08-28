@@ -31,6 +31,32 @@ from tools.environments.file_sync import (
 logger = logging.getLogger(__name__)
 
 
+_BULK_UPLOAD_MIN_TIMEOUT = 120
+_BULK_UPLOAD_MAX_TIMEOUT = 1800
+# Deliberately pessimistic: a cold sync of a large skills tree is thousands of
+# small files, where per-file overhead dominates raw link speed.
+_BULK_UPLOAD_BYTES_PER_SEC = 2_000_000
+
+
+def _bulk_upload_timeout(files: list[tuple[str, str]]) -> int:
+    """Return a transfer budget in seconds scaled to the payload size.
+
+    Sizing off the payload keeps a cold first sync (every skill and cache
+    file at once) from being killed mid-stream while still failing fast on a
+    genuinely wedged connection during small incremental syncs.
+    """
+    total = 0
+    for host_path, _ in files:
+        try:
+            total += os.path.getsize(host_path)
+        except OSError:
+            # An unreadable file is skipped by tar too; it costs no transfer
+            # time, so leaving it out of the estimate is correct.
+            continue
+    scaled = int(total / _BULK_UPLOAD_BYTES_PER_SEC) + _BULK_UPLOAD_MIN_TIMEOUT
+    return min(scaled, _BULK_UPLOAD_MAX_TIMEOUT)
+
+
 def _ensure_ssh_available() -> None:
     """Fail fast with a clear error when the SSH client is unavailable."""
     if not shutil.which("ssh"):
@@ -282,13 +308,13 @@ class SSHEnvironment(BaseEnvironment):
                     else:
                         raise
 
-            tar_cmd = ["tar", "-chf", "-", "-C", staging, "."]
+            tar_cmd = ["tar", "-czhf", "-", "-C", staging, "."]
             ssh_cmd = self._build_ssh_command()
             # --no-overwrite-dir prevents tar from overwriting the mode of
             # existing directories (e.g. /home/<user>) with the staging
             # directory's mode.  Without this, a umask 002 produces 0775
             # dirs which breaks sshd StrictModes (refuses authorized_keys).
-            ssh_cmd.append(f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}")
+            ssh_cmd.append(f"tar xzf - --no-overwrite-dir -C {shlex.quote(base)}")
 
             tar_proc = subprocess.Popen(
                 tar_cmd,
@@ -309,8 +335,15 @@ class SSHEnvironment(BaseEnvironment):
             # Allow tar_proc to receive SIGPIPE if ssh_proc exits early
             tar_proc.stdout.close()
 
+            # A fixed ceiling fails on payload, not on health: the first sync
+            # of a fresh remote pushes every skill and cache file at once
+            # (measured: 237 MB / 12k files), which cannot finish in 120s on a
+            # normal uplink, so every cold start died mid-transfer and rolled
+            # back. Scale the budget with the bytes actually being sent and
+            # keep a floor for small incremental syncs.
+            upload_timeout = _bulk_upload_timeout(files)
             try:
-                _, ssh_stderr = ssh_proc.communicate(timeout=120)
+                _, ssh_stderr = ssh_proc.communicate(timeout=upload_timeout)
                 # Use communicate() instead of wait() to drain stderr and
                 # avoid deadlock if tar produces more than PIPE_BUF of errors.
                 tar_stderr_raw = b""
@@ -354,16 +387,25 @@ class SSHEnvironment(BaseEnvironment):
         # paths (e.g. home/user/.hermes/skills/f.py), matching _pushed_hashes keys.
         rel_base = f"{self._remote_home}/.hermes".lstrip("/")
         ssh_cmd = self._build_ssh_command()
-        ssh_cmd.append(f"tar cf - -C / {shlex.quote(rel_base)}")
+        # The remote tree is live: a running agent writes cache and log files
+        # while tar reads them, which tar reports as "file changed as we read
+        # it" and exits 1. That is a warning about a file we will pick up on
+        # the next sync, not a transfer failure, so suppress it rather than
+        # failing every sync_back on a busy box.
+        ssh_cmd.append(
+            f"tar cf - --warning=no-file-changed --warning=no-file-removed "
+            f"-C / {shlex.quote(rel_base)}"
+        )
         with open(dest, "wb") as f:
             result = subprocess.run(
                 ssh_cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=f,
                 stderr=subprocess.PIPE,
-                timeout=120,
+                timeout=_BULK_UPLOAD_MAX_TIMEOUT,
             )
-        if result.returncode != 0:
+        # GNU tar exit 1 is "some files differed"; the archive is still valid.
+        if result.returncode not in (0, 1):
             raise EnvironmentConnectionError(
                 f"SSH bulk download failed: {result.stderr.decode(errors='replace').strip()}",
                 retry_hint=(
