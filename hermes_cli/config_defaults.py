@@ -264,6 +264,15 @@ DEFAULT_CONFIG = {
         # TUI, desktop — and programmatic callers, off for conversational
         # messaging surfaces). Doc/markdown/skill-only edits never fire it.
         "verify_on_stop": False,
+        # Surfaces subtracted from verify_on_stop, by platform or session
+        # source name (e.g. ["cron"], or the string "cron, kanban"). This is
+        # the axis "auto" cannot express: "auto" splits messaging from local,
+        # which lumps an interactive chat platform together with unattended
+        # cron. Excluding "cron" keeps the verification narrative on the
+        # surfaces a human is watching while stopping it from overwriting a
+        # scheduled job's final report. Subtraction only — listing a surface
+        # never enables verification that resolved off.
+        "verify_on_stop_exclude_surfaces": [],
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.

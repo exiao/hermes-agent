@@ -92,6 +92,65 @@ def _session_is_messaging_surface() -> bool:
         return False
 
 
+def _current_surface_identities() -> list[str]:
+    """Every name this turn's surface answers to, lowercased.
+
+    Mirrors the resolution order in
+    ``gateway.session_context.session_is_messaging_surface``: the platform
+    (``HERMES_PLATFORM``, else the session platform) and the session source.
+    Cron binds ``platform="cron"``; the CLI/TUI bind a source instead, so both
+    are consulted.
+    """
+    identities: list[str] = []
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = os.getenv("HERMES_PLATFORM") or get_session_env(
+            "HERMES_SESSION_PLATFORM", ""
+        )
+        source = get_session_env("HERMES_SESSION_SOURCE", "")
+    except Exception:
+        platform = os.environ.get("HERMES_PLATFORM") or os.environ.get(
+            "HERMES_SESSION_PLATFORM", ""
+        )
+        source = os.environ.get("HERMES_SESSION_SOURCE", "")
+    for identity in (platform, source):
+        token = str(identity or "").strip().lower()
+        if token:
+            identities.append(token)
+    return identities
+
+
+def _excluded_surfaces(agent_cfg: Any) -> frozenset[str]:
+    """Parse ``agent.verify_on_stop_exclude_surfaces`` into a name set.
+
+    Accepts a list (``["cron"]``) or a comma-separated string
+    (``"cron, kanban"``). Names are compared case- and whitespace-insensitively.
+    """
+    if not isinstance(agent_cfg, dict):
+        return frozenset()
+    raw = agent_cfg.get("verify_on_stop_exclude_surfaces")
+    if isinstance(raw, str):
+        parts: Iterable[Any] = raw.split(",")
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        parts = raw
+    else:
+        return frozenset()
+    return frozenset(
+        token
+        for token in (str(part or "").strip().lower() for part in parts)
+        if token
+    )
+
+
+def _surface_is_excluded(agent_cfg: Any) -> bool:
+    """Whether this turn's surface is named in the exclusion list."""
+    excluded = _excluded_surfaces(agent_cfg)
+    if not excluded:
+        return False
+    return any(identity in excluded for identity in _current_surface_identities())
+
+
 def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     """Return whether edit -> verify-before-finish behavior is enabled.
 
@@ -105,6 +164,11 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     conversational messaging surfaces (Telegram, Discord, etc.) where the
     verification narrative would reach a human as chat noise. A missing or
     unrecognized value falls back to OFF.
+
+    ``agent.verify_on_stop_exclude_surfaces`` then subtracts named surfaces
+    (matched against the session platform or source, e.g. ``["cron"]``), for
+    the case ``"auto"`` cannot express: on for an interactive chat platform,
+    off for unattended cron. It only ever turns the behavior off.
     """
     env = os.environ.get("HERMES_VERIFY_ON_STOP")
     if env is not None:
@@ -118,6 +182,11 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
             config = {}
     agent_cfg = (config or {}).get("agent") if isinstance(config, dict) else None
     cfg_val = agent_cfg.get("verify_on_stop") if isinstance(agent_cfg, dict) else None
+    # Subtract explicitly excluded surfaces. This runs BELOW the env override
+    # (which stays the top-precedence escape hatch) and only ever turns the
+    # behavior OFF — it never enables a setting that resolved off.
+    if _surface_is_excluded(agent_cfg):
+        return False
     if isinstance(cfg_val, bool):
         return cfg_val
     if isinstance(cfg_val, str):

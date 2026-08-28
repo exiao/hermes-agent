@@ -248,3 +248,68 @@ def test_is_non_code_path_classification():
     assert _is_non_code_path("src/app.ts") is False
     assert _is_non_code_path("config.yaml") is False
     assert _is_non_code_path("run_agent.py") is False
+
+
+# --- surface exclusion list -------------------------------------------------
+# "auto" is a single axis (messaging vs local) and cannot express "on for my
+# chat platform, off for unattended cron". agent.verify_on_stop_exclude_surfaces
+# subtracts named surfaces from an otherwise-enabled setting.
+
+
+def test_exclude_surfaces_turns_off_named_surface(clear_verify_env):
+    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "cron")
+    cfg = {"agent": {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": ["cron"]}}
+    assert verify_on_stop_enabled(cfg) is False
+
+
+def test_exclude_surfaces_leaves_other_surfaces_on(clear_verify_env):
+    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "signal")
+    cfg = {"agent": {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": ["cron"]}}
+    assert verify_on_stop_enabled(cfg) is True
+
+
+def test_exclude_surfaces_matches_session_source_too(clear_verify_env):
+    # cron binds platform, but a worker may only carry HERMES_SESSION_SOURCE.
+    clear_verify_env.setenv("HERMES_SESSION_SOURCE", "cron")
+    cfg = {"agent": {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": ["cron"]}}
+    assert verify_on_stop_enabled(cfg) is False
+
+
+def test_exclude_surfaces_is_case_and_space_insensitive(clear_verify_env):
+    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "CRON")
+    cfg = {"agent": {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": [" Cron "]}}
+    assert verify_on_stop_enabled(cfg) is False
+
+
+def test_exclude_surfaces_accepts_comma_string(clear_verify_env):
+    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "kanban")
+    cfg = {"agent": {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": "cron, kanban"}}
+    assert verify_on_stop_enabled(cfg) is False
+
+
+def test_exclude_surfaces_applies_under_auto(clear_verify_env):
+    # "auto" resolves ON for a local surface; the exclusion still subtracts it.
+    clear_verify_env.setenv("HERMES_SESSION_SOURCE", "cli")
+    cfg = {"agent": {"verify_on_stop": "auto", "verify_on_stop_exclude_surfaces": ["cli"]}}
+    assert verify_on_stop_enabled(cfg) is False
+
+
+def test_exclude_surfaces_never_enables_a_disabled_setting(clear_verify_env):
+    # Subtraction only. An off setting stays off for a non-excluded surface.
+    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "signal")
+    cfg = {"agent": {"verify_on_stop": False, "verify_on_stop_exclude_surfaces": ["cron"]}}
+    assert verify_on_stop_enabled(cfg) is False
+
+
+def test_explicit_env_override_beats_exclude_surfaces(clear_verify_env):
+    # HERMES_VERIFY_ON_STOP is the documented top-precedence escape hatch.
+    clear_verify_env.setenv("HERMES_VERIFY_ON_STOP", "1")
+    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "cron")
+    cfg = {"agent": {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": ["cron"]}}
+    assert verify_on_stop_enabled(cfg) is True
+
+
+def test_empty_exclude_list_changes_nothing(clear_verify_env):
+    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "cron")
+    cfg = {"agent": {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": []}}
+    assert verify_on_stop_enabled(cfg) is True
