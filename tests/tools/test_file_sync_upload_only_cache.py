@@ -167,3 +167,46 @@ def test_new_upload_only_path_is_protected_during_sync_back(monkeypatch, tmp_pat
     mgr.sync_back(hermes_home=tmp_path / "home")
     assert linked.read_text() == "host version"
 
+
+def test_retargeted_same_remote_path_is_protected(monkeypatch, tmp_path):
+    """A skill retargeted to another profile keeps its container path.
+
+    Forcing the refresh only on NEW remote paths missed this: the container
+    path is unchanged, so the warm memo was reused and the newly upload-only
+    host file was left unprotected until the TTL expired.
+    """
+    local = tmp_path / "local-skill.md"
+    local.write_text("local")
+    other_profile = tmp_path / "other-profile-skill.md"
+    other_profile.write_text("host version")
+    remote = "/root/.hermes/skills/shared.md"
+
+    files = [(str(local), remote)]
+    current_upload_only: set[str] = set()
+    monkeypatch.setattr(fs, "_credential_host_paths", lambda: set(current_upload_only))
+
+    def download_changed_file(destination):
+        with tarfile.open(destination, "w") as tar:
+            data = b"remote version"
+            info = tarfile.TarInfo("root/.hermes/skills/shared.md")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    mgr = FileSyncManager(
+        get_files_fn=lambda: list(files),
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+        bulk_download_fn=download_changed_file,
+    )
+    mgr.sync(force=True)
+
+    # Same remote path, now backed by another profile's file: upload-only.
+    files[0] = (str(other_profile), remote)
+    current_upload_only.add(str(other_profile.resolve()))
+    mgr.sync(force=True)
+    assert str(other_profile.resolve()) in mgr._upload_only_host_paths
+
+    current_upload_only.clear()
+    mgr.sync_back(hermes_home=tmp_path / "home")
+    assert other_profile.read_text() == "host version"
+

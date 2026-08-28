@@ -278,8 +278,6 @@ class FileSyncManager:
 
         current_files = self._get_files_fn()
         current_remote_paths = {remote for _, remote in current_files}
-        new_remote_paths = current_remote_paths.difference(self._synced_files)
-        self._refresh_upload_only_paths(force=bool(new_remote_paths))
 
         # --- Uploads: new or changed files ---
         to_upload: list[tuple[str, str]] = []
@@ -292,6 +290,12 @@ class FileSyncManager:
                 continue
             to_upload.append((host_path, remote_path))
             new_files[remote_path] = file_key
+
+        # Anything about to be uploaded may be newly upload-only: a brand new
+        # remote path, or an EXISTING one whose symlink was retargeted at the
+        # same container path. Both surface here as an upload, so force the
+        # refresh on uploads rather than on new remote paths alone.
+        self._refresh_upload_only_paths(force=bool(to_upload))
 
         # --- Deletes: synced paths no longer in current set ---
         to_delete = [p for p in self._synced_files if p not in current_remote_paths]
