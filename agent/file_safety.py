@@ -244,6 +244,71 @@ _BLOCKED_PROJECT_ENV_BASENAMES: set[str] = {
 }
 
 
+_CREDENTIAL_FILE_NAMES: tuple[str, ...] = (
+    "auth.json",
+    "auth.lock",
+    ".anthropic_oauth.json",
+    ".env",
+    "webhook_subscriptions.json",
+    os.path.join("auth", "google_oauth.json"),
+    # Bitwarden Secrets Manager disk cache: stores plaintext secret values
+    # to avoid re-fetching across back-to-back CLI invocations. The file
+    # was introduced by #31968 but not added to this guard.
+    os.path.join("cache", "bws_cache.json"),
+)
+
+# Keyed by the (HERMES_HOME, root) pair so a profile switch or a test that
+# repoints HERMES_HOME builds its own denylist rather than reusing a stale one.
+_DENYLIST_CACHE: dict[tuple[str, ...], tuple[frozenset[Path], tuple[Path, ...]]] = {}
+
+
+def _denied_path_set() -> tuple[frozenset[Path], tuple[Path, ...]]:
+    """Resolve the denylist once per (HERMES_HOME, root) pair.
+
+    Every entry below is a function of the two Hermes base directories, none of
+    which change while the process runs against a given home. Recomputing them
+    per call meant ~24 filesystem resolutions on every read check, which is
+    invisible for a single file tool call and dominates a 10k-file skills walk.
+
+    Cached on the resolved bases, not on a module flag, so a test or a profile
+    switch that moves HERMES_HOME gets its own entry instead of a stale one.
+    """
+    bases = (_hermes_home_path(), _hermes_root_path())
+    key = tuple(str(b) for b in bases)
+    cached = _DENYLIST_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    hermes_dirs: list[Path] = []
+    for base in bases:
+        try:
+            real = base.resolve()
+            if real not in hermes_dirs:
+                hermes_dirs.append(real)
+        except Exception:
+            continue
+
+    exact: set[Path] = set()
+    prefixes: list[Path] = []
+    for hd in hermes_dirs:
+        prefixes.append(hd / "skills" / ".hub")
+        for name in _CREDENTIAL_FILE_NAMES:
+            try:
+                exact.add((hd / name).resolve())
+            except Exception:
+                continue
+        try:
+            mcp = (hd / "mcp-tokens").resolve()
+        except Exception:
+            continue
+        exact.add(mcp)
+        prefixes.append(mcp)
+
+    result = (frozenset(exact), tuple(prefixes))
+    _DENYLIST_CACHE[key] = result
+    return result
+
+
 def get_read_block_error(path: str) -> Optional[str]:
     """Return an error message when a read targets a denied Hermes path.
 
@@ -296,82 +361,43 @@ def get_read_block_error(path: str) -> Optional[str]:
     # blocked when running under a profile (HERMES_HOME points at
     # <root>/profiles/<name> in profile mode). Same shape as the write
     # deny widening (#15981, #14157).
-    hermes_dirs: list[Path] = []
-    for base in (_hermes_home_path(), _hermes_root_path()):
-        try:
-            real = base.resolve()
-            if real not in hermes_dirs:
-                hermes_dirs.append(real)
-        except Exception:
-            continue
+    exact_blocked, prefix_blocked = _denied_path_set()
 
-    # Skills .hub: prompt-injection carriers.
-    for hd in hermes_dirs:
-        blocked_dirs = [
-            hd / "skills" / ".hub" / "index-cache",
-            hd / "skills" / ".hub",
-        ]
-        for blocked in blocked_dirs:
-            try:
-                resolved.relative_to(blocked)
-            except ValueError:
-                continue
-            return (
-                f"Access denied: {path} is an internal Hermes cache file "
-                "and cannot be read directly to prevent prompt injection. "
-                "Use the skills_list or skill_view tools instead."
-            )
-
-    # Credential / secret stores. Exact-file matches under either
-    # HERMES_HOME or <root>.
-    credential_file_names = (
-        "auth.json",
-        "auth.lock",
-        ".anthropic_oauth.json",
-        ".env",
-        "webhook_subscriptions.json",
-        os.path.join("auth", "google_oauth.json"),
-        # Bitwarden Secrets Manager disk cache: stores plaintext secret values
-        # to avoid re-fetching across back-to-back CLI invocations. The file
-        # was introduced by #31968 but not added to this guard.
-        os.path.join("cache", "bws_cache.json"),
-    )
-    for hd in hermes_dirs:
-        for name in credential_file_names:
-            try:
-                blocked = (hd / name).resolve()
-            except Exception:
-                continue
-            if resolved == blocked:
-                return (
-                    f"Access denied: {path} is a Hermes credential store "
-                    "and cannot be read directly. Provider tools consume "
-                    "these credentials through internal channels. "
-                    "(Defense-in-depth — not a security boundary; the "
-                    "terminal tool can still bypass.)"
-                )
-
-    # mcp-tokens/: directory prefix match — anything inside is OAuth
-    # token material.
-    for hd in hermes_dirs:
-        try:
-            mcp_tokens = (hd / "mcp-tokens").resolve()
-        except Exception:
-            continue
-        if resolved == mcp_tokens:
+    # Exact-file matches: credential stores under HERMES_HOME or <root>, plus
+    # the mcp-tokens directory itself.
+    if resolved in exact_blocked:
+        name = resolved.name
+        if resolved.parent.name == "mcp-tokens" or name == "mcp-tokens":
             return (
                 f"Access denied: {path} is the Hermes MCP token directory "
-                "and cannot be read directly. (Defense-in-depth — not a "
+                "and cannot be read directly. (Defense-in-depth \u2014 not a "
                 "security boundary; the terminal tool can still bypass.)"
             )
+        return (
+            f"Access denied: {path} is a Hermes credential store "
+            "and cannot be read directly. Provider tools consume "
+            "these credentials through internal channels. "
+            "(Defense-in-depth \u2014 not a security boundary; the "
+            "terminal tool can still bypass.)"
+        )
+
+    # Directory-prefix matches: skills/.hub (prompt-injection carriers) and
+    # anything inside mcp-tokens/ (OAuth token material).
+    for blocked in prefix_blocked:
         try:
-            resolved.relative_to(mcp_tokens)
+            resolved.relative_to(blocked)
         except ValueError:
             continue
+        if blocked.name == "mcp-tokens":
+            return (
+                f"Access denied: {path} is a Hermes MCP token file "
+                "and cannot be read directly. (Defense-in-depth \u2014 not a "
+                "security boundary; the terminal tool can still bypass.)"
+            )
         return (
-            f"Access denied: {path} is a Hermes MCP token file "
-            "and cannot be read directly. (Defense-in-depth — not a "
-            "security boundary; the terminal tool can still bypass.)"
+            f"Access denied: {path} is an internal Hermes cache file "
+            "and cannot be read directly to prevent prompt injection. "
+            "Use the skills_list or skill_view tools instead."
         )
 
     # Block common secret-bearing project-local .env files anywhere on disk.
