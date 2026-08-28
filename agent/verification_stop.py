@@ -92,14 +92,14 @@ def _session_is_messaging_surface() -> bool:
         return False
 
 
-def _surface_is_excluded(agent_cfg: Any) -> bool:
+def _surface_is_excluded(agent_cfg: Any, runtime_platform: str | None = None) -> bool:
     """Whether this turn's surface is named in ``verify_on_stop_exclude_surfaces``.
 
     The setting accepts a list (``["cron"]``) or a comma-separated string
     (``"cron, kanban"``); names are matched case- and whitespace-insensitively
-    against the session platform (cron binds ``platform="cron"``) and the
-    session source (the CLI/TUI bind that instead), mirroring the resolution
-    order in ``gateway.session_context.session_is_messaging_surface``.
+    against the agent's runtime platform when supplied (cron uses
+    ``platform="cron"``), then the session platform and source, mirroring the
+    resolution order in ``gateway.session_context.session_is_messaging_surface``.
     """
     if not isinstance(agent_cfg, dict):
         return False
@@ -117,12 +117,18 @@ def _surface_is_excluded(agent_cfg: Any) -> bool:
         def get_session_env(name: str, default: str = "") -> str:
             return os.environ.get(name, default)
 
-    platform = os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM", "")
+    platform = runtime_platform or os.getenv("HERMES_PLATFORM") or get_session_env(
+        "HERMES_SESSION_PLATFORM", ""
+    )
     source = get_session_env("HERMES_SESSION_SOURCE", "")
     return any(str(i or "").strip().lower() in excluded for i in (platform, source))
 
 
-def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
+def verify_on_stop_enabled(
+    config: dict[str, Any] | None = None,
+    *,
+    runtime_platform: str | None = None,
+) -> bool:
     """Return whether edit -> verify-before-finish behavior is enabled.
 
     Precedence: an explicit ``HERMES_VERIFY_ON_STOP`` env var wins, then an
@@ -156,7 +162,7 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     # Subtract explicitly excluded surfaces. This runs BELOW the env override
     # (which stays the top-precedence escape hatch) and only ever turns the
     # behavior OFF — it never enables a setting that resolved off.
-    if _surface_is_excluded(agent_cfg):
+    if _surface_is_excluded(agent_cfg, runtime_platform):
         return False
     if isinstance(cfg_val, bool):
         return cfg_val

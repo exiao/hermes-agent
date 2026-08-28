@@ -292,3 +292,17 @@ def test_verify_on_stop_exclude_surfaces(clear_verify_env, name, env, cfg, expec
     for key, value in env.items():
         clear_verify_env.setenv(key, value)
     assert verify_on_stop_enabled({"agent": cfg}) is expected
+
+
+def test_exclusion_uses_agent_runtime_platform(clear_verify_env):
+    # Cron passes its actual platform on AIAgent while the session platform
+    # context remains empty; the exclusion must use that runtime identity.
+    assert verify_on_stop_enabled(
+        {
+            "agent": {
+                "verify_on_stop": True,
+                "verify_on_stop_exclude_surfaces": ["cron"],
+            }
+        },
+        runtime_platform="cron",
+    ) is False
