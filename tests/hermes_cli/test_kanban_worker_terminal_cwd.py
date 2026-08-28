@@ -1,52 +1,44 @@
-"""Tests: kanban worker spawn pins TERMINAL_CWD to the task workspace.
+"""Tests: kanban worker spawn pins the right cwd for its terminal backend.
 
-Regression coverage for #34619 and #41312 (same root cause): ``_default_spawn``
-launched the worker subprocess with ``cwd=workspace`` and set
-``HERMES_KANBAN_WORKSPACE``, but did NOT set ``TERMINAL_CWD``. Because
-``TERMINAL_CWD`` takes precedence over the process cwd in both
-``tools/file_tools.py::_resolve_base_dir`` (relative ``write_file`` paths) and
-``agent_init``'s context-file loader (``AGENTS.md`` discovery), workers inherited
-the dispatching gateway's cwd — relative writes landed in the gateway user's
-home (#41312) and the wrong profile's ``AGENTS.md`` was loaded (#34619).
-Pinning ``TERMINAL_CWD`` to the workspace fixes both.
+Regression coverage for #34619 and #41312. ``_default_spawn`` launched the
+worker with ``cwd=workspace`` and ``TERMINAL_CWD`` unset, so workers inherited
+the dispatching gateway's cwd: relative writes landed in the gateway user's
+home (#41312) and the wrong profile's ``AGENTS.md`` loaded (#34619). A HOST
+backend (local, or docker bind-mounting the workspace) must be pinned to the
+task workspace; a REMOTE backend must never receive a host-only path.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
+from pathlib import Path
+
+import pytest
+
+ABSENT = object()  # key must not be in the child env
+WS = object()      # value must equal the task workspace
+NEUTRAL = object()  # empty dir that is neither the workspace nor the dispatcher cwd
 
 
-def _make_task(kb, *, assignee: str = "w"):
+def _make_task(kb):
     return kb.Task(
-        id="t_cwd",
-        title="cwd pin",
-        body=None,
-        assignee=assignee,
-        status="running",
-        priority=0,
-        created_by="test",
-        created_at=1,
-        started_at=None,
-        completed_at=None,
-        workspace_kind="dir",
-        workspace_path=None,
-        claim_lock="lock",
-        claim_expires=None,
-        tenant=None,
-        current_run_id=1,
+        id="t_cwd", title="cwd pin", body=None, assignee="w", status="running",
+        priority=0, created_by="test", created_at=1, started_at=None,
+        completed_at=None, workspace_kind="dir", workspace_path=None,
+        claim_lock="lock", claim_expires=None, tenant=None, current_run_id=1,
     )
 
 
-def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
+def _spawn(kb, monkeypatch, workspace: str) -> dict:
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-
     captured: dict = {}
 
     class FakeProc:
         pid = 4242
 
     def fake_popen(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
@@ -56,142 +48,193 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
     return captured
 
 
-def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
-    """A real, absolute workspace dir is pinned as TERMINAL_CWD."""
+def _setup(tmp_path, monkeypatch, profile_terminal: str, root_terminal: str, env: dict):
     root = tmp_path / ".hermes"
     (root / "profiles" / "w").mkdir(parents=True)
-    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    (root / "profiles" / "w" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n" + profile_terminal, encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\n" + root_terminal, encoding="utf-8"
+    )
     monkeypatch.setenv("HERMES_HOME", str(root))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
 
+
+MODAL = "terminal:\n  backend: modal\n"
+SSH = "terminal:\n  backend: ssh\n"
+HOST_CWD = {"TERMINAL_CWD": "/host/gateway"}
+
+# (id, profile terminal cfg, root terminal cfg, env, expected TERMINAL_CWD,
+#  expected HERMES_KANBAN_WORKSPACE, expected spawn cwd)
+CASES = [
+    ("local_default", "", "", {}, WS, WS, WS),
+    ("modal_profile", MODAL, "terminal:\n  backend: local\n", HOST_CWD, ABSENT, ABSENT, NEUTRAL),
+    ("docker_mount_profile",
+     "terminal:\n  backend: docker\n  docker_mount_cwd_to_workspace: true\n",
+     "terminal:\n  backend: local\n", HOST_CWD, WS, WS, WS),
+    ("env_only_modal", "", "", {"TERMINAL_ENV": "modal"}, None, ABSENT, NEUTRAL),
+    # An env-only selection sets backend and cwd together, so a sandbox-native
+    # path is the operator's intent, not a leaked dispatcher path.
+    ("env_only_modal_keeps_sandbox_cwd", "", "",
+     {"TERMINAL_ENV": "modal", "TERMINAL_CWD": "/root/project"},
+     "/root/project", ABSENT, NEUTRAL),
+    ("stale_docker_flag_on_modal",
+     MODAL + "  docker_mount_cwd_to_workspace: true\n", "", {}, None, ABSENT, NEUTRAL),
+    ("env_docker_with_mount", "", "",
+     {"TERMINAL_ENV": "docker", "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE": "true"},
+     WS, WS, WS),
+    ("ssh_profile", SSH, "", HOST_CWD, ABSENT, ABSENT, None),
+    ("ssh_profile_explicit_cwd", SSH + "  cwd: /srv/work\n", "", HOST_CWD,
+     "/srv/work", None, None),
+    ("env_only_ssh_keeps_remote_cwd", "", "",
+     {"TERMINAL_ENV": "ssh", "TERMINAL_CWD": "/srv/work"}, "/srv/work", ABSENT, NEUTRAL),
+    ("remote_drops_inherited_workspace_var", MODAL, "",
+     {"HERMES_KANBAN_WORKSPACE": "/host/parent-workspace"}, None, ABSENT, NEUTRAL),
+]
+
+
+@pytest.mark.parametrize(
+    "profile_cfg,root_cfg,env,want_cwd,want_ws,want_spawn",
+    [c[1:] for c in CASES],
+    ids=[c[0] for c in CASES],
+)
+def test_worker_spawn_cwd(
+    monkeypatch, tmp_path, profile_cfg, root_cfg, env, want_cwd, want_ws, want_spawn
+):
+    _setup(tmp_path, monkeypatch, profile_cfg, root_cfg, env)
     from hermes_cli import kanban_db as kb
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
+    got = _spawn(kb, monkeypatch, str(workspace))
 
-    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+    for key, want in (("TERMINAL_CWD", want_cwd), ("HERMES_KANBAN_WORKSPACE", want_ws)):
+        if want is ABSENT:
+            assert key not in got["env"], f"{key} leaked to a remote worker"
+        elif want is WS:
+            assert got["env"][key] == str(workspace)
+        elif want is not None:
+            assert got["env"][key] == want
 
-    assert captured["env"]["TERMINAL_CWD"] == str(workspace)
-    # The subprocess cwd and TERMINAL_CWD must agree — both anchor the workspace.
-    assert captured["cwd"] == str(workspace)
-    assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    if want_spawn is WS:
+        assert got["cwd"] == str(workspace)
+    elif want_spawn is NEUTRAL:
+        # cwd=None or the workspace would make the worker resolve relative
+        # paths and AGENTS.md against a path absent from the sandbox.
+        assert got["cwd"] not in (None, os.getcwd(), str(workspace))
+        assert not any(Path(got["cwd"]).iterdir())
 
 
 def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path):
     """A non-directory workspace must NOT clobber the inherited TERMINAL_CWD.
 
     file_tools rejects relative / sentinel TERMINAL_CWD values, so writing a
-    meaningless (nonexistent) path would be worse than leaving the inherited
-    one. The guard requires an existing absolute dir.
+    nonexistent path would be worse than leaving the inherited one.
     """
-    root = tmp_path / ".hermes"
-    (root / "profiles" / "w").mkdir(parents=True)
-    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.setenv("TERMINAL_CWD", "/pre/existing/anchor")
-
+    _setup(tmp_path, monkeypatch, "", "", {"TERMINAL_CWD": "/pre/existing/anchor"})
     from hermes_cli import kanban_db as kb
 
-    missing = tmp_path / "does-not-exist"
+    got = _spawn(kb, monkeypatch, str(tmp_path / "does-not-exist"))
 
-    captured = _capture_spawn_env(kb, monkeypatch, str(missing))
+    assert got["env"]["TERMINAL_CWD"] == "/pre/existing/anchor"
 
-    # Inherited value is preserved (not overwritten with a bogus path).
-    assert captured["env"]["TERMINAL_CWD"] == "/pre/existing/anchor"
+
+# Config-derived TERMINAL_* the dispatcher's bridge writes into os.environ when
+# the ROOT config has a ``terminal:`` section. _default_spawn copies os.environ,
+# and the child's bridge backfills with override=False, so these would silently
+# override the assignee profile's own backend, mounts, injected env and egress.
+LEAKED = {
+    "TERMINAL_ENV": "local",
+    "TERMINAL_MODAL_MODE": "auto",
+    "TERMINAL_DOCKER_IMAGE": "nikolaik/python-nodejs:python3.11-nodejs20",
+    "TERMINAL_MODAL_IMAGE": "nikolaik/python-nodejs:python3.11-nodejs20",
+    "TERMINAL_SINGULARITY_IMAGE": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
+    "TERMINAL_DAYTONA_IMAGE": "nikolaik/python-nodejs:python3.11-nodejs20",
+    "TERMINAL_CONTAINER_PERSISTENT": "True",
+    "TERMINAL_CONTAINER_CPU": "1",
+    "TERMINAL_CONTAINER_MEMORY": "5120",
+    "TERMINAL_CONTAINER_DISK": "51200",
+    "TERMINAL_LIFETIME_SECONDS": "300",
+    "TERMINAL_DOCKER_VOLUMES": "/host:/container",
+    "TERMINAL_DOCKER_ENV": "SECRET=root",
+    "TERMINAL_DOCKER_NETWORK": "host",
+    "TERMINAL_DOCKER_EXTRA_ARGS": "--privileged",
+    "TERMINAL_DOCKER_FORWARD_ENV": "PATH",
+    "TERMINAL_SANDBOX_DIR": "/root/sandbox",
+}
 
 
 def test_inherited_terminal_config_vars_scrubbed(monkeypatch, tmp_path):
-    """Leaked dispatcher TERMINAL_* config vars must NOT reach the worker.
-
-    Regression: the dispatcher's lazy terminal-config bridge overwrites os.environ
-    with the ROOT config's TERMINAL_* values (backend, images, container limits,
-    docker mounts/env/network) whenever the root config has a ``terminal:``
-    section. _default_spawn does ``env = dict(os.environ)``, so those leak into
-    the child. Because the child's own bridge early-returns when TERMINAL_ENV is
-    already present and otherwise backfills with override=False, the inherited
-    root values silently override the assignee profile's terminal.* config. The
-    spawn must scrub the config-derived TERMINAL_* vars so the child re-derives
-    them from its own profile config. TERMINAL_CWD / TERMINAL_TIMEOUT are pinned
-    deliberately and must survive.
-    """
-    root = tmp_path / ".hermes"
-    (root / "profiles" / "w").mkdir(parents=True)
-    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    # Root has a `terminal:` section — this is what makes the dispatcher bridge
-    # run with override=True and clobber os.environ, so scrubbing is warranted.
-    root.joinpath("config.yaml").write_text(
-        "toolsets:\n  - kanban\nterminal:\n  backend: local\n", encoding="utf-8"
-    )
-    monkeypatch.setenv("HERMES_HOME", str(root))
-
-    # Simulate the dispatcher's leaked env: backend, images, container limits, AND
-    # the docker mount/env/network settings the reviewer flagged (P1). Every one
-    # of these must be scrubbed so a docker/modal worker can't inherit the root
-    # profile's backend, bind mounts, injected env, or egress policy.
-    leaked = {
-        "TERMINAL_ENV": "local",
-        "TERMINAL_MODAL_MODE": "auto",
-        "TERMINAL_DOCKER_IMAGE": "nikolaik/python-nodejs:python3.11-nodejs20",
-        "TERMINAL_MODAL_IMAGE": "nikolaik/python-nodejs:python3.11-nodejs20",
-        "TERMINAL_SINGULARITY_IMAGE": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
-        "TERMINAL_DAYTONA_IMAGE": "nikolaik/python-nodejs:python3.11-nodejs20",
-        "TERMINAL_CONTAINER_PERSISTENT": "True",
-        "TERMINAL_CONTAINER_CPU": "1",
-        "TERMINAL_CONTAINER_MEMORY": "5120",
-        "TERMINAL_CONTAINER_DISK": "51200",
-        "TERMINAL_LIFETIME_SECONDS": "300",
-        "TERMINAL_DOCKER_VOLUMES": "/host:/container",
-        "TERMINAL_DOCKER_ENV": "SECRET=root",
-        "TERMINAL_DOCKER_NETWORK": "host",
-        "TERMINAL_DOCKER_EXTRA_ARGS": "--privileged",
-        "TERMINAL_DOCKER_FORWARD_ENV": "PATH",
-        "TERMINAL_SANDBOX_DIR": "/root/sandbox",
-    }
-    for k, v in leaked.items():
-        monkeypatch.setenv(k, v)
-
+    """Leaked dispatcher TERMINAL_* config vars must NOT reach the worker."""
+    _setup(tmp_path, monkeypatch, "", "terminal:\n  backend: local\n", LEAKED)
     from hermes_cli import kanban_db as kb
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
+    got = _spawn(kb, monkeypatch, str(workspace))
 
-    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
-
-    # None of the leaked config-derived vars survive into the child env.
-    for key in leaked:
-        assert key not in captured["env"], f"{key} leaked into the worker env"
-    # TERMINAL_CWD is a deliberate set, not a leak — it must still be present.
-    assert captured["env"]["TERMINAL_CWD"] == str(workspace)
+    for key in LEAKED:
+        assert key not in got["env"], f"{key} leaked into the worker env"
+    # TERMINAL_CWD is a deliberate set, not a leak.
+    assert got["env"]["TERMINAL_CWD"] == str(workspace)
 
 
-def test_explicit_terminal_env_preserved_when_root_has_no_terminal_section(monkeypatch, tmp_path):
-    """An operator's explicit TERMINAL_* must survive when root has no terminal cfg.
-
-    When the ROOT config.yaml has NO ``terminal:`` section, the dispatcher's
-    bridge ran with override=False and left any operator-exported TERMINAL_*
-    (e.g. a gateway launched with ``TERMINAL_ENV=modal``) untouched — that IS an
-    explicit selection. Scrubbing it would wrongly fall the worker back to its
-    default backend, so the spawn must NOT scrub in this case.
-    """
-    root = tmp_path / ".hermes"
-    (root / "profiles" / "w").mkdir(parents=True)
-    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    # No `terminal:` section in the root config.
-    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(root))
-
-    # Operator explicitly exported a backend + image on the gateway.
-    monkeypatch.setenv("TERMINAL_ENV", "modal")
-    monkeypatch.setenv("TERMINAL_MODAL_IMAGE", "im-operatorExplicit123")
-
+def test_explicit_terminal_env_preserved_when_root_has_no_terminal_section(
+    monkeypatch, tmp_path
+):
+    """Without a root ``terminal:`` section the bridge never clobbered anything,
+    so an operator-exported TERMINAL_* is an explicit choice and must survive."""
+    _setup(tmp_path, monkeypatch, "", "",
+           {"TERMINAL_ENV": "modal", "TERMINAL_MODAL_IMAGE": "im-operatorExplicit123"})
     from hermes_cli import kanban_db as kb
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
+    got = _spawn(kb, monkeypatch, str(workspace))
 
-    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+    assert got["env"]["TERMINAL_ENV"] == "modal"
+    assert got["env"]["TERMINAL_MODAL_IMAGE"] == "im-operatorExplicit123"
 
-    # The explicit operator selection is preserved, not scrubbed.
-    assert captured["env"]["TERMINAL_ENV"] == "modal"
-    assert captured["env"]["TERMINAL_MODAL_IMAGE"] == "im-operatorExplicit123"
+
+def test_env_only_remote_drops_a_host_shaped_cwd(monkeypatch, tmp_path):
+    """An env-only remote cwd that exists on the HOST is a leak, not intent.
+
+    ``TERMINAL_ENV=modal`` with a cwd that resolves to a real host directory is
+    the dispatcher's own path leaking through, not a sandbox-native value the
+    operator chose. Keeping it would anchor the worker's relative writes and
+    AGENTS.md discovery to a path the sandbox does not have.
+    """
+    host_dir = tmp_path / "dispatcher-checkout"
+    host_dir.mkdir()
+    _setup(tmp_path, monkeypatch, "", "",
+           {"TERMINAL_ENV": "modal", "TERMINAL_CWD": str(host_dir)})
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    got = _spawn(kb, monkeypatch, str(workspace))
+
+    assert "TERMINAL_CWD" not in got["env"]
+
+
+def test_spawn_dir_fallback_is_private_not_shared_tmp(monkeypatch, tmp_path):
+    """An unwritable board dir must not fall back to the shared temp root.
+
+    ``build_context_files_prompt()`` reads the process cwd as project context,
+    so launching in /tmp would load a pre-existing /tmp/AGENTS.md into the
+    worker's system prompt -- the opposite of the isolation this dir provides.
+    """
+    from hermes_cli import kanban_db as kb
+
+    def _refuse(*_a, **_kw):
+        raise OSError("read-only board directory")
+
+    monkeypatch.setattr(kb.Path, "mkdir", _refuse)
+
+    got = kb._remote_worker_spawn_dir()
+
+    assert got != Path(tempfile.gettempdir())
+    assert got.is_dir()
+    assert not any(got.iterdir())

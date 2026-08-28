@@ -82,6 +82,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -890,6 +891,28 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "logs"
     return board_dir(slug) / "logs"
+
+
+def _remote_worker_spawn_dir(board: Optional[str] = None) -> Path:
+    """Return a neutral, host-independent cwd for a remote worker process.
+
+    A remote (Modal/Daytona/Vercel/Singularity) worker gets no TERMINAL_CWD, so
+    its context-file loader and ``file_tools._resolve_base_dir`` fall back to
+    the PROCESS cwd. Inheriting the dispatcher's checkout there would load the
+    gateway's ``AGENTS.md`` and anchor relative paths to a path that does not
+    exist in the sandbox. An empty, stable directory gives both a defined
+    answer with nothing to pick up.
+    """
+    path = worker_logs_dir(board=board).parent / "remote-cwd"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # The shared temp root itself is NOT safe here: build_context_files_prompt()
+        # reads the process cwd as project context, so a pre-existing
+        # /tmp/AGENTS.md would enter the worker's system prompt. mkdtemp gives a
+        # fresh 0700 directory nothing else can have seeded.
+        return Path(tempfile.mkdtemp(prefix="hermes-kanban-remote-cwd-"))
+    return path
 
 
 def board_metadata_path(board: Optional[str] = None) -> Path:
@@ -12809,6 +12832,58 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_worker_terminal_config(
+    hermes_home: Optional[str],
+    inherited_backend: Optional[str] = None,
+    inherited_mount_cwd: Optional[str] = None,
+) -> tuple[Optional[str], bool, Optional[str], bool]:
+    """Return the assignee profile's backend, mount, cwd and backend source."""
+    if not hermes_home:
+        return None, False, None, False
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import apply_terminal_config_to_env, read_raw_config
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            # Use the same raw-config-versus-environment precedence as the
+            # worker's terminal bridge. In particular, a profile without a
+            # terminal section must preserve an explicitly inherited backend
+            # instead of reading DEFAULT_CONFIG's ``local`` value.
+            probe_env = {}
+            if inherited_backend:
+                probe_env["TERMINAL_ENV"] = inherited_backend
+            if inherited_mount_cwd is not None:
+                probe_env["TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE"] = inherited_mount_cwd
+            apply_terminal_config_to_env(env=probe_env)
+            raw_terminal_cfg = read_raw_config().get("terminal")
+            profile_backend_explicit = (
+                isinstance(raw_terminal_cfg, dict)
+                and "backend" in raw_terminal_cfg
+            )
+        finally:
+            reset_hermes_home_override(token)
+        backend = probe_env.get("TERMINAL_ENV", "local")
+        mount_cwd = probe_env.get("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
+        if isinstance(mount_cwd, str):
+            mount_cwd = mount_cwd.strip().lower() in {"true", "1", "yes"}
+        profile_cwd = probe_env.get("TERMINAL_CWD") or None
+        return (
+            str(backend).strip().lower() or "local",
+            bool(mount_cwd),
+            profile_cwd,
+            profile_backend_explicit,
+        )
+    except Exception as exc:
+        _log.warning(
+            "kanban worker: could not resolve terminal backend for HERMES_HOME=%r (%s); "
+            "not pinning the host workspace",
+            hermes_home,
+            exc,
+        )
+        return None, False, None, False
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -12941,10 +13016,44 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    (
+        worker_terminal_backend,
+        docker_mount_cwd,
+        worker_profile_cwd,
+        worker_backend_explicit,
+    ) = _resolve_worker_terminal_config(
+        env.get("HERMES_HOME"),
+        env.get("TERMINAL_ENV"),
+        env.get("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE"),
+    )
+    host_workspace_worker = worker_terminal_backend == "local" or (
+        worker_terminal_backend == "docker" and docker_mount_cwd
+    )
+    remote_worker = not host_workspace_worker
+    # Remote workers must not inherit the dispatcher's host cwd: file_tools and
+    # context-file loading consume TERMINAL_CWD before a terminal backend can
+    # sanitize it. Precedence: an explicitly configured profile cwd wins. Failing
+    # that, a backend selected by the PROFILE means any inherited TERMINAL_CWD
+    # came from the dispatcher, so drop it. For an environment-only selection the
+    # operator set both vars together, so the value is an intentional
+    # sandbox-native path (`TERMINAL_ENV=modal TERMINAL_CWD=/root/project`) —
+    # keep it unless it resolves to a real directory on the HOST, which is the
+    # signature of a leaked dispatcher path rather than a container one.
+    if remote_worker:
+        inherited_cwd = env.get("TERMINAL_CWD")
+        if worker_profile_cwd:
+            env["TERMINAL_CWD"] = worker_profile_cwd
+        elif worker_backend_explicit or not inherited_cwd:
+            env.pop("TERMINAL_CWD", None)
+        elif os.path.isdir(inherited_cwd):
+            env.pop("TERMINAL_CWD", None)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
-    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    if not remote_worker:
+        env["HERMES_KANBAN_WORKSPACE"] = workspace
+    else:
+        env.pop("HERMES_KANBAN_WORKSPACE", None)
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -12965,7 +13074,7 @@ def _default_spawn(
     # Only pin a real, absolute directory — file_tools rejects relative /
     # sentinel TERMINAL_CWD values, so a non-dir workspace must NOT be set
     # here (leave the inherited value rather than write a meaningless one).
-    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+    if not remote_worker and workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
@@ -13116,10 +13225,22 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    # A remote worker must not inherit the dispatcher's process cwd either:
+    # with TERMINAL_CWD cleared, resolve_context_cwd() returns None and both
+    # the context-file loader and file_tools._resolve_base_dir fall back to
+    # os.getcwd(), so the worker would still load the gateway checkout's
+    # AGENTS.md and anchor relative paths there. Launch it in a neutral,
+    # empty directory instead.
+    if remote_worker:
+        spawn_cwd: Optional[str] = str(_remote_worker_spawn_dir(board))
+    elif os.path.isdir(workspace):
+        spawn_cwd = workspace
+    else:
+        spawn_cwd = None
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=spawn_cwd,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
