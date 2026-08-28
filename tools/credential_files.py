@@ -351,6 +351,7 @@ def _safe_skills_path(skills_dir: Path) -> str:
 # Vendored dependency trees are re-installed remotely rather than shipped.
 _SKILL_SYNC_EXCLUDED_DIRS = frozenset({
     ".hub",              # registry index cache, lock/taps state, quarantine
+    ".curator_backups",  # curator's pre-run snapshots of the whole tree
     ".restore-backups",  # curator's local undo history
     ".worktrees",        # git worktrees for skill authoring
     ".git",
