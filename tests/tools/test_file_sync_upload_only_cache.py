@@ -1,0 +1,404 @@
+"""The upload-only path set must not re-walk the skills tree on every sync.
+
+`_sync_transaction` needs the upload-only set on EVERY sync, and computing it
+walks the entire skills tree a second time on top of `_get_files_fn()`. Two
+full walks per synced command: measured at ~3s each on an 8k-file skill
+collection, paid before a single byte moves, on SSH, Modal and Daytona alike.
+
+Behavior contracts asserted here (not a snapshot of any timing value):
+  1. Repeated syncs inside the TTL walk the tree exactly once.
+  2. The cache expires, so a newly added upload-only path is picked up.
+  3. The memo is per-manager, so one profile's paths never leak into another.
+"""
+
+import io
+import os
+import tarfile
+from unittest.mock import MagicMock
+
+import tools.environments.file_sync as fs
+from tools.environments.file_sync import FileSyncManager, _file_mtime_key
+
+
+def _install_counting_stubs(monkeypatch, skills):
+    """Point the lazily-imported helpers at counting stubs."""
+    calls = {"skills": 0}
+
+    def fake_iter_skills_files(*_a, **_kw):
+        calls["skills"] += 1
+        return list(skills)
+
+    import tools.credential_files as cf
+    monkeypatch.setattr(cf, "iter_skills_files", fake_iter_skills_files)
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda *_a, **_kw: [])
+    return calls
+
+
+def _manager(files=()):
+    return FileSyncManager(
+        get_files_fn=lambda: list(files),
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+    )
+
+
+def test_repeated_syncs_walk_skills_tree_once(monkeypatch, tmp_path):
+    """Ten syncs in a row must not mean ten skills walks."""
+    linked = tmp_path / "other-profile-skill.md"
+    linked.write_text("x")
+    calls = _install_counting_stubs(
+        monkeypatch, [{"host_path": str(linked), "upload_only": True}]
+    )
+
+    mgr = _manager()
+    for _ in range(10):
+        mgr.sync(force=True)
+
+    assert calls["skills"] == 1, (
+        f"skills tree walked {calls['skills']}x for 10 syncs; the per-sync "
+        "re-walk is the whole cost this memo exists to remove"
+    )
+    assert str(linked.resolve()) in mgr._upload_only_host_paths
+
+
+def test_cache_expires_and_sees_new_paths(monkeypatch, tmp_path):
+    """A stale memo must not outlive the TTL, or a new skill stays unprotected."""
+    a = tmp_path / "a.md"
+    a.write_text("x")
+    b = tmp_path / "b.md"
+    b.write_text("x")
+
+    skills = [{"host_path": str(a), "upload_only": True}]
+    calls = _install_counting_stubs(monkeypatch, skills)
+
+    mgr = _manager()
+    mgr.sync(force=True)
+    assert str(a.resolve()) in mgr._upload_only_host_paths
+    assert calls["skills"] == 1
+
+    # A new upload-only skill appears; the memo is still warm.
+    skills.append({"host_path": str(b), "upload_only": True})
+    mgr.sync(force=True)
+    assert str(b.resolve()) not in mgr._upload_only_host_paths
+
+    # Age the memo past its TTL.
+    mgr._upload_only_cache_time -= fs._UPLOAD_ONLY_TTL_SECONDS + 1
+    mgr.sync(force=True)
+    assert str(b.resolve()) in mgr._upload_only_host_paths
+    assert calls["skills"] == 2
+
+
+def test_memo_is_per_manager_not_shared(monkeypatch, tmp_path):
+    """Two managers (two profiles) must not share one memo."""
+    a = tmp_path / "profile-a.md"
+    a.write_text("x")
+    calls = _install_counting_stubs(
+        monkeypatch, [{"host_path": str(a), "upload_only": True}]
+    )
+
+    first = _manager()
+    first.sync(force=True)
+    assert calls["skills"] == 1
+
+    # A second manager must compute its own set, not inherit a warm cache.
+    second = _manager()
+    second.sync(force=True)
+    assert calls["skills"] == 2, (
+        "a module-global memo would leak one profile's credential paths "
+        "into another profile's sync"
+    )
+
+
+def test_empty_result_is_cached(monkeypatch):
+    """A profile with no credentials and no linked skills must still cache.
+
+    Guarding on the SET being truthy meant a validly-empty result was never
+    cached, so every sync re-walked the whole skills tree -- exactly the cost
+    this memo removes, still paid by every credential-free profile.
+    """
+    calls = _install_counting_stubs(monkeypatch, [])  # nothing upload-only
+
+    mgr = _manager()
+    for _ in range(5):
+        mgr.sync(force=True)
+
+    assert mgr._upload_only_host_paths == set()
+    assert calls["skills"] == 1, (
+        f"skills tree walked {calls['skills']}x for a validly-empty "
+        "upload-only set; an empty answer is still an answer"
+    )
+
+
+def test_ordinary_file_edit_honors_upload_only_ttl(monkeypatch, tmp_path):
+    """Editing an already-known file must not force another skills walk."""
+    local = tmp_path / "cache-entry"
+    local.write_text("first")
+    calls = _install_counting_stubs(monkeypatch, [])
+    remote = "/root/.hermes/cache/cache-entry"
+    mgr = _manager([(str(local), remote)])
+
+    mgr.sync(force=True)
+    assert calls["skills"] == 1
+
+    local.write_text("second")
+    mgr.sync(force=True)
+
+    assert calls["skills"] == 1
+
+
+def test_new_ordinary_file_honors_upload_only_ttl(monkeypatch, tmp_path):
+    """Creating a cache file must not force another skills walk."""
+    first = tmp_path / "first-cache-entry"
+    first.write_text("first")
+    calls = _install_counting_stubs(monkeypatch, [])
+    remote_base = "/root/.hermes/cache/cache-entry"
+    files = [(str(first), remote_base + "-first")]
+    mgr = _manager(files)
+
+    mgr.sync(force=True)
+    assert calls["skills"] == 1
+
+    second = tmp_path / "second-cache-entry"
+    second.write_text("second")
+    files.append((str(second), remote_base + "-second"))
+    mgr.sync(force=True)
+
+    assert calls["skills"] == 1
+
+
+def test_new_upload_only_path_is_protected_during_sync_back(monkeypatch, tmp_path):
+    """A path added during a warm memo remains protected through teardown."""
+    regular = tmp_path / "regular.md"
+    linked = tmp_path / "shared-skill.md"
+    regular.write_text("regular")
+    linked.write_text("host version")
+    regular_remote = "/root/.hermes/skills/regular.md"
+    linked_remote = "/root/.hermes/skills/shared-skill.md"
+    files = [(str(regular), regular_remote)]
+    current_upload_only: set[str] = set()
+    monkeypatch.setattr(fs, "_credential_host_paths", lambda: set(current_upload_only))
+
+    def download_changed_file(destination):
+        with tarfile.open(destination, "w") as tar:
+            data = b"remote version"
+            info = tarfile.TarInfo("root/.hermes/skills/shared-skill.md")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    mgr = FileSyncManager(
+        get_files_fn=lambda: list(files),
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+        bulk_download_fn=download_changed_file,
+    )
+    mgr.sync(force=True)
+
+    # The cache is warm when a new cross-profile link appears.
+    files.append((str(linked), linked_remote))
+    current_upload_only.add(str(linked.resolve()))
+    mgr.sync(force=True)
+    assert str(linked.resolve()) in mgr._upload_only_host_paths
+
+    # The link can disappear before teardown; the protection at upload time
+    # must still win over a fresh, now-empty discovery result.
+    current_upload_only.clear()
+    mgr.sync_back(hermes_home=tmp_path / "home")
+    assert linked.read_text() == "host version"
+
+
+def test_retargeted_same_remote_path_is_protected(monkeypatch, tmp_path):
+    """A skill retargeted to another profile keeps its container path.
+
+    Forcing the refresh only on NEW remote paths missed this: the container
+    path is unchanged, so the warm memo was reused and the newly upload-only
+    host file was left unprotected until the TTL expired.
+    """
+    local = tmp_path / "local-skill.md"
+    local.write_text("local")
+    other_profile = tmp_path / "other-profile-skill.md"
+    other_profile.write_text("host version")
+    remote = "/root/.hermes/skills/shared.md"
+
+    files = [(str(local), remote)]
+    current_upload_only: set[str] = set()
+    monkeypatch.setattr(fs, "_credential_host_paths", lambda: set(current_upload_only))
+
+    def download_changed_file(destination):
+        with tarfile.open(destination, "w") as tar:
+            data = b"remote version"
+            info = tarfile.TarInfo("root/.hermes/skills/shared.md")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    mgr = FileSyncManager(
+        get_files_fn=lambda: list(files),
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+        bulk_download_fn=download_changed_file,
+    )
+    mgr.sync(force=True)
+
+    # Same remote path, now backed by another profile's file: upload-only.
+    files[0] = (str(other_profile), remote)
+    current_upload_only.add(str(other_profile.resolve()))
+    mgr.sync(force=True)
+    assert str(other_profile.resolve()) in mgr._upload_only_host_paths
+
+    current_upload_only.clear()
+    mgr.sync_back(hermes_home=tmp_path / "home")
+    assert other_profile.read_text() == "host version"
+
+
+
+def test_retarget_with_identical_stat_key_is_protected(monkeypatch, tmp_path):
+    """A retarget producing no upload must still refresh the protections.
+
+    ``_synced_files`` keys on the remote path's ``(mtime, size)``. A symlink
+    retargeted to another profile's file with the SAME mtime and size yields
+    no upload at all, so forcing the refresh on ``to_upload`` alone left the
+    warm memo in place and the other profile's file unprotected.
+    """
+    local = tmp_path / "local-skill.md"
+    other_profile = tmp_path / "other-profile-skill.md"
+    local.write_text("host version")
+    # Byte-identical size, and the same mtime: the stat key cannot tell these
+    # two files apart.
+    other_profile.write_text("host version")
+    stat = local.stat()
+    os.utime(other_profile, (stat.st_atime, stat.st_mtime))
+    assert _file_mtime_key(str(local)) == _file_mtime_key(str(other_profile))
+
+    remote = "/root/.hermes/skills/shared.md"
+    files = [(str(local), remote)]
+    current_upload_only: set[str] = set()
+    monkeypatch.setattr(fs, "_credential_host_paths", lambda: set(current_upload_only))
+
+    def download_changed_file(destination):
+        with tarfile.open(destination, "w") as tar:
+            data = b"remote version"
+            info = tarfile.TarInfo("root/.hermes/skills/shared.md")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    mgr = FileSyncManager(
+        get_files_fn=lambda: list(files),
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+        bulk_download_fn=download_changed_file,
+    )
+    mgr.sync(force=True)
+
+    files[0] = (str(other_profile), remote)
+    current_upload_only.add(str(other_profile.resolve()))
+    mgr.sync(force=True)
+    assert str(other_profile.resolve()) in mgr._upload_only_host_paths, (
+        "a retarget with an identical stat key produced no upload, so the "
+        "protections were never refreshed"
+    )
+
+    current_upload_only.clear()
+    mgr.sync_back(hermes_home=tmp_path / "home")
+    assert other_profile.read_text() == "host version"
+
+
+def _write_skill(tree, name, text):
+    """Create <tree>/<name>/SKILL.md with real content."""
+    d = tree / name
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / "SKILL.md"
+    f.write_text(text, encoding="utf-8")
+    return f
+
+
+def test_real_symlink_retarget_across_profiles_is_upload_only(monkeypatch, tmp_path):
+    """End-to-end through the real resolver, no stubbing of the classifier.
+
+    Mirrors the production layout: a profile lane's skills tree is walked, and
+    ``hermes profile`` symlinks shared skills into it from the ROOT
+    ``~/.hermes/skills`` tree. That link is FOLLOWED (it stays inside a skills
+    boundary) but its target sits outside the walked tree, so it must be
+    classified upload-only or a remote edit synced back would overwrite the
+    shared copy. Drives the actual ``iter_skills_files`` / ``_walk_skill_tree``
+    walk; stubbing ``_credential_host_paths`` (as the other tests here do)
+    cannot catch a defect in that resolver/classifier coupling.
+    """
+    root = tmp_path / "hermes-root"
+    profile_home = root / "profiles" / "lane"
+    lane_skills = profile_home / "skills"
+    shared_skills = root / "skills"
+    lane_skills.mkdir(parents=True)
+    shared_skills.mkdir(parents=True)
+
+    own_skill = _write_skill(lane_skills, "own-skill", "own body")
+    shared_skill = _write_skill(shared_skills, "shared-skill", "shared body")
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    import tools.credential_files as cf
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda *_a, **_kw: [])
+    monkeypatch.setattr(cf, "_resolve_hermes_home", lambda: profile_home)
+
+    def _sync_files():
+        return [
+            (e["host_path"], e["container_path"]) for e in cf.iter_skills_files()
+        ]
+
+    mgr = FileSyncManager(
+        get_files_fn=_sync_files,
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+    )
+    mgr.sync(force=True)
+
+    resolved_own = str(own_skill.resolve())
+    resolved_shared = str(shared_skill.resolve())
+    assert resolved_own not in mgr._upload_only_host_paths, (
+        "a skill living inside the walked tree must stay writable"
+    )
+
+    # Retarget: same container path, now a link to the SHARED tree.
+    link = lane_skills / "own-skill" / "SKILL.md"
+    link.unlink()
+    link.symlink_to(shared_skill)
+    # Identical mtime and size hide the change from the stat key, so only the
+    # remote-to-host mapping reveals the retarget.
+    src = own_skill.parent.stat()
+    os.utime(shared_skill, (src.st_atime, src.st_mtime))
+
+    mgr.sync(force=True)
+
+    assert resolved_shared in mgr._upload_only_host_paths, (
+        "a skill reached by following a link OUT of the walked tree is shared "
+        "with another profile; a remote edit synced back would overwrite it"
+    )
+
+
+def test_deleted_paths_leave_the_host_mapping(monkeypatch, tmp_path):
+    """A removed file must not stay in the host mapping forever.
+
+    ``new_hosts`` starts as a copy of the whole previous mapping, so without
+    pruning on delete a session that repeatedly creates and removes cache
+    artifacts grows ``_synced_hosts`` without bound and copies the entire
+    history on every sync -- reintroducing the per-sync cost this memo removes.
+    """
+    _install_counting_stubs(monkeypatch, [])
+
+    kept = tmp_path / "kept.md"
+    kept.write_text("kept")
+    files = [(str(kept), "/root/.hermes/skills/kept.md")]
+
+    mgr = _manager(files)
+    mgr._get_files_fn = lambda: list(files)
+    mgr.sync(force=True)
+
+    for i in range(5):
+        transient = tmp_path / f"transient-{i}.md"
+        transient.write_text("x")
+        remote = f"/root/.hermes/skills/transient-{i}.md"
+        files.append((str(transient), remote))
+        mgr.sync(force=True)
+        files.pop()
+        mgr.sync(force=True)
+
+    assert set(mgr._synced_hosts) == {"/root/.hermes/skills/kept.md"}, (
+        f"deleted mappings accumulated: {sorted(mgr._synced_hosts)}"
+    )

@@ -42,6 +42,12 @@ _monotonic = time.monotonic
 _SYNC_INTERVAL_SECONDS = 5.0
 _FORCE_SYNC_ENV = "HERMES_FORCE_FILE_SYNC"
 
+# How long a FileSyncManager may reuse its upload-only path set before
+# recomputing it. Recomputing costs a full skills-tree walk (see
+# FileSyncManager._refresh_upload_only_paths), which the sync path would
+# otherwise pay on every single command.
+_UPLOAD_ONLY_TTL_SECONDS = 60.0
+
 # Transport callbacks provided by each backend
 UploadFn = Callable[[str, str], None]  # (host_path, remote_path) -> raises on failure
 BulkUploadFn = Callable[[list[tuple[str, str]]], None]  # [(host_path, remote_path), ...] -> raises on failure
@@ -85,6 +91,30 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     return files
 
 
+def _credential_mount_host_paths() -> set[str]:
+    """Return resolved host paths for explicitly mounted credentials."""
+    try:
+        from tools.credential_files import get_credential_file_mounts
+    except Exception:
+        return set()
+
+    try:
+        mounts = get_credential_file_mounts()
+    except Exception:
+        return set()
+
+    paths: set[str] = set()
+    for entry in mounts:
+        host_path = entry.get("host_path") if isinstance(entry, dict) else None
+        if not host_path:
+            continue
+        try:
+            paths.add(str(Path(host_path).expanduser().resolve()))
+        except OSError:
+            paths.add(str(Path(host_path).expanduser()))
+    return paths
+
+
 def _credential_host_paths() -> set[str]:
     """Host paths that are upload-only for remote sandboxes.
 
@@ -93,29 +123,17 @@ def _credential_host_paths() -> set[str]:
     so applying a remote edit to it would be a silent cross-profile write.
     """
     try:
-        from tools.credential_files import (
-            get_credential_file_mounts,
-            iter_skills_files,
-        )
+        from tools.credential_files import iter_skills_files
     except Exception:
         return set()
 
-    paths: set[str] = set()
+    paths = _credential_mount_host_paths()
 
     def _add(host_path: str) -> None:
         try:
             paths.add(str(Path(host_path).expanduser().resolve()))
         except OSError:
             paths.add(str(Path(host_path).expanduser()))
-
-    try:
-        mounts = get_credential_file_mounts()
-    except Exception:
-        return set()
-    for entry in mounts:
-        host_path = entry.get("host_path") if isinstance(entry, dict) else None
-        if host_path:
-            _add(host_path)
 
     try:
         skills = iter_skills_files()
@@ -128,6 +146,15 @@ def _credential_host_paths() -> set[str]:
         if host_path:
             _add(host_path)
     return paths
+
+
+def _is_skill_remote_path(remote_path: str) -> bool:
+    """Whether a remote path belongs to a skills tree."""
+    marker = "/.hermes/"
+    if marker not in remote_path:
+        return False
+    relative = remote_path.split(marker, 1)[1]
+    return relative.startswith(("skills/", "external_skills/", "project_skills/"))
 
 
 def synced_subtree_roots(container_base: str = "/root/.hermes") -> list[str]:
@@ -215,10 +242,46 @@ class FileSyncManager:
         self._delete_fn = delete_fn
         self._transaction_lock = threading.Lock()
         self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
+        # remote_path -> host_path. Kept separately from the stat key because a
+        # retargeted symlink can point at a different profile's file with an
+        # identical (mtime, size); that produces no upload, so the mapping
+        # itself is the only signal the upload-only set may have changed.
+        self._synced_hosts: dict[str, str] = {}
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
         self._upload_only_host_paths: set[str] = set()
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
+        # Memo for the upload-only set (see _refresh_upload_only_paths).
+        # Per-instance, never module-global: each manager belongs to one
+        # profile/backend, and a shared cache would leak one profile's
+        # credential paths into another's sync.
+        self._upload_only_cache_time: float = 0.0
+
+    def _refresh_upload_only_paths(self, *, force: bool = False) -> None:
+        """Refresh the upload-only path set, at most once per TTL.
+
+        ``_sync_transaction`` needs this set on every sync, but computing it
+        walks the whole skills tree a SECOND time on top of
+        ``_get_files_fn()`` -- two full walks per synced command. On a large
+        collection (8k+ skill files) that measured ~3s of local disk work per
+        walk, paid before a single byte moved, on SSH, Modal and Daytona
+        alike.
+
+        The set only changes when a skill is added or a symlink retargeted, so
+        a short TTL is safe. It is also strictly additive (``update``), so a
+        stale read can never un-protect a path that is already protected --
+        the failure mode of a missed refresh is one TTL of a NEW upload-only
+        file not yet being marked, never a credential losing its guard.
+        """
+        now = _monotonic()
+        if (
+            not force
+            and self._upload_only_cache_time
+            and now - self._upload_only_cache_time < _UPLOAD_ONLY_TTL_SECONDS
+        ):
+            return
+        self._upload_only_host_paths.update(_credential_host_paths())
+        self._upload_only_cache_time = now
 
     def sync(self, *, force: bool = False, raise_on_error: bool = False) -> None:
         """Run a sync cycle: upload changed files, delete removed files.
@@ -240,13 +303,35 @@ class FileSyncManager:
                 return
 
         current_files = self._get_files_fn()
-        self._upload_only_host_paths.update(_credential_host_paths())
         current_remote_paths = {remote for _, remote in current_files}
 
         # --- Uploads: new or changed files ---
         to_upload: list[tuple[str, str]] = []
         new_files = dict(self._synced_files)
+        new_hosts = dict(self._synced_hosts)
+        mapping_changed = False
+        credential_mount_host_paths: set[str] | None = None
         for host_path, remote_path in current_files:
+            if (
+                remote_path not in self._synced_hosts
+                or self._synced_hosts[remote_path] != host_path
+            ):
+                # New or retargeted skill mappings can change the upload-only
+                # set. Ordinary cache/plan mappings cannot.
+                if _is_skill_remote_path(remote_path):
+                    mapping_changed = True
+                else:
+                    if credential_mount_host_paths is None:
+                        credential_mount_host_paths = _credential_mount_host_paths()
+                    try:
+                        resolved_host_path = str(Path(host_path).expanduser().resolve())
+                    except OSError:
+                        resolved_host_path = str(Path(host_path).expanduser())
+                    mapping_changed = (
+                        mapping_changed
+                        or resolved_host_path in credential_mount_host_paths
+                    )
+            new_hosts[remote_path] = host_path
             file_key = _file_mtime_key(host_path)
             if file_key is None:
                 continue
@@ -254,6 +339,20 @@ class FileSyncManager:
                 continue
             to_upload.append((host_path, remote_path))
             new_files[remote_path] = file_key
+
+        # Anything about to be uploaded may be newly upload-only: a brand new
+        # remote path, or an EXISTING one whose symlink was retargeted at the
+        # same container path. An upload is the usual signal, but a retarget to
+        # a file with identical (mtime, size) produces none, so track the
+        # remote-to-host mapping independently of the stat key.
+        self._refresh_upload_only_paths(force=mapping_changed)
+        # Commit the mapping eagerly, before the no-work early return: a pure
+        # retarget with an identical stat key produces neither an upload nor a
+        # delete, and leaving the old mapping in place would re-force the
+        # refresh on every subsequent sync. Never rolled back with
+        # ``_synced_files`` -- a rollback restores the old stat key, so the
+        # retry re-uploads and force-refreshes on that path anyway.
+        self._synced_hosts = new_hosts
 
         # --- Deletes: synced paths no longer in current set ---
         to_delete = [p for p in self._synced_files if p not in current_remote_paths]
@@ -291,6 +390,11 @@ class FileSyncManager:
             for p in to_delete:
                 new_files.pop(p, None)
                 self._pushed_hashes.pop(p, None)
+                # Prune the host mapping too. Without this a session that
+                # repeatedly creates and removes cache artifacts grows
+                # _synced_hosts without bound and copies the whole historical
+                # mapping on every sync, restoring the cost this memo removes.
+                self._synced_hosts.pop(p, None)
 
             self._synced_files = new_files
             self._last_sync_time = _monotonic()
