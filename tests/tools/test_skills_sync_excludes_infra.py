@@ -1,0 +1,145 @@
+"""Skills sync ships skill content, not the tree's local infrastructure."""
+
+from pathlib import Path
+
+import pytest
+
+from tools.credential_files import _walk_skill_tree
+from tools.environments.file_sync import _is_excluded_skill_remote_path
+
+
+def _skill_tree(tmp_path: Path) -> Path:
+    root = tmp_path / "skills"
+    (root / "coding" / "debug").mkdir(parents=True)
+    (root / "coding" / "debug" / "SKILL.md").write_text("# debug\n")
+    (root / "coding" / "debug" / "references").mkdir()
+    (root / "coding" / "debug" / "references" / "api.md").write_text("api\n")
+    return root
+
+
+def _remote_paths(root: Path) -> set[str]:
+    return {e["container_path"] for e in _walk_skill_tree(root, "/root/.hermes/skills")}
+
+
+def test_real_skill_files_are_still_synced(tmp_path):
+    root = _skill_tree(tmp_path)
+    paths = _remote_paths(root)
+    assert "/root/.hermes/skills/coding/debug/SKILL.md" in paths
+    assert "/root/.hermes/skills/coding/debug/references/api.md" in paths
+
+
+def test_registry_index_cache_is_not_synced(tmp_path):
+    root = _skill_tree(tmp_path)
+    hub = root / ".hub" / "index-cache"
+    hub.mkdir(parents=True)
+    (hub / "hermes-index.json").write_text("{}" * 100)
+    assert not any(".hub" in p for p in _remote_paths(root))
+
+
+def test_vendored_dependencies_are_not_synced(tmp_path):
+    root = _skill_tree(tmp_path)
+    nm = root / "coding" / "debug" / "scripts" / "node_modules" / "left-pad"
+    nm.mkdir(parents=True)
+    (nm / "index.js").write_text("module.exports = 1\n")
+    assert not any("node_modules" in p for p in _remote_paths(root))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".archive",
+        ".curator_backups",
+        ".git",
+        ".github",
+        ".hub",
+        ".mypy_cache",
+        ".nox",
+        ".pytest_cache",
+        ".restore-backups",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        ".worktrees",
+        "__pycache__",
+        "node_modules",
+        "site-packages",
+        "venv",
+    ],
+)
+def test_each_excluded_dir_is_skipped(tmp_path, name):
+    root = _skill_tree(tmp_path)
+    junk = root / name
+    junk.mkdir()
+    (junk / "payload.bin").write_text("x" * 64)
+    assert not any(f"/{name}/" in p for p in _remote_paths(root))
+
+
+def test_a_skill_file_sharing_an_excluded_name_is_still_synced(tmp_path):
+    # The guard matches directories only: a file named ".git" or a skill
+    # documenting node_modules must not be dropped.
+    root = _skill_tree(tmp_path)
+    (root / "coding" / "debug" / "node_modules").write_text("notes\n")
+    paths = _remote_paths(root)
+    assert "/root/.hermes/skills/coding/debug/node_modules" in paths
+
+
+def test_symlink_to_excluded_directory_is_skipped(tmp_path):
+    root = _skill_tree(tmp_path)
+    target = root / ".archive"
+    target.mkdir()
+    (target / "payload.bin").write_text("x" * 64)
+    (root / "live").symlink_to(target, target_is_directory=True)
+    assert not any("/live/" in p for p in _remote_paths(root))
+
+
+def test_symlink_to_allowed_skill_directory_is_synced(tmp_path):
+    root = _skill_tree(tmp_path)
+    target = root / "shared"
+    target.mkdir()
+    (target / "SKILL.md").write_text("# shared\n")
+    (root / "alias").symlink_to(target, target_is_directory=True)
+    assert "/root/.hermes/skills/alias/SKILL.md" in _remote_paths(root)
+
+
+class TestSyncBackIgnoresExcludedInfra:
+    """A remote provisioned before the exclusion must not push its junk back."""
+
+    @pytest.mark.parametrize(
+        "remote_path",
+        [
+            "/root/.hermes/skills/.hub/index-cache/hermes-index.json",
+            "/root/.hermes/skills/.curator_backups/snap.tar.gz",
+            "/root/.hermes/skills/.restore-backups/old/SKILL.md",
+            "/root/.hermes/skills/coding/x/node_modules/pkg/index.js",
+            "/root/.hermes/skills/.worktrees/wt/SKILL.md",
+            "/root/.hermes/skills/marketing/__pycache__/m.cpython-312.pyc",
+            "/root/.hermes/external_skills/0/foo/node_modules/pkg/index.js",
+            "/root/.hermes/project_skills/0/bar/__pycache__/module.pyc",
+        ],
+    )
+    def test_excluded_infra_paths_are_skipped(self, remote_path):
+        assert _is_excluded_skill_remote_path(remote_path)
+
+    @pytest.mark.parametrize(
+        "remote_path",
+        [
+            "/root/.hermes/skills/coding/simplify/SKILL.md",
+            "/root/.hermes/skills/bloom/bloom-cli/references/api.md",
+            "/root/.hermes/skills/writer/SKILL.md",
+        ],
+    )
+    def test_real_skill_content_still_syncs_back(self, remote_path):
+        assert not _is_excluded_skill_remote_path(remote_path)
+
+    def test_non_skill_paths_are_untouched(self):
+        # Cache and credentials keep their own rules; this guard must not
+        # start filtering them.
+        assert not _is_excluded_skill_remote_path(
+            "/root/.hermes/cache/.hub/blob.json"
+        )
+
+    def test_a_dot_named_file_is_not_treated_as_a_directory(self):
+        # Only path segments before the filename are directories.
+        assert not _is_excluded_skill_remote_path(
+            "/root/.hermes/skills/coding/.gitignore"
+        )

@@ -27,6 +27,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, List, Optional
 from hermes_cli.config import cfg_get
+from agent.skill_utils import is_excluded_skill_dir_name
 
 try:  # pragma: no cover - exercised via the fail-closed test below
     from agent.file_safety import get_read_block_error
@@ -398,6 +399,8 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
             return
         for item in children:
             rel = f"{rel_prefix}{item.name}"
+            if is_excluded_skill_dir_name(item.name) and item.is_dir():
+                continue
             try:
                 item_real = item.resolve()
             except (OSError, RuntimeError):
@@ -408,6 +411,15 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
                 logger.warning(
                     "skills sync: skipping symlink out of the skills trees: %s", item,
                 )
+                continue
+            if item.is_symlink() and item.is_dir() and any(
+                item_real.is_relative_to(b)
+                and any(
+                    is_excluded_skill_dir_name(part)
+                    for part in item_real.relative_to(b).parts
+                )
+                for b in boundaries
+            ):
                 continue
             if item_real.is_dir():
                 walk(item, f"{rel}/", ancestors)
