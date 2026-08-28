@@ -104,3 +104,24 @@ def test_memo_is_per_manager_not_shared(monkeypatch, tmp_path):
         "a module-global memo would leak one profile's credential paths "
         "into another profile's sync"
     )
+
+
+def test_empty_result_is_cached(monkeypatch):
+    """A profile with no credentials and no linked skills must still cache.
+
+    Guarding on the SET being truthy meant a validly-empty result was never
+    cached, so every sync re-walked the whole skills tree -- exactly the cost
+    this memo removes, still paid by every credential-free profile.
+    """
+    calls = _install_counting_stubs(monkeypatch, [])  # nothing upload-only
+
+    mgr = _manager()
+    for _ in range(5):
+        mgr.sync(force=True)
+
+    assert mgr._upload_only_host_paths == set()
+    assert calls["skills"] == 1, (
+        f"skills tree walked {calls['skills']}x for a validly-empty "
+        "upload-only set; an empty answer is still an answer"
+    )
+

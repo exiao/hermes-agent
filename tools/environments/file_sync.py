@@ -249,7 +249,7 @@ class FileSyncManager:
         """
         now = _monotonic()
         if (
-            self._upload_only_host_paths
+            self._upload_only_cache_time
             and now - self._upload_only_cache_time < _UPLOAD_ONLY_TTL_SECONDS
         ):
             return
