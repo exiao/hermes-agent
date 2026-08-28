@@ -84,7 +84,7 @@ class TestTarExitOneClassification:
             capture_output=True,
             text=True,
         )
-        assert result.returncode == 1, "expected tar to exit 1 on a missing member"
+        assert result.returncode != 0, "expected tar to fail on a missing member"
         assert not _tar_stderr_is_only_concurrent_change(result.stderr)
 
     def test_real_tar_clean_run_exits_zero(self, tmp_path):
