@@ -83,6 +83,24 @@ def test_a_skill_file_sharing_an_excluded_name_is_still_synced(tmp_path):
     assert "/root/.hermes/skills/coding/debug/node_modules" in paths
 
 
+def test_symlink_to_excluded_directory_is_skipped(tmp_path):
+    root = _skill_tree(tmp_path)
+    target = root / ".archive"
+    target.mkdir()
+    (target / "payload.bin").write_text("x" * 64)
+    (root / "live").symlink_to(target, target_is_directory=True)
+    assert not any("/live/" in p for p in _remote_paths(root))
+
+
+def test_symlink_to_allowed_skill_directory_is_synced(tmp_path):
+    root = _skill_tree(tmp_path)
+    target = root / "shared"
+    target.mkdir()
+    (target / "SKILL.md").write_text("# shared\n")
+    (root / "alias").symlink_to(target, target_is_directory=True)
+    assert "/root/.hermes/skills/alias/SKILL.md" in _remote_paths(root)
+
+
 class TestSyncBackIgnoresExcludedInfra:
     """A remote provisioned before the exclusion must not push its junk back."""
 

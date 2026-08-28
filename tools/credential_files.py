@@ -412,6 +412,15 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
                     "skills sync: skipping symlink out of the skills trees: %s", item,
                 )
                 continue
+            if item.is_symlink() and item.is_dir() and any(
+                item_real.is_relative_to(b)
+                and any(
+                    is_excluded_skill_dir_name(part)
+                    for part in item_real.relative_to(b).parts
+                )
+                for b in boundaries
+            ):
+                continue
             if item_real.is_dir():
                 walk(item, f"{rel}/", ancestors)
             elif item_real.is_file():
