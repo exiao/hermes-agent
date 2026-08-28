@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tools.environments.base import EnvironmentConnectionError
 from tools.environments import ssh as ssh_env
 from tools.environments import modal as modal_env
 from tools.environments import daytona as daytona_env
@@ -121,15 +122,74 @@ class TestSSHBulkDownload:
         assert "testuser@example.com" in cmd_str
 
 
-    def test_ssh_bulk_download_uses_120s_timeout(self, ssh_mock_env, tmp_path):
-        """The subprocess.run call should use a 120s timeout."""
+    def test_ssh_bulk_download_uses_bounded_timeout(self, ssh_mock_env, tmp_path):
+        """The download must be bounded, and generous enough for a full tree."""
         dest = tmp_path / "backup.tar"
 
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as mock_run:
             ssh_mock_env._ssh_bulk_download(dest)
 
-        call_kwargs = mock_run.call_args
-        assert call_kwargs.kwargs.get("timeout") == 120 or call_kwargs[1].get("timeout") == 120
+        timeout = mock_run.call_args.kwargs.get("timeout")
+        assert timeout is not None
+        assert 120 <= timeout <= ssh_env._BULK_UPLOAD_MAX_TIMEOUT
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            b"tar: cache.db: file changed as we read it",
+            b"tar: cache.db: file removed before we read it",
+        ],
+    )
+    def test_ssh_bulk_download_allows_concurrent_change_warning(self, ssh_mock_env, tmp_path, stderr):
+        """Exit 1 is valid only for a known live-tree warning."""
+        dest = tmp_path / "backup.tar"
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, stderr=stderr),
+        ):
+            ssh_mock_env._ssh_bulk_download(dest)
+
+    def test_ssh_bulk_download_rejects_other_exit_one_errors(self, ssh_mock_env, tmp_path):
+        """An unrelated tar error must trigger the sync-back retry path."""
+        dest = tmp_path / "backup.tar"
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, stderr=b"tar: permission denied"),
+        ):
+            with pytest.raises(EnvironmentConnectionError):
+                ssh_mock_env._ssh_bulk_download(dest)
+
+    def test_ssh_bulk_upload_falls_back_without_remote_gzip(self, ssh_mock_env, tmp_path, monkeypatch):
+        """Hosts without gzip receive an uncompressed tar stream."""
+        source = tmp_path / "payload.txt"
+        source.write_text("payload")
+        tar_proc = MagicMock()
+        tar_proc.poll.return_value = 0
+        tar_proc.returncode = 0
+        tar_proc.stderr.read.return_value = b""
+        ssh_proc = MagicMock()
+        ssh_proc.communicate.return_value = (b"", b"")
+        ssh_proc.returncode = 0
+
+        monkeypatch.setattr(ssh_env, "unique_parent_dirs", lambda _files: [])
+        monkeypatch.setattr(ssh_mock_env, "_remote_supports_gzip", lambda: False)
+        with patch.object(
+            subprocess,
+            "Popen",
+            side_effect=[tar_proc, ssh_proc],
+        ) as mock_popen:
+            ssh_mock_env._ssh_bulk_upload(
+                [(str(source), "/home/testuser/.hermes/payload.txt")]
+            )
+
+        tar_command = mock_popen.call_args_list[0].args[0]
+        ssh_command = mock_popen.call_args_list[1].args[0]
+        assert "-chf" in tar_command
+        assert "tar xf -" in ssh_command[-1]
 
 
 class TestSSHCleanup:
