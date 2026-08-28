@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from tools.credential_files import _walk_skill_tree
+from tools.environments.file_sync import _is_excluded_skill_remote_path
 
 
 def _skill_tree(tmp_path: Path) -> Path:
@@ -80,3 +81,45 @@ def test_a_skill_file_sharing_an_excluded_name_is_still_synced(tmp_path):
     (root / "coding" / "debug" / "node_modules").write_text("notes\n")
     paths = _remote_paths(root)
     assert "/root/.hermes/skills/coding/debug/node_modules" in paths
+
+
+class TestSyncBackIgnoresExcludedInfra:
+    """A remote provisioned before the exclusion must not push its junk back."""
+
+    @pytest.mark.parametrize(
+        "remote_path",
+        [
+            "/root/.hermes/skills/.hub/index-cache/hermes-index.json",
+            "/root/.hermes/skills/.curator_backups/snap.tar.gz",
+            "/root/.hermes/skills/.restore-backups/old/SKILL.md",
+            "/root/.hermes/skills/coding/x/node_modules/pkg/index.js",
+            "/root/.hermes/skills/.worktrees/wt/SKILL.md",
+            "/root/.hermes/skills/marketing/__pycache__/m.cpython-312.pyc",
+        ],
+    )
+    def test_excluded_infra_paths_are_skipped(self, remote_path):
+        assert _is_excluded_skill_remote_path(remote_path)
+
+    @pytest.mark.parametrize(
+        "remote_path",
+        [
+            "/root/.hermes/skills/coding/simplify/SKILL.md",
+            "/root/.hermes/skills/bloom/bloom-cli/references/api.md",
+            "/root/.hermes/skills/writer/SKILL.md",
+        ],
+    )
+    def test_real_skill_content_still_syncs_back(self, remote_path):
+        assert not _is_excluded_skill_remote_path(remote_path)
+
+    def test_non_skill_paths_are_untouched(self):
+        # Cache and credentials keep their own rules; this guard must not
+        # start filtering them.
+        assert not _is_excluded_skill_remote_path(
+            "/root/.hermes/cache/.hub/blob.json"
+        )
+
+    def test_a_dot_named_file_is_not_treated_as_a_directory(self):
+        # Only path segments before the filename are directories.
+        assert not _is_excluded_skill_remote_path(
+            "/root/.hermes/skills/coding/.gitignore"
+        )

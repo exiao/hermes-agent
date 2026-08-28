@@ -91,6 +91,21 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     return files
 
 
+def _is_excluded_skill_remote_path(remote_path: str) -> bool:
+    """True if a remote path sits inside a skill directory we never sync.
+
+    Applies the same canonical predicate as the upload walk, so exclusion is
+    decided in one place for both directions.
+    """
+    from agent.skill_utils import is_excluded_skill_dir_name
+
+    if "/skills/" not in remote_path:
+        return False
+    tail = remote_path.split("/skills/", 1)[1]
+    # The last segment is the file itself; only directories are excluded.
+    return any(is_excluded_skill_dir_name(part) for part in tail.split("/")[:-1])
+
+
 def _credential_mount_host_paths() -> set[str]:
     """Return resolved host paths for explicitly mounted credentials."""
     try:
@@ -558,6 +573,20 @@ class FileSyncManager:
                         # pull back, or a worker editing its own plan would
                         # overwrite the authoritative copy on the host.
                         if "/plans/" in remote_path:
+                            continue
+
+                        # A remote provisioned before these directories were
+                        # excluded still holds them. They are never uploaded
+                        # now, so _pushed_hashes has no entry and every file
+                        # inside looks like new remote work: _infer_host_path
+                        # would prefix-match the skills mapping and copy the
+                        # stale tree back onto the host, re-creating exactly
+                        # what the exclusion removed.
+                        if _is_excluded_skill_remote_path(remote_path):
+                            logger.debug(
+                                "sync_back: skipping excluded skill infra %s",
+                                remote_path,
+                            )
                             continue
 
                         pushed_hash = self._pushed_hashes.get(remote_path)
