@@ -92,63 +92,30 @@ def _session_is_messaging_surface() -> bool:
         return False
 
 
-def _current_surface_identities() -> list[str]:
-    """Every name this turn's surface answers to, lowercased.
+def _surface_is_excluded(agent_cfg: Any) -> bool:
+    """Whether this turn's surface is named in ``verify_on_stop_exclude_surfaces``.
 
-    Mirrors the resolution order in
-    ``gateway.session_context.session_is_messaging_surface``: the platform
-    (``HERMES_PLATFORM``, else the session platform) and the session source.
-    Cron binds ``platform="cron"``; the CLI/TUI bind a source instead, so both
-    are consulted.
-    """
-    identities: list[str] = []
-    try:
-        from gateway.session_context import get_session_env
-
-        platform = os.getenv("HERMES_PLATFORM") or get_session_env(
-            "HERMES_SESSION_PLATFORM", ""
-        )
-        source = get_session_env("HERMES_SESSION_SOURCE", "")
-    except Exception:
-        platform = os.environ.get("HERMES_PLATFORM") or os.environ.get(
-            "HERMES_SESSION_PLATFORM", ""
-        )
-        source = os.environ.get("HERMES_SESSION_SOURCE", "")
-    for identity in (platform, source):
-        token = str(identity or "").strip().lower()
-        if token:
-            identities.append(token)
-    return identities
-
-
-def _excluded_surfaces(agent_cfg: Any) -> frozenset[str]:
-    """Parse ``agent.verify_on_stop_exclude_surfaces`` into a name set.
-
-    Accepts a list (``["cron"]``) or a comma-separated string
-    (``"cron, kanban"``). Names are compared case- and whitespace-insensitively.
+    The setting accepts a list (``["cron"]``) or a comma-separated string
+    (``"cron, kanban"``); names are matched case- and whitespace-insensitively
+    against the session platform (cron binds ``platform="cron"``) and the
+    session source (the CLI/TUI bind that instead), mirroring the resolution
+    order in ``gateway.session_context.session_is_messaging_surface``.
     """
     if not isinstance(agent_cfg, dict):
-        return frozenset()
+        return False
     raw = agent_cfg.get("verify_on_stop_exclude_surfaces")
-    if isinstance(raw, str):
-        parts: Iterable[Any] = raw.split(",")
-    elif isinstance(raw, (list, tuple, set, frozenset)):
-        parts = raw
-    else:
-        return frozenset()
-    return frozenset(
-        token
-        for token in (str(part or "").strip().lower() for part in parts)
-        if token
-    )
-
-
-def _surface_is_excluded(agent_cfg: Any) -> bool:
-    """Whether this turn's surface is named in the exclusion list."""
-    excluded = _excluded_surfaces(agent_cfg)
+    parts: Iterable[Any] = raw.split(",") if isinstance(raw, str) else (raw or ())
+    excluded = {str(p or "").strip().lower() for p in parts} - {""}
     if not excluded:
         return False
-    return any(identity in excluded for identity in _current_surface_identities())
+
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:  # gateway package unreachable (CLI, tests)
+        get_session_env = lambda name, default="": os.environ.get(name, default)  # noqa: E731
+    platform = os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM", "")
+    source = get_session_env("HERMES_SESSION_SOURCE", "")
+    return any(str(i or "").strip().lower() in excluded for i in (platform, source))
 
 
 def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
