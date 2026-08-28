@@ -73,10 +73,18 @@ def _builtin_gateway_liveness() -> Optional[bool]:
     machinery and are deliberately exempt — a missing gateway process means
     nothing for them, so they report active. ``None`` = probe failed; callers
     must not claim either way.
+
+    Check the PID file before the process scan: ``find_gateway_pids()`` excludes
+    the caller and its ancestor chain (#13242), so when this probe runs INSIDE
+    the gateway it would hide the very PID that proves the ticker is alive.
     """
     try:
         if _active_cron_provider_name() != "builtin":
             return True  # external provider fires jobs without the gateway
+        from gateway.status import is_gateway_running
+
+        if is_gateway_running(cleanup_stale=False):
+            return True
         from hermes_cli.gateway import find_gateway_pids
 
         return bool(find_gateway_pids())
