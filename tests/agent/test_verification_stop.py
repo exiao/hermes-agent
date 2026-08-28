@@ -248,3 +248,61 @@ def test_is_non_code_path_classification():
     assert _is_non_code_path("src/app.ts") is False
     assert _is_non_code_path("config.yaml") is False
     assert _is_non_code_path("run_agent.py") is False
+
+
+# --- agent.verify_on_stop_exclude_surfaces ----------------------------------
+# "auto" is a single axis (messaging vs local) and cannot express "on for my
+# chat platform, off for unattended cron". The exclusion list subtracts named
+# surfaces from an otherwise-enabled setting.
+
+
+@pytest.mark.parametrize(
+    "name,env,cfg,expected",
+    [
+        # The bug this exists for: verification stays on where a human reads
+        # it, and stops overwriting an unattended cron job's final report.
+        ("cron excluded", {"HERMES_SESSION_PLATFORM": "cron"},
+         {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": ["cron"]}, False),
+        ("signal still on", {"HERMES_SESSION_PLATFORM": "signal"},
+         {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": ["cron"]}, True),
+        # A worker may carry only a session source, never a platform.
+        ("matches session source", {"HERMES_SESSION_SOURCE": "cron"},
+         {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": ["cron"]}, False),
+        ("case and space insensitive", {"HERMES_SESSION_PLATFORM": "CRON"},
+         {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": [" Cron "]}, False),
+        ("comma string form", {"HERMES_SESSION_PLATFORM": "kanban"},
+         {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": "cron, kanban"}, False),
+        ("applies under auto", {"HERMES_SESSION_SOURCE": "cli"},
+         {"verify_on_stop": "auto", "verify_on_stop_exclude_surfaces": ["cli"]}, False),
+        # Subtraction only: listing a surface never turns verification ON.
+        ("never enables a disabled setting", {"HERMES_SESSION_PLATFORM": "signal"},
+         {"verify_on_stop": False, "verify_on_stop_exclude_surfaces": ["cron"]}, False),
+        ("empty list changes nothing", {"HERMES_SESSION_PLATFORM": "cron"},
+         {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": []}, True),
+        # A mistyped config value must not crash the stop guard.
+        ("non-iterable value is ignored", {"HERMES_SESSION_PLATFORM": "cron"},
+         {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": 5}, True),
+        # The documented top-precedence escape hatch still wins.
+        ("env override beats exclusion",
+         {"HERMES_SESSION_PLATFORM": "cron", "HERMES_VERIFY_ON_STOP": "1"},
+         {"verify_on_stop": True, "verify_on_stop_exclude_surfaces": ["cron"]}, True),
+    ],
+)
+def test_verify_on_stop_exclude_surfaces(clear_verify_env, name, env, cfg, expected):
+    for key, value in env.items():
+        clear_verify_env.setenv(key, value)
+    assert verify_on_stop_enabled({"agent": cfg}) is expected
+
+
+def test_exclusion_uses_agent_runtime_platform(clear_verify_env):
+    # Cron passes its actual platform on AIAgent while the session platform
+    # context remains empty; the exclusion must use that runtime identity.
+    assert verify_on_stop_enabled(
+        {
+            "agent": {
+                "verify_on_stop": True,
+                "verify_on_stop_exclude_surfaces": ["cron"],
+            }
+        },
+        runtime_platform="cron",
+    ) is False
