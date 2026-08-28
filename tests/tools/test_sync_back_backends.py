@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tools.environments.base import EnvironmentConnectionError
 from tools.environments import ssh as ssh_env
 from tools.environments import modal as modal_env
 from tools.environments import daytona as daytona_env
@@ -131,6 +132,36 @@ class TestSSHBulkDownload:
         timeout = mock_run.call_args.kwargs.get("timeout")
         assert timeout is not None
         assert 120 <= timeout <= ssh_env._BULK_UPLOAD_MAX_TIMEOUT
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            b"tar: cache.db: file changed as we read it",
+            b"tar: cache.db: file removed before we read it",
+        ],
+    )
+    def test_ssh_bulk_download_allows_concurrent_change_warning(self, ssh_mock_env, tmp_path, stderr):
+        """Exit 1 is valid only for a known live-tree warning."""
+        dest = tmp_path / "backup.tar"
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, stderr=stderr),
+        ):
+            ssh_mock_env._ssh_bulk_download(dest)
+
+    def test_ssh_bulk_download_rejects_other_exit_one_errors(self, ssh_mock_env, tmp_path):
+        """An unrelated tar error must trigger the sync-back retry path."""
+        dest = tmp_path / "backup.tar"
+
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, stderr=b"tar: permission denied"),
+        ):
+            with pytest.raises(EnvironmentConnectionError):
+                ssh_mock_env._ssh_bulk_download(dest)
 
 
 class TestSSHCleanup:

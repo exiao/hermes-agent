@@ -402,10 +402,19 @@ class SSHEnvironment(BaseEnvironment):
                 stderr=subprocess.PIPE,
                 timeout=_BULK_UPLOAD_MAX_TIMEOUT,
             )
-        # GNU tar exit 1 is "some files differed"; the archive is still valid.
-        if result.returncode not in (0, 1):
+        # GNU and BSD tar both use exit 1 for a concurrent file-change warning,
+        # but BSD tar also uses it for ordinary errors. Accept only the known
+        # warning text so a partial archive cannot suppress the retry.
+        stderr = (result.stderr or b"").decode(errors="replace").strip()
+        if result.returncode != 0 and (
+            result.returncode != 1
+            or not any(
+                marker in stderr.lower()
+                for marker in ("file changed as we read it", "file removed before we read it")
+            )
+        ):
             raise EnvironmentConnectionError(
-                f"SSH bulk download failed: {result.stderr.decode(errors='replace').strip()}",
+                f"SSH bulk download failed: {stderr}",
                 retry_hint=(
                     f"File sync from {self.host} failed — verify the SSH "
                     "connection is healthy, then retry."
