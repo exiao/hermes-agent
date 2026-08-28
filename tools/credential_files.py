@@ -27,6 +27,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, List, Optional
 from hermes_cli.config import cfg_get
+from agent.skill_utils import is_excluded_skill_dir_name
 
 try:  # pragma: no cover - exercised via the fail-closed test below
     from agent.file_safety import get_read_block_error
@@ -344,24 +345,6 @@ def _safe_skills_path(skills_dir: Path) -> str:
     return str(safe_dir)
 
 
-# Directories that live inside a skills tree but are not skill content. The
-# skills sync uploads every file it walks, so these rode along to every remote
-# lane on every box: the skill-registry index alone is 27 MB, and no agent
-# reads it -- skills are loaded through skill_view, not by parsing the index.
-# Vendored dependency trees are re-installed remotely rather than shipped.
-_SKILL_SYNC_EXCLUDED_DIRS = frozenset({
-    ".hub",              # registry index cache, lock/taps state, quarantine
-    ".curator_backups",  # curator's pre-run snapshots of the whole tree
-    ".restore-backups",  # curator's local undo history
-    ".worktrees",        # git worktrees for skill authoring
-    ".git",
-    ".github",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-})
-
-
 def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
     """Enumerate every regular file under *root*, following safe symlinks.
 
@@ -416,7 +399,7 @@ def _walk_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
             return
         for item in children:
             rel = f"{rel_prefix}{item.name}"
-            if item.name in _SKILL_SYNC_EXCLUDED_DIRS and item.is_dir():
+            if is_excluded_skill_dir_name(item.name) and item.is_dir():
                 continue
             try:
                 item_real = item.resolve()

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.credential_files import _SKILL_SYNC_EXCLUDED_DIRS, _walk_skill_tree
+from tools.credential_files import _walk_skill_tree
 
 
 def _skill_tree(tmp_path: Path) -> Path:
@@ -43,7 +43,28 @@ def test_vendored_dependencies_are_not_synced(tmp_path):
     assert not any("node_modules" in p for p in _remote_paths(root))
 
 
-@pytest.mark.parametrize("name", sorted(_SKILL_SYNC_EXCLUDED_DIRS))
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".archive",
+        ".curator_backups",
+        ".git",
+        ".github",
+        ".hub",
+        ".mypy_cache",
+        ".nox",
+        ".pytest_cache",
+        ".restore-backups",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        ".worktrees",
+        "__pycache__",
+        "node_modules",
+        "site-packages",
+        "venv",
+    ],
+)
 def test_each_excluded_dir_is_skipped(tmp_path, name):
     root = _skill_tree(tmp_path)
     junk = root / name
