@@ -31,6 +31,43 @@ from tools.environments.file_sync import (
 logger = logging.getLogger(__name__)
 
 
+# Diagnostics that mean "the tree moved under me while I read it", not a
+# transfer failure. The remote tree is live: agents write cache and log files
+# while tar reads them. The archive is complete apart from those entries and
+# the next sync picks them up.
+_TAR_CONCURRENT_CHANGE_WARNINGS = (
+    "file changed as we read it",
+    "file removed before we read it",
+)
+
+# Both tars print a summary line after the real diagnostics; it carries no
+# information of its own and must not decide the outcome.
+_TAR_SUMMARY_SUFFIXES = (
+    "exiting with failure status due to previous errors",
+    "error exit delayed from previous errors.",
+)
+
+
+def _tar_stderr_is_only_concurrent_change(stderr: str) -> bool:
+    """True if every tar diagnostic line is a known concurrent-change warning.
+
+    Requiring *every* line to match is the point: a benign warning printed
+    alongside a genuine read error must not launder a truncated archive into
+    an accepted sync-back. Empty stderr returns False, since exit 1 with no
+    explanation is not attributable to a warning.
+    """
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    for line in lines:
+        low = line.lower()
+        if low.endswith(_TAR_SUMMARY_SUFFIXES):
+            continue
+        if not any(w in low for w in _TAR_CONCURRENT_CHANGE_WARNINGS):
+            return False
+    return True
+
+
 _BULK_UPLOAD_MIN_TIMEOUT = 120
 _BULK_UPLOAD_MAX_TIMEOUT = 1800
 # Deliberately pessimistic: a cold sync of a large skills tree is thousands of
@@ -403,15 +440,14 @@ class SSHEnvironment(BaseEnvironment):
                 timeout=_BULK_UPLOAD_MAX_TIMEOUT,
             )
         # GNU and BSD tar both use exit 1 for a concurrent file-change warning,
-        # but BSD tar also uses it for ordinary errors. Accept only the known
-        # warning text so a partial archive cannot suppress the retry.
+        # but BSD tar also uses it for ordinary errors. Accept only when EVERY
+        # diagnostic line is a known warning: a real error printed alongside a
+        # warning would otherwise pass and suppress the retry on a partial
+        # archive.
         stderr = (result.stderr or b"").decode(errors="replace").strip()
         if result.returncode != 0 and (
             result.returncode != 1
-            or not any(
-                marker in stderr.lower()
-                for marker in ("file changed as we read it", "file removed before we read it")
-            )
+            or not _tar_stderr_is_only_concurrent_change(stderr)
         ):
             raise EnvironmentConnectionError(
                 f"SSH bulk download failed: {stderr}",
