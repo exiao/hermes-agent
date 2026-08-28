@@ -152,6 +152,25 @@ class TestCacheKeying:
             "second home must build its own denylist, not inherit the first"
         )
 
+    def test_retargeted_credential_symlink_refreshes_the_denylist(
+        self, tmp_path, hermes_home
+    ):
+        first_secret = tmp_path / "first-secret.json"
+        second_secret = tmp_path / "second-secret.json"
+        first_secret.write_text("first")
+        second_secret.write_text("second")
+        link = hermes_home / "auth.json"
+        try:
+            link.symlink_to(first_secret)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable on this platform: {exc}")
+
+        assert get_read_block_error(str(link)) is not None
+        link.unlink()
+        link.symlink_to(second_secret)
+
+        assert get_read_block_error(str(link)) is not None
+
 
 class TestPerCallCost:
     def test_repeated_checks_do_not_rewalk_the_filesystem(

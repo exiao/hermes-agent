@@ -259,7 +259,51 @@ _CREDENTIAL_FILE_NAMES: tuple[str, ...] = (
 
 # Keyed by the (HERMES_HOME, root) pair so a profile switch or a test that
 # repoints HERMES_HOME builds its own denylist rather than reusing a stale one.
-_DENYLIST_CACHE: dict[tuple[str, ...], tuple[frozenset[Path], tuple[Path, ...]]] = {}
+_DENYLIST_CACHE: dict[
+    tuple[str, ...],
+    tuple[
+        frozenset[Path],
+        tuple[Path, ...],
+        tuple[tuple[str, tuple[int, ...] | None], ...],
+    ],
+] = {}
+
+
+def _denylist_watch_signature(
+    bases: tuple[Path, Path],
+) -> tuple[tuple[str, tuple[int, ...] | None], ...]:
+    """Return metadata for paths whose symlink targets affect the denylist."""
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for base in bases:
+        for path in (
+            base,
+            *(base / name for name in _CREDENTIAL_FILE_NAMES),
+            base / "mcp-tokens",
+        ):
+            path_key = os.fspath(path)
+            if path_key in seen:
+                continue
+            seen.add(path_key)
+            paths.append(path)
+
+    signature: list[tuple[str, tuple[int, ...] | None]] = []
+    for path in paths:
+        try:
+            stat = os.lstat(path)
+        except OSError:
+            metadata = None
+        else:
+            metadata = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_mode,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+        signature.append((os.fspath(path), metadata))
+    return tuple(signature)
 
 
 def _denied_path_set() -> tuple[frozenset[Path], tuple[Path, ...]]:
@@ -275,9 +319,10 @@ def _denied_path_set() -> tuple[frozenset[Path], tuple[Path, ...]]:
     """
     bases = (_hermes_home_path(), _hermes_root_path())
     key = tuple(str(b) for b in bases)
+    watch_signature = _denylist_watch_signature(bases)
     cached = _DENYLIST_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if cached is not None and cached[2] == watch_signature:
+        return cached[:2]
 
     hermes_dirs: list[Path] = []
     for base in bases:
@@ -304,9 +349,9 @@ def _denied_path_set() -> tuple[frozenset[Path], tuple[Path, ...]]:
         exact.add(mcp)
         prefixes.append(mcp)
 
-    result = (frozenset(exact), tuple(prefixes))
+    result = (frozenset(exact), tuple(prefixes), watch_signature)
     _DENYLIST_CACHE[key] = result
-    return result
+    return result[:2]
 
 
 def get_read_block_error(path: str) -> Optional[str]:
