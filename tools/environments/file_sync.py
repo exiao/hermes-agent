@@ -91,6 +91,30 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
     return files
 
 
+def _credential_mount_host_paths() -> set[str]:
+    """Return resolved host paths for explicitly mounted credentials."""
+    try:
+        from tools.credential_files import get_credential_file_mounts
+    except Exception:
+        return set()
+
+    try:
+        mounts = get_credential_file_mounts()
+    except Exception:
+        return set()
+
+    paths: set[str] = set()
+    for entry in mounts:
+        host_path = entry.get("host_path") if isinstance(entry, dict) else None
+        if not host_path:
+            continue
+        try:
+            paths.add(str(Path(host_path).expanduser().resolve()))
+        except OSError:
+            paths.add(str(Path(host_path).expanduser()))
+    return paths
+
+
 def _credential_host_paths() -> set[str]:
     """Host paths that are upload-only for remote sandboxes.
 
@@ -99,29 +123,17 @@ def _credential_host_paths() -> set[str]:
     so applying a remote edit to it would be a silent cross-profile write.
     """
     try:
-        from tools.credential_files import (
-            get_credential_file_mounts,
-            iter_skills_files,
-        )
+        from tools.credential_files import iter_skills_files
     except Exception:
         return set()
 
-    paths: set[str] = set()
+    paths = _credential_mount_host_paths()
 
     def _add(host_path: str) -> None:
         try:
             paths.add(str(Path(host_path).expanduser().resolve()))
         except OSError:
             paths.add(str(Path(host_path).expanduser()))
-
-    try:
-        mounts = get_credential_file_mounts()
-    except Exception:
-        return set()
-    for entry in mounts:
-        host_path = entry.get("host_path") if isinstance(entry, dict) else None
-        if host_path:
-            _add(host_path)
 
     try:
         skills = iter_skills_files()
@@ -134,6 +146,15 @@ def _credential_host_paths() -> set[str]:
         if host_path:
             _add(host_path)
     return paths
+
+
+def _is_skill_remote_path(remote_path: str) -> bool:
+    """Whether a remote path belongs to a skills tree."""
+    marker = "/.hermes/"
+    if marker not in remote_path:
+        return False
+    relative = remote_path.split(marker, 1)[1]
+    return relative.startswith(("skills/", "external_skills/", "project_skills/"))
 
 
 def synced_subtree_roots(container_base: str = "/root/.hermes") -> list[str]:
@@ -289,15 +310,27 @@ class FileSyncManager:
         new_files = dict(self._synced_files)
         new_hosts = dict(self._synced_hosts)
         mapping_changed = False
+        credential_mount_host_paths: set[str] | None = None
         for host_path, remote_path in current_files:
             if (
                 remote_path not in self._synced_hosts
                 or self._synced_hosts[remote_path] != host_path
             ):
-                # A new remote path or a retargeted symlink may change the
-                # upload-only set. The stat key may be identical after a
-                # retarget, so the mapping is the only evidence it moved.
-                mapping_changed = True
+                # New or retargeted skill mappings can change the upload-only
+                # set. Ordinary cache/plan mappings cannot.
+                if _is_skill_remote_path(remote_path):
+                    mapping_changed = True
+                else:
+                    if credential_mount_host_paths is None:
+                        credential_mount_host_paths = _credential_mount_host_paths()
+                    try:
+                        resolved_host_path = str(Path(host_path).expanduser().resolve())
+                    except OSError:
+                        resolved_host_path = str(Path(host_path).expanduser())
+                    mapping_changed = (
+                        mapping_changed
+                        or resolved_host_path in credential_mount_host_paths
+                    )
             new_hosts[remote_path] = host_path
             file_key = _file_mtime_key(host_path)
             if file_key is None:
