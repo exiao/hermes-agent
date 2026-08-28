@@ -99,9 +99,10 @@ def _is_excluded_skill_remote_path(remote_path: str) -> bool:
     """
     from agent.skill_utils import is_excluded_skill_dir_name
 
-    if "/skills/" not in remote_path:
+    if not _is_skill_remote_path(remote_path):
         return False
-    tail = remote_path.split("/skills/", 1)[1]
+    relative = remote_path.split("/.hermes/", 1)[1]
+    tail = relative.split("/", 1)[1]
     # The last segment is the file itself; only directories are excluded.
     return any(is_excluded_skill_dir_name(part) for part in tail.split("/")[:-1])
 

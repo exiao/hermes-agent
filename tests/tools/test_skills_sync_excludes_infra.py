@@ -95,6 +95,8 @@ class TestSyncBackIgnoresExcludedInfra:
             "/root/.hermes/skills/coding/x/node_modules/pkg/index.js",
             "/root/.hermes/skills/.worktrees/wt/SKILL.md",
             "/root/.hermes/skills/marketing/__pycache__/m.cpython-312.pyc",
+            "/root/.hermes/external_skills/0/foo/node_modules/pkg/index.js",
+            "/root/.hermes/project_skills/0/bar/__pycache__/module.pyc",
         ],
     )
     def test_excluded_infra_paths_are_skipped(self, remote_path):
