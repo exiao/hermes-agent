@@ -11,6 +11,8 @@ Behavior contracts asserted here (not a snapshot of any timing value):
   3. The memo is per-manager, so one profile's paths never leak into another.
 """
 
+import io
+import tarfile
 from unittest.mock import MagicMock
 
 import tools.environments.file_sync as fs
@@ -124,4 +126,44 @@ def test_empty_result_is_cached(monkeypatch):
         f"skills tree walked {calls['skills']}x for a validly-empty "
         "upload-only set; an empty answer is still an answer"
     )
+
+
+def test_new_upload_only_path_is_protected_during_sync_back(monkeypatch, tmp_path):
+    """A path added during a warm memo remains protected through teardown."""
+    regular = tmp_path / "regular.md"
+    linked = tmp_path / "shared-skill.md"
+    regular.write_text("regular")
+    linked.write_text("host version")
+    regular_remote = "/root/.hermes/skills/regular.md"
+    linked_remote = "/root/.hermes/skills/shared-skill.md"
+    files = [(str(regular), regular_remote)]
+    current_upload_only: set[str] = set()
+    monkeypatch.setattr(fs, "_credential_host_paths", lambda: set(current_upload_only))
+
+    def download_changed_file(destination):
+        with tarfile.open(destination, "w") as tar:
+            data = b"remote version"
+            info = tarfile.TarInfo("root/.hermes/skills/shared-skill.md")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    mgr = FileSyncManager(
+        get_files_fn=lambda: list(files),
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+        bulk_download_fn=download_changed_file,
+    )
+    mgr.sync(force=True)
+
+    # The cache is warm when a new cross-profile link appears.
+    files.append((str(linked), linked_remote))
+    current_upload_only.add(str(linked.resolve()))
+    mgr.sync(force=True)
+    assert str(linked.resolve()) in mgr._upload_only_host_paths
+
+    # The link can disappear before teardown; the protection at upload time
+    # must still win over a fresh, now-empty discovery result.
+    current_upload_only.clear()
+    mgr.sync_back(hermes_home=tmp_path / "home")
+    assert linked.read_text() == "host version"
 

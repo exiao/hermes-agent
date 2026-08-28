@@ -231,7 +231,7 @@ class FileSyncManager:
         # credential paths into another's sync.
         self._upload_only_cache_time: float = 0.0
 
-    def _refresh_upload_only_paths(self) -> None:
+    def _refresh_upload_only_paths(self, *, force: bool = False) -> None:
         """Refresh the upload-only path set, at most once per TTL.
 
         ``_sync_transaction`` needs this set on every sync, but computing it
@@ -249,7 +249,8 @@ class FileSyncManager:
         """
         now = _monotonic()
         if (
-            self._upload_only_cache_time
+            not force
+            and self._upload_only_cache_time
             and now - self._upload_only_cache_time < _UPLOAD_ONLY_TTL_SECONDS
         ):
             return
@@ -276,8 +277,9 @@ class FileSyncManager:
                 return
 
         current_files = self._get_files_fn()
-        self._refresh_upload_only_paths()
         current_remote_paths = {remote for _, remote in current_files}
+        new_remote_paths = current_remote_paths.difference(self._synced_files)
+        self._refresh_upload_only_paths(force=bool(new_remote_paths))
 
         # --- Uploads: new or changed files ---
         to_upload: list[tuple[str, str]] = []
