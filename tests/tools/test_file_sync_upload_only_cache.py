@@ -129,6 +129,23 @@ def test_empty_result_is_cached(monkeypatch):
     )
 
 
+def test_ordinary_file_edit_honors_upload_only_ttl(monkeypatch, tmp_path):
+    """Editing an already-known file must not force another skills walk."""
+    local = tmp_path / "cache-entry"
+    local.write_text("first")
+    calls = _install_counting_stubs(monkeypatch, [])
+    remote = "/root/.hermes/cache/cache-entry"
+    mgr = _manager([(str(local), remote)])
+
+    mgr.sync(force=True)
+    assert calls["skills"] == 1
+
+    local.write_text("second")
+    mgr.sync(force=True)
+
+    assert calls["skills"] == 1
+
+
 def test_new_upload_only_path_is_protected_during_sync_back(monkeypatch, tmp_path):
     """A path added during a warm memo remains protected through teardown."""
     regular = tmp_path / "regular.md"
