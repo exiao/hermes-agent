@@ -12,11 +12,12 @@ Behavior contracts asserted here (not a snapshot of any timing value):
 """
 
 import io
+import os
 import tarfile
 from unittest.mock import MagicMock
 
 import tools.environments.file_sync as fs
-from tools.environments.file_sync import FileSyncManager
+from tools.environments.file_sync import FileSyncManager, _file_mtime_key
 
 
 def _install_counting_stubs(monkeypatch, skills):
@@ -210,3 +211,54 @@ def test_retargeted_same_remote_path_is_protected(monkeypatch, tmp_path):
     mgr.sync_back(hermes_home=tmp_path / "home")
     assert other_profile.read_text() == "host version"
 
+
+
+def test_retarget_with_identical_stat_key_is_protected(monkeypatch, tmp_path):
+    """A retarget producing no upload must still refresh the protections.
+
+    ``_synced_files`` keys on the remote path's ``(mtime, size)``. A symlink
+    retargeted to another profile's file with the SAME mtime and size yields
+    no upload at all, so forcing the refresh on ``to_upload`` alone left the
+    warm memo in place and the other profile's file unprotected.
+    """
+    local = tmp_path / "local-skill.md"
+    other_profile = tmp_path / "other-profile-skill.md"
+    local.write_text("host version")
+    # Byte-identical size, and the same mtime: the stat key cannot tell these
+    # two files apart.
+    other_profile.write_text("host version")
+    stat = local.stat()
+    os.utime(other_profile, (stat.st_atime, stat.st_mtime))
+    assert _file_mtime_key(str(local)) == _file_mtime_key(str(other_profile))
+
+    remote = "/root/.hermes/skills/shared.md"
+    files = [(str(local), remote)]
+    current_upload_only: set[str] = set()
+    monkeypatch.setattr(fs, "_credential_host_paths", lambda: set(current_upload_only))
+
+    def download_changed_file(destination):
+        with tarfile.open(destination, "w") as tar:
+            data = b"remote version"
+            info = tarfile.TarInfo("root/.hermes/skills/shared.md")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    mgr = FileSyncManager(
+        get_files_fn=lambda: list(files),
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+        bulk_download_fn=download_changed_file,
+    )
+    mgr.sync(force=True)
+
+    files[0] = (str(other_profile), remote)
+    current_upload_only.add(str(other_profile.resolve()))
+    mgr.sync(force=True)
+    assert str(other_profile.resolve()) in mgr._upload_only_host_paths, (
+        "a retarget with an identical stat key produced no upload, so the "
+        "protections were never refreshed"
+    )
+
+    current_upload_only.clear()
+    mgr.sync_back(hermes_home=tmp_path / "home")
+    assert other_profile.read_text() == "host version"

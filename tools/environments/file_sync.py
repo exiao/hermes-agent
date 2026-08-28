@@ -221,6 +221,11 @@ class FileSyncManager:
         self._delete_fn = delete_fn
         self._transaction_lock = threading.Lock()
         self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
+        # remote_path -> host_path. Kept separately from the stat key because a
+        # retargeted symlink can point at a different profile's file with an
+        # identical (mtime, size); that produces no upload, so the mapping
+        # itself is the only signal the upload-only set may have changed.
+        self._synced_hosts: dict[str, str] = {}
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
         self._upload_only_host_paths: set[str] = set()
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
@@ -282,7 +287,15 @@ class FileSyncManager:
         # --- Uploads: new or changed files ---
         to_upload: list[tuple[str, str]] = []
         new_files = dict(self._synced_files)
+        new_hosts = dict(self._synced_hosts)
+        remapped = False
         for host_path, remote_path in current_files:
+            if self._synced_hosts.get(remote_path, host_path) != host_path:
+                # Same container path, different host file: a retargeted
+                # symlink. The stat key may be identical to the old target's,
+                # so this is the only evidence the mapping moved.
+                remapped = True
+            new_hosts[remote_path] = host_path
             file_key = _file_mtime_key(host_path)
             if file_key is None:
                 continue
@@ -293,9 +306,17 @@ class FileSyncManager:
 
         # Anything about to be uploaded may be newly upload-only: a brand new
         # remote path, or an EXISTING one whose symlink was retargeted at the
-        # same container path. Both surface here as an upload, so force the
-        # refresh on uploads rather than on new remote paths alone.
-        self._refresh_upload_only_paths(force=bool(to_upload))
+        # same container path. An upload is the usual signal, but a retarget to
+        # a file with identical (mtime, size) produces none, so track the
+        # remote-to-host mapping independently of the stat key.
+        self._refresh_upload_only_paths(force=bool(to_upload) or remapped)
+        # Commit the mapping eagerly, before the no-work early return: a pure
+        # retarget with an identical stat key produces neither an upload nor a
+        # delete, and leaving the old mapping in place would re-force the
+        # refresh on every subsequent sync. Never rolled back with
+        # ``_synced_files`` -- a rollback restores the old stat key, so the
+        # retry re-uploads and force-refreshes on that path anyway.
+        self._synced_hosts = new_hosts
 
         # --- Deletes: synced paths no longer in current set ---
         to_delete = [p for p in self._synced_files if p not in current_remote_paths]
