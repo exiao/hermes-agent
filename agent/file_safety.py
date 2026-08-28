@@ -264,33 +264,37 @@ _DENYLIST_CACHE: dict[
     tuple[
         frozenset[Path],
         tuple[Path, ...],
+        tuple[Path, ...],
         tuple[tuple[str, tuple[int, ...] | None], ...],
     ],
 ] = {}
 
 
 def _denylist_watch_signature(
-    bases: tuple[Path, Path],
+    bases: tuple[Path, Path], symlink_paths: tuple[Path, ...]
 ) -> tuple[tuple[str, tuple[int, ...] | None], ...]:
-    """Return metadata for paths whose symlink targets affect the denylist."""
+    """Return metadata for directories and existing credential symlinks."""
     paths: list[Path] = []
     seen: set[str] = set()
     for base in bases:
-        for path in (
-            base,
-            *(base / name for name in _CREDENTIAL_FILE_NAMES),
-            base / "mcp-tokens",
-        ):
+        for path in (base, base / "auth", base / "cache"):
             path_key = os.fspath(path)
             if path_key in seen:
                 continue
             seen.add(path_key)
             paths.append(path)
+    for path in symlink_paths:
+        path_key = os.fspath(path)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+        paths.append(path)
 
     signature: list[tuple[str, tuple[int, ...] | None]] = []
+    symlink_keys = {os.fspath(path) for path in symlink_paths}
     for path in paths:
         try:
-            stat = os.lstat(path)
+            stat = os.lstat(path) if os.fspath(path) in symlink_keys else os.stat(path)
         except OSError:
             metadata = None
         else:
@@ -306,23 +310,37 @@ def _denylist_watch_signature(
     return tuple(signature)
 
 
+def _credential_symlink_paths(bases: tuple[Path, Path]) -> tuple[Path, ...]:
+    """Return credential paths that need direct target-change monitoring."""
+    paths: list[Path] = []
+    for base in bases:
+        for name in (*_CREDENTIAL_FILE_NAMES, "mcp-tokens"):
+            path = base / name
+            if os.path.islink(path):
+                paths.append(path)
+    return tuple(paths)
+
+
 def _denied_path_set() -> tuple[frozenset[Path], tuple[Path, ...]]:
     """Resolve the denylist once per (HERMES_HOME, root) pair.
 
-    Every entry below is a function of the two Hermes base directories, none of
-    which change while the process runs against a given home. Recomputing them
-    per call meant ~24 filesystem resolutions on every read check, which is
+    Every entry below is a function of the two Hermes base directories, which
+    normally stay fixed while the process runs against a given home. Recomputing
+    them per call meant ~24 filesystem resolutions on every read check, which is
     invisible for a single file tool call and dominates a 10k-file skills walk.
+    Parent-directory metadata and existing credential symlinks invalidate the
+    cache when a protected path changes.
 
     Cached on the resolved bases, not on a module flag, so a test or a profile
     switch that moves HERMES_HOME gets its own entry instead of a stale one.
     """
     bases = (_hermes_home_path(), _hermes_root_path())
     key = tuple(str(b) for b in bases)
-    watch_signature = _denylist_watch_signature(bases)
     cached = _DENYLIST_CACHE.get(key)
-    if cached is not None and cached[2] == watch_signature:
-        return cached[:2]
+    if cached is not None:
+        watch_signature = _denylist_watch_signature(bases, cached[2])
+        if cached[3] == watch_signature:
+            return cached[:2]
 
     hermes_dirs: list[Path] = []
     for base in bases:
@@ -349,7 +367,9 @@ def _denied_path_set() -> tuple[frozenset[Path], tuple[Path, ...]]:
         exact.add(mcp)
         prefixes.append(mcp)
 
-    result = (frozenset(exact), tuple(prefixes), watch_signature)
+    symlink_paths = _credential_symlink_paths(bases)
+    watch_signature = _denylist_watch_signature(bases, symlink_paths)
+    result = (frozenset(exact), tuple(prefixes), symlink_paths, watch_signature)
     _DENYLIST_CACHE[key] = result
     return result[:2]
 
