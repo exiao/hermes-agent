@@ -390,6 +390,11 @@ class FileSyncManager:
             for p in to_delete:
                 new_files.pop(p, None)
                 self._pushed_hashes.pop(p, None)
+                # Prune the host mapping too. Without this a session that
+                # repeatedly creates and removes cache artifacts grows
+                # _synced_hosts without bound and copies the whole historical
+                # mapping on every sync, restoring the cost this memo removes.
+                self._synced_hosts.pop(p, None)
 
             self._synced_files = new_files
             self._last_sync_time = _monotonic()

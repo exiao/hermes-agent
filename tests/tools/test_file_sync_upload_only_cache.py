@@ -299,3 +299,106 @@ def test_retarget_with_identical_stat_key_is_protected(monkeypatch, tmp_path):
     current_upload_only.clear()
     mgr.sync_back(hermes_home=tmp_path / "home")
     assert other_profile.read_text() == "host version"
+
+
+def _write_skill(tree, name, text):
+    """Create <tree>/<name>/SKILL.md with real content."""
+    d = tree / name
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / "SKILL.md"
+    f.write_text(text, encoding="utf-8")
+    return f
+
+
+def test_real_symlink_retarget_across_profiles_is_upload_only(monkeypatch, tmp_path):
+    """End-to-end through the real resolver, no stubbing of the classifier.
+
+    Mirrors the production layout: a profile lane's skills tree is walked, and
+    ``hermes profile`` symlinks shared skills into it from the ROOT
+    ``~/.hermes/skills`` tree. That link is FOLLOWED (it stays inside a skills
+    boundary) but its target sits outside the walked tree, so it must be
+    classified upload-only or a remote edit synced back would overwrite the
+    shared copy. Drives the actual ``iter_skills_files`` / ``_walk_skill_tree``
+    walk; stubbing ``_credential_host_paths`` (as the other tests here do)
+    cannot catch a defect in that resolver/classifier coupling.
+    """
+    root = tmp_path / "hermes-root"
+    profile_home = root / "profiles" / "lane"
+    lane_skills = profile_home / "skills"
+    shared_skills = root / "skills"
+    lane_skills.mkdir(parents=True)
+    shared_skills.mkdir(parents=True)
+
+    own_skill = _write_skill(lane_skills, "own-skill", "own body")
+    shared_skill = _write_skill(shared_skills, "shared-skill", "shared body")
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    import tools.credential_files as cf
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda *_a, **_kw: [])
+    monkeypatch.setattr(cf, "_resolve_hermes_home", lambda: profile_home)
+
+    def _sync_files():
+        return [
+            (e["host_path"], e["container_path"]) for e in cf.iter_skills_files()
+        ]
+
+    mgr = FileSyncManager(
+        get_files_fn=_sync_files,
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+    )
+    mgr.sync(force=True)
+
+    resolved_own = str(own_skill.resolve())
+    resolved_shared = str(shared_skill.resolve())
+    assert resolved_own not in mgr._upload_only_host_paths, (
+        "a skill living inside the walked tree must stay writable"
+    )
+
+    # Retarget: same container path, now a link to the SHARED tree.
+    link = lane_skills / "own-skill" / "SKILL.md"
+    link.unlink()
+    link.symlink_to(shared_skill)
+    # Identical mtime and size hide the change from the stat key, so only the
+    # remote-to-host mapping reveals the retarget.
+    src = own_skill.parent.stat()
+    os.utime(shared_skill, (src.st_atime, src.st_mtime))
+
+    mgr.sync(force=True)
+
+    assert resolved_shared in mgr._upload_only_host_paths, (
+        "a skill reached by following a link OUT of the walked tree is shared "
+        "with another profile; a remote edit synced back would overwrite it"
+    )
+
+
+def test_deleted_paths_leave_the_host_mapping(monkeypatch, tmp_path):
+    """A removed file must not stay in the host mapping forever.
+
+    ``new_hosts`` starts as a copy of the whole previous mapping, so without
+    pruning on delete a session that repeatedly creates and removes cache
+    artifacts grows ``_synced_hosts`` without bound and copies the entire
+    history on every sync -- reintroducing the per-sync cost this memo removes.
+    """
+    _install_counting_stubs(monkeypatch, [])
+
+    kept = tmp_path / "kept.md"
+    kept.write_text("kept")
+    files = [(str(kept), "/root/.hermes/skills/kept.md")]
+
+    mgr = _manager(files)
+    mgr._get_files_fn = lambda: list(files)
+    mgr.sync(force=True)
+
+    for i in range(5):
+        transient = tmp_path / f"transient-{i}.md"
+        transient.write_text("x")
+        remote = f"/root/.hermes/skills/transient-{i}.md"
+        files.append((str(transient), remote))
+        mgr.sync(force=True)
+        files.pop()
+        mgr.sync(force=True)
+
+    assert set(mgr._synced_hosts) == {"/root/.hermes/skills/kept.md"}, (
+        f"deleted mappings accumulated: {sorted(mgr._synced_hosts)}"
+    )
