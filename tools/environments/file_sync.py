@@ -42,6 +42,12 @@ _monotonic = time.monotonic
 _SYNC_INTERVAL_SECONDS = 5.0
 _FORCE_SYNC_ENV = "HERMES_FORCE_FILE_SYNC"
 
+# How long a FileSyncManager may reuse its upload-only path set before
+# recomputing it. Recomputing costs a full skills-tree walk (see
+# FileSyncManager._refresh_upload_only_paths), which the sync path would
+# otherwise pay on every single command.
+_UPLOAD_ONLY_TTL_SECONDS = 60.0
+
 # Transport callbacks provided by each backend
 UploadFn = Callable[[str, str], None]  # (host_path, remote_path) -> raises on failure
 BulkUploadFn = Callable[[list[tuple[str, str]]], None]  # [(host_path, remote_path), ...] -> raises on failure
@@ -219,6 +225,36 @@ class FileSyncManager:
         self._upload_only_host_paths: set[str] = set()
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
+        # Memo for the upload-only set (see _refresh_upload_only_paths).
+        # Per-instance, never module-global: each manager belongs to one
+        # profile/backend, and a shared cache would leak one profile's
+        # credential paths into another's sync.
+        self._upload_only_cache_time: float = 0.0
+
+    def _refresh_upload_only_paths(self) -> None:
+        """Refresh the upload-only path set, at most once per TTL.
+
+        ``_sync_transaction`` needs this set on every sync, but computing it
+        walks the whole skills tree a SECOND time on top of
+        ``_get_files_fn()`` -- two full walks per synced command. On a large
+        collection (8k+ skill files) that measured ~3s of local disk work per
+        walk, paid before a single byte moved, on SSH, Modal and Daytona
+        alike.
+
+        The set only changes when a skill is added or a symlink retargeted, so
+        a short TTL is safe. It is also strictly additive (``update``), so a
+        stale read can never un-protect a path that is already protected --
+        the failure mode of a missed refresh is one TTL of a NEW upload-only
+        file not yet being marked, never a credential losing its guard.
+        """
+        now = _monotonic()
+        if (
+            self._upload_only_host_paths
+            and now - self._upload_only_cache_time < _UPLOAD_ONLY_TTL_SECONDS
+        ):
+            return
+        self._upload_only_host_paths.update(_credential_host_paths())
+        self._upload_only_cache_time = now
 
     def sync(self, *, force: bool = False, raise_on_error: bool = False) -> None:
         """Run a sync cycle: upload changed files, delete removed files.
@@ -240,7 +276,7 @@ class FileSyncManager:
                 return
 
         current_files = self._get_files_fn()
-        self._upload_only_host_paths.update(_credential_host_paths())
+        self._refresh_upload_only_paths()
         current_remote_paths = {remote for _, remote in current_files}
 
         # --- Uploads: new or changed files ---

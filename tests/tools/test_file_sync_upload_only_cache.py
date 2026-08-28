@@ -1,0 +1,106 @@
+"""The upload-only path set must not re-walk the skills tree on every sync.
+
+`_sync_transaction` needs the upload-only set on EVERY sync, and computing it
+walks the entire skills tree a second time on top of `_get_files_fn()`. Two
+full walks per synced command: measured at ~3s each on an 8k-file skill
+collection, paid before a single byte moves, on SSH, Modal and Daytona alike.
+
+Behavior contracts asserted here (not a snapshot of any timing value):
+  1. Repeated syncs inside the TTL walk the tree exactly once.
+  2. The cache expires, so a newly added upload-only path is picked up.
+  3. The memo is per-manager, so one profile's paths never leak into another.
+"""
+
+from unittest.mock import MagicMock
+
+import tools.environments.file_sync as fs
+from tools.environments.file_sync import FileSyncManager
+
+
+def _install_counting_stubs(monkeypatch, skills):
+    """Point the lazily-imported helpers at counting stubs."""
+    calls = {"skills": 0}
+
+    def fake_iter_skills_files(*_a, **_kw):
+        calls["skills"] += 1
+        return list(skills)
+
+    import tools.credential_files as cf
+    monkeypatch.setattr(cf, "iter_skills_files", fake_iter_skills_files)
+    monkeypatch.setattr(cf, "get_credential_file_mounts", lambda *_a, **_kw: [])
+    return calls
+
+
+def _manager(files=()):
+    return FileSyncManager(
+        get_files_fn=lambda: list(files),
+        upload_fn=MagicMock(),
+        delete_fn=MagicMock(),
+    )
+
+
+def test_repeated_syncs_walk_skills_tree_once(monkeypatch, tmp_path):
+    """Ten syncs in a row must not mean ten skills walks."""
+    linked = tmp_path / "other-profile-skill.md"
+    linked.write_text("x")
+    calls = _install_counting_stubs(
+        monkeypatch, [{"host_path": str(linked), "upload_only": True}]
+    )
+
+    mgr = _manager()
+    for _ in range(10):
+        mgr.sync(force=True)
+
+    assert calls["skills"] == 1, (
+        f"skills tree walked {calls['skills']}x for 10 syncs; the per-sync "
+        "re-walk is the whole cost this memo exists to remove"
+    )
+    assert str(linked.resolve()) in mgr._upload_only_host_paths
+
+
+def test_cache_expires_and_sees_new_paths(monkeypatch, tmp_path):
+    """A stale memo must not outlive the TTL, or a new skill stays unprotected."""
+    a = tmp_path / "a.md"
+    a.write_text("x")
+    b = tmp_path / "b.md"
+    b.write_text("x")
+
+    skills = [{"host_path": str(a), "upload_only": True}]
+    calls = _install_counting_stubs(monkeypatch, skills)
+
+    mgr = _manager()
+    mgr.sync(force=True)
+    assert str(a.resolve()) in mgr._upload_only_host_paths
+    assert calls["skills"] == 1
+
+    # A new upload-only skill appears; the memo is still warm.
+    skills.append({"host_path": str(b), "upload_only": True})
+    mgr.sync(force=True)
+    assert str(b.resolve()) not in mgr._upload_only_host_paths
+
+    # Age the memo past its TTL.
+    mgr._upload_only_cache_time -= fs._UPLOAD_ONLY_TTL_SECONDS + 1
+    mgr.sync(force=True)
+    assert str(b.resolve()) in mgr._upload_only_host_paths
+    assert calls["skills"] == 2
+
+
+def test_memo_is_per_manager_not_shared(monkeypatch, tmp_path):
+    """Two managers (two profiles) must not share one memo."""
+    a = tmp_path / "profile-a.md"
+    a.write_text("x")
+    calls = _install_counting_stubs(
+        monkeypatch, [{"host_path": str(a), "upload_only": True}]
+    )
+
+    first = _manager()
+    first.sync(force=True)
+    assert calls["skills"] == 1
+
+    # A second manager must compute its own set, not inherit a warm cache.
+    second = _manager()
+    second.sync(force=True)
+    assert calls["skills"] == 2, (
+        "a module-global memo would leak one profile's credential paths "
+        "into another profile's sync"
+    )
