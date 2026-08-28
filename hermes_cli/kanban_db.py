@@ -907,7 +907,11 @@ def _remote_worker_spawn_dir(board: Optional[str] = None) -> Path:
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError:
-        return Path(tempfile.gettempdir())
+        # The shared temp root itself is NOT safe here: build_context_files_prompt()
+        # reads the process cwd as project context, so a pre-existing
+        # /tmp/AGENTS.md would enter the worker's system prompt. mkdtemp gives a
+        # fresh 0700 directory nothing else can have seeded.
+        return Path(tempfile.mkdtemp(prefix="hermes-kanban-remote-cwd-"))
     return path
 
 
@@ -12998,13 +13002,20 @@ def _default_spawn(
     remote_worker = not host_workspace_worker
     # Remote workers must not inherit the dispatcher's host cwd: file_tools and
     # context-file loading consume TERMINAL_CWD before a terminal backend can
-    # sanitize it. Preserve an explicitly configured profile cwd. Environment-
-    # only SSH keeps its explicitly inherited remote cwd, while profile-selected
-    # SSH and every other remote backend discard the inherited host value.
+    # sanitize it. Precedence: an explicitly configured profile cwd wins. Failing
+    # that, a backend selected by the PROFILE means any inherited TERMINAL_CWD
+    # came from the dispatcher, so drop it. For an environment-only selection the
+    # operator set both vars together, so the value is an intentional
+    # sandbox-native path (`TERMINAL_ENV=modal TERMINAL_CWD=/root/project`) —
+    # keep it unless it resolves to a real directory on the HOST, which is the
+    # signature of a leaked dispatcher path rather than a container one.
     if remote_worker:
+        inherited_cwd = env.get("TERMINAL_CWD")
         if worker_profile_cwd:
             env["TERMINAL_CWD"] = worker_profile_cwd
-        elif worker_terminal_backend != "ssh" or worker_backend_explicit:
+        elif worker_backend_explicit or not inherited_cwd:
+            env.pop("TERMINAL_CWD", None)
+        elif os.path.isdir(inherited_cwd):
             env.pop("TERMINAL_CWD", None)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant

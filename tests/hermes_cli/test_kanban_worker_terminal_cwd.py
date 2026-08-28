@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,11 @@ CASES = [
      "terminal:\n  backend: docker\n  docker_mount_cwd_to_workspace: true\n",
      "terminal:\n  backend: local\n", HOST_CWD, WS, WS, WS),
     ("env_only_modal", "", "", {"TERMINAL_ENV": "modal"}, None, ABSENT, NEUTRAL),
+    # An env-only selection sets backend and cwd together, so a sandbox-native
+    # path is the operator's intent, not a leaked dispatcher path.
+    ("env_only_modal_keeps_sandbox_cwd", "", "",
+     {"TERMINAL_ENV": "modal", "TERMINAL_CWD": "/root/project"},
+     "/root/project", ABSENT, NEUTRAL),
     ("stale_docker_flag_on_modal",
      MODAL + "  docker_mount_cwd_to_workspace: true\n", "", {}, None, ABSENT, NEUTRAL),
     ("env_docker_with_mount", "", "",
@@ -190,3 +196,45 @@ def test_explicit_terminal_env_preserved_when_root_has_no_terminal_section(
 
     assert got["env"]["TERMINAL_ENV"] == "modal"
     assert got["env"]["TERMINAL_MODAL_IMAGE"] == "im-operatorExplicit123"
+
+
+def test_env_only_remote_drops_a_host_shaped_cwd(monkeypatch, tmp_path):
+    """An env-only remote cwd that exists on the HOST is a leak, not intent.
+
+    ``TERMINAL_ENV=modal`` with a cwd that resolves to a real host directory is
+    the dispatcher's own path leaking through, not a sandbox-native value the
+    operator chose. Keeping it would anchor the worker's relative writes and
+    AGENTS.md discovery to a path the sandbox does not have.
+    """
+    host_dir = tmp_path / "dispatcher-checkout"
+    host_dir.mkdir()
+    _setup(tmp_path, monkeypatch, "", "",
+           {"TERMINAL_ENV": "modal", "TERMINAL_CWD": str(host_dir)})
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    got = _spawn(kb, monkeypatch, str(workspace))
+
+    assert "TERMINAL_CWD" not in got["env"]
+
+
+def test_spawn_dir_fallback_is_private_not_shared_tmp(monkeypatch, tmp_path):
+    """An unwritable board dir must not fall back to the shared temp root.
+
+    ``build_context_files_prompt()`` reads the process cwd as project context,
+    so launching in /tmp would load a pre-existing /tmp/AGENTS.md into the
+    worker's system prompt -- the opposite of the isolation this dir provides.
+    """
+    from hermes_cli import kanban_db as kb
+
+    def _refuse(*_a, **_kw):
+        raise OSError("read-only board directory")
+
+    monkeypatch.setattr(kb.Path, "mkdir", _refuse)
+
+    got = kb._remote_worker_spawn_dir()
+
+    assert got != Path(tempfile.gettempdir())
+    assert got.is_dir()
+    assert not any(got.iterdir())
