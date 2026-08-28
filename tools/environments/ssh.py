@@ -390,12 +390,10 @@ class SSHEnvironment(BaseEnvironment):
         # The remote tree is live: a running agent writes cache and log files
         # while tar reads them, which tar reports as "file changed as we read
         # it" and exits 1. That is a warning about a file we will pick up on
-        # the next sync, not a transfer failure, so suppress it rather than
-        # failing every sync_back on a busy box.
-        ssh_cmd.append(
-            f"tar cf - --warning=no-file-changed --warning=no-file-removed "
-            f"-C / {shlex.quote(rel_base)}"
-        )
+        # the next sync, not a transfer failure. --warning= is GNU-only and the
+        # remote may run BSD/libarchive tar, so tolerate the exit code below
+        # instead of passing a flag that would make every download fail there.
+        ssh_cmd.append(f"tar cf - -C / {shlex.quote(rel_base)}")
         with open(dest, "wb") as f:
             result = subprocess.run(
                 ssh_cmd,

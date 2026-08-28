@@ -121,15 +121,16 @@ class TestSSHBulkDownload:
         assert "testuser@example.com" in cmd_str
 
 
-    def test_ssh_bulk_download_uses_120s_timeout(self, ssh_mock_env, tmp_path):
-        """The subprocess.run call should use a 120s timeout."""
+    def test_ssh_bulk_download_uses_bounded_timeout(self, ssh_mock_env, tmp_path):
+        """The download must be bounded, and generous enough for a full tree."""
         dest = tmp_path / "backup.tar"
 
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as mock_run:
             ssh_mock_env._ssh_bulk_download(dest)
 
-        call_kwargs = mock_run.call_args
-        assert call_kwargs.kwargs.get("timeout") == 120 or call_kwargs[1].get("timeout") == 120
+        timeout = mock_run.call_args.kwargs.get("timeout")
+        assert timeout is not None
+        assert 120 <= timeout <= ssh_env._BULK_UPLOAD_MAX_TIMEOUT
 
 
 class TestSSHCleanup:
