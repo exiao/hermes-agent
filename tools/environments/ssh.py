@@ -345,13 +345,15 @@ class SSHEnvironment(BaseEnvironment):
                     else:
                         raise
 
-            tar_cmd = ["tar", "-czhf", "-", "-C", staging, "."]
+            compressed = self._remote_supports_gzip()
+            tar_cmd = ["tar", "-czhf" if compressed else "-chf", "-", "-C", staging, "."]
             ssh_cmd = self._build_ssh_command()
             # --no-overwrite-dir prevents tar from overwriting the mode of
             # existing directories (e.g. /home/<user>) with the staging
             # directory's mode.  Without this, a umask 002 produces 0775
             # dirs which breaks sshd StrictModes (refuses authorized_keys).
-            ssh_cmd.append(f"tar xzf - --no-overwrite-dir -C {shlex.quote(base)}")
+            extract_flags = "xzf" if compressed else "xf"
+            ssh_cmd.append(f"tar {extract_flags} - --no-overwrite-dir -C {shlex.quote(base)}")
 
             tar_proc = subprocess.Popen(
                 tar_cmd,
@@ -417,6 +419,22 @@ class SSHEnvironment(BaseEnvironment):
                 )
 
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
+
+    def _remote_supports_gzip(self) -> bool:
+        """Return whether the remote tar can invoke gzip for archive extraction."""
+        cmd = self._build_ssh_command()
+        cmd.append("command -v gzip >/dev/null 2>&1")
+        try:
+            result = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
 
     def _ssh_bulk_download(self, dest: Path) -> None:
         """Download remote .hermes/ as a tar archive."""

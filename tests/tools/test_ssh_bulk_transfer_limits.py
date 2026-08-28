@@ -6,6 +6,7 @@ import subprocess
 import pytest
 
 from tools.environments.ssh import (
+    _BULK_UPLOAD_BYTES_PER_SEC,
     _BULK_UPLOAD_MAX_TIMEOUT,
     _BULK_UPLOAD_MIN_TIMEOUT,
     _bulk_upload_timeout,
@@ -15,7 +16,8 @@ from tools.environments.ssh import (
 
 def _write(tmp_path, name, size):
     p = tmp_path / name
-    p.write_bytes(b"x" * size)
+    p.touch()
+    os.truncate(p, size)
     return (str(p), f"/root/.hermes/{name}")
 
 
@@ -40,11 +42,14 @@ def test_budget_grows_with_payload(tmp_path):
     assert _bulk_upload_timeout(large) > _bulk_upload_timeout(small)
 
 
-def test_budget_is_capped(tmp_path):
-    huge = [(str(tmp_path / "missing"), "/root/.hermes/x")]
-    # Simulate an enormous payload without writing it to disk.
-    files = huge * 10
-    assert _bulk_upload_timeout(files) <= _BULK_UPLOAD_MAX_TIMEOUT
+def test_budget_is_capped(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        os.path,
+        "getsize",
+        lambda _path: _BULK_UPLOAD_BYTES_PER_SEC * _BULK_UPLOAD_MAX_TIMEOUT,
+    )
+    files = [(str(tmp_path / "huge"), "/root/.hermes/x")]
+    assert _bulk_upload_timeout(files) == _BULK_UPLOAD_MAX_TIMEOUT
 
 
 def test_unreadable_file_does_not_break_estimation(tmp_path):

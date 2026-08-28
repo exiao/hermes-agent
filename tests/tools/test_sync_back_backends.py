@@ -163,6 +163,34 @@ class TestSSHBulkDownload:
             with pytest.raises(EnvironmentConnectionError):
                 ssh_mock_env._ssh_bulk_download(dest)
 
+    def test_ssh_bulk_upload_falls_back_without_remote_gzip(self, ssh_mock_env, tmp_path, monkeypatch):
+        """Hosts without gzip receive an uncompressed tar stream."""
+        source = tmp_path / "payload.txt"
+        source.write_text("payload")
+        tar_proc = MagicMock()
+        tar_proc.poll.return_value = 0
+        tar_proc.returncode = 0
+        tar_proc.stderr.read.return_value = b""
+        ssh_proc = MagicMock()
+        ssh_proc.communicate.return_value = (b"", b"")
+        ssh_proc.returncode = 0
+
+        monkeypatch.setattr(ssh_env, "unique_parent_dirs", lambda _files: [])
+        monkeypatch.setattr(ssh_mock_env, "_remote_supports_gzip", lambda: False)
+        with patch.object(
+            subprocess,
+            "Popen",
+            side_effect=[tar_proc, ssh_proc],
+        ) as mock_popen:
+            ssh_mock_env._ssh_bulk_upload(
+                [(str(source), "/home/testuser/.hermes/payload.txt")]
+            )
+
+        tar_command = mock_popen.call_args_list[0].args[0]
+        ssh_command = mock_popen.call_args_list[1].args[0]
+        assert "-chf" in tar_command
+        assert "tar xf -" in ssh_command[-1]
+
 
 class TestSSHCleanup:
     """Verify SSH cleanup() calls sync_back() before closing ControlMaster."""
