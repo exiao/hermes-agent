@@ -947,3 +947,85 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+class TestBackgroundReviewPatchOnly:
+    """skills.background_review_patch_only blocks NEW skills from the background
+    self-improvement fork, without touching foreground creation or patching.
+
+    Motivation: the fork already prefers patching, but its option-4 escape
+    hatch (create a new umbrella when nothing fits) drifts on a large library
+    and accumulates near-duplicate '*-review' style skills.
+    """
+
+    @staticmethod
+    def _cfg(patch_only: bool):
+        return patch(
+            "hermes_cli.config.load_config",
+            return_value={"skills": {"background_review_patch_only": patch_only}},
+        )
+
+    def test_background_create_blocked_when_enabled(self, tmp_path):
+        with (
+            _skill_dir(tmp_path),
+            self._cfg(True),
+            patch("tools.skill_provenance.is_background_review", return_value=True),
+        ):
+            result = json.loads(skill_manage(
+                action="create", name="test-skill", content=VALID_SKILL_CONTENT,
+            ))
+        assert result["success"] is False
+        assert "patch_only" in result.get("error", "").lower() or \
+               "patch" in result.get("error", "").lower()
+        # the skill must not exist on disk
+        assert not (tmp_path / "test-skill").exists()
+
+    def test_foreground_create_still_allowed_when_enabled(self, tmp_path):
+        """The gate keys on provenance, not on the flag alone."""
+        with (
+            _skill_dir(tmp_path),
+            self._cfg(True),
+            patch("tools.skill_provenance.is_background_review", return_value=False),
+        ):
+            result = json.loads(skill_manage(
+                action="create", name="test-skill", content=VALID_SKILL_CONTENT,
+            ))
+        assert result["success"] is True, result
+
+    def test_background_create_allowed_when_disabled(self, tmp_path):
+        """Default (false) preserves today's behaviour exactly."""
+        with (
+            _skill_dir(tmp_path),
+            self._cfg(False),
+            patch("tools.skill_provenance.is_background_review", return_value=True),
+        ):
+            result = json.loads(skill_manage(
+                action="create", name="test-skill", content=VALID_SKILL_CONTENT,
+            ))
+        assert result["success"] is True, result
+
+    def test_background_patch_still_allowed_when_enabled(self, tmp_path, monkeypatch):
+        """Patch-only means patching still works — that's the whole point.
+
+        Uses the same _curator_pass harness as the other background-fork
+        tests: it points HERMES_HOME at the temp tree, marks skills
+        curator-managed, and flips is_background_review() to True. Without
+        it, the ownership and read-before-write guards refuse the patch
+        before this gate is ever consulted.
+        """
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root, self._cfg(True):
+            _create_curator_skill("reviewed", _skill_content("reviewed"))
+            assert json.loads(skill_view("reviewed"))["success"] is True
+            result = json.loads(skill_manage(
+                action="patch", name="reviewed",
+                old_string="A test skill",
+                new_string="A patched test skill",
+            ))
+        assert result["success"] is True, result
+        body = (skills_root / "reviewed" / "SKILL.md").read_text(encoding="utf-8")
+        assert "A patched test skill" in body
+        _reset_background_review_read_marks()

@@ -2186,6 +2186,21 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Patch-only mode for the background self-improvement review fork.
+        # The fork already PREFERS patching an existing skill (see the
+        # preference order in agent/background_review.py), but option 4 lets
+        # it create a new umbrella when nothing fits. On a large library that
+        # judgement call drifts: near-duplicate skills accumulate around the
+        # same class (e.g. a dozen "*-review" variants) because creating is
+        # easier than finding the right umbrella to extend.
+        #   false (default) — unchanged; the fork may create new skills.
+        #   true            — the fork may patch/edit/write_file but NOT
+        #                     create. skill_manage(action='create') returns an
+        #                     error telling it to patch the closest umbrella
+        #                     or add a support file instead.
+        # Foreground, user-directed creation is never affected: the gate only
+        # fires when tools.skill_provenance.is_background_review() is true.
+        "background_review_patch_only": False,
         # Per-mutation audit ledger (tracker #79686 P3). Every skill mutation
         # — curator, agent, or user — appends one JSONL entry to
         # ~/.hermes/skills/.curator_ledger.jsonl with before/after file
