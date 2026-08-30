@@ -1563,6 +1563,27 @@ def skill_manage(
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
 
+    if action == "create":
+        _patch_only = False
+        try:
+            from hermes_cli.config import load_config
+            _patch_only = bool(
+                load_config().get("skills", {}).get("background_review_patch_only", False)
+            )
+        except Exception:
+            _patch_only = False
+        if _patch_only:
+            from tools.skill_provenance import is_background_review as _is_bg
+            if _is_bg():
+                return tool_error(
+                    "skills.background_review_patch_only is enabled: the background "
+                    "self-improvement review may patch existing skills but may not "
+                    "create new ones. Patch the closest existing umbrella skill "
+                    "instead, or add a support file under it via action='write_file'. "
+                    "A user can still create skills in a foreground session.",
+                    success=False,
+                )
+
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
     # (default) passes straight through. The gate is bypassed when this call is
@@ -1594,25 +1615,6 @@ def skill_manage(
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        _patch_only = False
-        try:
-            from hermes_cli.config import load_config
-            _patch_only = bool(
-                load_config().get("skills", {}).get("background_review_patch_only", False)
-            )
-        except Exception:
-            _patch_only = False
-        if _patch_only:
-            from tools.skill_provenance import is_background_review as _is_bg
-            if _is_bg():
-                return tool_error(
-                    "skills.background_review_patch_only is enabled: the background "
-                    "self-improvement review may patch existing skills but may not "
-                    "create new ones. Patch the closest existing umbrella skill "
-                    "instead, or add a support file under it via action='write_file'. "
-                    "A user can still create skills in a foreground session.",
-                    success=False,
-                )
         result = _create_skill(name, content, category)
 
     elif action == "edit":

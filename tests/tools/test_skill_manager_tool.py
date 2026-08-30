@@ -1004,6 +1004,31 @@ class TestBackgroundReviewPatchOnly:
             ))
         assert result["success"] is True, result
 
+    def test_background_create_blocked_before_write_approval_staging(self, tmp_path):
+        """Patch-only must win when write approval would otherwise stage create."""
+        with (
+            _skill_dir(tmp_path),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "skills": {
+                        "background_review_patch_only": True,
+                        "write_approval": True,
+                    }
+                },
+            ),
+            patch("tools.skill_provenance.is_background_review", return_value=True),
+            patch("tools.write_approval.evaluate_gate") as evaluate_gate,
+            patch("tools.write_approval.stage_write") as stage_write,
+        ):
+            result = json.loads(skill_manage(
+                action="create", name="test-skill", content=VALID_SKILL_CONTENT,
+            ))
+        assert result["success"] is False
+        evaluate_gate.assert_not_called()
+        stage_write.assert_not_called()
+        assert not (tmp_path / "test-skill").exists()
+
     def test_background_patch_still_allowed_when_enabled(self, tmp_path, monkeypatch):
         """Patch-only means patching still works — that's the whole point.
 
