@@ -434,6 +434,7 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Background tasks
         self._sse_task: Optional[asyncio.Task] = None
+        self._sse_listener_generation = 0
         self._health_monitor_task: Optional[asyncio.Task] = None
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         # Per-chat typing-indicator backoff. When signal-cli reports
@@ -531,7 +532,10 @@ class SignalAdapter(BasePlatformAdapter):
 
             self._running = True
             self._last_sse_activity = time.time()
-            self._sse_task = asyncio.create_task(self._sse_listener())
+            self._sse_listener_generation += 1
+            self._sse_task = asyncio.create_task(
+                self._sse_listener(self._sse_listener_generation)
+            )
             self._health_monitor_task = asyncio.create_task(self._health_monitor())
 
             logger.info("Signal: connected to %s", self.http_url)
@@ -586,12 +590,14 @@ class SignalAdapter(BasePlatformAdapter):
     # SSE Streaming (inbound messages)
     # ------------------------------------------------------------------
 
-    async def _sse_listener(self) -> None:
+    async def _sse_listener(self, listener_generation: Optional[int] = None) -> None:
         """Listen for SSE events from signal-cli daemon."""
+        if listener_generation is None:
+            listener_generation = self._sse_listener_generation
         url = f"{self.http_url}/api/v1/events?account={quote(self.account, safe='')}"
         backoff = SSE_RETRY_DELAY_INITIAL
 
-        while self._running:
+        while self._running and listener_generation == self._sse_listener_generation:
             try:
                 logger.debug("Signal SSE: connecting to %s", url)
                 async with self.sse_client.stream(
@@ -599,6 +605,8 @@ class SignalAdapter(BasePlatformAdapter):
                     headers={"Accept": "text/event-stream"},
                     timeout=None,
                 ) as response:
+                    if listener_generation != self._sse_listener_generation:
+                        break
                     gap = time.time() - self._last_sse_activity
                     self._sse_response = response
                     backoff = SSE_RETRY_DELAY_INITIAL  # Reset on successful connection
@@ -623,7 +631,10 @@ class SignalAdapter(BasePlatformAdapter):
 
                     buffer = ""
                     async for chunk in response.aiter_text():
-                        if not self._running:
+                        if (
+                            not self._running
+                            or listener_generation != self._sse_listener_generation
+                        ):
                             break
                         buffer += chunk
                         while "\n" in buffer:
@@ -660,7 +671,7 @@ class SignalAdapter(BasePlatformAdapter):
                 if self._running:
                     logger.warning("Signal SSE: error: %s (reconnecting in %.0fs)", e, backoff)
 
-            if self._running:
+            if self._running and listener_generation == self._sse_listener_generation:
                 # Add 20% jitter to prevent thundering herd on reconnection
                 jitter = backoff * 0.2 * random.random()
                 await asyncio.sleep(backoff + jitter)
@@ -761,6 +772,7 @@ class SignalAdapter(BasePlatformAdapter):
 
         old_task = self._sse_task
         old_client = self.sse_client
+        self._sse_listener_generation += 1
         self._sse_response = None
 
         # Order matters: cancel, then tear the pool down, THEN await. A task
@@ -793,7 +805,9 @@ class SignalAdapter(BasePlatformAdapter):
         self._last_sse_activity = time.time()
         self._reconnect_requested_at_generation = None
         self._stale_checks_since_reconnect = 0
-        self._sse_task = asyncio.create_task(self._sse_listener())
+        self._sse_task = asyncio.create_task(
+            self._sse_listener(self._sse_listener_generation)
+        )
         logger.info("Signal: SSE listener task recreated")
 
     # ------------------------------------------------------------------

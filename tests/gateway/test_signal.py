@@ -2293,6 +2293,69 @@ class TestSignalSSEReconnectEscalation:
                 task.cancel()
 
     @pytest.mark.asyncio
+    async def test_stale_listener_cannot_use_replacement_client(self, monkeypatch):
+        """A listener that outlives restart must not subscribe on the new pool."""
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._running = True
+
+        class BlockingStream(httpx.AsyncByteStream):
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def __aiter__(self):
+                self.started.set()
+                await self.release.wait()
+                yield b": stale\n\n"
+
+            async def aclose(self):
+                self.release.set()
+
+        class Context:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_):
+                await self.response.aclose()
+
+        class Client:
+            def __init__(self, context):
+                self.context = context
+                self.stream_calls = 0
+
+            def stream(self, *_args, **_kwargs):
+                self.stream_calls += 1
+                return self.context
+
+        request = httpx.Request("GET", "http://localhost:8080/api/v1/events")
+        stale_stream = BlockingStream()
+        stale_client = Client(
+            Context(httpx.Response(200, request=request, stream=stale_stream))
+        )
+        replacement_client = Client(None)
+        adapter.sse_client = stale_client
+        adapter._sse_listener_generation = 1
+        stale_task = asyncio.create_task(adapter._sse_listener(1))
+
+        try:
+            await asyncio.wait_for(stale_stream.started.wait(), timeout=2)
+            adapter._sse_listener_generation = 2
+            adapter.sse_client = replacement_client
+            stale_stream.release.set()
+            await asyncio.wait_for(stale_task, timeout=2)
+        finally:
+            adapter._running = False
+            if not stale_task.done():
+                stale_task.cancel()
+                await stale_task
+
+        assert stale_client.stream_calls == 1
+        assert replacement_client.stream_calls == 0
+
+    @pytest.mark.asyncio
     async def test_gap_after_reconnect_is_logged(self, monkeypatch, caplog):
         """signal-cli does not replay: a delivery gap must not pass silently."""
         adapter = _make_signal_adapter(monkeypatch)
