@@ -70,6 +70,9 @@ SSE_RETRY_DELAY_INITIAL = 2.0
 SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+# How long a requested reconnect may stay pending before the health monitor
+# stops waiting politely and cancels/recreates the listener task outright.
+SSE_RECONNECT_ESCALATE_AFTER = 2  # consecutive stale checks with no new stream
 
 
 class SignalRPCError(RuntimeError):
@@ -420,8 +423,14 @@ class SignalAdapter(BasePlatformAdapter):
         dm_allowed_str = _sig_secret("SIGNAL_ALLOWED_USERS", "*")
         self.dm_allow_from = set(_parse_comma_list(dm_allowed_str))
 
-        # HTTP client
+        # HTTP client. `client` serves outbound RPC; `sse_client` is a
+        # SEPARATE pool for the inbound stream. Sharing one pool meant an
+        # aclose() on the streaming response could sit pending until some
+        # unrelated outbound send poked the pool -- on a quiet channel that
+        # wait is unbounded, which is exactly when an inbound stall is least
+        # likely to be noticed (#255).
         self.client: Optional[httpx.AsyncClient] = None
+        self.sse_client: Optional[httpx.AsyncClient] = None
 
         # Background tasks
         self._sse_task: Optional[asyncio.Task] = None
@@ -438,6 +447,13 @@ class SignalAdapter(BasePlatformAdapter):
         self._running = False
         self._last_sse_activity = 0.0
         self._sse_response: Optional[httpx.Response] = None
+        # Monotonic counter incremented each time the listener establishes a
+        # stream. The health monitor snapshots it when asking for a reconnect
+        # so it can tell "the reconnect landed" from "the reconnect is still
+        # pending" -- the two used to be indistinguishable (#255).
+        self._sse_generation = 0
+        self._reconnect_requested_at_generation: Optional[int] = None
+        self._stale_checks_since_reconnect = 0
 
         # Normalize account for self-message filtering
         self._account_normalized = self.account.strip()
@@ -499,6 +515,9 @@ class SignalAdapter(BasePlatformAdapter):
         # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
         from gateway.platforms._http_client_limits import platform_httpx_limits
         self.client = httpx.AsyncClient(timeout=30.0, limits=platform_httpx_limits())
+        # Dedicated pool for the inbound SSE stream -- see the sse_client note
+        # in __init__. One connection is all it ever needs.
+        self.sse_client = httpx.AsyncClient(timeout=30.0, limits=platform_httpx_limits())
         try:
             # Health check — verify signal-cli daemon is reachable
             try:
@@ -522,6 +541,9 @@ class SignalAdapter(BasePlatformAdapter):
                 if self.client:
                     await self.client.aclose()
                     self.client = None
+                if self.sse_client:
+                    await self.sse_client.aclose()
+                    self.sse_client = None
                 if lock_acquired:
                     self._release_platform_lock()
 
@@ -552,6 +574,10 @@ class SignalAdapter(BasePlatformAdapter):
             await self.client.aclose()
             self.client = None
 
+        if self.sse_client:
+            await self.sse_client.aclose()
+            self.sse_client = None
+
         self._release_platform_lock()
 
         logger.info("Signal: disconnected")
@@ -568,15 +594,32 @@ class SignalAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 logger.debug("Signal SSE: connecting to %s", url)
-                async with self.client.stream(
+                async with self.sse_client.stream(
                     "GET", url,
                     headers={"Accept": "text/event-stream"},
                     timeout=None,
                 ) as response:
+                    gap = time.time() - self._last_sse_activity
                     self._sse_response = response
                     backoff = SSE_RETRY_DELAY_INITIAL  # Reset on successful connection
                     self._last_sse_activity = time.time()
-                    logger.info("Signal SSE: connected")
+                    # A reconnect satisfies any pending request; clear the
+                    # escalation state so the monitor stops chasing it.
+                    self._sse_generation += 1
+                    self._reconnect_requested_at_generation = None
+                    self._stale_checks_since_reconnect = 0
+                    if gap > HEALTH_CHECK_STALE_THRESHOLD:
+                        # signal-cli's /api/v1/events does not replay, so any
+                        # envelope it emitted while we were between streams is
+                        # permanently lost. Name the window instead of letting
+                        # it vanish silently (#255).
+                        logger.warning(
+                            "Signal SSE: reconnected after %.0fs without events — "
+                            "any messages delivered in that window were dropped "
+                            "(the daemon does not replay them)", gap,
+                        )
+                    else:
+                        logger.info("Signal SSE: connected")
 
                     buffer = ""
                     async for chunk in response.aiter_text():
@@ -637,40 +680,119 @@ class SignalAdapter(BasePlatformAdapter):
                 break
 
             elapsed = time.time() - self._last_sse_activity
-            if elapsed > HEALTH_CHECK_STALE_THRESHOLD:
-                logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
-                try:
-                    resp = await self.client.get(
-                        f"{self.http_url}/api/v1/check", timeout=10.0
-                    )
-                    if resp.status_code == 200:
-                        # Daemon is alive but SSE is stale — a healthy HTTP endpoint
-                        # does NOT mean the SSE stream is still open. Force reconnect.
-                        logger.warning("Signal: daemon healthy but SSE idle for %.0fs, forcing reconnect", elapsed)
-                        self._force_reconnect()
-                    else:
-                        logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)
-                        self._force_reconnect()
-                except Exception as e:
-                    logger.warning("Signal: health check error: %s, forcing reconnect", e)
-                    self._force_reconnect()
+            if elapsed <= HEALTH_CHECK_STALE_THRESHOLD:
+                continue
 
-    def _force_reconnect(self) -> None:
-        """Force SSE reconnection by closing the current response.
+            # A reconnect we already asked for is still pending (the listener
+            # bumps _sse_generation the moment it re-establishes). Closing the
+            # response again is useless — the handle is already gone. Give it
+            # a grace interval, then stop being polite and rebuild the task.
+            if self._reconnect_requested_at_generation == self._sse_generation:
+                self._stale_checks_since_reconnect += 1
+                if self._stale_checks_since_reconnect >= SSE_RECONNECT_ESCALATE_AFTER:
+                    logger.error(
+                        "Signal: SSE still idle %.0fs after %d reconnect attempts — "
+                        "recreating listener task",
+                        elapsed, self._stale_checks_since_reconnect,
+                    )
+                    await self._restart_sse_listener()
+                else:
+                    logger.warning(
+                        "Signal: SSE idle %.0fs, reconnect pending", elapsed
+                    )
+                continue
+
+            logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
+            try:
+                resp = await self.client.get(
+                    f"{self.http_url}/api/v1/check", timeout=10.0
+                )
+                if resp.status_code == 200:
+                    # Daemon is alive but SSE is stale — a healthy HTTP endpoint
+                    # does NOT mean the SSE stream is still open. Force reconnect.
+                    logger.warning("Signal: daemon healthy but SSE idle for %.0fs, forcing reconnect", elapsed)
+                else:
+                    logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)
+            except Exception as e:
+                logger.warning("Signal: health check error: %s, forcing reconnect", e)
+            # Request the reconnect regardless of what the health probe said:
+            # daemon reachability tells us nothing about whether OUR stream is
+            # still delivering, and a failed probe is no reason to skip it.
+            self._request_reconnect()
+
+    def _request_reconnect(self) -> None:
+        """Ask the SSE listener to reconnect by closing the current response.
 
         Guard on is_closed, NOT is_stream_consumed: httpx sets
         is_stream_consumed=True when iteration *begins*, so an actively
         streaming response — the only kind we ever need to reconnect — always
-        reports True and would be skipped, making this a silent no-op.
+        reports True and would be skipped, making this a silent no-op (#211).
+
+        This only *requests* a reconnect: aclose() is scheduled on another
+        task and the listener does not observe the closure until its pending
+        read unblocks. Record the generation we asked at so the health monitor
+        can distinguish "landed" from "still pending" and escalate rather than
+        firing no-ops at a handle it already cleared (#255).
         """
-        if self._sse_response is not None and not self._sse_response.is_closed:
+        self._reconnect_requested_at_generation = self._sse_generation
+        self._stale_checks_since_reconnect = 0
+        response, self._sse_response = self._sse_response, None
+        if response is not None and not response.is_closed:
             try:
-                task = asyncio.create_task(self._sse_response.aclose())
+                task = asyncio.create_task(response.aclose())
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
             except Exception:
                 pass
-            self._sse_response = None
+
+    # Back-compat alias: _force_reconnect was the pre-#255 name.
+    _force_reconnect = _request_reconnect
+
+    async def _restart_sse_listener(self) -> None:
+        """Cancel and recreate the SSE listener task.
+
+        Last resort when a requested reconnect never lands — e.g. the listener
+        is parked on a read that the response close did not interrupt. Unlike
+        _request_reconnect this does not depend on the old stream noticing
+        anything: the task is torn down and rebuilt from scratch.
+        """
+        if not self._running:
+            return
+
+        old_task = self._sse_task
+        old_client = self.sse_client
+        self._sse_response = None
+
+        # Order matters: cancel, then tear the pool down, THEN await. A task
+        # parked on a socket read may not observe cancellation until the read
+        # unblocks, and closing the pool underneath it is what unblocks it.
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        if old_client is not None:
+            try:
+                await old_client.aclose()
+            except Exception:
+                logger.debug("Signal: error closing SSE client", exc_info=True)
+        if old_task is not None and not old_task.done():
+            try:
+                # shield: on timeout we give up waiting, but do not re-cancel
+                # and do not block the health monitor forever on a wedged read.
+                await asyncio.wait_for(asyncio.shield(old_task), timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception:
+                logger.debug("Signal: cancelled SSE listener raised", exc_info=True)
+
+        from gateway.platforms._http_client_limits import platform_httpx_limits
+        self.sse_client = httpx.AsyncClient(
+            timeout=30.0, limits=platform_httpx_limits()
+        )
+
+        self._last_sse_activity = time.time()
+        self._reconnect_requested_at_generation = None
+        self._stale_checks_since_reconnect = 0
+        self._sse_task = asyncio.create_task(self._sse_listener())
+        logger.info("Signal: SSE listener task recreated")
 
     # ------------------------------------------------------------------
     # Message Handling

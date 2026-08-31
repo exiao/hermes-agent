@@ -2,7 +2,9 @@
 import asyncio
 import base64
 import httpx
+import logging
 import pytest
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
@@ -98,9 +100,12 @@ class TestSignalConnectCleanup:
             result = await adapter.connect()
 
         assert result is False
-        mock_client.aclose.assert_awaited_once()
+        # Two pools are built now (outbound RPC + the dedicated SSE stream),
+        # and the failed-connect path must close BOTH.
+        assert mock_client.aclose.await_count == 2
         mock_release.assert_called_once_with("signal-phone", "+15551234567")
         assert adapter.client is None
+        assert adapter.sse_client is None
         assert adapter._platform_lock_identity is None
 
 
@@ -314,7 +319,7 @@ class TestSignalSSEUrlEncoding:
         second_response = httpx.Response(200, request=request, stream=second_stream)
         second_entered = asyncio.Event()
         second_exited = asyncio.Event()
-        adapter.client = StreamingClient([
+        adapter.sse_client = StreamingClient([
             StreamContext(first_response, first_entered, first_exited),
             StreamContext(second_response, second_entered, second_exited),
         ])
@@ -2163,3 +2168,180 @@ class TestUuidOnlyEnvelopePreservesNumberAlias:
 
         assert a._recipient_number_by_uuid[uid] == "+15551234567"
         assert a._resolve_quoted_media_paths("1700000000000", uid) == [str(f)]
+
+
+# ---------------------------------------------------------------------------
+# SSE reconnect escalation (#255)
+#
+# #211 made _force_reconnect actually close the stream. It left two gaps:
+# the request was one-shot (the handle was cleared before the close landed,
+# so every later attempt was a silent no-op), and a close that never landed
+# had no fallback. Inbound Signal stayed dead while the monitor logged
+# "forcing reconnect" every 30s.
+# ---------------------------------------------------------------------------
+class TestSignalSSEReconnectEscalation:
+
+    @pytest.mark.asyncio
+    async def test_repeat_requests_are_not_silent_noops(self, monkeypatch):
+        """A pending reconnect must escalate, not re-fire at a cleared handle."""
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._running = True
+        adapter._sse_task = None
+
+        request = httpx.Request("GET", "http://localhost:8080/api/v1/events")
+        response = httpx.Response(200, request=request)
+        adapter._sse_response = response
+
+        # First request: clears the handle and records the generation.
+        adapter._request_reconnect()
+        assert adapter._sse_response is None
+        assert adapter._reconnect_requested_at_generation == adapter._sse_generation
+
+        restarts = []
+        async def fake_restart():
+            restarts.append(True)
+        monkeypatch.setattr(adapter, "_restart_sse_listener", fake_restart)
+        monkeypatch.setattr(
+            "gateway.platforms.signal.HEALTH_CHECK_INTERVAL", 0.01
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.signal.HEALTH_CHECK_STALE_THRESHOLD", 0.0
+        )
+        # Stream never reconnects, so the generation never advances.
+        adapter._last_sse_activity = 0.0
+
+        monitor = asyncio.create_task(adapter._health_monitor())
+        try:
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if restarts:
+                    break
+        finally:
+            adapter._running = False
+            monitor.cancel()
+            try:
+                await monitor
+            except asyncio.CancelledError:
+                pass
+
+        assert restarts, (
+            "health monitor never escalated: a reconnect that never lands "
+            "must recreate the listener task, not spin on no-ops"
+        )
+
+    @pytest.mark.asyncio
+    async def test_listener_reconnect_clears_pending_request(self, monkeypatch):
+        """Re-establishing the stream must reset the escalation state."""
+        adapter = _make_signal_adapter(monkeypatch)
+        monkeypatch.setattr("gateway.platforms.signal.SSE_RETRY_DELAY_INITIAL", 0)
+
+        class OneShotStream(httpx.AsyncByteStream):
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def __aiter__(self):
+                self.started.set()
+                yield b": keepalive\n\n"
+                await self.release.wait()
+
+            async def aclose(self):
+                self.release.set()
+
+        class Ctx:
+            def __init__(self, response):
+                self.response = response
+            async def __aenter__(self):
+                return self.response
+            async def __aexit__(self, *_):
+                await self.response.aclose()
+
+        class Client:
+            def __init__(self, ctxs):
+                self.ctxs = iter(ctxs)
+            def stream(self, *_a, **_k):
+                return next(self.ctxs)
+
+        request = httpx.Request("GET", "http://localhost:8080/api/v1/events")
+        s1, s2 = OneShotStream(), OneShotStream()
+        adapter.sse_client = Client([
+            Ctx(httpx.Response(200, request=request, stream=s1)),
+            Ctx(httpx.Response(200, request=request, stream=s2)),
+        ])
+        adapter._running = True
+
+        task = asyncio.create_task(adapter._sse_listener())
+        try:
+            await asyncio.wait_for(s1.started.wait(), timeout=2)
+            gen_before = adapter._sse_generation
+
+            adapter._request_reconnect()
+            assert adapter._reconnect_requested_at_generation == gen_before
+
+            await asyncio.wait_for(s2.started.wait(), timeout=2)
+            # The listener re-established: the pending request is satisfied.
+            assert adapter._sse_generation > gen_before
+            assert adapter._reconnect_requested_at_generation is None
+            assert adapter._stale_checks_since_reconnect == 0
+        finally:
+            adapter._running = False
+            s1.release.set()
+            s2.release.set()
+            try:
+                await asyncio.wait_for(task, timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_gap_after_reconnect_is_logged(self, monkeypatch, caplog):
+        """signal-cli does not replay: a delivery gap must not pass silently."""
+        adapter = _make_signal_adapter(monkeypatch)
+        monkeypatch.setattr("gateway.platforms.signal.SSE_RETRY_DELAY_INITIAL", 0)
+
+        class Stream(httpx.AsyncByteStream):
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+            async def __aiter__(self):
+                self.started.set()
+                yield b": keepalive\n\n"
+                await self.release.wait()
+            async def aclose(self):
+                self.release.set()
+
+        class Ctx:
+            def __init__(self, response):
+                self.response = response
+            async def __aenter__(self):
+                return self.response
+            async def __aexit__(self, *_):
+                await self.response.aclose()
+
+        class Client:
+            def __init__(self, ctx):
+                self.ctx = ctx
+            def stream(self, *_a, **_k):
+                return self.ctx
+
+        request = httpx.Request("GET", "http://localhost:8080/api/v1/events")
+        stream = Stream()
+        adapter.sse_client = Client(Ctx(httpx.Response(200, request=request, stream=stream)))
+        adapter._running = True
+        # Last event was well beyond the stale threshold: a gap happened.
+        adapter._last_sse_activity = time.time() - 600
+
+        with caplog.at_level(logging.WARNING, logger="gateway.platforms.signal"):
+            task = asyncio.create_task(adapter._sse_listener())
+            try:
+                await asyncio.wait_for(stream.started.wait(), timeout=2)
+            finally:
+                adapter._running = False
+                stream.release.set()
+                try:
+                    await asyncio.wait_for(task, timeout=2)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    task.cancel()
+
+        assert any(
+            "were dropped" in r.getMessage() for r in caplog.records
+        ), "reconnect after a long gap must warn that messages were lost"
