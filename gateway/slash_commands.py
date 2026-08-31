@@ -4517,8 +4517,10 @@ class GatewaySlashCommandsMixin:
         """
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
-        with self._profile_secret_scope_for_source(source):
-            history = await self.async_session_store.load_transcript(session_entry.session_id)
+        # Already inside the source profile's runtime scope: the public
+        # _handle_compress_command wrapper installs it around this whole
+        # handler, so the transcript read resolves the right store.
+        history = await self.async_session_store.load_transcript(session_entry.session_id)
 
         if not history or len(history) < 4:
             return t("gateway.compress.not_enough")
