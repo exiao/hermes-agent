@@ -85,3 +85,36 @@ def test_a_waiter_that_times_out_against_a_dead_holder_sees_no_holder():
     # The advice must stay truthful: a named holder means the workdir advice
     # is at least addressed at something real.
     assert "NO job holds it" not in described
+
+
+def test_timeout_holder_is_captured_before_the_blocker_releases():
+    """The description must come from the moment of the timeout, not after.
+
+    Codex's P2 on #261: `holder_description()` retakes the condition lock
+    separately, so a blocker that releases in that window reads back as
+    "NO job holds it" — the message then blames a dead run when a live
+    workdir job was genuinely holding the lock. Capture at timeout instead.
+    """
+    lock = _lock()
+    released = threading.Event()
+
+    def blocker():
+        assert lock.acquire_write(timeout=5, job="live-job")
+        released.wait(timeout=5)
+        lock.release_write()
+
+    t = threading.Thread(target=blocker, daemon=True)
+    t.start()
+
+    while True:
+        with lock._cond:
+            if lock._writer_active:
+                break
+
+    assert lock.acquire_read(timeout=0.2) is False
+    # The blocker releases DURING the window the old code described in.
+    released.set()
+    t.join(timeout=5)
+
+    assert "live-job" in lock.last_timeout_holder()
+    assert lock.holder_description() == "NO job holds it"

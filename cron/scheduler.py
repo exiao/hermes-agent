@@ -1233,18 +1233,36 @@ class _ReadWriteLock:
         # restarted mid-run), which is a different problem with a different
         # fix than "a workdir job is hogging the lock".
         self._writer_job: str | None = None
+        # Holder description captured atomically at the moment a wait timed
+        # out, so the error names the job that was actually blocking rather
+        # than whatever the lock looks like after the race window.
+        self._timeout_holder: str = "NO job holds it"
+
+    def last_timeout_holder(self) -> str:
+        """Who was holding the lock when the most recent wait timed out."""
+        with self._cond:
+            return self._timeout_holder
 
     def holder_description(self) -> str:
         """Describe the current writer for a timed-out waiter's error."""
         with self._cond:
-            if self._writer_active:
-                who = self._writer_job or "an unnamed workdir job"
-                return f"workdir job {who!r} holds it"
-            if self._writers_waiting > 0:
-                return "a workdir job is queued ahead of this one"
-            if self._readers > 0:
-                return f"{self._readers} workdir-less job(s) still hold it"
-            return "NO job holds it"
+            return self._describe_locked()
+
+    def _describe_locked(self) -> str:
+        """Describe the holder. Caller MUST already hold ``self._cond``.
+
+        Read under the same lock hold as the timeout itself: describing
+        afterwards races with the blocker releasing, which reads back as
+        "NO job holds it" and misdiagnoses a live contender as a dead run.
+        """
+        if self._writer_active:
+            who = self._writer_job or "an unnamed workdir job"
+            return f"workdir job {who!r} holds it"
+        if self._writers_waiting > 0:
+            return "a workdir job is queued ahead of this one"
+        if self._readers > 0:
+            return f"{self._readers} workdir-less job(s) still hold it"
+        return "NO job holds it"
 
     def acquire_read(self, timeout: float | None = None) -> bool:
         """Acquire a read lock.
@@ -1261,6 +1279,7 @@ class _ReadWriteLock:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        self._timeout_holder = self._describe_locked()
                         self._cond.notify_all()
                         return False
                     self._cond.wait(timeout=remaining)
@@ -1291,6 +1310,7 @@ class _ReadWriteLock:
                     if deadline is not None:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
+                            self._timeout_holder = self._describe_locked()
                             self._cond.notify_all()
                             return False
                         self._cond.wait(timeout=remaining)
@@ -5653,7 +5673,7 @@ def run_job(
                 f"Timed out waiting for the TERMINAL_CWD "
                 f"{'write' if _holds_cwd_write else 'read'} lock after "
                 f"{_cwd_lock_timeout:.0f}s — "
-                f"{_terminal_cwd_lock.holder_description()}. "
+                f"{_terminal_cwd_lock.last_timeout_holder()}. "
                 f"If a workdir job holds it, stagger its schedule or remove "
                 f"its workdir. If NO job holds it, a previous run died "
                 f"without releasing (a gateway restart or a killed run mid-"
