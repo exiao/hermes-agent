@@ -1,25 +1,31 @@
 """Built-in adapters must resolve gateway.profile_routes at ingress.
 
-Regression: ``build_source`` reads routes through ``self.gateway_runner``.
-The runner only attached that back-reference to plugin adapters and two
-built-ins, so a routed built-in platform (Signal) stamped
+Regression: ``build_source`` reads routes through ``self.gateway_runner``. The
+runner attached that back-reference to plugin adapters and to two built-ins
+(api_server, webhook) — every other routed built-in (Signal) stamped
 ``source.profile = None``. The adapter then keyed ``_active_sessions`` and the
-clarify text-intercept bypass under ``agent:main:…`` while the runner ran the
-turn under ``agent:<profile>:…`` — a clarify reply missed its pending entry and
-fell through to the busy handler's "Interrupting current task" ack.
+clarify text-intercept bypass under ``agent:main:<chat>`` while the runner ran
+the turn under ``agent:<profile>:<chat>``, so a reply to a clarify prompt missed
+its pending entry and fell through to the busy handler's interrupt ack.
 """
 
 from types import SimpleNamespace
 
+import pytest
+
+from gateway.config import PlatformConfig
 from gateway.platforms.base import Platform
 from gateway.profile_routing import parse_profile_routes
 from gateway.run import GatewayRunner
+from gateway.session import build_session_key
 
 
 CHAT_ID = "group:routed-chat"
 
 
-def _runner_with_route():
+@pytest.fixture
+def runner(monkeypatch):
+    """A minimal runner that routes CHAT_ID to the served ``manager`` profile."""
     runner = object.__new__(GatewayRunner)
     runner.config = SimpleNamespace(
         multiplex_profiles=True,
@@ -36,52 +42,61 @@ def _runner_with_route():
             ]
         ),
     )
+    monkeypatch.setattr(
+        "gateway.run._multiplex_profile_homes",
+        lambda config: [("manager", "/tmp/manager")],
+    )
     return runner
 
 
-def test_created_builtin_adapter_gets_runner_backref(monkeypatch):
-    runner = _runner_with_route()
-    built = SimpleNamespace(gateway_runner=None)
-    monkeypatch.setattr(
-        GatewayRunner, "_build_adapter", lambda self, platform, config: built
+@pytest.fixture
+def signal_adapter(runner, monkeypatch):
+    """A real Signal adapter built the way the gateway builds it."""
+    monkeypatch.setenv("SIGNAL_HTTP_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("SIGNAL_ACCOUNT", "+15550000000")
+    config = PlatformConfig(
+        enabled=True,
+        extra={"http_url": "http://127.0.0.1:8080", "account": "+15550000000"},
     )
-
-    adapter = runner._create_adapter(Platform.SIGNAL, SimpleNamespace(extra={}))
-
-    assert adapter is built
-    assert adapter.gateway_runner is runner
+    adapter = runner._create_adapter(Platform.SIGNAL, config)
+    assert adapter is not None, "Signal adapter should build from a valid config"
+    return adapter
 
 
-def test_routed_source_carries_the_profile(monkeypatch):
-    """With the back-reference in place, build_source stamps the profile."""
-    runner = _runner_with_route()
-    monkeypatch.setattr(
-        "gateway.run._multiplex_profile_homes",
-        lambda config: [("manager", "/tmp/manager")],
+def test_builtin_adapter_stamps_the_routed_profile(signal_adapter):
+    """The adapter's own ingress must resolve the route, not just the runner's."""
+    source = signal_adapter.build_source(
+        chat_id=CHAT_ID, chat_type="group", user_id="+15551111111", user_name="E X"
     )
+    assert source.profile == "manager"
 
-    source = SimpleNamespace(
-        platform=Platform.SIGNAL,
-        chat_id=CHAT_ID,
-        thread_id=None,
-        guild_id=None,
-        parent_chat_id=None,
+
+def test_adapter_and_runner_agree_on_the_session_key(runner, signal_adapter):
+    """Both sides must derive one key, or the clarify bypass looks in the wrong lane."""
+    source = signal_adapter.build_source(
+        chat_id=CHAT_ID, chat_type="group", user_id="+15551111111", user_name="E X"
     )
-    assert runner._profile_name_for_source(source) == "manager"
-
-
-def test_unrouted_chat_stays_on_the_default_profile(monkeypatch):
-    runner = _runner_with_route()
-    monkeypatch.setattr(
-        "gateway.run._multiplex_profile_homes",
-        lambda config: [("manager", "/tmp/manager")],
+    adapter_key = build_session_key(
+        source,
+        group_sessions_per_user=signal_adapter.config.extra.get(
+            "group_sessions_per_user", True
+        ),
+        thread_sessions_per_user=signal_adapter.config.extra.get(
+            "thread_sessions_per_user", False
+        ),
+        profile=signal_adapter._session_key_profile(source),
     )
-
-    source = SimpleNamespace(
-        platform=Platform.SIGNAL,
-        chat_id="group:some-other-chat",
-        thread_id=None,
-        guild_id=None,
-        parent_chat_id=None,
+    runner_key = build_session_key(
+        source,
+        group_sessions_per_user=runner.config.group_sessions_per_user,
+        thread_sessions_per_user=runner.config.thread_sessions_per_user,
+        profile=runner._profile_name_for_source(source),
     )
-    assert runner._profile_name_for_source(source) is None
+    assert adapter_key == runner_key == f"agent:manager:signal:group:{CHAT_ID}"
+
+
+def test_unrouted_chat_stays_on_the_default_profile(signal_adapter):
+    source = signal_adapter.build_source(
+        chat_id="group:other-chat", chat_type="group", user_id="+1", user_name="E X"
+    )
+    assert source.profile is None
