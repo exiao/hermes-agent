@@ -1227,6 +1227,42 @@ class _ReadWriteLock:
         self._readers = 0
         self._writer_active = False
         self._writers_waiting = 0
+        # Job name of the current writer, so a timed-out waiter can name the
+        # real holder instead of guessing. A wait that times out with no
+        # writer means the holder died without releasing (e.g. the gateway
+        # restarted mid-run), which is a different problem with a different
+        # fix than "a workdir job is hogging the lock".
+        self._writer_job: str | None = None
+        # Holder description captured atomically at the moment a wait timed
+        # out, so the error names the job that was actually blocking rather
+        # than whatever the lock looks like after the race window.
+        self._timeout_holder = threading.local()
+
+    def last_timeout_holder(self) -> str:
+        """Who was holding the lock when the most recent wait timed out."""
+        with self._cond:
+            return getattr(self._timeout_holder, "value", "NO job holds it")
+
+    def holder_description(self) -> str:
+        """Describe the current writer for a timed-out waiter's error."""
+        with self._cond:
+            return self._describe_locked()
+
+    def _describe_locked(self, *, exclude_current_writer: bool = False) -> str:
+        """Describe the holder. Caller MUST already hold ``self._cond``.
+
+        Read under the same lock hold as the timeout itself: describing
+        afterwards races with the blocker releasing, which reads back as
+        "NO job holds it" and misdiagnoses a live contender as a dead run.
+        """
+        if self._writer_active:
+            who = self._writer_job or "an unnamed workdir job"
+            return f"workdir job {who!r} holds it"
+        if self._writers_waiting > int(exclude_current_writer):
+            return "a workdir job is queued ahead of this one"
+        if self._readers > 0:
+            return f"{self._readers} workdir-less job(s) still hold it"
+        return "NO job holds it"
 
     def acquire_read(self, timeout: float | None = None) -> bool:
         """Acquire a read lock.
@@ -1243,6 +1279,7 @@ class _ReadWriteLock:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        self._timeout_holder.value = self._describe_locked()
                         self._cond.notify_all()
                         return False
                     self._cond.wait(timeout=remaining)
@@ -1257,7 +1294,7 @@ class _ReadWriteLock:
             if self._readers == 0:
                 self._cond.notify_all()
 
-    def acquire_write(self, timeout: float | None = None) -> bool:
+    def acquire_write(self, timeout: float | None = None, job: str | None = None) -> bool:
         """Acquire a write lock.
 
         Returns ``True`` if the lock was acquired, ``False`` on timeout.
@@ -1273,6 +1310,9 @@ class _ReadWriteLock:
                     if deadline is not None:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
+                            self._timeout_holder.value = self._describe_locked(
+                                exclude_current_writer=True
+                            )
                             self._cond.notify_all()
                             return False
                         self._cond.wait(timeout=remaining)
@@ -1281,11 +1321,13 @@ class _ReadWriteLock:
             finally:
                 self._writers_waiting -= 1
             self._writer_active = True
+            self._writer_job = job
         return True
 
     def release_write(self) -> None:
         with self._cond:
             self._writer_active = False
+            self._writer_job = None
             self._cond.notify_all()
 
 
@@ -5605,7 +5647,9 @@ def run_job(
     _cwd_lock_timeout = _cwd_lock_timeout_seconds()
     _cwd_lock_acquired = True
     if _holds_cwd_write:
-        if not _terminal_cwd_lock.acquire_write(timeout=_cwd_lock_timeout):
+        if not _terminal_cwd_lock.acquire_write(
+            timeout=_cwd_lock_timeout, job=job.get("name") or job.get("id")
+        ):
             _cwd_lock_acquired = False
     else:
         if not _terminal_cwd_lock.acquire_read(timeout=_cwd_lock_timeout):
@@ -5630,11 +5674,13 @@ def run_job(
             raise TimeoutError(
                 f"Timed out waiting for the TERMINAL_CWD "
                 f"{'write' if _holds_cwd_write else 'read'} lock after "
-                f"{_cwd_lock_timeout:.0f}s — another cron job (a workdir "
-                f"writer, or long-running readers) has held it for longer "
-                f"than the cron inactivity limit. If a workdir job is the "
-                f"holder, stagger its schedule or remove its workdir to "
-                f"unblock this job (#79768)."
+                f"{_cwd_lock_timeout:.0f}s — "
+                f"{_terminal_cwd_lock.last_timeout_holder()}. "
+                f"If a workdir job holds it, stagger its schedule or remove "
+                f"its workdir. If NO job holds it, a previous run died "
+                f"without releasing (a gateway restart or a killed run mid-"
+                f"job); nothing is misconfigured and the next tick should "
+                f"succeed (#79768)."
             )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
