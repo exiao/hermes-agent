@@ -1004,7 +1004,8 @@ class GatewaySlashCommandsMixin:
             return "\n".join(lines)
 
         # Last resort: rough estimate from transcript
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        with self._profile_secret_scope_for_source(source):
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
         if history:
             from agent.model_metadata import estimate_messages_tokens_rough
 
@@ -2861,7 +2862,8 @@ class GatewaySlashCommandsMixin:
         """Handle /retry command - re-send the last user message."""
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        with self._profile_secret_scope_for_source(source):
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
         
         # Find the last *real* user message. Timeline bookkeeping rows carry
         # role=user + display_kind (model_switch / async_delegation_complete /
@@ -4515,7 +4517,8 @@ class GatewaySlashCommandsMixin:
         """
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        with self._profile_secret_scope_for_source(source):
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
 
         if not history or len(history) < 4:
             return t("gateway.compress.not_enough")
@@ -5287,7 +5290,8 @@ class GatewaySlashCommandsMixin:
         title = await self._session_db.get_session_title(target_id) or name
 
         # Count messages for context
-        history = await self.async_session_store.load_transcript(target_id)
+        with self._profile_secret_scope_for_source(source):
+            history = await self.async_session_store.load_transcript(target_id)
         msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
         msg_part = f" ({msg_count} message{'s' if msg_count != 1 else ''})" if msg_count else ""
 
@@ -5393,7 +5397,8 @@ class GatewaySlashCommandsMixin:
 
         # Load the current session and its transcript
         current_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(current_entry.session_id)
+        with self._profile_secret_scope_for_source(source):
+            history = await self.async_session_store.load_transcript(current_entry.session_id)
         if not history:
             return t("gateway.branch.no_conversation")
 
@@ -5578,7 +5583,8 @@ class GatewaySlashCommandsMixin:
             history: list[dict] = []
             try:
                 entry = self.session_store.get_or_create_session(source)
-                history = self.session_store.load_transcript(entry.session_id) or []
+                with self._profile_secret_scope_for_source(source):
+                    history = self.session_store.load_transcript(entry.session_id) or []
             except Exception:
                 history = []
 
@@ -5609,7 +5615,8 @@ class GatewaySlashCommandsMixin:
             history: list[dict] = []
             try:
                 entry = self.session_store.get_or_create_session(source)
-                history = self.session_store.load_transcript(entry.session_id) or []
+                with self._profile_secret_scope_for_source(source):
+                    history = self.session_store.load_transcript(entry.session_id) or []
             except Exception:
                 history = []
 
@@ -5798,7 +5805,8 @@ class GatewaySlashCommandsMixin:
 
         # No agent at all -- check session history for a rough count
         session_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        with self._profile_secret_scope_for_source(source):
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
         if history:
             from agent.model_metadata import estimate_messages_tokens_rough
             msgs = [m for m in history if m.get("role") in {"user", "assistant"} and m.get("content")]

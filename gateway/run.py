@@ -19903,8 +19903,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # began processing if the gateway died while it was still waiting.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
-        # Load conversation history from transcript
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        # Load conversation history from transcript, in the profile scope
+        # that owns it (see _load_transcript_for_source).
+        history = await self._load_transcript_for_source(
+            session_entry.session_id, source
+        )
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -28801,6 +28804,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(source, "thread_id", None), getattr(source, "parent_chat_id", None),
         )
         return None
+
+    async def _load_transcript_for_source(
+        self, session_id: str, source: SessionSource
+    ) -> list:
+        """Load a session transcript from the store that actually owns it.
+
+        Turns run inside ``_profile_runtime_scope`` (see ``_run_agent``), so a
+        routed profile's messages are PERSISTED to ``profiles/<name>/state.db``.
+        An unscoped read here resolves the ROOT ``state.db``, which holds only
+        the session row and zero messages — the gateway then replays an empty
+        history and the agent reports total amnesia on every turn while the
+        real transcript sits intact in the profile store. The read side has to
+        follow the same scope the write side already does.
+
+        Transparent pass-through when multiplexing is off.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self.async_session_store.load_transcript(session_id)
+        with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+            return await self.async_session_store.load_transcript(session_id)
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME should serve this inbound source.
