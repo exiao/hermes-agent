@@ -7363,11 +7363,17 @@ class BasePlatformAdapter(ABC):
         if chat_topic is not None and not chat_topic.strip():
             chat_topic = None
 
-        # Resolve profile from configured routes (None when no match / no routes)
+        # A secondary adapter's credential owns every event it receives. A
+        # global route may match the same chat for the primary/shared adapter,
+        # but must not move a credential-owned event into another profile's
+        # session, memory, or configuration.
         profile = None
         profile_route_rejected = False
+        owner_profile = getattr(self, "_owner_profile", None)
+        if isinstance(owner_profile, str) and owner_profile.strip():
+            profile = owner_profile.strip()
         runner = getattr(self, "gateway_runner", None)
-        if runner is not None:
+        if profile is None and runner is not None:
             from gateway.profile_routing import ProfileRouteRejected
 
             try:

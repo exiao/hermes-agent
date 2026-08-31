@@ -16503,6 +16503,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
     def _create_adapter(
+        self,
+        platform: Platform,
+        config: Any,
+    ) -> Optional[BasePlatformAdapter]:
+        """Create an adapter and give it the runner back-reference.
+
+        ``build_source`` resolves ``gateway.profile_routes`` through
+        ``self.gateway_runner._profile_name_for_source``. Plugin adapters got
+        that reference in the registry branch of ``_build_adapter``, but the
+        built-in branch only set it on two platforms, so every other built-in
+        (Signal included) stamped ``source.profile = None`` at ingress. The
+        adapter then keyed ``_active_sessions`` and the clarify bypass under
+        ``agent:main:…`` while the runner ran the turn under
+        ``agent:<profile>:…`` — the clarify reply missed its own pending entry
+        and fell through to the busy handler's interrupt ack.
+        """
+        adapter = self._build_adapter(platform, config)
+        if adapter is not None:
+            adapter.gateway_runner = self  # type: ignore[assignment]
+        return adapter
+
+    def _build_adapter(
         self, 
         platform: Platform, 
         config: Any
@@ -16528,14 +16550,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if platform_registry.is_registered(platform.value):
                 adapter = platform_registry.create_adapter(platform.value, config)
                 if adapter is not None:
-                    # Inject a back-reference to the gateway runner so every
-                    # adapter can (a) deliver cross-platform admin alerts and
-                    # (b) resolve inbound profile routing through
-                    # ``runner._profile_name_for_source``. Unconditional:
-                    # ``BasePlatformAdapter`` declares ``gateway_runner``, so
-                    # this reaches ALL platforms (not just the ones that
-                    # pre-declared it), making profile routing platform-generic.
-                    adapter.gateway_runner = self
                     return adapter
                 # Registered but failed to instantiate — don't silently fall
                 # through to built-ins (there are none for plugin platforms).
@@ -16588,7 +16602,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("API Server: aiohttp not installed")
                 return None
             adapter = APIServerAdapter(config)
-            adapter.gateway_runner = self
             return adapter
 
         elif platform == Platform.WEBHOOK:
@@ -16597,7 +16610,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Webhook: aiohttp not installed")
                 return None
             adapter = WebhookAdapter(config)
-            adapter.gateway_runner = self  # For cross-platform delivery
             return adapter
 
         elif platform == Platform.MSGRAPH_WEBHOOK:
