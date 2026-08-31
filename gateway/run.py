@@ -2422,6 +2422,32 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_hermes_home_override(home_token)
 
 
+def _profile_scoped_gateway_handler(handler):
+    """Keep the source profile active for the complete inbound turn."""
+    @functools.wraps(handler)
+    async def wrapped(self, event, *args, **kwargs):
+        source = getattr(event, "source", None)
+        config = getattr(self, "config", None)
+        if (
+            source is None
+            or not getattr(config, "multiplex_profiles", False)
+            or getattr(source, "profile_route_rejected", False) is True
+        ):
+            return await handler(self, event, *args, **kwargs)
+
+        from gateway.profile_routing import ProfileRouteRejected
+
+        try:
+            profile_home = self._resolve_profile_home_for_source(source)
+        except ProfileRouteRejected:
+            # Let _handle_message apply its normal fail-closed ingress handling.
+            return await handler(self, event, *args, **kwargs)
+        with _profile_runtime_scope(profile_home):
+            return await handler(self, event, *args, **kwargs)
+
+    return wrapped
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner.
 
@@ -17191,6 +17217,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
+    @_profile_scoped_gateway_handler
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.

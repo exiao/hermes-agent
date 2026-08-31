@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import hashlib
 import inspect
 import logging
@@ -54,6 +55,16 @@ logger = logging.getLogger("gateway.run")
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+
+
+def _profile_scoped_command(handler):
+    """Keep profile state active through a command's reads and writes."""
+    @functools.wraps(handler)
+    async def wrapped(self, event, *args, **kwargs):
+        with self._profile_secret_scope_for_source(event.source):
+            return await handler(self, event, *args, **kwargs)
+
+    return wrapped
 
 
 def _clean_str(value: Any) -> str:
@@ -2858,6 +2869,7 @@ class GatewaySlashCommandsMixin:
         self._ephemeral_system_prompt = new_prompt
         return t("gateway.personality.set_to", name=name)
 
+    @_profile_scoped_command
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
         source = event.source
@@ -5381,6 +5393,7 @@ class GatewaySlashCommandsMixin:
             title=title,
         )
 
+    @_profile_scoped_command
     async def _handle_branch_command(self, event: MessageEvent) -> str:
         """Handle /branch [name] — fork the current session into a new independent copy.
 
