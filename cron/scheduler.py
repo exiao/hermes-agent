@@ -3068,7 +3068,19 @@ def _deliver_result_impl(job: dict, content: str, adapters=None, loop=None) -> O
 
         from gateway.delivery import resolve_delivery_transport
 
-        transport = resolve_delivery_transport(platform, config, adapters)
+        # In multiplex mode, the in-process ticker receives the gateway's
+        # process-level adapter map while it scopes execution to each profile.
+        # A routed secondary can disable its duplicate native config and still
+        # deliver through that shared adapter. A missing adapter remains
+        # rejected by the resolver, and non-cron DeliveryRouter callers keep
+        # the strict disabled-config default.
+        allow_disabled_native = bool(adapters and adapters.get(platform) is not None)
+        transport = resolve_delivery_transport(
+            platform,
+            config,
+            adapters,
+            allow_disabled_native=allow_disabled_native,
+        )
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -3078,14 +3090,21 @@ def _deliver_result_impl(job: dict, content: str, adapters=None, loop=None) -> O
             pconfig = config.platforms.get(platform)
             runtime_adapter = None
 
-        if transport is not None and transport.is_relay:
-            # A relay transport carries the RELAY adapter's config, and
-            # resolve_delivery_transport already applied relay's enablement
-            # rule (config block absent OR enabled). The logical platform is
-            # deliberately NOT natively enabled in a relay-fronted deployment
-            # (its credential lives in the connector), so the native
-            # configured/enabled gate below must not apply — it used to
-            # reject exactly the targets the relay was resolved to serve.
+        if transport is not None:
+            # A resolved transport has ALREADY passed its own enablement rule
+            # in resolve_delivery_transport (native: config block absent OR
+            # enabled; relay: relay's own block absent OR enabled). Re-applying
+            # a native configured/enabled gate here rejected exactly the
+            # targets the resolver had just approved:
+            #   - relay-fronted logical platforms carry the RELAY config and
+            #     are deliberately not natively enabled;
+            #   - a live adapter supplied with NO config block for this profile
+            #     (the documented "explicitly supplied live adapter" case, and
+            #     what a multiplexed secondary profile sees — the shared
+            #     default-profile adapter fronts it, so the profile owns no
+            #     platform block of its own) yields pconfig=None.
+            # Both are deliverable; synthesize an enabled config for the
+            # downstream standalone-send fallback, which expects an object.
             if pconfig is None:
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(enabled=True)
@@ -3326,7 +3345,11 @@ def _deliver_result_impl(job: dict, content: str, adapters=None, loop=None) -> O
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(
+                        config,
+                        adapters,
+                        allow_disabled_native=allow_disabled_native,
+                    )
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
