@@ -2408,3 +2408,199 @@ class TestSignalSSEReconnectEscalation:
         assert any(
             "were dropped" in r.getMessage() for r in caplog.records
         ), "reconnect after a long gap must warn that messages were lost"
+
+    @pytest.mark.asyncio
+    async def test_landed_but_silent_reconnects_escalate(self, monkeypatch):
+        """A reconnect that lands but delivers nothing must still escalate.
+
+        #255 escalates only while a reconnect is *pending*. When the reconnect
+        succeeds at the HTTP level and the stream then delivers nothing, the
+        listener clears the pending state and zeroes the stale counter, so the
+        monitor falls through to _request_reconnect() forever and the listener
+        is never rebuilt. Observed in production: inbound Signal stayed dead
+        for ~10 minutes across repeated "daemon healthy but SSE idle, forcing
+        reconnect" cycles while "recreating listener task" never once fired.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        monkeypatch.setattr("gateway.platforms.signal.SSE_RETRY_DELAY_INITIAL", 0)
+        monkeypatch.setattr("gateway.platforms.signal.HEALTH_CHECK_INTERVAL", 0.01)
+        monkeypatch.setattr("gateway.platforms.signal.HEALTH_CHECK_STALE_THRESHOLD", 0.0)
+
+        # A stream that connects for real and then delivers nothing, until the
+        # response is closed under it. No manual generation bookkeeping: the
+        # listener does the reconnecting itself.
+        class SilentStream(httpx.AsyncByteStream):
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def __aiter__(self):
+                self.started.set()
+                await self.release.wait()
+                return
+                yield b""  # pragma: no cover - never reached
+
+            async def aclose(self):
+                self.release.set()
+
+        class Ctx:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_):
+                await self.response.aclose()
+
+        class SilentClient:
+            """Every connect succeeds; every stream stays silent."""
+
+            def __init__(self):
+                self.streams = []
+                self.closed = False
+
+            def stream(self, *_a, **_k):
+                request = httpx.Request(
+                    "GET", "http://localhost:8080/api/v1/events"
+                )
+                stream = SilentStream()
+                self.streams.append(stream)
+                return Ctx(httpx.Response(200, request=request, stream=stream))
+
+            async def aclose(self):
+                self.closed = True
+                for stream in self.streams:
+                    stream.release.set()
+
+        # Daemon always reports healthy — exactly what made this invisible.
+        class _OK:
+            status_code = 200
+
+        class _HealthyClient:
+            async def get(self, *_a, **_k):
+                return _OK()
+
+        silent_client = SilentClient()
+        adapter.sse_client = silent_client
+        adapter.client = _HealthyClient()
+        adapter._running = True
+
+        # Call the REAL restart; only record that it ran and stop the loops so
+        # the rebuilt listener does not dial a real socket.
+        real_restart = adapter._restart_sse_listener
+        restarts = []
+
+        async def observed_restart():
+            restarts.append(adapter._reconnects_without_events)
+            await real_restart()
+            adapter._running = False
+
+        monkeypatch.setattr(adapter, "_restart_sse_listener", observed_restart)
+
+        gen_before = adapter._sse_listener_generation
+        listener = asyncio.create_task(adapter._sse_listener())
+        adapter._sse_task = listener
+        monitor = asyncio.create_task(adapter._health_monitor())
+        try:
+            for _ in range(200):
+                if silent_client.streams:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.wait_for(silent_client.streams[0].started.wait(), timeout=2)
+            await asyncio.wait_for(monitor, timeout=10)
+        except asyncio.TimeoutError:
+            monitor.cancel()
+        finally:
+            adapter._running = False
+            for stream in silent_client.streams:
+                stream.release.set()
+            for task in (listener, monitor):
+                if not task.done():
+                    task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+
+        assert restarts, (
+            "health monitor never escalated: reconnects that land but deliver "
+            "no events must rebuild the listener, not reconnect forever"
+        )
+        assert len(silent_client.streams) > 1, (
+            "expected the listener to really re-establish the stream before "
+            "escalation, not to escalate on the first idle check"
+        )
+        assert silent_client.closed, "the stale client pool must be torn down"
+        assert adapter._sse_listener_generation > gen_before, (
+            "the listener task must actually be rebuilt"
+        )
+        assert adapter._reconnects_without_events == 0
+
+    @pytest.mark.asyncio
+    async def test_delivered_events_reset_dead_stream_counter(self, monkeypatch):
+        """Traffic proves the stream is alive: routine churn must not escalate."""
+        adapter = _make_signal_adapter(monkeypatch)
+        monkeypatch.setattr("gateway.platforms.signal.SSE_RETRY_DELAY_INITIAL", 0)
+
+        from gateway.platforms.signal import SSE_DEAD_STREAM_ESCALATE_AFTER
+
+        # Two reconnects' worth of suspicion, right at the escalation edge.
+        adapter._reconnects_without_events = SSE_DEAD_STREAM_ESCALATE_AFTER
+
+        class Stream(httpx.AsyncByteStream):
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def __aiter__(self):
+                self.started.set()
+                yield b": keepalive\n\n"
+                await self.release.wait()
+
+            async def aclose(self):
+                self.release.set()
+
+        class Ctx:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_):
+                await self.response.aclose()
+
+        class Client:
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+            def stream(self, *_a, **_k):
+                return self.ctx
+
+        request = httpx.Request("GET", "http://localhost:8080/api/v1/events")
+        stream = Stream()
+        adapter.sse_client = Client(
+            Ctx(httpx.Response(200, request=request, stream=stream))
+        )
+        adapter._running = True
+
+        task = asyncio.create_task(adapter._sse_listener())
+        try:
+            await asyncio.wait_for(stream.started.wait(), timeout=2)
+            # Let the keepalive line be consumed.
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if adapter._reconnects_without_events == 0:
+                    break
+        finally:
+            adapter._running = False
+            stream.release.set()
+            try:
+                await asyncio.wait_for(task, timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+
+        assert adapter._reconnects_without_events == 0, (
+            "a stream that delivered traffic must clear the dead-stream count"
+        )

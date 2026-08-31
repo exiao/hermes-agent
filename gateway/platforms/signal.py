@@ -73,6 +73,7 @@ HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before conc
 # How long a requested reconnect may stay pending before the health monitor
 # stops waiting politely and cancels/recreates the listener task outright.
 SSE_RECONNECT_ESCALATE_AFTER = 2  # consecutive stale checks with no new stream
+SSE_DEAD_STREAM_ESCALATE_AFTER = 2  # forced reconnects that landed but stayed silent
 
 
 class SignalRPCError(RuntimeError):
@@ -455,6 +456,10 @@ class SignalAdapter(BasePlatformAdapter):
         self._sse_generation = 0
         self._reconnect_requested_at_generation: Optional[int] = None
         self._stale_checks_since_reconnect = 0
+        # A reconnect can succeed at the HTTP level and still deliver nothing
+        # (#255 only escalated when the reconnect never landed). Count landed-
+        # but-silent reconnects so a dead stream also gets the listener rebuilt.
+        self._reconnects_without_events = 0
 
         # Normalize account for self-message filtering
         self._account_normalized = self.account.strip()
@@ -647,6 +652,7 @@ class SignalAdapter(BasePlatformAdapter):
                             # doesn't report false idle warnings.
                             if line.startswith(":"):
                                 self._last_sse_activity = time.time()
+                                self._reconnects_without_events = 0
                                 continue
                             # Parse SSE data lines
                             if line.startswith("data:"):
@@ -654,6 +660,7 @@ class SignalAdapter(BasePlatformAdapter):
                                 if not data_str:
                                     continue
                                 self._last_sse_activity = time.time()
+                                self._reconnects_without_events = 0
                                 try:
                                     data = json.loads(data_str)
                                     await self._handle_envelope(data)
@@ -713,6 +720,20 @@ class SignalAdapter(BasePlatformAdapter):
                     )
                 continue
 
+            # A reconnect that lands but delivers nothing clears the pending
+            # state above, so _stale_checks_since_reconnect resets every cycle
+            # and the #255 escalation can never fire. Count the reconnects that
+            # produced no traffic and rebuild the listener once being polite has
+            # demonstrably stopped working.
+            if self._reconnects_without_events >= SSE_DEAD_STREAM_ESCALATE_AFTER:
+                logger.error(
+                    "Signal: SSE idle %.0fs after %d reconnects that delivered "
+                    "no events — recreating listener task",
+                    elapsed, self._reconnects_without_events,
+                )
+                await self._restart_sse_listener()
+                continue
+
             logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
             try:
                 resp = await self.client.get(
@@ -747,6 +768,7 @@ class SignalAdapter(BasePlatformAdapter):
         """
         self._reconnect_requested_at_generation = self._sse_generation
         self._stale_checks_since_reconnect = 0
+        self._reconnects_without_events += 1
         response, self._sse_response = self._sse_response, None
         if response is not None and not response.is_closed:
             try:
@@ -805,6 +827,7 @@ class SignalAdapter(BasePlatformAdapter):
         self._last_sse_activity = time.time()
         self._reconnect_requested_at_generation = None
         self._stale_checks_since_reconnect = 0
+        self._reconnects_without_events = 0
         self._sse_task = asyncio.create_task(
             self._sse_listener(self._sse_listener_generation)
         )
