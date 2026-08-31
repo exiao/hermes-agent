@@ -770,7 +770,9 @@ class SignalAdapter(BasePlatformAdapter):
             old_task.cancel()
         if old_client is not None:
             try:
-                await old_client.aclose()
+                await asyncio.wait_for(old_client.aclose(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Signal: timed out closing stale SSE client")
             except Exception:
                 logger.debug("Signal: error closing SSE client", exc_info=True)
         if old_task is not None and not old_task.done():
