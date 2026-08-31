@@ -95,6 +95,24 @@ def test_adapter_and_runner_agree_on_the_session_key(runner, signal_adapter):
     assert adapter_key == runner_key == f"agent:manager:signal:group:{CHAT_ID}"
 
 
+def test_credential_owned_adapter_wins_over_global_route(
+    runner, signal_adapter, monkeypatch
+):
+    """A secondary credential must not be rerouted by the shared chat rule."""
+    monkeypatch.setattr(
+        "gateway.run._multiplex_profile_homes",
+        lambda config: [("manager", "/tmp/manager"), ("secondary", "/tmp/secondary")],
+    )
+    signal_adapter.set_owner_profile("secondary")
+
+    source = signal_adapter.build_source(
+        chat_id=CHAT_ID, chat_type="group", user_id="+15551111111", user_name="E X"
+    )
+
+    assert source.profile == "secondary"
+    assert source.profile_route_rejected is False
+
+
 def test_unrouted_chat_stays_on_the_default_profile(signal_adapter):
     source = signal_adapter.build_source(
         chat_id="group:other-chat", chat_type="group", user_id="+1", user_name="E X"
