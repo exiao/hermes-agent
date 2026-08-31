@@ -17,12 +17,13 @@ row sitting in the root store.
 
 import sqlite3
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig
-from gateway.session import SessionStore
+from gateway.config import GatewayConfig, Platform
+from gateway.session import AsyncSessionStore, SessionStore, SessionSource
+from gateway.platforms.base import MessageEvent
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 
@@ -253,47 +254,109 @@ def test_runner_session_db_follows_the_active_profile_scope(multiplex_homes):
     assert profile_db._db._conn is None
 
 
-def test_inbound_turn_runs_inside_the_profile_scope(multiplex_homes):
-    """Session resolution + transcript load must see the profile's store.
+@pytest.mark.asyncio
+async def test_inbound_turn_uses_real_profile_scoped_session_store(multiplex_homes, monkeypatch):
+    """The complete inbound path loads and persists against the routed store.
 
-    The reported bug: ``_handle_message_with_agent`` resolved the session and
-    loaded the transcript BEFORE ``_run_agent`` installed the profile scope,
-    so a multiplexed turn read history from the root ``state.db`` while the
-    agent wrote its messages into ``profiles/<name>/state.db``.  Every turn
-    started from an empty transcript.
-
-    Assert on the home resolved at the moment the inner handler runs — that is
-    exactly what ``SessionStore._db`` and ``load_transcript`` follow.
+    This reproduces the reported split: the runner is constructed outside a
+    profile scope, then a real multiplexed turn resolves an existing session,
+    loads its prior messages, and persists the next turn.  Both the read and
+    write assertions inspect the two actual state.db files, so a test double at
+    ``_handle_message_with_agent_inner`` cannot make this pass.
     """
-    import asyncio
-
     from gateway.run import GatewayRunner
     from hermes_constants import get_hermes_home
 
     root, profile = multiplex_homes
-
-    class _Cfg:
-        multiplex_profiles = True
-
-    runner = object.__new__(GatewayRunner)
-    runner.config = _Cfg()
-    runner._resolve_profile_home_for_source = lambda source: profile
-
-    seen = {}
-
-    async def _inner(event, source, _quick_key, run_generation):
-        seen["home"] = Path(get_hermes_home())
-        return "ok"
-
-    runner._handle_message_with_agent_inner = _inner
-
-    result = asyncio.run(
-        runner._handle_message_with_agent(object(), object(), "k", 1)
+    store = _make_store(root)
+    store.config.multiplex_profiles = True
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-88532",
+        chat_type="dm",
+        user_id="user-88532",
     )
 
-    assert result == "ok"
-    assert seen["home"] == profile
-    # The scope is per-turn: it must not leak past the handler.
+    # Seed the profile database through the same scope-aware store that the
+    # gateway uses.  The root database must remain empty.
+    token = set_hermes_home_override(str(profile))
+    try:
+        entry = store.get_or_create_session(source)
+        store.append_to_transcript(
+            entry.session_id,
+            {"role": "user", "content": "Earlier message"},
+        )
+        store.append_to_transcript(
+            entry.session_id,
+            {"role": "assistant", "content": "Earlier answer"},
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = store.config
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_db_pinned = None
+    runner._resolve_profile_home_for_source = lambda _source: profile
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._is_telegram_topic_lane = lambda _source: False
+    runner._set_session_env = lambda _context: None
+    runner._clear_session_env = lambda _tokens: None
+    runner._pinned_session_context_prompt = lambda _context, _redact, _key: ""
+    runner._mark_durable_active_turn = AsyncMock(return_value=False)
+    runner._is_session_run_current = lambda _key, _generation: True
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._adapter_for_source = lambda _source: None
+    runner._bind_adapter_run_generation = lambda *_args: None
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._drain_watch_notifications = AsyncMock()
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._clear_restart_failure_count = AsyncMock()
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "New answer",
+            "messages": [
+                {"role": "user", "content": "Earlier message"},
+                {"role": "assistant", "content": "Earlier answer"},
+                {"role": "user", "content": "Current message"},
+                {"role": "assistant", "content": "New answer"},
+            ],
+            "history_offset": 2,
+            "tools": [],
+            "api_calls": 1,
+            "last_prompt_tokens": 0,
+            "agent_persisted": False,
+        }
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+
+    event = MessageEvent(text="Current message", source=source, message_id="msg-88532")
+    result = await runner._handle_message_with_agent(event, source, "quick-88532", 1)
+
+    assert result == "New answer"
+    assert [
+        (message["role"], message["content"])
+        for message in runner._run_agent.call_args.kwargs["history"]
+    ] == [
+        ("user", "Earlier message"),
+        ("assistant", "Earlier answer"),
+    ]
+    token = set_hermes_home_override(str(profile))
+    try:
+        profile_messages = store.load_transcript(entry.session_id)
+    finally:
+        reset_hermes_home_override(token)
+    assert [message["content"] for message in profile_messages if "content" in message] == [
+        "Earlier message",
+        "Earlier answer",
+        "Current message",
+        "New answer",
+    ]
+    assert _session_ids(profile / "state.db") == {entry.session_id}
+    assert _session_ids(root / "state.db") == set()
     assert Path(get_hermes_home()) == root
 
 
