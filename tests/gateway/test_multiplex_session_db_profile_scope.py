@@ -251,3 +251,81 @@ def test_runner_session_db_follows_the_active_profile_scope(multiplex_homes):
     assert runner._session_db_handles == {}
     assert root_db._db._conn is None
     assert profile_db._db._conn is None
+
+
+def test_inbound_turn_runs_inside_the_profile_scope(multiplex_homes):
+    """Session resolution + transcript load must see the profile's store.
+
+    The reported bug: ``_handle_message_with_agent`` resolved the session and
+    loaded the transcript BEFORE ``_run_agent`` installed the profile scope,
+    so a multiplexed turn read history from the root ``state.db`` while the
+    agent wrote its messages into ``profiles/<name>/state.db``.  Every turn
+    started from an empty transcript.
+
+    Assert on the home resolved at the moment the inner handler runs — that is
+    exactly what ``SessionStore._db`` and ``load_transcript`` follow.
+    """
+    import asyncio
+
+    from gateway.run import GatewayRunner
+    from hermes_constants import get_hermes_home
+
+    root, profile = multiplex_homes
+
+    class _Cfg:
+        multiplex_profiles = True
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = _Cfg()
+    runner._resolve_profile_home_for_source = lambda source: profile
+
+    seen = {}
+
+    async def _inner(event, source, _quick_key, run_generation):
+        seen["home"] = Path(get_hermes_home())
+        return "ok"
+
+    runner._handle_message_with_agent_inner = _inner
+
+    result = asyncio.run(
+        runner._handle_message_with_agent(object(), object(), "k", 1)
+    )
+
+    assert result == "ok"
+    assert seen["home"] == profile
+    # The scope is per-turn: it must not leak past the handler.
+    assert Path(get_hermes_home()) == root
+
+
+def test_inbound_turn_is_a_pass_through_without_multiplexing(multiplex_homes):
+    """Single-profile gateways never enter the scope."""
+    import asyncio
+
+    from gateway.run import GatewayRunner
+    from hermes_constants import get_hermes_home
+
+    root, profile = multiplex_homes
+
+    class _Cfg:
+        multiplex_profiles = False
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = _Cfg()
+
+    def _boom(source):
+        raise AssertionError("profile home must not be resolved when multiplexing is off")
+
+    runner._resolve_profile_home_for_source = _boom
+
+    seen = {}
+
+    async def _inner(event, source, _quick_key, run_generation):
+        seen["home"] = Path(get_hermes_home())
+        return "ok"
+
+    runner._handle_message_with_agent_inner = _inner
+
+    assert asyncio.run(
+        runner._handle_message_with_agent(object(), object(), "k", 1)
+    ) == "ok"
+    assert seen["home"] == root

@@ -19520,6 +19520,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return source
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+        """Profile-scoping wrapper around the inbound turn.
+
+        Session resolution and transcript load happen HERE, before
+        ``_run_agent`` installs its own scope — so without this wrapper a
+        multiplexed turn READ history from the root ``state.db`` while the
+        agent WROTE its messages into the profile's own store. Every turn then
+        started from an empty transcript and the user's prior messages were
+        invisible to the model.
+
+        Same fix shape as ``_run_agent`` and the #88532 handle work: enter the
+        scope for the whole region so reads and writes resolve to one store.
+        Transparent pass-through when multiplexing is off.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._handle_message_with_agent_inner(
+                event, source, _quick_key, run_generation
+            )
+        with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+            return await self._handle_message_with_agent_inner(
+                event, source, _quick_key, run_generation
+            )
+
+    async def _handle_message_with_agent_inner(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
