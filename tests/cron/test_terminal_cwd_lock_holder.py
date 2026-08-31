@@ -118,3 +118,55 @@ def test_timeout_holder_is_captured_before_the_blocker_releases():
 
     assert "live-job" in lock.last_timeout_holder()
     assert lock.holder_description() == "NO job holds it"
+
+
+def test_write_timeout_describes_readers_not_the_timing_out_writer():
+    """A write waiter must not diagnose itself as queued ahead."""
+    lock = _lock()
+    assert lock.acquire_read(timeout=5)
+    try:
+        assert lock.acquire_write(timeout=0.01, job="timed-out-writer") is False
+        description = lock.last_timeout_holder()
+    finally:
+        lock.release_read()
+
+    assert "workdir-less job(s) still hold it" in description
+    assert "queued ahead" not in description
+
+
+def test_timeout_holder_is_scoped_to_the_waiting_thread():
+    """Concurrent timeout descriptions must not overwrite one another."""
+    lock = _lock()
+    assert lock.acquire_read(timeout=5)
+    started = threading.Barrier(3)
+    finished = threading.Barrier(3)
+    descriptions = {}
+    describe = lock._describe_locked
+
+    def describe_with_waiter(**kwargs):
+        return f"{threading.current_thread().name}: {describe(**kwargs)}"
+
+    lock._describe_locked = describe_with_waiter
+
+    def waiter(name):
+        started.wait(timeout=5)
+        assert lock.acquire_write(timeout=0.05, job=name) is False
+        finished.wait(timeout=5)
+        descriptions[name] = lock.last_timeout_holder()
+
+    threads = [
+        threading.Thread(target=waiter, args=(name,), name=name)
+        for name in ("one", "two")
+    ]
+    for thread in threads:
+        thread.start()
+    started.wait(timeout=5)
+    finished.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    lock.release_read()
+
+    assert set(descriptions) == {"one", "two"}
+    assert descriptions["one"].startswith("one: ")
+    assert descriptions["two"].startswith("two: ")

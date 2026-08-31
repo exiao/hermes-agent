@@ -1236,19 +1236,19 @@ class _ReadWriteLock:
         # Holder description captured atomically at the moment a wait timed
         # out, so the error names the job that was actually blocking rather
         # than whatever the lock looks like after the race window.
-        self._timeout_holder: str = "NO job holds it"
+        self._timeout_holder = threading.local()
 
     def last_timeout_holder(self) -> str:
         """Who was holding the lock when the most recent wait timed out."""
         with self._cond:
-            return self._timeout_holder
+            return getattr(self._timeout_holder, "value", "NO job holds it")
 
     def holder_description(self) -> str:
         """Describe the current writer for a timed-out waiter's error."""
         with self._cond:
             return self._describe_locked()
 
-    def _describe_locked(self) -> str:
+    def _describe_locked(self, *, exclude_current_writer: bool = False) -> str:
         """Describe the holder. Caller MUST already hold ``self._cond``.
 
         Read under the same lock hold as the timeout itself: describing
@@ -1258,7 +1258,7 @@ class _ReadWriteLock:
         if self._writer_active:
             who = self._writer_job or "an unnamed workdir job"
             return f"workdir job {who!r} holds it"
-        if self._writers_waiting > 0:
+        if self._writers_waiting > int(exclude_current_writer):
             return "a workdir job is queued ahead of this one"
         if self._readers > 0:
             return f"{self._readers} workdir-less job(s) still hold it"
@@ -1279,7 +1279,7 @@ class _ReadWriteLock:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        self._timeout_holder = self._describe_locked()
+                        self._timeout_holder.value = self._describe_locked()
                         self._cond.notify_all()
                         return False
                     self._cond.wait(timeout=remaining)
@@ -1310,7 +1310,9 @@ class _ReadWriteLock:
                     if deadline is not None:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
-                            self._timeout_holder = self._describe_locked()
+                            self._timeout_holder.value = self._describe_locked(
+                                exclude_current_writer=True
+                            )
                             self._cond.notify_all()
                             return False
                         self._cond.wait(timeout=remaining)
