@@ -211,6 +211,33 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_list_json_exposes_and_filters_task_identity(kanban_home):
+    with kb.connect() as conn:
+        matching = kb.create_task(
+            conn, title="matching", idempotency_key="dedupe-key"
+        )
+        kb.create_task(conn, title="other", idempotency_key="other-key")
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+            (1234567890, matching),
+        )
+        conn.commit()
+
+    listed = json.loads(kc.run_slash("ls --json"))
+    assert all(
+        "idempotency_key" in row and "last_heartbeat_at" in row
+        for row in listed
+    )
+    matching_row = next(row for row in listed if row["id"] == matching)
+    assert matching_row["idempotency_key"] == "dedupe-key"
+    assert matching_row["last_heartbeat_at"] == 1234567890
+
+    filtered = json.loads(
+        kc.run_slash("ls --idempotency-key dedupe-key --json")
+    )
+    assert [row["id"] for row in filtered] == [matching]
+
+
 def test_kanban_json_includes_model_override(kanban_home):
     """The per-task model override must be visible on every JSON surface
     (`create`/`show`/`list --json`), not just plain-text `show`, so a

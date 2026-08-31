@@ -4837,6 +4837,7 @@ def list_tasks(
     status: Optional[str] = None,
     tenant: Optional[str] = None,
     session_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
     include_archived: bool = False,
     limit: Optional[int] = None,
     order_by: Optional[str] = None,
@@ -4867,6 +4868,9 @@ def list_tasks(
     if session_id is not None:
         query += " AND session_id = ?"
         params.append(session_id)
+    if idempotency_key is not None:
+        query += " AND idempotency_key = ?"
+        params.append(idempotency_key)
     if workflow_template_id is not None:
         query += " AND workflow_template_id = ?"
         params.append(workflow_template_id)

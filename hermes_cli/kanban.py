@@ -85,6 +85,13 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     }
 
 
+def _task_to_list_dict(t: kb.Task) -> dict[str, Any]:
+    task = _task_to_dict(t)
+    task["idempotency_key"] = t.idempotency_key
+    task["last_heartbeat_at"] = t.last_heartbeat_at
+    return task
+
+
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
     st = getattr(args, "state_type", None)
     sn = getattr(args, "state_name", None)
@@ -445,6 +452,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_list.add_argument("--session", default=None,
                         help="Filter by originating chat/agent session id "
                              "(set on tasks created from inside an ACP loop)")
+    p_list.add_argument(
+        "--idempotency-key",
+        default=None,
+        metavar="KEY",
+        help="Restrict to tasks with this exact idempotency key",
+    )
     p_list.add_argument("--archived", action="store_true",
                         help="Include archived tasks")
     p_list.add_argument("--json", action="store_true")
@@ -1673,13 +1686,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
             status=args.status,
             tenant=args.tenant,
             session_id=args.session,
+            idempotency_key=args.idempotency_key,
             include_archived=args.archived,
             order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
         )
     if getattr(args, "json", False):
-        print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
+        print(json.dumps([_task_to_list_dict(t) for t in tasks], indent=2, ensure_ascii=False))
         return 0
     # Passive discoverability: when the user has multiple boards, surface
     # which one they're looking at in the list header. Single-board users
