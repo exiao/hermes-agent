@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from cron.scheduler import _deliver_result
 from gateway.config import Platform, PlatformConfig
+from gateway.delivery import resolve_delivery_transport
 
 
 def _clear_home_env(monkeypatch):
@@ -71,10 +72,13 @@ class TestNativeAdapterWithoutProfileConfig:
         config.get_home_channel = lambda p: None
         return config
 
-    def test_live_native_adapter_with_no_config_block_delivers(self, monkeypatch):
-        """The multiplexed-secondary-profile case: adapter live, no block."""
+    def test_live_shared_native_adapter_with_disabled_profile_config_delivers(self, monkeypatch):
+        """A routed secondary may disable its duplicate while using the shared adapter."""
         _clear_home_env(monkeypatch)
-        result = self._run({Platform.SIGNAL: AsyncMock()}, self._config({}))
+        result = self._run(
+            {Platform.SIGNAL: AsyncMock()},
+            self._config({Platform.SIGNAL: PlatformConfig(enabled=False)}),
+        )
         assert result is None  # None == delivered without errors
 
     def test_explicitly_disabled_native_adapter_still_rejected(self, monkeypatch):
@@ -92,3 +96,18 @@ class TestNativeAdapterWithoutProfileConfig:
         result = self._run({}, self._config({}))
         assert result is not None
         assert "not configured/enabled" in result
+
+    def test_disabled_native_requires_shared_transport_opt_in(self):
+        """The resolver keeps explicit disabled-native behavior strict by default."""
+        config = self._config({Platform.SIGNAL: PlatformConfig(enabled=False)})
+        adapter = AsyncMock()
+
+        assert resolve_delivery_transport(Platform.SIGNAL, config, {Platform.SIGNAL: adapter}) is None
+        transport = resolve_delivery_transport(
+            Platform.SIGNAL,
+            config,
+            {Platform.SIGNAL: adapter},
+            allow_disabled_native=True,
+        )
+        assert transport is not None
+        assert transport.adapter is adapter

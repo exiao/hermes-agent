@@ -3068,7 +3068,19 @@ def _deliver_result_impl(job: dict, content: str, adapters=None, loop=None) -> O
 
         from gateway.delivery import resolve_delivery_transport
 
-        transport = resolve_delivery_transport(platform, config, adapters)
+        # In multiplex mode, the in-process ticker receives the gateway's
+        # process-level adapter map while it scopes execution to each profile.
+        # A routed secondary can disable its duplicate native config and still
+        # deliver through that shared adapter. A missing adapter remains
+        # rejected by the resolver, and non-cron DeliveryRouter callers keep
+        # the strict disabled-config default.
+        allow_disabled_native = bool(adapters and adapters.get(platform) is not None)
+        transport = resolve_delivery_transport(
+            platform,
+            config,
+            adapters,
+            allow_disabled_native=allow_disabled_native,
+        )
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -3333,7 +3345,11 @@ def _deliver_result_impl(job: dict, content: str, adapters=None, loop=None) -> O
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(
+                        config,
+                        adapters,
+                        allow_disabled_native=allow_disabled_native,
+                    )
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),

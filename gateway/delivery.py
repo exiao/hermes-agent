@@ -93,13 +93,18 @@ def resolve_delivery_transport(
     platform: Platform,
     config: GatewayConfig,
     adapters: Optional[Dict[Platform, Any]],
+    *,
+    allow_disabled_native: bool = False,
 ) -> Optional[DeliveryTransport]:
     """Resolve a logical platform to its live delivery transport.
 
     A concrete native adapter always wins. Relay is eligible only when its
     authenticated transport explicitly advertises that it fronts the logical
     platform, which keeps restart-time delivery independent of per-chat caches
-    without letting Relay hijack unrelated platform targets.
+    without letting Relay hijack unrelated platform targets. Callers may opt in
+    to a disabled native config only when their adapter map is the gateway's
+    shared process-level transport map (the multiplexed cron path); a disabled
+    native adapter remains rejected by default.
     """
     live_adapters = adapters or {}
     native = live_adapters.get(platform)
@@ -107,7 +112,11 @@ def resolve_delivery_transport(
     # Preserve DeliveryRouter's historical support for explicitly supplied live
     # adapters with no config block, but never let an explicitly disabled native
     # adapter shadow an enabled Relay transport.
-    if native is not None and (native_config is None or native_config.enabled):
+    if native is not None and (
+        native_config is None
+        or native_config.enabled
+        or allow_disabled_native
+    ):
         return DeliveryTransport(
             adapter=native,
             config=native_config,
@@ -300,7 +309,8 @@ class DeliveryRouter:
     """
     
     def __init__(self, config: GatewayConfig, adapters: Dict[Platform, Any] = None,
-                 dead_targets: Optional[DeadTargetRegistry] = None):
+                 dead_targets: Optional[DeadTargetRegistry] = None,
+                 allow_disabled_native: bool = False):
         """
         Initialize the delivery router.
         
@@ -309,9 +319,13 @@ class DeliveryRouter:
             adapters: Dict mapping platforms to their adapter instances
             dead_targets: Optional shared registry of confirmed-unreachable
                 targets.  When omitted, a profile-local registry is created.
+            allow_disabled_native: Whether the adapter map is a shared gateway
+                transport map that may serve a multiplexed profile with a
+                disabled duplicate native config.
         """
         self.config = config
         self.adapters = adapters or {}
+        self.allow_disabled_native = allow_disabled_native
         self.output_dir = get_hermes_home() / "cron" / "output"
         self.dead_targets = dead_targets or DeadTargetRegistry()
     
@@ -464,7 +478,12 @@ class DeliveryRouter:
         metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Deliver content to a messaging platform."""
-        transport = resolve_delivery_transport(target.platform, self.config, self.adapters)
+        transport = resolve_delivery_transport(
+            target.platform,
+            self.config,
+            self.adapters,
+            allow_disabled_native=self.allow_disabled_native,
+        )
         if transport is None:
             raise ValueError(f"No adapter configured for {target.platform.value}")
         adapter = transport.adapter
