@@ -16,6 +16,7 @@ config block" case that ``resolve_delivery_transport`` promises to support.
 """
 
 import asyncio
+import logging
 from concurrent.futures import Future
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -96,6 +97,28 @@ class TestNativeAdapterWithoutProfileConfig:
         result = self._run({}, self._config({}))
         assert result is not None
         assert "not configured/enabled" in result
+
+    def test_no_adapter_with_enabled_config_logs_info_with_transport_cause(
+        self, monkeypatch, caplog
+    ):
+        """An enabled target without a live transport is not a config failure."""
+        _clear_home_env(monkeypatch)
+        with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+            result = self._run(
+                {},
+                self._config({Platform.SIGNAL: PlatformConfig(enabled=True)}),
+            )
+
+        assert result is not None
+        assert "not configured/enabled" not in result
+        assert "no live adapter or relay available" in result
+        matching = [
+            record
+            for record in caplog.records
+            if "no live adapter or relay available" in record.message
+        ]
+        assert matching
+        assert all(record.levelno == logging.INFO for record in matching)
 
     def test_disabled_native_requires_shared_transport_opt_in(self):
         """The resolver keeps explicit disabled-native behavior strict by default."""
