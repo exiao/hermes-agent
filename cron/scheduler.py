@@ -3164,8 +3164,6 @@ def _deliver_result_impl(job: dict, content: str, adapters=None, loop=None) -> O
                 "adapter or relay available"
             )
             logger.info("Job '%s': %s", job["id"], msg)
-            delivery_errors.append(msg)
-            continue
 
         # Prefer the resolved live transport when the gateway is running. This
         # supports E2EE native adapters and relay-fronted logical platforms.

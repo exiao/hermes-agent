@@ -103,15 +103,17 @@ class TestNativeAdapterWithoutProfileConfig:
     ):
         """An enabled target without a live transport is not a config failure."""
         _clear_home_env(monkeypatch)
-        with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+        with patch(
+            "tools.send_message_tool._send_to_platform",
+            new=AsyncMock(return_value={"success": True}),
+        ) as send_mock, caplog.at_level(logging.INFO, logger="cron.scheduler"):
             result = self._run(
                 {},
-                self._config({Platform.SIGNAL: PlatformConfig(enabled=True)}),
+                self._config({Platform.SIGNAL: PlatformConfig(enabled=True, token="tok")}),
             )
 
-        assert result is not None
-        assert "not configured/enabled" not in result
-        assert "no live adapter or relay available" in result
+        assert result is None
+        send_mock.assert_awaited_once()
         matching = [
             record
             for record in caplog.records
