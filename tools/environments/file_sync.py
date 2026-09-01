@@ -130,6 +130,42 @@ _SYNC_BACK_MAX_RETRIES = 3
 _SYNC_BACK_BACKOFF = (2, 4, 8)  # seconds between retries
 _SYNC_BACK_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB — refuse to extract larger tars
 
+# Temp artifacts created by sync-back and bulk upload. NamedTemporaryFile and
+# TemporaryDirectory clean up on normal exit and on trapped signals, but the
+# sandbox reaper kills with SIGKILL, which cannot be trapped — so these leak.
+# Named prefixes keep the sweep to our own files instead of every tmp*.tar in
+# the shared temp root.
+_SYNC_BACK_TAR_PREFIX = "hermes-sync-back-tar-"
+_SYNC_ARTIFACT_PATTERNS = (
+    f"{_SYNC_BACK_TAR_PREFIX}*.tar",
+    "hermes-sync-back-*",
+    "hermes-ssh-bulk-*",
+)
+
+
+def cleanup_file_sync_artifacts(max_age_hours: int = 24) -> int:
+    """Delete sync temp files/dirs orphaned by SIGKILL'd runs. Returns count."""
+    cutoff = time.time() - max_age_hours * 3600
+    temp_root = Path(tempfile.gettempdir())
+    removed = 0
+    for pattern in _SYNC_ARTIFACT_PATTERNS:
+        try:
+            candidates = list(temp_root.glob(pattern))
+        except OSError:
+            continue
+        for candidate in candidates:
+            try:
+                if candidate.stat().st_mtime >= cutoff:
+                    continue
+                if candidate.is_dir():
+                    shutil.rmtree(candidate, ignore_errors=True)
+                else:
+                    candidate.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
 
 class FileSyncManager:
     """Tracks local file changes and syncs to a remote environment.
@@ -361,7 +397,9 @@ class FileSyncManager:
         except Exception:
             file_mapping = []
 
-        with tempfile.NamedTemporaryFile(suffix=".tar") as tf:
+        with tempfile.NamedTemporaryFile(
+            prefix=_SYNC_BACK_TAR_PREFIX, suffix=".tar"
+        ) as tf:
             self._bulk_download_fn(Path(tf.name))
 
             # Defensive size cap: a misbehaving sandbox could produce an

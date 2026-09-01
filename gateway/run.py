@@ -30222,6 +30222,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     from tools.tool_result_storage import cleanup_spillover_cache
     from tools.bot_mode_dm import cleanup_bot_dm_cache
     from tools.bot_relay import cleanup_bot_relay_artifacts
+    from tools.environments.file_sync import cleanup_file_sync_artifacts
     from hermes_cli.debug import _sweep_expired_pastes
 
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
@@ -30243,7 +30244,18 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         ("Spillover", cleanup_spillover_cache),
         ("Bot DM", cleanup_bot_dm_cache),
         ("Bot relay", cleanup_bot_relay_artifacts),
+        ("Sync temp", cleanup_file_sync_artifacts),
     )
+
+    # Sync tars/staging dirs are orphaned by SIGKILL, which no atexit or
+    # signal handler can catch — so a run killed by the reaper leaves them
+    # behind until the next gateway start. Sweep once now, then hourly.
+    try:
+        _swept = cleanup_file_sync_artifacts(max_age_hours=1)
+        if _swept:
+            logger.info("Startup sweep: removed %d stale sync temp file(s)", _swept)
+    except Exception as e:
+        logger.debug("Startup sync temp sweep error: %s", e)
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
