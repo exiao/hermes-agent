@@ -70,6 +70,12 @@ def _tar_stderr_is_only_concurrent_change(stderr: str) -> bool:
 
 _BULK_UPLOAD_MIN_TIMEOUT = 120
 _BULK_UPLOAD_MAX_TIMEOUT = 1800
+
+# Remote-only directories excluded from sync_back. These are created on the
+# remote and never uploaded, so pulling them back is pure cost: the diff
+# always discards them. Keep this list to genuinely remote-generated build
+# artifacts — anything an agent might legitimately author must sync back.
+_SYNC_BACK_EXCLUDE_DIRS = ("venvs",)
 # Deliberately pessimistic: a cold sync of a large skills tree is thousands of
 # small files, where per-file overhead dominates raw link speed.
 _BULK_UPLOAD_BYTES_PER_SEC = 2_000_000
@@ -448,7 +454,21 @@ class SSHEnvironment(BaseEnvironment):
         # the next sync, not a transfer failure. --warning= is GNU-only and the
         # remote may run BSD/libarchive tar, so tolerate the exit code below
         # instead of passing a flag that would make every download fail there.
-        ssh_cmd.append(f"tar cf - -C / {shlex.quote(rel_base)}")
+        # Never pull back remote-only build artifacts. `venvs/` is created ON
+        # the remote by tooling and is never uploaded (the push side sends an
+        # explicit file list), so every byte of it is one-way junk that the
+        # diff below discards anyway. Measured on the Hetzner QA box: it is
+        # 204 MB of the 247 MB tree and takes sync_back from 6.6s to 56s, so
+        # three retries overrun the 120s shutdown watchdog and the gateway is
+        # SIGKILLed mid-cleanup. It also contains an absolute symlink
+        # (venvs/*/bin/python), which makes Python's tarfile extraction raise
+        # "is a link to an absolute path" and fail the attempt outright.
+        # Excluding it fixes both the timeout and the hard error.
+        exclude_args = " ".join(
+            f"--exclude={shlex.quote(f'{rel_base}/{d}')}"
+            for d in _SYNC_BACK_EXCLUDE_DIRS
+        )
+        ssh_cmd.append(f"tar cf - -C / {exclude_args} {shlex.quote(rel_base)}")
         with open(dest, "wb") as f:
             result = subprocess.run(
                 ssh_cmd,
