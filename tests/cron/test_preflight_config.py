@@ -340,3 +340,51 @@ class TestDeliveryPlatform:
 
         assert success is True
         assert agent_constructed is True
+
+    def test_live_adapter_allows_disabled_profile_target(self, tmp_path, monkeypatch):
+        """A live shared adapter makes a disabled native target deliverable."""
+        from gateway.config import Platform
+
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n  signal:\n    enabled: false\n",
+            encoding="utf-8",
+        )
+        job = _job(deliver="signal:group:abc=")
+        adapter = object()
+        loop = MagicMock()
+        delivered = []
+
+        def fake_deliver(job, content, adapters=None, loop=None):
+            delivered.append((content, adapters, loop))
+            return None
+
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("cron.scheduler._hermes_home", tmp_path), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+                 patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+                 patch("hermes_state.SessionDB", return_value=MagicMock()), \
+                 patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+                 patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                       return_value=dict(_RUNTIME)), \
+                 patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
+                 patch.object(sched, "create_execution", return_value={"id": "exec-pf"}), \
+                 patch.object(sched, "claim_dispatch", return_value=True), \
+                 patch.object(sched, "mark_execution_running"), \
+                 patch.object(sched, "save_job_output", return_value="/tmp/pf.txt"), \
+                 patch.object(sched, "mark_job_run"), \
+                 patch.object(sched, "finish_execution"), \
+                 patch("run_agent.AIAgent") as mock_agent_cls:
+                mock_agent_cls.return_value.run_conversation.return_value = {
+                    "final_response": "ok"
+                }
+                monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+                processed = sched.run_one_job(
+                    job,
+                    adapters={Platform.SIGNAL: adapter},
+                    loop=loop,
+                )
+
+        assert processed is True
+        assert mock_agent_cls.called is True
+        assert delivered == [("ok", {Platform.SIGNAL: adapter}, loop)]
