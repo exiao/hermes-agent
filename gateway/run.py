@@ -5358,6 +5358,8 @@ class TurnRunner:
                     progress_lines = []
                     ctx.last_progress_msg[0] = None
                     ctx.repeat_count[0] = 0
+                    # Yield so a burst of resets cannot starve the event loop.
+                    await asyncio.sleep(0)
                     pending_raw = _NO_PENDING_RAW
                     continue
                 else:
