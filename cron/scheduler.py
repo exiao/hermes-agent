@@ -4906,17 +4906,19 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
-def _preflight_check_delivery(job: dict) -> Optional[str]:
+def _preflight_check_delivery(job: dict, adapters=None) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
     ``local``/``origin`` (and the ``all`` routing token) need no gateway
     credentials and are never checked — a deliver=local job must not pay a
     gateway-config load. For concrete platform targets, an unknown platform
-    always blocks; a known platform additionally blocks when the gateway
-    config is loadable and reports it unconnected (enabled + credentials —
-    the same source `cron_delivery_targets` uses). Gateway-config load
-    failures fail OPEN so a transient config hiccup never wedges delivery
-    that would have worked.
+    always blocks; a known platform additionally blocks when it has no live
+    adapter and the gateway config is loadable and reports it unconnected
+    (enabled + credentials — the same source `cron_delivery_targets` uses).
+    Gateway-config load failures fail OPEN so a transient config hiccup never
+    wedges delivery that would have worked. ``adapters`` is optional because
+    standalone cron callers do not have the gateway's live adapter map; only a
+    positively resolved adapter can relax the native credential check.
     """
     deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
     platform_parts: list[str] = []
@@ -4941,6 +4943,16 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 "delivery target. Fix the job's `deliver` value or configure "
                 "the platform's gateway credentials."
             )
+        try:
+            from gateway.config import Platform
+
+            live_adapter = bool(
+                adapters and adapters.get(Platform(platform_name.lower())) is not None
+            )
+        except Exception:
+            live_adapter = False
+        if live_adapter:
+            continue
         if connected is None:
             try:
                 from gateway.config import load_gateway_config
@@ -5021,7 +5033,7 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(job: dict, cfg: dict, adapters=None) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -5040,7 +5052,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
-        ("delivery", lambda: _preflight_check_delivery(job)),
+        ("delivery", lambda: _preflight_check_delivery(job, adapters=adapters)),
     ):
         try:
             reason = check()
@@ -5181,6 +5193,7 @@ class _BoundedCronSessionDB:
 def run_job(
     job: dict,
     *,
+    adapters=None,
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
@@ -5201,6 +5214,10 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run',
     prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
     never persisted to the job definition.
+
+    ``adapters``: optional live gateway adapter map. When present, preflight
+    can recognize a shared adapter even if this profile's native platform
+    config is disabled.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -5897,7 +5914,7 @@ def run_job(
         _pf_reason = None
         try:
             if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
+                _pf_reason = _preflight_job_config(job, _cfg, adapters=adapters)
                 if not _pf_reason and job.get("preflight_alerted"):
                     # Configuration validates again — clear the alert-once
                     # marker so a FUTURE config break re-alerts.
@@ -6933,12 +6950,14 @@ def _run_one_job_body(
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
                     job,
+                    adapters=adapters,
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
                 )
             else:
                 success, output, final_response, error = run_job(
                     job,
+                    adapters=adapters,
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
                     cancel_event=fire_claim_lost,
