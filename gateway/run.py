@@ -3772,6 +3772,88 @@ def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None
     return slug, declared_name
 
 
+# ── Known-but-inactive skill lookup cache ─────────────────────────────────
+#
+# :func:`_check_unavailable_skill` maps an unresolved slash command onto a
+# disabled or uninstalled skill by walking every ``SKILL.md`` on disk (1000+
+# files on a full install) and parsing each one's frontmatter. That walk used
+# to run inline on the gateway event loop for every unresolved ``/command``.
+# Warm it is ~70ms; with the page cache cold — or the box in swap, which is
+# exactly when it happens — it blocks the loop for tens of seconds, long
+# enough for :mod:`gateway.shutdown_watchdog` to miss three liveness probes
+# and exit 75 (observed repeatedly on 2026-09-01).
+#
+# The map only feeds an advisory "disabled / not installed" hint, so a
+# slightly stale copy is harmless: memoise it for
+# ``HERMES_SKILL_SCAN_CACHE_TTL`` seconds (default 300, 0 disables caching).
+# A newly installed or newly disabled skill is picked up on the next rebuild.
+# The authoritative active-skill path (``resolve_skill_command_key``) does not
+# go through here and stays exact.
+_SKILL_SCAN_CACHE_TTL = 300.0
+_skill_scan_cache: "dict[tuple[str, str], tuple[float, dict[str, str]]]" = {}
+_skill_scan_cache_lock = threading.Lock()
+
+
+def _skill_scan_cache_ttl() -> float:
+    raw = os.environ.get("HERMES_SKILL_SCAN_CACHE_TTL")
+    if raw is None:
+        return _SKILL_SCAN_CACHE_TTL
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _SKILL_SCAN_CACHE_TTL
+
+
+def _cached_skill_scan(kind: str, root: Path, builder) -> "dict[str, str]":
+    """Return ``builder(root)``, memoised per ``(kind, root)`` for a short TTL.
+
+    The build runs outside the lock: a concurrent miss may scan twice, which
+    is cheaper than serialising every caller behind one filesystem walk.
+    """
+    key = (kind, str(root))
+    ttl = _skill_scan_cache_ttl()
+    if ttl > 0:
+        with _skill_scan_cache_lock:
+            hit = _skill_scan_cache.get(key)
+            if hit is not None and (time.monotonic() - hit[0]) < ttl:
+                return hit[1]
+    mapping = builder(root)
+    with _skill_scan_cache_lock:
+        _skill_scan_cache[key] = (time.monotonic(), mapping)
+    return mapping
+
+
+def _scan_installed_skill_slugs(root: Path) -> "dict[str, str]":
+    """Map slug -> declared frontmatter name for every SKILL.md under *root*."""
+    from agent.skill_utils import is_excluded_skill_path
+
+    found: "dict[str, str]" = {}
+    for skill_md in root.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md):
+            continue
+        slug, declared_name = _skill_slug_from_frontmatter(skill_md)
+        if not slug or not declared_name:
+            continue
+        found.setdefault(slug, declared_name)
+    return found
+
+
+def _scan_optional_skill_slugs(root: Path) -> "dict[str, str]":
+    """Map slug -> ``hermes skills install`` path for every optional SKILL.md."""
+    from agent.skill_utils import is_excluded_skill_path
+
+    found: "dict[str, str]" = {}
+    for skill_md in root.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md):
+            continue
+        slug, _declared = _skill_slug_from_frontmatter(skill_md)
+        if not slug:
+            continue
+        rel = skill_md.parent.relative_to(root)
+        found.setdefault(slug, f"official/{'/'.join(rel.parts)}")
+    return found
+
+
 def _check_unavailable_skill(command_name: str) -> str | None:
     """Check if a command matches a known-but-inactive skill.
 
@@ -3790,47 +3872,43 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     normalized = command_name.lower().replace("_", "-")
     try:
         from tools.skills_tool import _get_disabled_skill_names
-        from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+        from agent.skill_utils import get_all_skills_dirs
         disabled = _get_disabled_skill_names()
 
-        # Check disabled skills across all dirs (local + external)
+        # Check disabled skills across all dirs (local + external).
+        # The slug -> declared-name map is cached (see _cached_skill_scan);
+        # `disabled` itself is read fresh every call, so toggling a skill via
+        # `hermes skills config` takes effect immediately.
         for skills_dir in get_all_skills_dirs():
             if not skills_dir.exists():
                 continue
-            for skill_md in skills_dir.rglob("SKILL.md"):
-                if is_excluded_skill_path(skill_md):
-                    continue
-                slug, declared_name = _skill_slug_from_frontmatter(skill_md)
-                if not slug or not declared_name:
-                    continue
-                # disabled is keyed by the declared frontmatter name (what
-                # skills.disabled / skills.platform_disabled store).
-                if slug == normalized and declared_name in disabled:
-                    return (
-                        f"The **{command_name}** skill is installed but disabled.\n"
-                        f"Enable it with: `hermes skills config`"
-                    )
+            installed = _cached_skill_scan(
+                "installed", skills_dir, _scan_installed_skill_slugs
+            )
+            # disabled is keyed by the declared frontmatter name (what
+            # skills.disabled / skills.platform_disabled store).
+            declared_name = installed.get(normalized)
+            if declared_name and declared_name in disabled:
+                return (
+                    f"The **{command_name}** skill is installed but disabled.\n"
+                    f"Enable it with: `hermes skills config`"
+                )
 
         # Check optional skills (shipped with repo but not installed)
         from hermes_constants import get_optional_skills_dir
         repo_root = Path(__file__).resolve().parent.parent
         optional_dir = get_optional_skills_dir(repo_root / "optional-skills")
         if optional_dir.exists():
-            for skill_md in optional_dir.rglob("SKILL.md"):
-                if is_excluded_skill_path(skill_md):
-                    continue
-                slug, _declared = _skill_slug_from_frontmatter(skill_md)
-                if not slug:
-                    continue
-                if slug == normalized:
-                    # Build install path: official/<category>/<name>
-                    rel = skill_md.parent.relative_to(optional_dir)
-                    parts = list(rel.parts)
-                    install_path = f"official/{'/'.join(parts)}"
-                    return (
-                        f"The **{command_name}** skill is available but not installed.\n"
-                        f"Install it with: `hermes skills install {install_path}`"
-                    )
+            optional = _cached_skill_scan(
+                "optional", optional_dir, _scan_optional_skill_slugs
+            )
+            # Install path is official/<category>/<name>
+            install_path = optional.get(normalized)
+            if install_path:
+                return (
+                    f"The **{command_name}** skill is available but not installed.\n"
+                    f"Install it with: `hermes skills install {install_path}`"
+                )
     except Exception:
         pass
     return None
@@ -18672,7 +18750,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
                     # uninstalled skill and give actionable guidance.
-                    _unavail_msg = _check_unavailable_skill(command)
+                    # Off-loop: the lookup can touch the filesystem when its
+                    # cache is cold, and blocking the event loop here trips
+                    # the shutdown watchdog (exit 75) under memory pressure.
+                    _unavail_msg = await asyncio.to_thread(
+                        _check_unavailable_skill, command
+                    )
                     if _unavail_msg:
                         return _unavail_msg
                     # Genuinely unrecognized /command: not a built-in, not a
