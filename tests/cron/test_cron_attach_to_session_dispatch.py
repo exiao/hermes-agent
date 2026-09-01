@@ -66,19 +66,31 @@ class TestAttachToSessionReachesTheStore:
         assert _cron_mirror_delivery_enabled(job, {"cron": {"mirror_delivery": True}}) is True
 
 
-def test_every_schema_property_is_forwarded_or_documented():
+def test_every_schema_property_is_forwarded_or_documented(monkeypatch):
     """Class guard: a property the model can send must either reach cronjob()
     through the handler, or be on the explicit exclusion list above. This is
-    what catches the next parameter dropped between schema and function."""
-    import inspect
+    what catches the next parameter dropped between schema and function.
 
+    Runs the registered handler with a unique sentinel per property and reads
+    the keyword arguments cronjob() actually received, so a refactor of the
+    handler is free as long as the values still arrive.
+    """
     import tools.cronjob_tools as mod
 
-    source = inspect.getsource(_handler())
-    dropped = {
+    received: dict = {}
+    monkeypatch.setattr(
+        mod, "cronjob", lambda **kwargs: received.update(kwargs) or "{}"
+    )
+
+    properties = list(mod.CRONJOB_SCHEMA["parameters"]["properties"])
+    args = {name: f"sentinel-{name}" for name in properties}
+    args["action"] = "list"
+    _handler()(args)
+
+    dropped = sorted(
         name
-        for name in mod.CRONJOB_SCHEMA["parameters"]["properties"]
+        for name in properties
         if name not in INTENTIONALLY_NOT_FORWARDED
-        and f'args.get("{name}"' not in source
-    }
-    assert not dropped, f"schema properties never read by the handler: {sorted(dropped)}"
+        and received.get(name) != args[name]
+    )
+    assert not dropped, f"schema properties never reaching cronjob(): {dropped}"
