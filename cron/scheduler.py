@@ -3151,10 +3151,19 @@ def _deliver_result_impl(job: dict, content: str, adapters=None, loop=None) -> O
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(enabled=True)
         elif not pconfig or not pconfig.enabled:
-            msg = f"platform '{platform_name}' not configured/enabled"
+            msg = (
+                f"platform '{platform_name}' target '{chat_id}' "
+                "not configured/enabled"
+            )
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
             continue
+        elif adapters is not None:
+            msg = (
+                f"platform '{platform_name}' target '{chat_id}' has no live "
+                "adapter or relay available"
+            )
+            logger.info("Job '%s': %s", job["id"], msg)
 
         # Prefer the resolved live transport when the gateway is running. This
         # supports E2EE native adapters and relay-fronted logical platforms.
