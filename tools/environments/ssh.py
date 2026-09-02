@@ -353,6 +353,14 @@ class SSHEnvironment(BaseEnvironment):
 
             compressed = self._remote_supports_gzip()
             tar_cmd = ["tar", "-czhf" if compressed else "-chf", "-", "-C", staging, "."]
+            # macOS bsdtar stores each file's extended attributes as a
+            # separate AppleDouble "._name" member. Linux tar has no idea
+            # what those are and unpacks them as real 163-byte files, so
+            # every push littered the remote ~/.hermes with one stub per
+            # synced file (measured: 14,601 on hermes-a, 2,164 on hermes-b).
+            # COPYFILE_DISABLE=1 makes bsdtar omit them; it is a no-op for
+            # GNU tar on Linux hosts.
+            tar_env = {**os.environ, "COPYFILE_DISABLE": "1"}
             ssh_cmd = self._build_ssh_command()
             # --no-overwrite-dir prevents tar from overwriting the mode of
             # existing directories (e.g. /home/<user>) with the staging
@@ -363,6 +371,7 @@ class SSHEnvironment(BaseEnvironment):
 
             tar_proc = subprocess.Popen(
                 tar_cmd,
+                env=tar_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
