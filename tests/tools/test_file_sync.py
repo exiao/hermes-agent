@@ -419,3 +419,64 @@ class TestBulkUpload:
         mgr.sync(force=True)
         bulk_upload.assert_called_once()
         assert len(bulk_upload.call_args[0][0]) == 3
+
+
+class TestPersistedState:
+    def test_rebuilt_manager_reuses_manifest(self, tmp_files):
+        upload = MagicMock()
+        saved = {}
+        first = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=upload,
+            delete_fn=MagicMock(),
+            manifest_save_fn=lambda files: saved.update(files),
+        )
+        first.sync(force=True)
+        assert len(saved) == 3
+        assert upload.call_count == 3
+
+        upload.reset_mock()
+        load = MagicMock(return_value=saved.copy())
+        second = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=upload,
+            delete_fn=MagicMock(),
+            manifest_load_fn=load,
+        )
+        second.sync(force=True)
+
+        load.assert_called_once_with()
+        upload.assert_not_called()
+
+    def test_missing_manifest_is_rewritten(self, tmp_files):
+        save = MagicMock()
+        mgr = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            manifest_load_fn=lambda: None,
+            manifest_save_fn=save,
+        )
+        mgr.sync(force=True)
+        save.assert_called_once_with(mgr._synced_files)
+
+    def test_large_sync_warns_with_largest_directory(self, tmp_path, caplog, monkeypatch):
+        skills = tmp_path / "skills.bin"
+        plans = tmp_path / "plans.bin"
+        skills.write_bytes(b"s" * 8)
+        plans.write_bytes(b"p" * 4)
+        monkeypatch.setattr("tools.environments.file_sync._SYNC_WARNING_BYTES", 10)
+        mgr = FileSyncManager(
+            get_files_fn=lambda: [
+                (str(skills), "/root/.hermes/skills/skills.bin"),
+                (str(plans), "/root/.hermes/plans/plans.bin"),
+            ],
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+        )
+
+        with caplog.at_level("WARNING", logger="tools.environments.file_sync"):
+            mgr.sync(force=True)
+
+        assert "sync set is" in caplog.text
+        assert "largest directory is skills" in caplog.text

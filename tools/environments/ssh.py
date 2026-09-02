@@ -1,6 +1,7 @@
 """SSH remote execution environment with ControlMaster connection persistence."""
 
 import hashlib
+import json
 import logging
 import os
 
@@ -146,6 +147,10 @@ class SSHEnvironment(BaseEnvironment):
         _ensure_ssh_available()
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
+        self._sync_manifest_path = f"{self._remote_home}/.hermes/.sync-manifest.json"
+        self._sync_manifest_key = (
+            f"{self.user}@{self.host}:{self.port}|{self._remote_home}/.hermes"
+        )
 
         self._ensure_remote_dirs()
         self._sync_manager = FileSyncManager(
@@ -154,6 +159,8 @@ class SSHEnvironment(BaseEnvironment):
             delete_fn=self._ssh_delete,
             bulk_upload_fn=self._ssh_bulk_upload,
             bulk_download_fn=self._ssh_bulk_download,
+            manifest_load_fn=self._load_sync_manifest,
+            manifest_save_fn=self._save_sync_manifest,
         )
         self._sync_manager.sync(force=True)
 
@@ -232,6 +239,81 @@ class SSHEnvironment(BaseEnvironment):
     # ------------------------------------------------------------------
     # File sync (via FileSyncManager)
     # ------------------------------------------------------------------
+
+    def _load_sync_manifest(self) -> dict[str, tuple[float, int]] | None:
+        path = shlex.quote(self._sync_manifest_path)
+        cmd = self._build_ssh_command()
+        cmd.append(f"if test -f {path}; then cat {path}; else exit 3; fi")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode == 3:
+            return None
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"remote sync manifest read failed: {result.stderr.strip()}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != 1 or payload.get("key") != self._sync_manifest_key:
+            return None
+        files = payload.get("files")
+        if not isinstance(files, dict):
+            return None
+
+        parsed: dict[str, tuple[float, int]] = {}
+        for remote_path, file_key in files.items():
+            if not isinstance(remote_path, str) or not isinstance(file_key, list):
+                return None
+            if len(file_key) != 2:
+                return None
+            try:
+                mtime, size = float(file_key[0]), int(file_key[1])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if size < 0:
+                return None
+            parsed[remote_path] = (mtime, size)
+        return parsed
+
+    def _save_sync_manifest(self, files: dict[str, tuple[float, int]]) -> None:
+        payload = json.dumps(
+            {
+                "version": 1,
+                "key": self._sync_manifest_key,
+                "files": {
+                    remote_path: [mtime, size]
+                    for remote_path, (mtime, size) in files.items()
+                },
+            },
+            sort_keys=True,
+        )
+        manifest_path = shlex.quote(self._sync_manifest_path)
+        manifest_dir = shlex.quote(self._sync_manifest_path.rsplit("/", 1)[0])
+        cmd = self._build_ssh_command()
+        cmd.append(
+            f"tmp=$(mktemp {manifest_dir}/.sync-manifest.XXXXXX) "
+            f"&& cat > \"$tmp\" && chmod 600 \"$tmp\" && mv \"$tmp\" {manifest_path}"
+        )
+        result = subprocess.run(
+            cmd,
+            input=payload,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"remote sync manifest write failed: {result.stderr.strip()}"
+            )
 
     def _ensure_remote_dirs(self) -> None:
         """Create base ~/.hermes directory tree on remote in one SSH call."""

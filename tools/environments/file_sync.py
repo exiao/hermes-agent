@@ -54,6 +54,10 @@ BulkUploadFn = Callable[[list[tuple[str, str]]], None]  # [(host_path, remote_pa
 BulkDownloadFn = Callable[[Path], None]  # (dest_tar_path) -> writes tar archive, raises on failure
 DeleteFn = Callable[[list[str]], None]  # (remote_paths) -> raises on failure
 GetFilesFn = Callable[[], list[tuple[str, str]]]  # () -> [(host_path, remote_path), ...]
+ManifestLoadFn = Callable[[], dict[str, tuple[float, int]] | None]
+ManifestSaveFn = Callable[[dict[str, tuple[float, int]]], None]
+
+_SYNC_WARNING_BYTES = 100 * 1024 * 1024
 
 
 def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, str]]:
@@ -250,6 +254,8 @@ class FileSyncManager:
         sync_interval: float = _SYNC_INTERVAL_SECONDS,
         bulk_upload_fn: BulkUploadFn | None = None,
         bulk_download_fn: BulkDownloadFn | None = None,
+        manifest_load_fn: ManifestLoadFn | None = None,
+        manifest_save_fn: ManifestSaveFn | None = None,
     ):
         self._get_files_fn = get_files_fn
         self._upload_fn = upload_fn
@@ -267,11 +273,56 @@ class FileSyncManager:
         self._upload_only_host_paths: set[str] = set()
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
+        self._manifest_load_fn = manifest_load_fn
+        self._manifest_save_fn = manifest_save_fn
+        self._manifest_needs_save = False
+        self._load_persisted_state()
         # Memo for the upload-only set (see _refresh_upload_only_paths).
         # Per-instance, never module-global: each manager belongs to one
         # profile/backend, and a shared cache would leak one profile's
         # credential paths into another's sync.
         self._upload_only_cache_time: float = 0.0
+
+    def _load_persisted_state(self) -> None:
+        if self._manifest_load_fn is None:
+            return
+        try:
+            manifest = self._manifest_load_fn()
+        except Exception as exc:
+            logger.warning("file_sync: could not load persisted manifest: %s", exc)
+            self._manifest_needs_save = True
+            return
+        if manifest is None or not isinstance(manifest, dict):
+            self._manifest_needs_save = True
+            return
+
+        valid: dict[str, tuple[float, int]] = {}
+        for remote_path, file_key in manifest.items():
+            if not isinstance(remote_path, str) or not isinstance(file_key, (list, tuple)):
+                self._manifest_needs_save = True
+                continue
+            if len(file_key) != 2:
+                self._manifest_needs_save = True
+                continue
+            try:
+                mtime, size = float(file_key[0]), int(file_key[1])
+            except (TypeError, ValueError, OverflowError):
+                self._manifest_needs_save = True
+                continue
+            if size < 0:
+                self._manifest_needs_save = True
+                continue
+            valid[remote_path] = (mtime, size)
+        self._synced_files = valid
+
+    def _persist_state(self, files: dict[str, tuple[float, int]]) -> None:
+        if self._manifest_save_fn is None:
+            return
+        try:
+            self._manifest_save_fn(dict(files))
+            self._manifest_needs_save = False
+        except Exception as exc:
+            logger.warning("file_sync: could not save persisted manifest: %s", exc)
 
     def _refresh_upload_only_paths(self, *, force: bool = False) -> None:
         """Refresh the upload-only path set, at most once per TTL.
@@ -320,6 +371,8 @@ class FileSyncManager:
 
         current_files = self._get_files_fn()
         current_remote_paths = {remote for _, remote in current_files}
+        sync_bytes = 0
+        directory_bytes: dict[str, int] = {}
 
         # --- Uploads: new or changed files ---
         to_upload: list[tuple[str, str]] = []
@@ -351,10 +404,25 @@ class FileSyncManager:
             file_key = _file_mtime_key(host_path)
             if file_key is None:
                 continue
+            sync_bytes += file_key[1]
+            relative = remote_path.split("/.hermes/", 1)[-1].lstrip("/")
+            directory = relative.split("/", 1)[0] or "."
+            directory_bytes[directory] = directory_bytes.get(directory, 0) + file_key[1]
             if self._synced_files.get(remote_path) == file_key:
                 continue
             to_upload.append((host_path, remote_path))
             new_files[remote_path] = file_key
+
+        if sync_bytes > _SYNC_WARNING_BYTES and directory_bytes:
+            largest_directory, largest_bytes = max(
+                directory_bytes.items(), key=lambda item: item[1]
+            )
+            logger.warning(
+                "file_sync: sync set is %.1f MB; largest directory is %s (%.1f MB)",
+                sync_bytes / (1024 * 1024),
+                largest_directory,
+                largest_bytes / (1024 * 1024),
+            )
 
         # Anything about to be uploaded may be newly upload-only: a brand new
         # remote path, or an EXISTING one whose symlink was retargeted at the
@@ -375,6 +443,8 @@ class FileSyncManager:
 
         if not to_upload and not to_delete:
             self._last_sync_time = _monotonic()
+            if self._manifest_needs_save:
+                self._persist_state(self._synced_files)
             return
 
         # Snapshot for rollback (only when there's work to do)
@@ -414,6 +484,7 @@ class FileSyncManager:
 
             self._synced_files = new_files
             self._last_sync_time = _monotonic()
+            self._persist_state(self._synced_files)
 
         except Exception as exc:
             self._synced_files = prev_files
