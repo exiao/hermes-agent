@@ -718,6 +718,8 @@ def test_concurrent_rollover_uses_current_file_and_keeps_other_errors(tmp_path):
             return os.replace(source, destination)
         with patch.object(hermes_logging.os, "rename", side_effect=race):
             second.doRollover()
+        assert second.stream is not None
+        assert os.fstat(second.stream.fileno()).st_ino == log_path.stat().st_ino
         second.emit(logging.LogRecord("test", logging.INFO, "", 0, "after", (), None))
         assert "after" in log_path.read_text()
         with patch.object(hermes_logging.RotatingFileHandler, "doRollover", side_effect=PermissionError):
