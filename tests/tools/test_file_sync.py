@@ -425,18 +425,22 @@ class TestPersistedState:
     def test_rebuilt_manager_reuses_manifest(self, tmp_files):
         upload = MagicMock()
         saved = {}
+        saved_hashes = {}
         first = FileSyncManager(
             get_files_fn=_make_get_files(tmp_files),
             upload_fn=upload,
             delete_fn=MagicMock(),
-            manifest_save_fn=lambda files: saved.update(files),
+            manifest_save_fn=lambda files, hashes: (
+                saved.update(files), saved_hashes.update(hashes)
+            ),
         )
         first.sync(force=True)
         assert len(saved) == 3
+        assert len(saved_hashes) == 3
         assert upload.call_count == 3
 
         upload.reset_mock()
-        load = MagicMock(return_value=saved.copy())
+        load = MagicMock(return_value=(saved.copy(), saved_hashes.copy()))
         second = FileSyncManager(
             get_files_fn=_make_get_files(tmp_files),
             upload_fn=upload,
@@ -444,9 +448,69 @@ class TestPersistedState:
             manifest_load_fn=load,
         )
         second.sync(force=True)
-
         load.assert_called_once_with()
         upload.assert_not_called()
+
+    def test_rebuilt_manager_keeps_host_edit_when_remote_is_unchanged(self, tmp_files, tmp_path):
+        upload = MagicMock()
+        saved = {}
+        saved_hashes = {}
+        first = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=upload,
+            delete_fn=MagicMock(),
+            manifest_save_fn=lambda files, hashes: (
+                saved.update(files), saved_hashes.update(hashes)
+            ),
+        )
+        first.sync(force=True)
+
+        skill = Path(tmp_files["skill_main.py"])
+        remote_snapshot = {
+            "root/.hermes/skill_main.py": b"content of skill_main.py"
+        }
+
+        def bulk_download(dest: Path) -> None:
+            with tarfile.open(dest, "w") as tar:
+                for name, data in remote_snapshot.items():
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+
+        second = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_download_fn=bulk_download,
+            manifest_load_fn=lambda: (saved.copy(), saved_hashes.copy()),
+        )
+        second.sync(force=True)
+        skill.write_text("host edit")
+        second.sync_back(hermes_home=tmp_path)
+
+        assert skill.read_text() == "host edit"
+
+    def test_legacy_manifest_reuploads_to_build_hash_baseline(self, tmp_files):
+        upload = MagicMock()
+        legacy = {}
+        first = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=upload,
+            delete_fn=MagicMock(),
+            manifest_save_fn=lambda files, hashes: legacy.update(files),
+        )
+        first.sync(force=True)
+
+        upload.reset_mock()
+        rebuilt = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=upload,
+            delete_fn=MagicMock(),
+            manifest_load_fn=lambda: legacy.copy(),
+        )
+        rebuilt.sync(force=True)
+
+        assert upload.call_count == 3
 
     def test_missing_manifest_is_rewritten(self, tmp_files):
         save = MagicMock()
@@ -458,7 +522,7 @@ class TestPersistedState:
             manifest_save_fn=save,
         )
         mgr.sync(force=True)
-        save.assert_called_once_with(mgr._synced_files)
+        save.assert_called_once_with(mgr._synced_files, mgr._pushed_hashes)
 
     def test_large_sync_warns_with_largest_directory(self, tmp_path, caplog, monkeypatch):
         skills = tmp_path / "skills.bin"

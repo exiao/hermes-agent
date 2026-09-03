@@ -54,8 +54,9 @@ BulkUploadFn = Callable[[list[tuple[str, str]]], None]  # [(host_path, remote_pa
 BulkDownloadFn = Callable[[Path], None]  # (dest_tar_path) -> writes tar archive, raises on failure
 DeleteFn = Callable[[list[str]], None]  # (remote_paths) -> raises on failure
 GetFilesFn = Callable[[], list[tuple[str, str]]]  # () -> [(host_path, remote_path), ...]
-ManifestLoadFn = Callable[[], dict[str, tuple[float, int]] | None]
-ManifestSaveFn = Callable[[dict[str, tuple[float, int]]], None]
+ManifestState = tuple[dict[str, tuple[float, int]], dict[str, str]]
+ManifestLoadFn = Callable[[], ManifestState | None]
+ManifestSaveFn = Callable[[dict[str, tuple[float, int]], dict[str, str]], None]
 
 _SYNC_WARNING_BYTES = 100 * 1024 * 1024
 
@@ -270,6 +271,7 @@ class FileSyncManager:
         # itself is the only signal the upload-only set may have changed.
         self._synced_hosts: dict[str, str] = {}
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
+        self._manifest_hashes_need_rebuild = False
         self._upload_only_host_paths: set[str] = set()
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
@@ -293,12 +295,37 @@ class FileSyncManager:
             logger.warning("file_sync: could not load persisted manifest: %s", exc)
             self._manifest_needs_save = True
             return
-        if manifest is None or not isinstance(manifest, dict):
+        if manifest is None or not isinstance(manifest, (dict, tuple)):
             self._manifest_needs_save = True
             return
 
+        persisted_hashes: dict[str, str] = {}
+        if (
+            isinstance(manifest, tuple)
+            and len(manifest) == 2
+            and isinstance(manifest[0], dict)
+            and isinstance(manifest[1], dict)
+        ):
+            raw_files, raw_hashes = manifest
+            for remote_path, digest in raw_hashes.items():
+                if isinstance(remote_path, str) and isinstance(digest, str):
+                    try:
+                        if len(digest) == 64:
+                            int(digest, 16)
+                            persisted_hashes[remote_path] = digest
+                    except ValueError:
+                        pass
+        else:
+            # Accept the pre-hash callback shape while old managers are being
+            # upgraded. Those entries are re-uploaded once to establish the
+            # sync-back baseline instead of risking a host overwrite.
+            raw_files = manifest
+
         valid: dict[str, tuple[float, int]] = {}
-        for remote_path, file_key in manifest.items():
+        if not isinstance(raw_files, dict):
+            self._manifest_needs_save = True
+            return
+        for remote_path, file_key in raw_files.items():
             if not isinstance(remote_path, str) or not isinstance(file_key, (list, tuple)):
                 self._manifest_needs_save = True
                 continue
@@ -315,12 +342,16 @@ class FileSyncManager:
                 continue
             valid[remote_path] = (mtime, size)
         self._synced_files = valid
+        self._pushed_hashes = persisted_hashes
+        self._manifest_hashes_need_rebuild = any(
+            remote_path not in persisted_hashes for remote_path in valid
+        )
 
     def _persist_state(self, files: dict[str, tuple[float, int]]) -> None:
         if self._manifest_save_fn is None:
             return
         try:
-            self._manifest_save_fn(dict(files))
+            self._manifest_save_fn(dict(files), dict(self._pushed_hashes))
             self._manifest_needs_save = False
         except Exception as exc:
             logger.warning("file_sync: could not save persisted manifest: %s", exc)
@@ -409,7 +440,10 @@ class FileSyncManager:
             relative = remote_path.split("/.hermes/", 1)[-1].lstrip("/")
             directory = relative.split("/", 1)[0] or "."
             directory_bytes[directory] = directory_bytes.get(directory, 0) + file_key[1]
-            if self._synced_files.get(remote_path) == file_key:
+            if (
+                self._synced_files.get(remote_path) == file_key
+                and not self._manifest_hashes_need_rebuild
+            ):
                 continue
             to_upload.append((host_path, remote_path))
             new_files[remote_path] = file_key
@@ -487,6 +521,10 @@ class FileSyncManager:
                 self._synced_hosts.pop(p, None)
 
             self._synced_files = new_files
+            self._manifest_hashes_need_rebuild = any(
+                remote_path not in self._pushed_hashes
+                for remote_path in new_files
+            )
             self._last_sync_time = _monotonic()
             self._persist_state(self._synced_files)
 

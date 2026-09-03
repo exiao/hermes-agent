@@ -1,3 +1,4 @@
+
 """SSH remote execution environment with ControlMaster connection persistence."""
 
 import hashlib
@@ -16,6 +17,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from hermes_constants import hermes_home_key
 from tools.environments.base import (
     BaseEnvironment,
     EnvironmentConnectionError,
@@ -149,7 +151,8 @@ class SSHEnvironment(BaseEnvironment):
         self._remote_home = self._detect_remote_home()
         self._sync_manifest_path = f"{self._remote_home}/.hermes/.sync-manifest.json"
         self._sync_manifest_key = (
-            f"{self.user}@{self.host}:{self.port}|{self._remote_home}/.hermes"
+            f"{hermes_home_key()}|{self.user}@{self.host}:{self.port}|"
+            f"{self._remote_home}/.hermes"
         )
 
         self._ensure_remote_dirs()
@@ -240,7 +243,7 @@ class SSHEnvironment(BaseEnvironment):
     # File sync (via FileSyncManager)
     # ------------------------------------------------------------------
 
-    def _load_sync_manifest(self) -> dict[str, tuple[float, int]] | None:
+    def _load_sync_manifest(self) -> tuple[dict[str, tuple[float, int]], dict[str, str]] | None:
         path = shlex.quote(self._sync_manifest_path)
         cmd = self._build_ssh_command()
         cmd.append(f"if test -f {path}; then cat {path}; else exit 3; fi")
@@ -282,9 +285,23 @@ class SSHEnvironment(BaseEnvironment):
             if size < 0:
                 return None
             parsed[remote_path] = (mtime, size)
-        return parsed
+        raw_hashes = payload.get("hashes", {})
+        if not isinstance(raw_hashes, dict):
+            raw_hashes = {}
+        hashes = {
+            remote_path: digest
+            for remote_path, digest in raw_hashes.items()
+            if isinstance(remote_path, str)
+            and isinstance(digest, str)
+            and len(digest) == 64
+        }
+        return parsed, hashes
 
-    def _save_sync_manifest(self, files: dict[str, tuple[float, int]]) -> None:
+    def _save_sync_manifest(
+        self,
+        files: dict[str, tuple[float, int]],
+        hashes: dict[str, str],
+    ) -> None:
         payload = json.dumps(
             {
                 "version": 1,
@@ -293,6 +310,7 @@ class SSHEnvironment(BaseEnvironment):
                     remote_path: [mtime, size]
                     for remote_path, (mtime, size) in files.items()
                 },
+                "hashes": hashes,
             },
             sort_keys=True,
         )

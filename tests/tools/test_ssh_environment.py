@@ -263,7 +263,7 @@ class TestSSHManifest:
         env.control_socket = "/tmp/hermes-ssh-test.sock"
         env._remote_home = "/home/alice"
         env._sync_manifest_path = "/home/alice/.hermes/.sync-manifest.json"
-        env._sync_manifest_key = "alice@example.com:22|/home/alice/.hermes"
+        env._sync_manifest_key = "/home/alice/.hermes|alice@example.com:22|/home/alice/.hermes"
         return env
 
     def test_loads_versioned_manifest(self, monkeypatch):
@@ -278,9 +278,10 @@ class TestSSHManifest:
         ))
         monkeypatch.setattr(ssh_env.subprocess, "run", run)
 
-        assert env._load_sync_manifest() == {
-            "/home/alice/.hermes/skills/a.md": (1.5, 3)
-        }
+        assert env._load_sync_manifest() == (
+            {"/home/alice/.hermes/skills/a.md": (1.5, 3)},
+            {},
+        )
         run.assert_called_once()
 
     def test_saves_manifest_atomically_over_ssh(self, monkeypatch):
@@ -290,11 +291,34 @@ class TestSSHManifest:
         ))
         monkeypatch.setattr(ssh_env.subprocess, "run", run)
 
-        env._save_sync_manifest({"/home/alice/.hermes/skills/a.md": (1.5, 3)})
+        env._save_sync_manifest(
+            {"/home/alice/.hermes/skills/a.md": (1.5, 3)},
+            {"/home/alice/.hermes/skills/a.md": "a" * 64},
+        )
 
         kwargs = run.call_args.kwargs
         saved = json.loads(kwargs["input"])
         assert saved["version"] == 1
         assert saved["key"] == env._sync_manifest_key
         assert saved["files"] == {"/home/alice/.hermes/skills/a.md": [1.5, 3]}
+        assert saved["hashes"] == {"/home/alice/.hermes/skills/a.md": "a" * 64}
         assert "mktemp" in run.call_args.args[0][-1]
+
+    def test_manifest_key_is_scoped_to_local_hermes_home(self, monkeypatch):
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/alice")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+        monkeypatch.setattr(
+            ssh_env,
+            "FileSyncManager",
+            lambda **kw: type("M", (), {"sync": lambda self, **k: None})(),
+        )
+
+        monkeypatch.setattr(ssh_env, "hermes_home_key", lambda: "/home/alice/.hermes")
+        first = SSHEnvironment(host="example.com", user="alice")
+        monkeypatch.setattr(ssh_env, "hermes_home_key", lambda: "/home/bob/.hermes")
+        second = SSHEnvironment(host="example.com", user="alice")
+
+        assert first._sync_manifest_key != second._sync_manifest_key
