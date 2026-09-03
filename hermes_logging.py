@@ -552,10 +552,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
             super().doRollover()
         except FileNotFoundError:
             # Another process completed the same rollover first.
-            self._chmod_if_managed()
             self._reopen_if_externally_rotated()
-            self._record_stream_stat()
-            return
         self._chmod_if_managed()
         self._record_stream_stat()
 
