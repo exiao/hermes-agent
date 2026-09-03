@@ -682,6 +682,7 @@ class FileSyncManager:
                     tar.extractall(staging, filter="data")
 
                 applied = 0
+                remote_paths: set[str] = set()
                 upload_only_host_paths = (
                     self._upload_only_host_paths | _credential_host_paths()
                 )
@@ -690,6 +691,7 @@ class FileSyncManager:
                         staged_file = os.path.join(dirpath, fname)
                         rel = os.path.relpath(staged_file, staging)
                         remote_path = "/" + rel
+                        remote_paths.add(remote_path)
 
                         # Plans are read-only card context: push down, never
                         # pull back, or a worker editing its own plan would
@@ -756,6 +758,13 @@ class FileSyncManager:
                         os.makedirs(os.path.dirname(host_path), exist_ok=True)
                         shutil.copy2(staged_file, host_path)
                         applied += 1
+
+                missing_paths = set(self._synced_files) - remote_paths
+                if missing_paths:
+                    for remote_path in missing_paths:
+                        self._synced_files.pop(remote_path, None)
+                        self._pushed_hashes.pop(remote_path, None)
+                    self._persist_state(self._synced_files)
 
                 if applied:
                     logger.info("sync_back: applied %d changed file(s)", applied)

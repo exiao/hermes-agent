@@ -559,3 +559,53 @@ class TestPersistedState:
 
         assert caplog.text.count("sync set is") == 1
         assert "largest directory is skills" in caplog.text
+
+    def test_remote_deletion_is_restored_after_manager_rebuild(self, tmp_files, tmp_path):
+        upload = MagicMock()
+        saved = {"files": {}, "hashes": {}}
+
+        def save(files, hashes):
+            saved["files"] = dict(files)
+            saved["hashes"] = dict(hashes)
+
+        first = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=upload,
+            delete_fn=MagicMock(),
+            manifest_save_fn=save,
+        )
+        first.sync(force=True)
+
+        remote_snapshot = {
+            "root/.hermes/cred_b.json": b"content of cred_b.json",
+            "root/.hermes/skill_main.py": b"content of skill_main.py",
+        }
+
+        def bulk_download(destination: Path) -> None:
+            with tarfile.open(destination, "w") as tar:
+                for name, data in remote_snapshot.items():
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+
+        second = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            bulk_download_fn=bulk_download,
+            manifest_load_fn=lambda: (saved["files"].copy(), saved["hashes"].copy()),
+            manifest_save_fn=save,
+        )
+        second.sync_back(hermes_home=tmp_path)
+
+        upload.reset_mock()
+        rebuilt = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=upload,
+            delete_fn=MagicMock(),
+            manifest_load_fn=lambda: (saved["files"].copy(), saved["hashes"].copy()),
+        )
+        rebuilt.sync(force=True)
+
+        assert upload.call_count == 1
+        assert "cred_a.json" in upload.call_args.args[0]
