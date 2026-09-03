@@ -20,6 +20,7 @@ creation time and before each command (for resync on Modal).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import posixpath
@@ -58,6 +59,14 @@ _config_files: List[Dict[str, str]] | None = None
 def _resolve_hermes_home() -> Path:
     from hermes_constants import get_hermes_home
     return get_hermes_home()
+
+
+def _ssh_profile_remote_hermes_home() -> str:
+    """Return the deterministic SSH Hermes root before an env exists."""
+    from hermes_constants import hermes_home_key
+
+    scope = hashlib.sha256(hermes_home_key().encode()).hexdigest()
+    return f"~/.hermes/profiles/{scope}"
 
 
 def register_credential_file(
@@ -682,10 +691,10 @@ def to_agent_visible_cache_path(
             active_env = get_active_env("default")
             container_base = (
                 getattr(active_env, "_remote_hermes_home", None)
-                or "~/.hermes"
+                or _ssh_profile_remote_hermes_home()
             )
         except Exception:
-            container_base = "~/.hermes"
+            container_base = _ssh_profile_remote_hermes_home()
     else:
         # Plugin-registered backends declare where synced cache files land
         # via ``cache_path_base``; None means host paths remain correct.

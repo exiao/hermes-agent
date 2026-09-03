@@ -41,6 +41,32 @@ def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tm
     assert sync_calls == [True]
 
 
+def test_postprocess_uses_profile_scoped_root_before_ssh_env_exists(monkeypatch, tmp_path):
+    from tools import image_generation_tool
+    from hermes_constants import hermes_home_key
+    import hashlib
+
+    hermes_home = tmp_path / ".hermes"
+    image_dir = hermes_home / "cache" / "images"
+    image_dir.mkdir(parents=True)
+    image_path = image_dir / "first.png"
+    image_path.write_bytes(b"png")
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setattr(image_generation_tool, "_active_terminal_env", lambda _task_id: None)
+
+    scope = hashlib.sha256(hermes_home_key().encode()).hexdigest()
+    raw = json.dumps({"success": True, "image": str(image_path)})
+    result = json.loads(
+        image_generation_tool._postprocess_image_generate_result(raw, task_id="task-1")
+    )
+
+    assert result["agent_visible_image"] == (
+        f"~/.hermes/profiles/{scope}/cache/images/first.png"
+    )
+
+
 def test_concurrent_image_results_preserve_shared_remote_sync_state(monkeypatch, tmp_path):
     from tools import image_generation_tool
     from tools.environments import file_sync

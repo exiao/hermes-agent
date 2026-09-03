@@ -1137,7 +1137,9 @@ def _agent_cache_base_for_env(env: Any) -> str | None:
     if backend in {"docker", "singularity", "modal"}:
         return "/root/.hermes"
     if backend == "ssh":
-        return "~/.hermes"
+        from tools.credential_files import _ssh_profile_remote_hermes_home
+
+        return _ssh_profile_remote_hermes_home()
     return None
 
 

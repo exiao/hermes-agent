@@ -458,7 +458,12 @@ class TestToAgentVisiblePathPerBackend:
         staged = self._staged(tmp_path, monkeypatch)
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         from tools.credential_files import to_agent_visible_cache_path
-        assert to_agent_visible_cache_path(staged) == "~/.hermes/attachments/drop.zip"
+        from hermes_constants import hermes_home_key
+        import hashlib
+        scope = hashlib.sha256(hermes_home_key().encode()).hexdigest()
+        assert to_agent_visible_cache_path(staged) == (
+            f"~/.hermes/profiles/{scope}/attachments/drop.zip"
+        )
 
     def test_ssh_maps_to_active_profile_home(self, tmp_path, monkeypatch):
         staged = self._staged(tmp_path, monkeypatch)
