@@ -524,6 +524,20 @@ class TestPersistedState:
         mgr.sync(force=True)
         save.assert_called_once_with(mgr._synced_files, mgr._pushed_hashes)
 
+    def test_manifest_save_failure_is_retried_on_no_work_sync(self, tmp_files):
+        save = MagicMock(side_effect=[RuntimeError("transient write failure"), None])
+        mgr = FileSyncManager(
+            get_files_fn=_make_get_files(tmp_files),
+            upload_fn=MagicMock(),
+            delete_fn=MagicMock(),
+            manifest_save_fn=save,
+        )
+
+        mgr.sync(force=True)
+        mgr.sync(force=True)
+
+        assert save.call_count == 2
+
     def test_large_sync_warns_with_largest_directory(self, tmp_path, caplog, monkeypatch):
         skills = tmp_path / "skills.bin"
         plans = tmp_path / "plans.bin"

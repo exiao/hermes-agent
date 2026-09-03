@@ -322,3 +322,4 @@ class TestSSHManifest:
         second = SSHEnvironment(host="example.com", user="alice")
 
         assert first._sync_manifest_key != second._sync_manifest_key
+        assert first._sync_manifest_path != second._sync_manifest_path

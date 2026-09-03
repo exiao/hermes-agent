@@ -149,7 +149,12 @@ class SSHEnvironment(BaseEnvironment):
         _ensure_ssh_available()
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
-        self._sync_manifest_path = f"{self._remote_home}/.hermes/.sync-manifest.json"
+        manifest_scope = hashlib.sha256(
+            hermes_home_key().encode()
+        ).hexdigest()
+        self._sync_manifest_path = (
+            f"{self._remote_home}/.hermes/.sync-manifest-{manifest_scope}.json"
+        )
         self._sync_manifest_key = (
             f"{hermes_home_key()}|{self.user}@{self.host}:{self.port}|"
             f"{self._remote_home}/.hermes"

@@ -354,6 +354,7 @@ class FileSyncManager:
             self._manifest_save_fn(dict(files), dict(self._pushed_hashes))
             self._manifest_needs_save = False
         except Exception as exc:
+            self._manifest_needs_save = True
             logger.warning("file_sync: could not save persisted manifest: %s", exc)
 
     def _refresh_upload_only_paths(self, *, force: bool = False) -> None:
