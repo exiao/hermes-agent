@@ -1118,6 +1118,9 @@ def _agent_cache_base_for_env(env: Any) -> str | None:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("active env agent_visible_cache_base failed: %s", exc)
 
+        remote_hermes_home = getattr(env, "_remote_hermes_home", None)
+        if remote_hermes_home:
+            return str(remote_hermes_home).rstrip("/")
         remote_home = getattr(env, "_remote_home", None)
         if remote_home:
             return f"{str(remote_home).rstrip('/')}/.hermes"

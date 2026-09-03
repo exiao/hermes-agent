@@ -596,6 +596,31 @@ def map_cache_path_to_container(
     return None
 
 
+def _map_plan_path_to_container(
+    host_path: str,
+    container_base: str,
+) -> Optional[str]:
+    """Map a host plan path into the active remote Hermes profile root."""
+    from hermes_constants import get_default_hermes_root
+
+    hermes_home = _resolve_hermes_home()
+    plans_dirs = [get_default_hermes_root(hermes_home) / "plans"]
+    profile_plans = hermes_home / "plans"
+    if profile_plans not in plans_dirs:
+        plans_dirs.append(profile_plans)
+
+    path = Path(host_path)
+    for plans_dir in plans_dirs:
+        try:
+            relative = path.relative_to(plans_dir)
+        except ValueError:
+            continue
+        return posixpath.join(
+            container_base.rstrip("/"), "plans", relative.as_posix()
+        )
+    return None
+
+
 def from_agent_visible_cache_path(
     container_path: str,
     container_base: str = "/root/.hermes",
@@ -652,7 +677,15 @@ def to_agent_visible_cache_path(
     if backend in ("docker", "modal"):
         pass  # /root/.hermes default
     elif backend in ("ssh", "daytona", "vercel_sandbox"):
-        container_base = "~/.hermes"
+        try:
+            from tools.terminal_tool import get_active_env
+            active_env = get_active_env("default")
+            container_base = (
+                getattr(active_env, "_remote_hermes_home", None)
+                or "~/.hermes"
+            )
+        except Exception:
+            container_base = "~/.hermes"
     else:
         # Plugin-registered backends declare where synced cache files land
         # via ``cache_path_base``; None means host paths remain correct.
@@ -668,6 +701,11 @@ def to_agent_visible_cache_path(
         container_base = str(plugin_base)
 
     mapped = map_cache_path_to_container(host_path, container_base=container_base)
+    if mapped is None:
+        # SSH syncs plans into the profile-scoped Hermes root as well.  Keep
+        # plan paths in card references aligned with that remote location,
+        # just like attachments and cached media.
+        mapped = _map_plan_path_to_container(host_path, container_base)
     return mapped if mapped is not None else host_path
 
 

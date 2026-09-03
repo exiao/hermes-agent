@@ -546,8 +546,8 @@ class TestPersistedState:
         monkeypatch.setattr("tools.environments.file_sync._SYNC_WARNING_BYTES", 10)
         mgr = FileSyncManager(
             get_files_fn=lambda: [
-                (str(skills), "/root/.hermes/skills/skills.bin"),
-                (str(plans), "/root/.hermes/plans/plans.bin"),
+                (str(skills), "/root/.hermes/profiles/profile-a/skills/skills.bin"),
+                (str(plans), "/root/.hermes/profiles/profile-a/plans/plans.bin"),
             ],
             upload_fn=MagicMock(),
             delete_fn=MagicMock(),

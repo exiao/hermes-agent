@@ -444,6 +444,8 @@ class FileSyncManager:
                 continue
             sync_bytes += file_key[1]
             relative = remote_path.split("/.hermes/", 1)[-1].lstrip("/")
+            if relative.startswith("profiles/"):
+                relative = relative.split("/", 2)[-1]
             directory = relative.split("/", 1)[0] or "."
             directory_bytes[directory] = directory_bytes.get(directory, 0) + file_key[1]
             if (

@@ -20,6 +20,7 @@ def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tm
             sync_calls.append(force)
 
     env = SimpleNamespace(
+        _remote_hermes_home="/home/remotesshuser/.hermes/profiles/profile-a",
         _remote_home="/home/remotesshuser",
         _sync_manager=FakeSyncManager(),
     )
@@ -35,7 +36,7 @@ def test_postprocess_adds_agent_visible_image_for_active_ssh_env(monkeypatch, tm
     assert result["image"] == str(image_path)
     assert result["host_image"] == str(image_path)
     assert result["agent_visible_image"] == (
-        "/home/remotesshuser/.hermes/cache/images/xai_grok-imagine-image_test.jpg"
+        "/home/remotesshuser/.hermes/profiles/profile-a/cache/images/xai_grok-imagine-image_test.jpg"
     )
     assert sync_calls == [True]
 

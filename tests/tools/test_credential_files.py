@@ -1,6 +1,7 @@
 """Tests for credential file passthrough and skills directory mounting."""
 
 import os
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -458,6 +459,40 @@ class TestToAgentVisiblePathPerBackend:
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         from tools.credential_files import to_agent_visible_cache_path
         assert to_agent_visible_cache_path(staged) == "~/.hermes/attachments/drop.zip"
+
+    def test_ssh_maps_to_active_profile_home(self, tmp_path, monkeypatch):
+        staged = self._staged(tmp_path, monkeypatch)
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_active_env",
+            lambda _: SimpleNamespace(
+                _remote_hermes_home="/home/alice/.hermes/profiles/profile-a"
+            ),
+        )
+        from tools.credential_files import to_agent_visible_cache_path
+        assert to_agent_visible_cache_path(staged) == (
+            "/home/alice/.hermes/profiles/profile-a/attachments/drop.zip"
+        )
+
+    def test_ssh_maps_plan_to_active_profile_home(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        plans = hermes_home / "plans"
+        plans.mkdir(parents=True)
+        plan = plans / "task.md"
+        plan.write_text("# plan")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_active_env",
+            lambda _: SimpleNamespace(
+                _remote_hermes_home="/home/alice/.hermes/profiles/profile-a"
+            ),
+        )
+        from tools.credential_files import to_agent_visible_cache_path
+
+        assert to_agent_visible_cache_path(str(plan)) == (
+            "/home/alice/.hermes/profiles/profile-a/plans/task.md"
+        )
 
     @pytest.mark.parametrize("backend", ["local", "singularity", ""])
     def test_untranslated_backends_keep_host_path(self, tmp_path, monkeypatch, backend):
