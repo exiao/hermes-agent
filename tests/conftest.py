@@ -894,6 +894,29 @@ def _reset_combined_test_state():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _restore_purged_modules():
+    """Put back any module a test deleted or replaced in ``sys.modules``.
+
+    Several test files force a fresh import by purging whole package prefixes
+    (``agent.``, ``tools.``, ``hermes_``). Under per-file process isolation
+    that is harmless, but in a combined run every already-imported test module
+    keeps a reference to the ORIGINAL module object while ``unittest.mock.patch``
+    targets look up the NEW one, so later patches silently apply to a module
+    nobody calls. Restoring the pre-test mapping keeps a purge local to the
+    test that wanted it.
+    """
+    before = dict(sys.modules)
+    yield
+    for _name, _module in before.items():
+        if sys.modules.get(_name) is not _module:
+            sys.modules[_name] = _module
+            _parent, _, _leaf = _name.rpartition(".")
+            _parent_mod = sys.modules.get(_parent) if _parent else None
+            if _parent_mod is not None and getattr(_parent_mod, _leaf, None) is not _module:
+                setattr(_parent_mod, _leaf, _module)
+
+
 # ── tui_gateway.server shared-module state isolation ───────────────────────
 #
 # ``tui_gateway.server`` registers its RPC handlers in a module-level
