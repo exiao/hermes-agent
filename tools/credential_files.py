@@ -685,7 +685,7 @@ def to_agent_visible_cache_path(
     backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
     if backend in ("docker", "modal"):
         pass  # /root/.hermes default
-    elif backend in ("ssh", "daytona", "vercel_sandbox"):
+    elif backend == "ssh":
         try:
             from tools.terminal_tool import get_active_env
             active_env = get_active_env("default")
@@ -695,6 +695,10 @@ def to_agent_visible_cache_path(
             )
         except Exception:
             container_base = _ssh_profile_remote_hermes_home()
+    elif backend in ("daytona", "vercel_sandbox"):
+        # These backends sync directly into <remote_home>/.hermes; unlike SSH,
+        # they do not use SSHEnvironment's profile-scoped remote root.
+        container_base = "~/.hermes"
     else:
         # Plugin-registered backends declare where synced cache files land
         # via ``cache_path_base``; None means host paths remain correct.

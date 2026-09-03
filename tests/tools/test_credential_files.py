@@ -479,6 +479,13 @@ class TestToAgentVisiblePathPerBackend:
             "/home/alice/.hermes/profiles/profile-a/attachments/drop.zip"
         )
 
+    @pytest.mark.parametrize("backend", ["daytona", "vercel_sandbox"])
+    def test_non_ssh_remote_backends_keep_unscoped_home(self, tmp_path, monkeypatch, backend):
+        staged = self._staged(tmp_path, monkeypatch)
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        from tools.credential_files import to_agent_visible_cache_path
+        assert to_agent_visible_cache_path(staged) == "~/.hermes/attachments/drop.zip"
+
     def test_ssh_maps_plan_to_active_profile_home(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         plans = hermes_home / "plans"
