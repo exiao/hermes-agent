@@ -703,3 +703,27 @@ class TestAsyncQueueLogging:
             for h in hermes_logging.rotating_file_handlers()
         )
 
+
+def test_concurrent_rollover_uses_current_file_and_keeps_other_errors(tmp_path):
+    log_path = tmp_path / "errors.log"
+    first = hermes_logging._ManagedRotatingFileHandler(str(log_path), maxBytes=1, backupCount=2, encoding="utf-8")
+    second = hermes_logging._ManagedRotatingFileHandler(str(log_path), maxBytes=1, backupCount=2, encoding="utf-8")
+    try:
+        log_path.write_text("before\n")
+        first.doRollover()
+        def race(source, destination):
+            if source == str(tmp_path / "errors.log.1"):
+                os.replace(source, destination)
+                raise FileNotFoundError(source, destination)
+            return os.replace(source, destination)
+        with patch.object(hermes_logging.os, "rename", side_effect=race):
+            second.doRollover()
+        second.emit(logging.LogRecord("test", logging.INFO, "", 0, "after", (), None))
+        assert "after" in log_path.read_text()
+        with patch.object(hermes_logging.RotatingFileHandler, "doRollover", side_effect=PermissionError):
+            with pytest.raises(PermissionError):
+                second.doRollover()
+    finally:
+        first.close()
+        second.close()
+

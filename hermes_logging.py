@@ -548,11 +548,14 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         return stream
 
     def doRollover(self):
-        super().doRollover()
+        try:
+            super().doRollover()
+        except FileNotFoundError:
+            # Another process completed the same rollover first.
+            pass
         self._chmod_if_managed()
-        # Our own rollover writes a new baseFilename; refresh the snapshot
-        # so the next emit doesn't mistake it for external rotation.
         self._record_stream_stat()
+        self._reopen_if_externally_rotated()
 
 
 class _ProfileRoutingFileHandler(logging.Handler):
