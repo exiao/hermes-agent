@@ -323,3 +323,4 @@ class TestSSHManifest:
 
         assert first._sync_manifest_key != second._sync_manifest_key
         assert first._sync_manifest_path != second._sync_manifest_path
+        assert first._remote_hermes_home != second._remote_hermes_home

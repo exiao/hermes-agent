@@ -175,6 +175,11 @@ def _is_skill_remote_path(remote_path: str) -> bool:
     if marker not in remote_path:
         return False
     relative = remote_path.split(marker, 1)[1]
+    if relative.startswith("profiles/"):
+        parts = relative.split("/", 2)
+        if len(parts) != 3:
+            return False
+        relative = parts[2]
     return relative.startswith(("skills/", "external_skills/", "project_skills/"))
 
 

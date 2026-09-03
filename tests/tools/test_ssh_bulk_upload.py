@@ -36,7 +36,9 @@ def mock_env(monkeypatch):
         ssh_env, "FileSyncManager",
         lambda **kw: type("M", (), {"sync": lambda self, **k: None})(),
     )
-    return SSHEnvironment(host="example.com", user="testuser")
+    env = SSHEnvironment(host="example.com", user="testuser")
+    env._remote_hermes_home = "/home/testuser/.hermes"
+    return env
 
 
 class TestSSHBulkUpload:

@@ -152,17 +152,16 @@ class SSHEnvironment(BaseEnvironment):
         manifest_scope = hashlib.sha256(
             hermes_home_key().encode()
         ).hexdigest()
-        self._sync_manifest_path = (
-            f"{self._remote_home}/.hermes/.sync-manifest-{manifest_scope}.json"
-        )
+        self._remote_hermes_home = f"{self._remote_home}/.hermes/profiles/{manifest_scope}"
+        self._sync_manifest_path = f"{self._remote_hermes_home}/.sync-manifest.json"
         self._sync_manifest_key = (
             f"{hermes_home_key()}|{self.user}@{self.host}:{self.port}|"
-            f"{self._remote_home}/.hermes"
+            f"{self._remote_hermes_home}"
         )
 
         self._ensure_remote_dirs()
         self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+            get_files_fn=lambda: iter_sync_files(self._remote_hermes_home),
             upload_fn=self._scp_upload,
             delete_fn=self._ssh_delete,
             bulk_upload_fn=self._ssh_bulk_upload,
@@ -340,7 +339,7 @@ class SSHEnvironment(BaseEnvironment):
 
     def _ensure_remote_dirs(self) -> None:
         """Create base ~/.hermes directory tree on remote in one SSH call."""
-        base = f"{self._remote_home}/.hermes"
+        base = self._remote_hermes_home
         dirs = [base, f"{base}/skills", f"{base}/credentials", f"{base}/cache"]
         cmd = self._build_ssh_command()
         cmd.append(quoted_mkdir_command(dirs))
@@ -405,7 +404,7 @@ class SSHEnvironment(BaseEnvironment):
         if not files:
             return
 
-        base = f"{self._remote_home}/.hermes"
+        base = self._remote_hermes_home
         parents = unique_parent_dirs(files)
         if parents:
             cmd = self._build_ssh_command()
@@ -560,7 +559,7 @@ class SSHEnvironment(BaseEnvironment):
         """Download remote .hermes/ as a tar archive."""
         # Tar from / with the full path so archive entries preserve absolute
         # paths (e.g. home/user/.hermes/skills/f.py), matching _pushed_hashes keys.
-        rel_base = f"{self._remote_home}/.hermes".lstrip("/")
+        rel_base = self._remote_hermes_home.lstrip("/")
         ssh_cmd = self._build_ssh_command()
         # The remote tree is live: a running agent writes cache and log files
         # while tar reads them, which tar reports as "file changed as we read
@@ -642,6 +641,7 @@ class SSHEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn an SSH process that runs bash on the remote host."""
         cmd = self._build_ssh_command()
+        cmd_string = f"export HERMES_HOME={shlex.quote(self._remote_hermes_home)}; {cmd_string}"
         if login:
             cmd.extend(["bash", "-l", "-c", shlex.quote(cmd_string)])
         else:
