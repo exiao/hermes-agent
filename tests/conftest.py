@@ -800,6 +800,100 @@ def _state_db_write_guard(request, monkeypatch):
 # approvals from one test's session into another's.
 
 
+@pytest.fixture(autouse=True)
+def _reset_combined_test_state():
+    """Reset process state that must not cross a multi-file pytest run.
+
+    The canonical runner starts one process per test file, but direct pytest
+    invocations and CI diagnostics intentionally combine files in one worker.
+    Keep those runs equivalent by clearing the same mutable registries and
+    context-local values at each test boundary.
+    """
+    try:
+        from tools import approval as _approval_mod
+        for _name in (
+            "_session_approved",
+            "_session_yolo",
+            "_permanent_approved",
+            "_pending",
+            "_gateway_queues",
+            "_gateway_notify_cbs",
+        ):
+            getattr(_approval_mod, _name).clear()
+        _approval_mod._approval_session_key.set("")
+    except Exception:
+        pass
+
+    try:
+        from tools import interrupt as _interrupt_mod
+        with _interrupt_mod._lock:
+            _interrupt_mod._interrupted_threads.clear()
+    except Exception:
+        pass
+
+    try:
+        from gateway import session_context as _session_context
+        for _context_var in (
+            _session_context._SESSION_PLATFORM,
+            _session_context._SESSION_CHAT_ID,
+            _session_context._SESSION_CHAT_NAME,
+            _session_context._SESSION_THREAD_ID,
+            _session_context._SESSION_USER_ID,
+            _session_context._SESSION_USER_NAME,
+            _session_context._SESSION_KEY,
+            _session_context._CRON_AUTO_DELIVER_PLATFORM,
+            _session_context._CRON_AUTO_DELIVER_CHAT_ID,
+            _session_context._CRON_AUTO_DELIVER_THREAD_ID,
+        ):
+            _context_var.set(_session_context._UNSET)
+    except Exception:
+        pass
+
+    try:
+        from tools import env_passthrough as _env_passthrough
+        _env_passthrough._allowed_env_vars_var.set(set())
+        _env_passthrough._config_passthrough = None
+    except Exception:
+        pass
+
+    try:
+        from tools import credential_files as _credential_files
+        _credential_files._registered_files_var.set({})
+        _credential_files._config_files = None
+    except Exception:
+        pass
+
+    try:
+        from tools import file_tools as _file_tools
+        with _file_tools._read_tracker_lock:
+            _file_tools._read_tracker.clear()
+        with _file_tools._file_ops_lock:
+            _file_tools._file_ops_cache.clear()
+        _file_tools._max_read_chars_cached = None
+    except Exception:
+        pass
+
+    try:
+        from agent import secret_scope as _secret_scope
+        _secret_scope.set_multiplex_active(False)
+        _secret_scope.set_secret_scope(None)
+    except Exception:
+        pass
+
+    try:
+        from agent import skill_commands as _skill_commands
+        _skill_commands._skill_commands.clear()
+        _skill_commands._skill_commands_platform = None
+    except Exception:
+        pass
+
+    try:
+        from agent import file_safety as _file_safety
+        _file_safety._deny_path_set_cache = None
+    except Exception:
+        pass
+
+
 # ── tui_gateway.server shared-module state isolation ───────────────────────
 #
 # ``tui_gateway.server`` registers its RPC handlers in a module-level
