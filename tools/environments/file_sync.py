@@ -276,6 +276,7 @@ class FileSyncManager:
         self._manifest_load_fn = manifest_load_fn
         self._manifest_save_fn = manifest_save_fn
         self._manifest_needs_save = False
+        self._large_sync_warning_active = False
         self._load_persisted_state()
         # Memo for the upload-only set (see _refresh_upload_only_paths).
         # Per-instance, never module-global: each manager belongs to one
@@ -414,16 +415,19 @@ class FileSyncManager:
             new_files[remote_path] = file_key
 
         if sync_bytes > _SYNC_WARNING_BYTES and directory_bytes:
-            largest_directory, largest_bytes = max(
-                directory_bytes.items(), key=lambda item: item[1]
-            )
-            logger.warning(
-                "file_sync: sync set is %.1f MB; largest directory is %s (%.1f MB)",
-                sync_bytes / (1024 * 1024),
-                largest_directory,
-                largest_bytes / (1024 * 1024),
-            )
-
+            if not self._large_sync_warning_active:
+                largest_directory, largest_bytes = max(
+                    directory_bytes.items(), key=lambda item: item[1]
+                )
+                logger.warning(
+                    "file_sync: sync set is %.1f MB; largest directory is %s (%.1f MB)",
+                    sync_bytes / (1024 * 1024),
+                    largest_directory,
+                    largest_bytes / (1024 * 1024),
+                )
+            self._large_sync_warning_active = True
+        else:
+            self._large_sync_warning_active = False
         # Anything about to be uploaded may be newly upload-only: a brand new
         # remote path, or an EXISTING one whose symlink was retargeted at the
         # same container path. An upload is the usual signal, but a retarget to

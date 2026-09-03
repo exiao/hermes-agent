@@ -477,6 +477,7 @@ class TestPersistedState:
 
         with caplog.at_level("WARNING", logger="tools.environments.file_sync"):
             mgr.sync(force=True)
+            mgr.sync(force=True)
 
-        assert "sync set is" in caplog.text
+        assert caplog.text.count("sync set is") == 1
         assert "largest directory is skills" in caplog.text

@@ -250,3 +250,51 @@ class TestPersistentSSH:
         assert len(lines) == 1000
         assert lines[0] == "1"
         assert lines[-1] == "1000"
+
+
+class TestSSHManifest:
+    @staticmethod
+    def _env():
+        env = object.__new__(SSHEnvironment)
+        env.host = "example.com"
+        env.user = "alice"
+        env.port = 22
+        env.key_path = ""
+        env.control_socket = "/tmp/hermes-ssh-test.sock"
+        env._remote_home = "/home/alice"
+        env._sync_manifest_path = "/home/alice/.hermes/.sync-manifest.json"
+        env._sync_manifest_key = "alice@example.com:22|/home/alice/.hermes"
+        return env
+
+    def test_loads_versioned_manifest(self, monkeypatch):
+        env = self._env()
+        payload = {
+            "version": 1,
+            "key": env._sync_manifest_key,
+            "files": {"/home/alice/.hermes/skills/a.md": [1.5, 3]},
+        }
+        run = MagicMock(return_value=subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(payload), stderr=""
+        ))
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+
+        assert env._load_sync_manifest() == {
+            "/home/alice/.hermes/skills/a.md": (1.5, 3)
+        }
+        run.assert_called_once()
+
+    def test_saves_manifest_atomically_over_ssh(self, monkeypatch):
+        env = self._env()
+        run = MagicMock(return_value=subprocess.CompletedProcess(
+            [], 0, stdout="", stderr=""
+        ))
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+
+        env._save_sync_manifest({"/home/alice/.hermes/skills/a.md": (1.5, 3)})
+
+        kwargs = run.call_args.kwargs
+        saved = json.loads(kwargs["input"])
+        assert saved["version"] == 1
+        assert saved["key"] == env._sync_manifest_key
+        assert saved["files"] == {"/home/alice/.hermes/skills/a.md": [1.5, 3]}
+        assert "mktemp" in run.call_args.args[0][-1]
