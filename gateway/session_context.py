@@ -416,6 +416,16 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def get_session_source(default: str = "") -> str:
+    """Resolve the session source without leaking a cleared CLI context."""
+    source = get_session_env("HERMES_SESSION_SOURCE", default)
+    if source or _SESSION_PLATFORM.get() is not _UNSET:
+        return source
+    import os
+
+    return os.getenv("HERMES_SESSION_SOURCE", default)
+
+
 # Surfaces that are not a human chat channel. The gateway binds a platform
 # value (``telegram``) to HERMES_SESSION_PLATFORM, while the CLI, TUI, and
 # desktop bind HERMES_SESSION_SOURCE (``cli``, ``tui``, ``desktop``) and leave
@@ -460,7 +470,7 @@ def session_is_messaging_surface() -> bool:
     import os
 
     platform = os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM", "")
-    source = get_session_env("HERMES_SESSION_SOURCE", "")
+    source = get_session_source("")
     for identity in (platform, source):
         identity = str(identity or "").strip().lower()
         if identity and identity not in NON_MESSAGING_SESSION_SURFACES:
