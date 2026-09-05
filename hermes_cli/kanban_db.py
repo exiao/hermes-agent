@@ -13768,10 +13768,11 @@ def add_notify_sub(
 
     ``delivery_mode`` (see ``_NOTIFY_DELIVERY_MODES``) selects how the
     kanban-notifier reacts to a terminal event for this subscription. ``None``
-    leaves an existing row's mode untouched (and inserts the ``"notify"``
-    default for a fresh row); an explicit value is last-write-wins, so an
-    operator can intentionally re-subscribe to change the mode (e.g.
-    ``notify`` -> ``wake``). An unknown value falls back to ``"notify"``.
+    leaves an existing row's mode untouched (and inserts ``"notify+wake"`` for
+    a fresh row, or ``"notify"`` when the platform is ``tui``); an explicit
+    value is last-write-wins, so an operator can intentionally re-subscribe to
+    change the mode (e.g. ``notify+wake`` -> ``notify``). An unknown value
+    falls back to the same platform default.
     New subscriptions start "caught up": ``last_event_id`` snaps to the
     task's current ``MAX(task_events.id)`` at creation instead of the
     schema default 0. A cursor of 0 on an already-active task made the
@@ -13782,13 +13783,20 @@ def add_notify_sub(
     task creation, where the snapshot is 0 anyway.
     """
     insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else (
-        # api_server is stateless: the adapter has no send() — the wake
-        # self-post IS the delivery on that path (see gateway/wake.py and
-        # test_kanban_notifier_apiserver_wake). A plain-'notify' default
-        # would leave those subscriptions with no delivery mechanism at
-        # all, regressing the pre-delivery_mode behavior where a task
-        # carrying a session_id always woke. Explicit modes still win.
-        "notify+wake" if platform == "api_server" else "notify"
+        # A chat that files a card wants to hear back from the AGENT, not just
+        # a one-line ping — passive 'notify' sends a message and runs no turn,
+        # so the card completes and the conversation stays dead. Every path
+        # that already knew better (the kanban_create tool, /kanban create)
+        # was passing 'notify+wake' explicitly; the paths that forgot
+        # (hermes kanban notify-subscribe, the dashboard home-subscribe route)
+        # inherited passive delivery by accident. Measured 2026-09-05: 1,103
+        # of 1,123 live subscriptions were passive. Defaulting here fixes the
+        # whole class instead of one caller.
+        #
+        # 'tui' is the exception and keeps passive delivery: the TUI poller
+        # (tui_gateway/server.py) posts the completion into the running
+        # session itself and has no wake path to drive.
+        "notify" if platform == "tui" else "notify+wake"
     )
     insert_chat_type = chat_type or "dm"
     now = int(time.time())

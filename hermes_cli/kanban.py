@@ -898,11 +898,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         choices=kb._NOTIFY_DELIVERY_MODES,
         default=None,
         help="How the kanban-notifier reacts to terminal events for this "
-             "subscription: 'notify' (passive message only; default), "
+             "subscription: 'notify' (passive message only), "
              "'notify+wake' (message AND wake the destination gateway agent so "
-             "it reads the full board context and replies in its own voice), or "
+             "it reads the full board context and replies in its own voice; "
+             "the default), or "
              "'wake' (wake the agent only, no passive message). Omit to leave an "
-             "existing subscription's mode unchanged (new subs default to 'notify').",
+             "existing subscription's mode unchanged.",
     )
 
     p_nlist = sub.add_parser(
