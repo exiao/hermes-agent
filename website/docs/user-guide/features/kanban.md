@@ -1053,12 +1053,12 @@ A subscription removes itself automatically once the task reaches `done` or `arc
 
 ### Delivery modes
 
-`--delivery-mode` controls **how** the notifier reacts to a terminal event. Every subscription is in one of three modes (`notify` is the default and the original behavior):
+`--delivery-mode` controls **how** the notifier reacts to a terminal event. Every subscription is in one of three modes (`notify+wake` is the default for new subscriptions):
 
 | Mode | Passive message | Wakes the agent | Use it when |
 |------|-----------------|-----------------|-------------|
-| `notify` | yes | no | You just want a heads-up message in the chat (default). |
-| `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice. Chat-originated auto-subscribes use this. |
+| `notify` | yes | no | You just want a heads-up message in the chat. |
+| `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice (default for new subscriptions). |
 | `wake` | no | yes | You only want the agent to act on the event, with no separate ping. |
 
 A "wake" forges a synthetic inbound message to the destination gateway agent so it takes a normal turn (reads the comment + result, reasons, replies) instead of getting a one-line passive notification. It only fires when the notifier runs inside a live gateway process; otherwise a `notify+wake` subscription still delivers its passive message, while a `wake`-only subscription does nothing in that process.

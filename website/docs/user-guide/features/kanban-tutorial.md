@@ -307,4 +307,4 @@ Status is `Running`. The active run appears in the Run History section with outc
 - [Kanban overview](./kanban) — the full data model, event vocabulary, and CLI reference.
 - `hermes kanban --help` — every subcommand, every flag.
 - `hermes kanban watch --kinds completed,gave_up,timed_out` — live stream terminal events across the whole board.
-- `hermes kanban notify-subscribe <task> --platform telegram --chat-id <id>` — get a gateway ping when a specific task finishes.
+- `hermes kanban notify-subscribe <task> --platform telegram --chat-id <id>` — get a gateway ping and wake the agent when a specific task finishes. Pass `--delivery-mode notify` for a passive ping only.
