@@ -1829,7 +1829,7 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
-def _delegation_fallback_chain():
+def _delegation_fallback_chain(config=None):
     """Explicit fallback chain for a provider-pinned delegation child.
 
     Read from ``delegation.fallback_providers`` (same shape as the top-level
@@ -1843,12 +1843,16 @@ def _delegation_fallback_chain():
     Naming the chain under ``delegation`` keeps the reroute explicit and
     scoped to children.
     """
-    try:
-        from hermes_cli.config import load_config, cfg_get
-        chain = cfg_get(load_config(), "delegation", "fallback_providers",
-                        default=None)
-    except Exception:
+    if config is None:
+        try:
+            from hermes_cli.config import load_config, cfg_get
+
+            config = cfg_get(load_config(), "delegation", default=None)
+        except Exception:
+            return None
+    if not isinstance(config, dict):
         return None
+    chain = config.get("fallback_providers")
     if not isinstance(chain, list) or not chain:
         return None
     # Same entry shape the top-level chain uses; drop anything malformed
@@ -1875,6 +1879,7 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
+    override_fallback_providers: Optional[List[Dict[str, Any]]] = None,
     override_max_tokens: Optional[int] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
@@ -2173,7 +2178,7 @@ def _build_child_agent(
     # accident.  Without it a single 429 ends the run outright, which is
     # what happened on 2026-09-05 to a meta-ai-pinned child.
     parent_fallback = (
-        _delegation_fallback_chain()
+        override_fallback_providers
         if override_provider
         else (getattr(parent_agent, "_fallback_chain", None) or None)
     )
@@ -4352,6 +4357,7 @@ def delegate_task(
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
                 override_request_overrides=creds.get("request_overrides"),
+                override_fallback_providers=creds.get("fallback_providers"),
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
@@ -4984,6 +4990,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+    configured_fallback_providers = _delegation_fallback_chain(cfg)
 
     # delegation.request_overrides: explicit per-child request settings from
     # config. Honored on EVERY resolution branch (direct base_url, named
@@ -5103,6 +5110,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "fallback_providers": configured_fallback_providers,
             "request_overrides": request_overrides,
             "max_output_tokens": max_output_tokens,
         }
@@ -5120,6 +5128,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": None,
             "api_key": None,
             "api_mode": None,
+            "fallback_providers": configured_fallback_providers,
             "request_overrides": _merge_request_overrides(
                 getattr(parent_agent, "request_overrides", None),
                 explicit_request_overrides,
@@ -5167,6 +5176,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
+        "fallback_providers": configured_fallback_providers,
         # Explicit delegation.request_overrides merges OVER the named
         # provider's runtime overrides (explicit wins; extra_body deep-merged
         # one level) — same precedence as the direct-base_url branch above.

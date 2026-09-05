@@ -1004,6 +1004,22 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["api_key"])
         self.assertIsNone(creds["api_mode"])
         self.assertIsNone(creds["model"])
+        self.assertIsNone(creds["fallback_providers"])
+
+    def test_credentials_use_fallbacks_from_effective_config(self):
+        parent = _make_mock_parent(depth=0)
+        fallback_chain = [{"provider": "anthropic", "model": "claude-sonnet-5"}]
+        creds = _resolve_delegation_credentials(
+            {
+                "model": "review-model",
+                "provider": "",
+                "base_url": "http://localhost:1234/v1",
+                "api_key": "local-key",
+                "fallback_providers": fallback_chain,
+            },
+            parent,
+        )
+        self.assertEqual(creds["fallback_providers"], fallback_chain)
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
         parent = _make_mock_parent(depth=0)
@@ -2430,6 +2446,31 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+    def test_pinned_provider_uses_effective_config_fallback_chain(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "parent-model", "api_key": "parent-key"}
+        ]
+        child_chain = [{"provider": "anthropic", "model": "claude-sonnet-5"}]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test effective fallback chain",
+                context=None,
+                toolsets=None,
+                model="review-model",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="openrouter",
+                override_fallback_providers=child_chain,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], child_chain)
 
     def test_pinned_acp_command_missing_raises(self):
         """A pinned delegation command absent from PATH must refuse the spawn

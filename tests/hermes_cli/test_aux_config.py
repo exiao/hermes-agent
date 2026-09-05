@@ -146,7 +146,12 @@ def test_reset_aux_clears_delegation_routing_preserves_settings(tmp_path, monkey
     cfg = _lc()
     cfg.setdefault("delegation", {})
     cfg["delegation"].update(
-        {"provider": "openrouter", "model": "x", "max_concurrent_children": 7}
+        {
+            "provider": "openrouter",
+            "model": "x",
+            "fallback_providers": [{"provider": "anthropic", "model": "m"}],
+            "max_concurrent_children": 7,
+        }
     )
     save_config(cfg)
 
@@ -157,6 +162,7 @@ def test_reset_aux_clears_delegation_routing_preserves_settings(tmp_path, monkey
     d = cfg["delegation"]
     assert d["provider"] == ""
     assert d["model"] == ""
+    assert d["fallback_providers"] == []
     assert d["max_concurrent_children"] == 7
 
 

@@ -4518,9 +4518,9 @@ def _reset_aux_to_auto() -> int:
     dele = cfg.get("delegation")
     if isinstance(dele, dict):
         changed = False
-        for field in ("provider", "model", "base_url", "api_key"):
+        for field in ("provider", "model", "base_url", "api_key", "fallback_providers"):
             if dele.get(field):
-                dele[field] = ""
+                dele[field] = [] if field == "fallback_providers" else ""
                 changed = True
         if changed:
             count += 1
