@@ -1829,6 +1829,37 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+def _delegation_fallback_chain():
+    """Explicit fallback chain for a provider-pinned delegation child.
+
+    Read from ``delegation.fallback_providers`` (same shape as the top-level
+    ``fallback_providers``). Returns None when unset, which preserves the
+    fail-loud behaviour a bare pin has always had.
+
+    This exists because ``delegation.provider`` suppresses inheritance of the
+    parent's chain on purpose (#80450: a quiet child must not silently
+    reroute onto the parent's models mid-run). The suppression left a pinned
+    child with no recovery whatsoever, so one upstream 429 ended the run.
+    Naming the chain under ``delegation`` keeps the reroute explicit and
+    scoped to children.
+    """
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        chain = cfg_get(load_config(), "delegation", "fallback_providers",
+                        default=None)
+    except Exception:
+        return None
+    if not isinstance(chain, list) or not chain:
+        return None
+    # Same entry shape the top-level chain uses; drop anything malformed
+    # rather than handing AIAgent a half-built entry.
+    clean = [
+        e for e in chain
+        if isinstance(e, dict) and e.get("provider") and e.get("model")
+    ]
+    return clean or None
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -2134,8 +2165,15 @@ def _build_child_agent(
     # same class of silent-drag the override_provider filter-clearing below
     # already prevents for OpenRouter routing preferences.  Predictability >
     # liveness for explicit pins: the pinned child fails loudly instead.
+    #
+    # A pinned child may still opt IN to its own chain via
+    # delegation.fallback_providers.  That is not the silent inheritance
+    # #80450 forbids: the user named these providers for the child
+    # explicitly, so the reroute is declared rather than inherited by
+    # accident.  Without it a single 429 ends the run outright, which is
+    # what happened on 2026-09-05 to a meta-ai-pinned child.
     parent_fallback = (
-        None
+        _delegation_fallback_chain()
         if override_provider
         else (getattr(parent_agent, "_fallback_chain", None) or None)
     )

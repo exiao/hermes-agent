@@ -2138,6 +2138,17 @@ DEFAULT_CONFIG = {
     "delegation": {
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        # Fallback chain for PINNED children, same shape as the top-level
+        # "fallback_providers": [{"provider": ..., "model": ...}, ...].
+        # Only consulted when "provider" above is set. A pin means "children
+        # run on THIS provider", so the parent's chain is deliberately NOT
+        # inherited (a mid-run 429 must not silently reroute a quiet child
+        # onto the parent's models). That left a pinned child with no
+        # recovery at all: one rate-limit ended the run. This key is the
+        # explicit opt-in — the user names the pinned child's own fallbacks,
+        # so the reroute is declared rather than inherited by accident.
+        # Empty (default) keeps the fail-loud behaviour.
+        "fallback_providers": [],
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "api_mode": "",    # wire protocol for delegation.base_url: "chat_completions",
