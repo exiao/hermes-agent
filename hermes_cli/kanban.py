@@ -3100,7 +3100,15 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
         delivery_mode = getattr(args, "delivery_mode", None)
-        if delivery_mode is None and args.chat_type is None:
+        route_ready = (
+            args.chat_type == "dm"
+            or (args.chat_type == "thread" and args.thread_id)
+            or (
+                args.chat_type in ("group", "channel")
+                and (args.user_id or getattr(args, "user_id_alt", None))
+            )
+        )
+        if delivery_mode is None and not route_ready:
             existing = conn.execute(
                 """
                 SELECT 1 FROM kanban_notify_subs

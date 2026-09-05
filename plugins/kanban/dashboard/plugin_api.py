@@ -2543,6 +2543,13 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        existing = conn.execute(
+            """
+            SELECT 1 FROM kanban_notify_subs
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (task_id, platform, home["chat_id"], home["thread_id"] or ""),
+        ).fetchone()
         kanban_db.add_notify_sub(
             conn,
             task_id=task_id,
@@ -2552,7 +2559,7 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
             notifier_profile=_active_profile_name(),
             # Dashboard home subscriptions lack the originating session's
             # routing data, so they must not create a wake with a guessed DM key.
-            delivery_mode="notify",
+            delivery_mode="notify" if existing is None else None,
         )
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:

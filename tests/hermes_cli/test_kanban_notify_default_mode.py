@@ -86,7 +86,7 @@ def test_cli_notify_subscribe_wakes_by_default(board):
     args = parser.parse_args([
         "notify-subscribe", tid,
         "--platform", "signal", "--chat-id", "group:abc",
-        "--chat-type", "group",
+        "--chat-type", "group", "--user-id", "user-1",
     ])
     assert kanban_cli.kanban_command(args) == 0
     assert _mode(board, tid) == "notify+wake"
@@ -100,6 +100,20 @@ def test_cli_notify_subscribe_without_chat_type_stays_passive(board):
     args = parser.parse_args([
         "notify-subscribe", tid,
         "--platform", "signal", "--chat-id", "group:abc",
+    ])
+    assert kanban_cli.kanban_command(args) == 0
+    assert _mode(board, tid) == "notify"
+
+
+def test_cli_group_subscribe_without_participant_stays_passive(board):
+    """A group type without the participant key must not wake a shared guess."""
+    tid = kb.create_task(board, title="t", assignee="dev")
+    top = argparse.ArgumentParser(prog="hermes")
+    parser = kanban_cli.build_parser(top.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "notify-subscribe", tid,
+        "--platform", "signal", "--chat-id", "group:abc",
+        "--chat-type", "group",
     ])
     assert kanban_cli.kanban_command(args) == 0
     assert _mode(board, tid) == "notify"
