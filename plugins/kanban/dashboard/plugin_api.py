@@ -2550,6 +2550,9 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
             chat_id=home["chat_id"],
             thread_id=home["thread_id"] or None,
             notifier_profile=_active_profile_name(),
+            # Dashboard home subscriptions lack the originating session's
+            # routing data, so they must not create a wake with a guessed DM key.
+            delivery_mode="notify",
         )
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:
