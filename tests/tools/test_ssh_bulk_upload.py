@@ -36,7 +36,9 @@ def mock_env(monkeypatch):
         ssh_env, "FileSyncManager",
         lambda **kw: type("M", (), {"sync": lambda self, **k: None})(),
     )
-    return SSHEnvironment(host="example.com", user="testuser")
+    env = SSHEnvironment(host="example.com", user="testuser")
+    env._remote_hermes_home = "/home/testuser/.hermes"
+    return env
 
 
 class TestSSHBulkUpload:
@@ -80,9 +82,13 @@ class TestSSHBulkUpload:
              patch.object(subprocess, "Popen", side_effect=make_proc):
             mock_env._ssh_bulk_upload(files)
 
-        # Exactly one subprocess.run call for mkdir
-        assert mock_run.call_count == 1
-        mkdir_cmd = mock_run.call_args[0][0]
+        # The gzip capability probe is also a run; count mkdir calls only.
+        mkdir_calls = [
+            call.args[0] for call in mock_run.call_args_list
+            if "mkdir -p" in " ".join(call.args[0])
+        ]
+        assert len(mkdir_calls) == 1
+        mkdir_cmd = mkdir_calls[0]
         # Should contain mkdir -p with both parent dirs
         mkdir_str = " ".join(mkdir_cmd)
         assert "mkdir -p" in mkdir_str

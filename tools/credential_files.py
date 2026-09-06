@@ -7,6 +7,7 @@ dirs, and host cache dirs to mount or sync in, at creation and before each comma
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import posixpath
@@ -63,6 +64,14 @@ def _contained_host_path(rel: str, hermes_home: Path, abs_msg: str, traversal_ms
         logger.warning(traversal_msg, rel, containment_error)
         return None
     return host_path.resolve()
+
+
+def _ssh_profile_remote_hermes_home() -> str:
+    """Return the deterministic SSH Hermes root before an env exists."""
+    from hermes_constants import hermes_home_key
+
+    scope = hashlib.sha256(hermes_home_key().encode()).hexdigest()
+    return f"~/.hermes/profiles/{scope}"
 
 
 def register_credential_file(relative_path: str, container_base: str = "/root/.hermes") -> bool:
@@ -376,6 +385,31 @@ def _remap_cache_path(path: str, container_base: str, src: str, dst: str, join: 
     return None
 
 
+def _map_plan_path_to_container(
+    host_path: str,
+    container_base: str,
+) -> Optional[str]:
+    """Map a host plan path into the active remote Hermes profile root."""
+    from hermes_constants import get_default_hermes_root
+
+    hermes_home = _resolve_hermes_home()
+    plans_dirs = [get_default_hermes_root(hermes_home) / "plans"]
+    profile_plans = hermes_home / "plans"
+    if profile_plans not in plans_dirs:
+        plans_dirs.append(profile_plans)
+
+    path = Path(host_path)
+    for plans_dir in plans_dirs:
+        try:
+            relative = path.relative_to(plans_dir)
+        except ValueError:
+            continue
+        return posixpath.join(
+            container_base.rstrip("/"), "plans", relative.as_posix()
+        )
+    return None
+
+
 def map_cache_path_to_container(host_path: str, container_base: str = "/root/.hermes") -> Optional[str]:
     """POSIX container path for a host path under an auto-mounted cache dir, else None."""
     return _remap_cache_path(host_path, container_base, "host_path", "container_path", lambda root, rel: posixpath.join(root, rel.as_posix()))
@@ -409,7 +443,27 @@ def to_agent_visible_cache_path(host_path: str, container_base: str = "/root/.he
     (#76577 gap).
     """
     backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
-    if backend in _HOME_RELATIVE_BACKENDS:
+    if backend in ("docker", "modal"):
+        pass  # /root/.hermes default
+    elif backend == "ssh":
+        # ssh is home-relative like daytona/vercel_sandbox, but NOT plain
+        # "~/.hermes": this PR gives each profile its own remote root so two
+        # profiles cannot overwrite each other's synced trees. Resolve the
+        # live environment's root, falling back to the profile-scoped default.
+        # Keeping ssh inside _HOME_RELATIVE_BACKENDS here would re-collapse
+        # every profile onto one shared path, which is the bug this PR fixes.
+        try:
+            from tools.terminal_tool import get_active_env
+            active_env = get_active_env("default")
+            container_base = (
+                getattr(active_env, "_remote_hermes_home", None)
+                or _ssh_profile_remote_hermes_home()
+            )
+        except Exception:
+            container_base = _ssh_profile_remote_hermes_home()
+    elif backend in _HOME_RELATIVE_BACKENDS:
+        # These backends sync directly into <remote_home>/.hermes; unlike SSH,
+        # they do not use SSHEnvironment's profile-scoped remote root.
         container_base = "~/.hermes"
     elif backend not in ("docker", "modal"):
         try:
@@ -422,6 +476,11 @@ def to_agent_visible_cache_path(host_path: str, container_base: str = "/root/.he
         container_base = str(plugin_base)
 
     mapped = map_cache_path_to_container(host_path, container_base=container_base)
+    if mapped is None:
+        # SSH syncs plans into the profile-scoped Hermes root as well.  Keep
+        # plan paths in card references aligned with that remote location,
+        # just like attachments and cached media.
+        mapped = _map_plan_path_to_container(host_path, container_base)
     return mapped if mapped is not None else host_path
 
 

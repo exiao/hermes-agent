@@ -347,3 +347,159 @@ class TestPersistentSSH:
         assert len(lines) == 1000
         assert lines[0] == "1"
         assert lines[-1] == "1000"
+
+
+class TestSSHManifest:
+    @staticmethod
+    def _env():
+        env = object.__new__(SSHEnvironment)
+        env.host = "example.com"
+        env.user = "alice"
+        env.port = 22
+        env.key_path = ""
+        env.control_socket = "/tmp/hermes-ssh-test.sock"
+        env._remote_home = "/home/alice"
+        env._sync_manifest_path = "/home/alice/.hermes/.sync-manifest.json"
+        env._sync_manifest_key = "/home/alice/.hermes|alice@example.com:22|/home/alice/.hermes"
+        return env
+
+    def test_loads_versioned_manifest(self, monkeypatch):
+        env = self._env()
+        payload = {
+            "version": 1,
+            "key": env._sync_manifest_key,
+            "files": {"/home/alice/.hermes/skills/a.md": [1.5, 3]},
+        }
+        run = MagicMock(return_value=subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(payload), stderr=""
+        ))
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+
+        assert env._load_sync_manifest() == (
+            {"/home/alice/.hermes/skills/a.md": (1.5, 3)},
+            {},
+        )
+        run.assert_called_once()
+
+    def test_saves_manifest_atomically_over_ssh(self, monkeypatch):
+        env = self._env()
+        run = MagicMock(return_value=subprocess.CompletedProcess(
+            [], 0, stdout="", stderr=""
+        ))
+        monkeypatch.setattr(ssh_env.subprocess, "run", run)
+
+        env._save_sync_manifest(
+            {"/home/alice/.hermes/skills/a.md": (1.5, 3)},
+            {"/home/alice/.hermes/skills/a.md": "a" * 64},
+        )
+
+        kwargs = run.call_args.kwargs
+        saved = json.loads(kwargs["input"])
+        assert saved["version"] == 1
+        assert saved["key"] == env._sync_manifest_key
+        assert saved["files"] == {"/home/alice/.hermes/skills/a.md": [1.5, 3]}
+        assert saved["hashes"] == {"/home/alice/.hermes/skills/a.md": "a" * 64}
+        assert "mktemp" in run.call_args.args[0][-1]
+
+    def test_manifest_key_is_scoped_to_local_hermes_home(self, monkeypatch):
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/alice")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+        monkeypatch.setattr(
+            ssh_env,
+            "FileSyncManager",
+            lambda **kw: type("M", (), {"sync": lambda self, **k: None})(),
+        )
+
+        monkeypatch.setattr(ssh_env, "hermes_home_key", lambda: "/home/alice/.hermes")
+        first = SSHEnvironment(host="example.com", user="alice")
+        monkeypatch.setattr(ssh_env, "hermes_home_key", lambda: "/home/bob/.hermes")
+        second = SSHEnvironment(host="example.com", user="alice")
+
+        assert first._sync_manifest_key != second._sync_manifest_key
+        assert first._sync_manifest_path != second._sync_manifest_path
+        assert first._remote_hermes_home != second._remote_hermes_home
+
+class TestLegacySkillsAlias:
+    """~/.hermes/skills must keep resolving after the profile-scoped move.
+
+    Skills advertise literal ~/.hermes/skills/<name>/scripts/... commands in
+    their SKILL.md and the remote shell expands that tilde itself, so exporting
+    HERMES_HOME does not redirect it.
+    """
+
+    def _env(self, monkeypatch, commands):
+        monkeypatch.setattr(ssh_env.shutil, 'which', lambda _name: '/usr/bin/ssh')
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_establish_connection', lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_detect_remote_home', lambda self: '/home/alice')
+        monkeypatch.setattr(ssh_env.SSHEnvironment, 'init_session', lambda self: None)
+        monkeypatch.setattr(
+            ssh_env, 'FileSyncManager',
+            lambda **kw: type('M', (), {'sync': lambda self, **k: None})(),
+        )
+
+        def _fake_run_ssh(self, remote_cmd, timeout):
+            commands.append(remote_cmd)
+            return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_run_ssh', _fake_run_ssh)
+        return SSHEnvironment(host='example.com', user='alice')
+
+    def test_ensure_remote_dirs_links_legacy_skills_path(self, monkeypatch):
+        commands = []
+        env = self._env(monkeypatch, commands)
+        joined = chr(10).join(commands)
+
+        assert '/home/alice/.hermes/skills' in joined, 'legacy path never referenced'
+        assert 'ln -s' in joined, 'no alias created for the legacy skills path'
+        assert env._remote_hermes_home + '/skills' in joined
+
+    def test_alias_is_guarded_so_a_real_directory_survives(self, monkeypatch):
+        commands = []
+        self._env(monkeypatch, commands)
+        link_cmd = next(c for c in commands if 'ln -s' in c)
+
+        # An unguarded  would clobber a real shared skills/ directory
+        # left by an older layout.
+        assert '[ ! -e' in link_cmd, 'alias is not guarded by an existence test'
+        assert '-sfn' not in link_cmd, 'unguarded force-link would retarget a live tree'
+
+class TestSyncBackExclusions:
+    def test_manifest_is_excluded_from_sync_back(self, monkeypatch, tmp_path):
+        """The manifest is controller bookkeeping; pulling it back would drop a
+        .sync-manifest.json into the host hermes home on every cleanup."""
+        captured = {}
+
+        monkeypatch.setattr(ssh_env.shutil, 'which', lambda _name: '/usr/bin/ssh')
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_establish_connection', lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_detect_remote_home', lambda self: '/home/alice')
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_ensure_remote_dirs', lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, 'init_session', lambda self: None)
+        monkeypatch.setattr(
+            ssh_env, 'FileSyncManager',
+            lambda **kw: type('M', (), {'sync': lambda self, **k: None})(),
+        )
+        env = SSHEnvironment(host='example.com', user='alice')
+
+        def _fake_run(cmd, **kwargs):
+            captured['cmd'] = cmd
+            return type('R', (), {'returncode': 0, 'stderr': b''})()
+
+        monkeypatch.setattr(ssh_env.subprocess, 'run', _fake_run)
+        env._ssh_bulk_download(tmp_path / 'out.tar')
+
+        tar_cmd = captured['cmd'][-1]
+        assert '.sync-manifest.json' in tar_cmd, 'manifest not excluded from sync-back'
+        assert '.sync-manifest.*' in tar_cmd, 'mktemp manifest siblings not excluded'
+        assert 'venvs' in tar_cmd, 'existing venvs exclusion was dropped'
+
+
+class TestSnapshotDoesNotPinHermesHome:
+    def test_hermes_home_is_excluded_from_the_session_snapshot(self):
+        """_run_bash exports the scoped value per command, but the snapshot is
+        sourced first — a remote login profile exporting its own HERMES_HOME
+        would otherwise win forever and defeat profile isolation."""
+        assert 'HERMES_HOME' in SSHEnvironment._additional_profile_scoped_passthrough_names(
+            SSHEnvironment.__new__(SSHEnvironment))

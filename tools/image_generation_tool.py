@@ -307,13 +307,53 @@ def _agent_cache_base_for_env(env: Any) -> str | None:
                     return str(value).rstrip("/")
             except Exception as exc:  # noqa: BLE001
                 logger.debug("active env agent_visible_cache_base failed: %s", exc)
+        # Profile-scoped remote root (this PR) wins over the shared
+        # "<home>/.hermes" fallback below, so a generated image resolves to the
+        # profile's own tree rather than another profile's.
+        remote_hermes_home = getattr(env, "_remote_hermes_home", None)
+        if remote_hermes_home:
+            return str(remote_hermes_home).rstrip("/")
         remote_home = getattr(env, "_remote_home", None)
         if remote_home:
             return f"{str(remote_home).rstrip('/')}/.hermes"
         if env.__class__.__name__ in _CONTAINER_HOME_ENVS:
             return "/root/.hermes"
     backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    if backend == "ssh":
+        # Base's _CACHE_BASE_BY_BACKEND has no ssh entry that can express a
+        # profile-scoped root, so resolve it here (this PR). Every other
+        # backend keeps base's table lookup.
+        from tools.credential_files import _ssh_profile_remote_hermes_home
+
+        return _ssh_profile_remote_hermes_home()
     return _CACHE_BASE_BY_BACKEND.get(backend)
+
+
+def _agent_visible_cache_path(host_path: str, env: Any) -> str | None:
+    if not _looks_like_absolute_file_path(host_path):
+        return None
+
+    cache_base = _agent_cache_base_for_env(env)
+    if not cache_base:
+        return None
+
+    try:
+        from tools.credential_files import map_cache_path_to_container
+
+        return map_cache_path_to_container(host_path, container_base=cache_base)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not translate image cache path for backend: %s", exc)
+    return None
+
+
+def _force_artifact_sync(env: Any) -> None:
+    sync_manager = getattr(env, "_sync_manager", None)
+    if sync_manager is None:
+        return
+    try:
+        sync_manager.sync(force=True)
+    except Exception as exc:  # noqa: BLE001 - keep generation success; log for operators
+        logger.warning("Could not force-sync generated image artifact: %s", exc)
 
 
 def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> str:

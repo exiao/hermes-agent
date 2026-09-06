@@ -1,7 +1,9 @@
+
 """SSH remote execution environment with ControlMaster connection persistence."""
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import shlex
@@ -11,6 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import Iterable
 
+from hermes_constants import hermes_home_key
 from tools.environments.base import BaseEnvironment, EnvironmentConnectionError
 from tools.environments.base_output import _popen_bash
 from tools.environments.file_sync import (
@@ -28,6 +31,13 @@ _BULK_UPLOAD_MIN_TIMEOUT = 120
 _BULK_UPLOAD_MAX_TIMEOUT = 1800
 _BULK_UPLOAD_BYTES_PER_SEC = 2_000_000
 _SYNC_BACK_EXCLUDE_DIRS = ("venvs",)
+# The manifest is controller-side bookkeeping that this environment WRITES to the
+# remote; pulling it back is never wanted. It has no pushed hash, so
+# _infer_host_path() would map it by remote-root prefix and drop a
+# ".sync-manifest.json" into $HERMES_HOME on every cleanup — creating an internal
+# artifact on the controller, or overwriting a user file of that name. The
+# mktemp siblings (.sync-manifest.XXXXXX) are excluded for the same reason.
+_SYNC_BACK_EXCLUDE_GLOBS = (".sync-manifest.json", ".sync-manifest.*")
 
 
 def _tar_stderr_is_only_concurrent_change(stderr: str) -> bool:
@@ -84,6 +94,20 @@ class SSHEnvironment(BaseEnvironment):
     # they stay out of the remote snapshot under multiplex.
     _profile_scoped_passthrough = True
 
+    def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
+        """Keep HERMES_HOME out of the session snapshot.
+
+        ``_run_bash`` exports the profile-scoped value ahead of every command,
+        but the snapshot is sourced FIRST by ``_wrap_command``. A remote login
+        profile that exports its own ``HERMES_HOME`` (or an earlier command
+        that persisted one) would otherwise be captured once and then win on
+        every later command, pointing the agent at the unscoped shared tree
+        while files sync under the scoped root — silently defeating this
+        environment's profile isolation. Excluding the name means the snapshot
+        never carries it and the per-command export is always the live value.
+        """
+        return ("HERMES_HOME",)
+
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
                  probe_only: bool = False):
@@ -106,11 +130,30 @@ class SSHEnvironment(BaseEnvironment):
             self._sync_manager = None
             return
         self._remote_home = self._detect_remote_home()
+        # Profile-scoped remote root + persisted manifest: the PR's whole
+        # point. Base still syncs every profile into one shared
+        # "<home>/.hermes", which is what lets two profiles overwrite each
+        # other's trees and forces a full re-upload after eviction.
+        manifest_scope = hashlib.sha256(
+            hermes_home_key().encode()
+        ).hexdigest()
+        self._remote_hermes_home = f"{self._remote_home}/.hermes/profiles/{manifest_scope}"
+        self._sync_manifest_path = f"{self._remote_hermes_home}/.sync-manifest.json"
+        self._sync_manifest_key = (
+            f"{hermes_home_key()}|{self.user}@{self.host}:{self.port}|"
+            f"{self._remote_hermes_home}"
+        )
+
         self._ensure_remote_dirs()
         self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-            upload_fn=self._scp_upload, delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload, bulk_download_fn=self._ssh_bulk_download)
+            get_files_fn=lambda: iter_sync_files(self._remote_hermes_home),
+            upload_fn=self._scp_upload,
+            delete_fn=self._ssh_delete,
+            bulk_upload_fn=self._ssh_bulk_upload,
+            bulk_download_fn=self._ssh_bulk_download,
+            manifest_load_fn=self._load_sync_manifest,
+            manifest_save_fn=self._save_sync_manifest,
+        )
         self._sync_manager.sync(force=True)
         self.init_session()
 
@@ -185,11 +228,127 @@ class SSHEnvironment(BaseEnvironment):
                 return result.stdout.strip()
         return "/root" if self.user == "root" else f"/home/{self.user}"
 
+    def _load_sync_manifest(self) -> tuple[dict[str, tuple[float, int]], dict[str, str]] | None:
+        path = shlex.quote(self._sync_manifest_path)
+        cmd = self._build_ssh_command()
+        cmd.append(f"if test -f {path}; then cat {path}; else exit 3; fi")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode == 3:
+            return None
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"remote sync manifest read failed: {result.stderr.strip()}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != 1 or payload.get("key") != self._sync_manifest_key:
+            return None
+        files = payload.get("files")
+        if not isinstance(files, dict):
+            return None
+
+        parsed: dict[str, tuple[float, int]] = {}
+        for remote_path, file_key in files.items():
+            if not isinstance(remote_path, str) or not isinstance(file_key, list):
+                return None
+            if len(file_key) != 2:
+                return None
+            try:
+                mtime, size = float(file_key[0]), int(file_key[1])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if size < 0:
+                return None
+            parsed[remote_path] = (mtime, size)
+        raw_hashes = payload.get("hashes", {})
+        if not isinstance(raw_hashes, dict):
+            raw_hashes = {}
+        hashes = {
+            remote_path: digest
+            for remote_path, digest in raw_hashes.items()
+            if isinstance(remote_path, str)
+            and isinstance(digest, str)
+            and len(digest) == 64
+        }
+        return parsed, hashes
+
+    def _save_sync_manifest(
+        self,
+        files: dict[str, tuple[float, int]],
+        hashes: dict[str, str],
+    ) -> None:
+        payload = json.dumps(
+            {
+                "version": 1,
+                "key": self._sync_manifest_key,
+                "files": {
+                    remote_path: [mtime, size]
+                    for remote_path, (mtime, size) in files.items()
+                },
+                "hashes": hashes,
+            },
+            sort_keys=True,
+        )
+        manifest_path = shlex.quote(self._sync_manifest_path)
+        manifest_dir = shlex.quote(self._sync_manifest_path.rsplit("/", 1)[0])
+        cmd = self._build_ssh_command()
+        cmd.append(
+            f"tmp=$(mktemp {manifest_dir}/.sync-manifest.XXXXXX) "
+            f"&& cat > \"$tmp\" && chmod 600 \"$tmp\" && mv \"$tmp\" {manifest_path}"
+        )
+        result = subprocess.run(
+            cmd,
+            input=payload,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"remote sync manifest write failed: {result.stderr.strip()}"
+            )
+
     def _ensure_remote_dirs(self) -> None:
-        """Create base ~/.hermes directory tree on remote in one SSH call."""
-        base = f"{self._remote_home}/.hermes"
+        """Create the profile-scoped ~/.hermes tree on remote in one SSH call.
+
+        Also points ``~/.hermes/skills`` at this profile's ``skills/``. Skills
+        advertise literal ``~/.hermes/skills/<name>/scripts/...`` commands in
+        their SKILL.md (48 of them on this install), and the shell expands that
+        tilde itself — exporting HERMES_HOME does not redirect it. Without the
+        link every such command reaches the unscoped shared path, which after
+        this PR holds a stale copy or nothing at all.
+
+        The link is only created when nothing already occupies that path, so a
+        real shared ``skills/`` directory from an older layout is never
+        replaced. ``ln -sfn`` alone would silently retarget a live directory
+        symlink, so the existence test is the guard, not a nicety.
+        """
+        base = self._remote_hermes_home
         self._run_ssh(quoted_mkdir_command([base, f"{base}/skills", f"{base}/credentials", f"{base}/cache"]),
                       timeout=10)
+        legacy_skills = f"{self._remote_home}/.hermes/skills"
+        scoped_skills = f"{base}/skills"
+        # `[ -e ]` is false for a dangling symlink, so a link left by a previous
+        # profile is replaced; a real directory or live link is left alone.
+        self._run_ssh(
+            f"if [ ! -e {shlex.quote(legacy_skills)} ]; then "
+            f"rm -f {shlex.quote(legacy_skills)} 2>/dev/null; "
+            f"ln -s {shlex.quote(scoped_skills)} {shlex.quote(legacy_skills)} 2>/dev/null; "
+            f"fi",
+            timeout=10,
+        )
+
+    # _get_sync_files provided via iter_sync_files in FileSyncManager init
 
     def _scp_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via scp over ControlMaster."""
@@ -205,7 +364,8 @@ class SSHEnvironment(BaseEnvironment):
         connection to remote ``tar x``, after a single batched ``mkdir -p``."""
         if not files:
             return
-        base = f"{self._remote_home}/.hermes"
+
+        base = self._remote_hermes_home
         parents = unique_parent_dirs(files)
         if parents:
             self._run_ssh_checked(quoted_mkdir_command(parents), 30, "remote mkdir failed",
@@ -286,10 +446,35 @@ class SSHEnvironment(BaseEnvironment):
         """Download remote .hermes/ as a tar archive."""
         # Tar from / with the full path so archive entries keep absolute paths
         # (home/user/.hermes/skills/f.py), matching _pushed_hashes keys.
-        rel_base = f"{self._remote_home}/.hermes".lstrip("/")
+        # Profile-scoped base (this PR) so sync-back only pulls THIS profile's
+        # tree instead of every profile sharing one remote directory.
+        rel_base = self._remote_hermes_home.lstrip("/")
+        # The remote tree is live: a running agent writes cache and log files
+        # while tar reads them, which tar reports as "file changed as we read
+        # it" and exits 1. That is a warning about a file we will pick up on
+        # the next sync, not a transfer failure. --warning= is GNU-only and the
+        # remote may run BSD/libarchive tar, so tolerate the exit code below
+        # instead of passing a flag that would make every download fail there.
+        # Never pull back remote-only build artifacts. `venvs/` is created ON
+        # the remote by tooling and is never uploaded (the push side sends an
+        # explicit file list), so every byte of it is one-way junk that the
+        # diff below discards anyway. Measured on the Hetzner QA box: it is
+        # 204 MB of the 247 MB tree and takes sync_back from 6.6s to 56s, so
+        # three retries overrun the 120s shutdown watchdog and the gateway is
+        # SIGKILLed mid-cleanup. It also contains an absolute symlink
+        # (venvs/*/bin/python), which makes Python's tarfile extraction raise
+        # "is a link to an absolute path" and fail the attempt outright.
+        # Excluding it fixes both the timeout and the hard error.
         exclude_args = " ".join(
-            f"--exclude={shlex.quote(f'{rel_base}/{directory}')}"
-            for directory in _SYNC_BACK_EXCLUDE_DIRS)
+            [
+                f"--exclude={shlex.quote(f'{rel_base}/{directory}')}"
+                for directory in _SYNC_BACK_EXCLUDE_DIRS
+            ]
+            + [
+                f"--exclude={shlex.quote(pattern)}"
+                for pattern in _SYNC_BACK_EXCLUDE_GLOBS
+            ]
+        )
         ssh_cmd = self._build_ssh_command() + [
             f"tar cf - -C / {exclude_args} {shlex.quote(rel_base)}"]
         with open(dest, "wb") as f:
@@ -316,8 +501,14 @@ class SSHEnvironment(BaseEnvironment):
         ``terminal.env_passthrough``) the way docker does: ``SendEnv`` carries the names, the ssh
         client's env carries the values, so secrets never enter the remote ``bash -c`` argv. The
         remote sshd must ``AcceptEnv`` them (#14091). Profile-scoped names missing from the active
-        scope are unset remotely so a shared host cannot serve another profile's value."""
+        scope are unset remotely so a shared host cannot serve another profile's value.
+
+        HERMES_HOME is exported inline (this PR) rather than sent via SendEnv: it is a path, not a
+        secret, so the argv is a safe place for it, and sending it would need another AcceptEnv
+        entry on every remote host. Without it the remote agent writes to the unscoped default and
+        the profile isolation this PR adds is lost on the remote side."""
         values, unset_names = resolve_passthrough_env(hermes_env_loader=_load_hermes_env_vars)
+        cmd_string = f"export HERMES_HOME={shlex.quote(self._remote_hermes_home)}; {cmd_string}"
         cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
         client_env = client_env_with(values)
         return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)

@@ -45,6 +45,11 @@ BulkUploadFn = Callable[[list[tuple[str, str]]], None]  # [(host_path, remote_pa
 BulkDownloadFn = Callable[[Path], None]  # (dest_tar_path) -> writes tar archive, raises on failure
 DeleteFn = Callable[[list[str]], None]  # (remote_paths) -> raises on failure
 GetFilesFn = Callable[[], list[tuple[str, str]]]  # () -> [(host_path, remote_path), ...]
+ManifestState = tuple[dict[str, tuple[float, int]], dict[str, str]]
+ManifestLoadFn = Callable[[], ManifestState | None]
+ManifestSaveFn = Callable[[dict[str, tuple[float, int]], dict[str, str]], None]
+
+_SYNC_WARNING_BYTES = 100 * 1024 * 1024
 
 _SYNC_BACK_MAX_RETRIES = 3
 _SYNC_BACK_BACKOFF = (2, 4, 8)  # seconds between retries
@@ -110,6 +115,11 @@ def _is_skill_remote_path(remote_path: str) -> bool:
     if marker not in remote_path:
         return False
     relative = remote_path.split(marker, 1)[1]
+    if relative.startswith("profiles/"):
+        parts = relative.split("/", 2)
+        if len(parts) != 3:
+            return False
+        relative = parts[2]
     return relative.startswith(("skills/", "external_skills/", "project_skills/"))
 
 
@@ -172,7 +182,10 @@ class FileSyncManager:
         delete_fn: DeleteFn,
         sync_interval: float = _SYNC_INTERVAL_SECONDS,
         bulk_upload_fn: BulkUploadFn | None = None,
-        bulk_download_fn: BulkDownloadFn | None = None):
+        bulk_download_fn: BulkDownloadFn | None = None,
+        manifest_load_fn: ManifestLoadFn | None = None,
+        manifest_save_fn: ManifestSaveFn | None = None,
+    ):
         self._get_files_fn = get_files_fn
         self._upload_fn = upload_fn
         self._bulk_upload_fn = bulk_upload_fn
@@ -182,10 +195,91 @@ class FileSyncManager:
         self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
         self._synced_hosts: dict[str, str] = {}
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
+        self._manifest_hashes_need_rebuild = False
         self._upload_only_host_paths: set[str] = set()
         self._upload_only_cache_time = 0.0
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
+        self._manifest_load_fn = manifest_load_fn
+        self._manifest_save_fn = manifest_save_fn
+        self._manifest_needs_save = False
+        self._large_sync_warning_active = False
+        self._load_persisted_state()
+        # Memo for the upload-only set (see _refresh_upload_only_paths).
+        # Per-instance, never module-global: each manager belongs to one
+        # profile/backend, and a shared cache would leak one profile's
+        # credential paths into another's sync.
+
+    def _load_persisted_state(self) -> None:
+        if self._manifest_load_fn is None:
+            return
+        try:
+            manifest = self._manifest_load_fn()
+        except Exception as exc:
+            logger.warning("file_sync: could not load persisted manifest: %s", exc)
+            self._manifest_needs_save = True
+            return
+        if manifest is None or not isinstance(manifest, (dict, tuple)):
+            self._manifest_needs_save = True
+            return
+
+        persisted_hashes: dict[str, str] = {}
+        if (
+            isinstance(manifest, tuple)
+            and len(manifest) == 2
+            and isinstance(manifest[0], dict)
+            and isinstance(manifest[1], dict)
+        ):
+            raw_files, raw_hashes = manifest
+            for remote_path, digest in raw_hashes.items():
+                if isinstance(remote_path, str) and isinstance(digest, str):
+                    try:
+                        if len(digest) == 64:
+                            int(digest, 16)
+                            persisted_hashes[remote_path] = digest
+                    except ValueError:
+                        pass
+        else:
+            # Accept the pre-hash callback shape while old managers are being
+            # upgraded. Those entries are re-uploaded once to establish the
+            # sync-back baseline instead of risking a host overwrite.
+            raw_files = manifest
+
+        valid: dict[str, tuple[float, int]] = {}
+        if not isinstance(raw_files, dict):
+            self._manifest_needs_save = True
+            return
+        for remote_path, file_key in raw_files.items():
+            if not isinstance(remote_path, str) or not isinstance(file_key, (list, tuple)):
+                self._manifest_needs_save = True
+                continue
+            if len(file_key) != 2:
+                self._manifest_needs_save = True
+                continue
+            try:
+                mtime, size = float(file_key[0]), int(file_key[1])
+            except (TypeError, ValueError, OverflowError):
+                self._manifest_needs_save = True
+                continue
+            if size < 0:
+                self._manifest_needs_save = True
+                continue
+            valid[remote_path] = (mtime, size)
+        self._synced_files = valid
+        self._pushed_hashes = persisted_hashes
+        self._manifest_hashes_need_rebuild = any(
+            remote_path not in persisted_hashes for remote_path in valid
+        )
+
+    def _persist_state(self, files: dict[str, tuple[float, int]]) -> None:
+        if self._manifest_save_fn is None:
+            return
+        try:
+            self._manifest_save_fn(dict(files), dict(self._pushed_hashes))
+            self._manifest_needs_save = False
+        except Exception as exc:
+            self._manifest_needs_save = True
+            logger.warning("file_sync: could not save persisted manifest: %s", exc)
 
     def _refresh_upload_only_paths(self, *, force: bool = False) -> None:
         now = _monotonic()
@@ -212,35 +306,134 @@ class FileSyncManager:
             return
 
         current_files = self._get_files_fn()
-        mapping_changed = any(
-            self._synced_hosts.get(remote) != host and _is_skill_remote_path(remote)
-            for host, remote in current_files)
-        if not mapping_changed:
-            credential_paths = _credential_mount_host_paths()
-            mapping_changed = any(
-                self._synced_hosts.get(remote) != host
-                and _resolve_host_path_str(host) in credential_paths
-                for host, remote in current_files)
+        current_remote_paths = {remote for _, remote in current_files}
+        sync_bytes = 0
+        directory_bytes: dict[str, int] = {}
+
+        # --- Uploads: new or changed files ---
+        to_upload: list[tuple[str, str]] = []
+        new_files = dict(self._synced_files)
+        new_hosts = dict(self._synced_hosts)
+        mapping_changed = False
+        credential_mount_host_paths: set[str] | None = None
+        for host_path, remote_path in current_files:
+            if (
+                remote_path not in self._synced_hosts
+                or self._synced_hosts[remote_path] != host_path
+            ):
+                # New or retargeted skill mappings can change the upload-only
+                # set. Ordinary cache/plan mappings cannot.
+                if _is_skill_remote_path(remote_path):
+                    mapping_changed = True
+                else:
+                    if credential_mount_host_paths is None:
+                        credential_mount_host_paths = _credential_mount_host_paths()
+                    try:
+                        resolved_host_path = str(Path(host_path).expanduser().resolve())
+                    except OSError:
+                        resolved_host_path = str(Path(host_path).expanduser())
+                    mapping_changed = (
+                        mapping_changed
+                        or resolved_host_path in credential_mount_host_paths
+                    )
+            new_hosts[remote_path] = host_path
+            file_key = _file_mtime_key(host_path)
+            if file_key is None:
+                continue
+            sync_bytes += file_key[1]
+            relative = remote_path.split("/.hermes/", 1)[-1].lstrip("/")
+            if relative.startswith("profiles/"):
+                relative = relative.split("/", 2)[-1]
+            directory = relative.split("/", 1)[0] or "."
+            directory_bytes[directory] = directory_bytes.get(directory, 0) + file_key[1]
+            if (
+                self._synced_files.get(remote_path) == file_key
+                and not self._manifest_hashes_need_rebuild
+            ):
+                continue
+            to_upload.append((host_path, remote_path))
+            new_files[remote_path] = file_key
+
+        if sync_bytes > _SYNC_WARNING_BYTES and directory_bytes:
+            if not self._large_sync_warning_active:
+                largest_directory, largest_bytes = max(
+                    directory_bytes.items(), key=lambda item: item[1]
+                )
+                logger.warning(
+                    "file_sync: sync set is %.1f MB; largest directory is %s (%.1f MB)",
+                    sync_bytes / (1024 * 1024),
+                    largest_directory,
+                    largest_bytes / (1024 * 1024),
+                )
+            self._large_sync_warning_active = True
+        else:
+            self._large_sync_warning_active = False
+        # Anything about to be uploaded may be newly upload-only: a brand new
+        # remote path, or an EXISTING one whose symlink was retargeted at the
+        # same container path. An upload is the usual signal, but a retarget to
+        # a file with identical (mtime, size) produces none, so track the
+        # remote-to-host mapping independently of the stat key.
         self._refresh_upload_only_paths(force=mapping_changed)
-        self._synced_hosts = {remote: host for host, remote in current_files}
-        to_upload, new_files, to_delete = self._plan_sync(current_files)
+        # Commit the mapping eagerly, before the no-work early return: a pure
+        # retarget with an identical stat key produces neither an upload nor a
+        # delete, and leaving the old mapping in place would re-force the
+        # refresh on every subsequent sync. Never rolled back with
+        # ``_synced_files`` -- a rollback restores the old stat key, so the
+        # retry re-uploads and force-refreshes on that path anyway.
+        self._synced_hosts = new_hosts
+
+        # --- Deletes: synced paths no longer in current set ---
+        to_delete = [p for p in self._synced_files if p not in current_remote_paths]
 
         if not to_upload and not to_delete:
             self._last_sync_time = _monotonic()
+            if self._manifest_needs_save:
+                self._persist_state(self._synced_files)
             return
 
+        # Snapshot for rollback (only when there's work to do)
         prev_files = dict(self._synced_files)
         prev_hashes = dict(self._pushed_hashes)
+
+        if to_upload:
+            logger.debug("file_sync: uploading %d file(s)", len(to_upload))
+        if to_delete:
+            logger.debug("file_sync: deleting %d stale remote file(s)", len(to_delete))
+
         try:
-            self._push(to_upload, to_delete)
-            # Commit (all succeeded).
+            if to_upload and self._bulk_upload_fn is not None:
+                self._bulk_upload_fn(to_upload)
+                logger.debug("file_sync: bulk-uploaded %d file(s)", len(to_upload))
+            else:
+                for host_path, remote_path in to_upload:
+                    self._upload_fn(host_path, remote_path)
+                    logger.debug("file_sync: uploaded %s -> %s", host_path, remote_path)
+
+            if to_delete:
+                self._delete_fn(to_delete)
+                logger.debug("file_sync: deleted %s", to_delete)
+
+            # --- Commit (all succeeded) ---
             for host_path, remote_path in to_upload:
                 self._pushed_hashes[remote_path] = _sha256_file(host_path)
+
             for p in to_delete:
                 new_files.pop(p, None)
                 self._pushed_hashes.pop(p, None)
+                # Prune the host mapping too. Without this a session that
+                # repeatedly creates and removes cache artifacts grows
+                # _synced_hosts without bound and copies the whole historical
+                # mapping on every sync, restoring the cost this memo removes.
+                self._synced_hosts.pop(p, None)
+
             self._synced_files = new_files
+            self._manifest_hashes_need_rebuild = any(
+                remote_path not in self._pushed_hashes
+                for remote_path in new_files
+            )
             self._last_sync_time = _monotonic()
+            self._persist_state(self._synced_files)
+
         except Exception as exc:
             self._synced_files = prev_files
             self._pushed_hashes = prev_hashes
@@ -249,39 +442,6 @@ class FileSyncManager:
             logger.warning("file_sync: sync failed, rolled back state: %s", exc)
             if raise_on_error:
                 raise
-
-    def _plan_sync(
-        self, current_files: list[tuple[str, str]]
-    ) -> tuple[list[tuple[str, str]], dict[str, tuple[float, int]], list[str]]:
-        """Diff *current_files* against synced state -> ``(to_upload, new_synced_state, to_delete)``."""
-        to_upload: list[tuple[str, str]] = []
-        new_files = dict(self._synced_files)
-        for host_path, remote_path in current_files:
-            file_key = _file_mtime_key(host_path)
-            if file_key is None or self._synced_files.get(remote_path) == file_key:
-                continue
-            to_upload.append((host_path, remote_path))
-            new_files[remote_path] = file_key
-        current_remote_paths = {remote for _, remote in current_files}
-        to_delete = [p for p in self._synced_files if p not in current_remote_paths]
-        return to_upload, new_files, to_delete
-
-    def _push(self, to_upload: list[tuple[str, str]], to_delete: list[str]) -> None:
-        """Run the transport calls for one cycle (bulk upload when available)."""
-        if to_upload:
-            logger.debug("file_sync: uploading %d file(s)", len(to_upload))
-        if to_delete:
-            logger.debug("file_sync: deleting %d stale remote file(s)", len(to_delete))
-        if to_upload and self._bulk_upload_fn is not None:
-            self._bulk_upload_fn(to_upload)
-            logger.debug("file_sync: bulk-uploaded %d file(s)", len(to_upload))
-        else:
-            for host_path, remote_path in to_upload:
-                self._upload_fn(host_path, remote_path)
-                logger.debug("file_sync: uploaded %s -> %s", host_path, remote_path)
-        if to_delete:
-            self._delete_fn(to_delete)
-            logger.debug("file_sync: deleted %s", to_delete)
 
     # --- Sync-back: pull remote changes to host on teardown ---
     def sync_back(self, hermes_home: Path | None = None) -> None:
@@ -398,17 +558,26 @@ class FileSyncManager:
 
                 upload_only = self._upload_only_host_paths | _credential_host_paths()
                 applied = 0
+                remote_paths: set[str] = set()
                 for dirpath, _dirnames, filenames in os.walk(staging):
                     for fname in filenames:
                         staged_file = os.path.join(dirpath, fname)
                         # Remote keys are POSIX; relpath uses host separators (backslashes on Windows).
                         remote_path = "/" + Path(os.path.relpath(staged_file, staging)).as_posix()
+                        remote_paths.add(remote_path)
                         if "/plans/" in remote_path:
                             continue
                         if _is_excluded_skill_remote_path(remote_path):
                             logger.debug("sync_back: skipping excluded skill infra %s", remote_path)
                             continue
                         applied += self._apply_staged_file(staged_file, remote_path, file_mapping, upload_only)
+
+                missing_paths = set(self._synced_files) - remote_paths
+                if missing_paths:
+                    for remote_path in missing_paths:
+                        self._synced_files.pop(remote_path, None)
+                        self._pushed_hashes.pop(remote_path, None)
+                    self._persist_state(self._synced_files)
 
                 if applied:
                     logger.info("sync_back: applied %d changed file(s)", applied)
