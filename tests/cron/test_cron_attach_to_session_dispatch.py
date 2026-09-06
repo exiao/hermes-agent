@@ -23,7 +23,10 @@ from cron.scheduler import _cron_mirror_delivery_enabled
 # model/provider/base_url: per-job inference pins are user-owned, so a model
 # must not be able to point unattended spend elsewhere. include_disabled is a
 # read filter with its own default. See the comment in the handler lambda.
-INTENTIONALLY_NOT_FORWARDED = {"model", "provider", "base_url", "reasoning_effort"}
+INTENTIONALLY_NOT_FORWARDED = {
+    "model", "provider", "base_url", "reasoning_effort",
+    "monitor",  # normalized into monitor_script / monitor_url by the handler
+}
 
 
 @pytest.fixture()
@@ -38,7 +41,7 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 def _handler():
     import tools.cronjob_tools as mod
 
-    return mod.registry._tools["cronjob"].handler
+    return mod.registry._tools[mod.CRONJOB_SCHEMA["name"]].handler
 
 
 def _create_via_tool(**extra):

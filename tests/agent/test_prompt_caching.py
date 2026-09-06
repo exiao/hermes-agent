@@ -107,7 +107,7 @@ def test_t20880_tool_heavy_native_loop_reproduction():
 
     assert final_tool_marked
     assert shared_transaction_endpoint
-    assert after_exchange.marker_count <= 4
+    assert _count_cache_markers(after_exchange.messages, after_exchange.tools) <= 4
 
 
 class TestPromptCachePlan:
@@ -133,7 +133,7 @@ class TestPromptCachePlan:
         assert plan.tools is not tools
         assert "cache_control" not in tools[-1]
         assert plan.tools[-1]["cache_control"] == MARKER
-        assert plan.marker_count == 4
+        assert _count_cache_markers(plan.messages, plan.tools) == 4
 
     def test_unmarkable_endpoint_does_not_consume_a_slot(self):
         messages = [
@@ -148,7 +148,7 @@ class TestPromptCachePlan:
             direct_native_tool_cache=True,
         )
 
-        assert plan.marker_count == 2
+        assert _count_cache_markers(plan.messages, plan.tools) == 2
         assert "cache_control" not in plan.messages[-1]
 
     def test_static_prefix_equal_to_whole_prompt_emits_no_empty_block(self):
@@ -203,7 +203,7 @@ class TestPromptCachePlan:
             native_anthropic=True,
             direct_native_tool_cache=True,
         )
-        assert plan.marker_count == 3
+        assert _count_cache_markers(plan.messages, plan.tools) == 3
         assert len(plan.tools) == 0
 
 
@@ -478,9 +478,9 @@ class TestNormalizationOrdering:
         """Ordering invariant, locked against regression."""
         import inspect
 
-        from agent import conversation_loop
+        from agent import turn_request_assembly
 
-        src = inspect.getsource(conversation_loop)
+        src = inspect.getsource(turn_request_assembly)
         # Anchor on the call-block request plan, not the retry helper.
         anchor = src.index("Build the request-local cache sections")
         mark = src.index("build_prompt_cache_plan(\n", anchor)
