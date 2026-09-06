@@ -42,7 +42,7 @@ def test_picker_synthesizes_900k_variants_for_verified_slugs():
     in the list as the cheaper 272K default."""
     model_ids = get_codex_model_ids()  # offline curated path
 
-    for base in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4"):
+    for base in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-6-astra"):
         assert base in model_ids
         assert f"{base}-900k" in model_ids
         assert model_ids.index(f"{base}-900k") == model_ids.index(base) + 1
@@ -62,6 +62,22 @@ def test_picker_never_synthesizes_900k_for_pro_or_unknown_slugs():
     out = _finalize_codex_models(["gpt-5.6-sol-pro", "gpt-5.6-nova"])
     assert "gpt-5.6-sol-pro-900k" not in out
     assert "gpt-5.6-nova-900k" not in out
+
+
+def test_picker_synthesizes_astra_but_never_astra_pro_or_tiers():
+    """gpt-6-astra is eligible, but Astra Pro and the fast/flex tier slugs
+    (OpenRouter/Nous concepts, untested on Codex) never gain a variant."""
+    from hermes_cli.codex_models import _finalize_codex_models
+
+    out = _finalize_codex_models(["gpt-6-astra"])
+    assert "gpt-6-astra-900k" in out
+
+    out = _finalize_codex_models(
+        ["gpt-6-astra-pro", "gpt-6-astra-fast", "gpt-6-astra-flex"]
+    )
+    assert "gpt-6-astra-pro-900k" not in out
+    assert "gpt-6-astra-fast-900k" not in out
+    assert "gpt-6-astra-flex-900k" not in out
 
 
 

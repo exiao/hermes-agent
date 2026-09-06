@@ -640,8 +640,8 @@ class TestCodexOAuthContextLength:
             )
         assert ctx == 272_000
 
-    @pytest.mark.parametrize("slug", ["gpt-5.6-sol-900k", "gpt-daybreak-blue-latest-900k"])
-    def test_fallback_table_resolution_also_bumped(self, slug):
+    @pytest.mark.parametrize("model", ["gpt-5.6-sol-900k", "gpt-daybreak-blue-latest-900k", "gpt-6-astra-900k"])
+    def test_fallback_table_resolution_also_bumped(self, model):
         """When the live probe fails, the 272K fallback-table value for an
         opted-in ``-900k`` variant is bumped the same way (same enforcement
         applies — the fallback lookup strips the suffix first)."""
@@ -654,15 +654,15 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             ctx = get_model_context_length(
-                model=slug,
+                model=model,
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="expired-token",
                 provider="openai-codex",
             )
         assert ctx == 900_000
 
-    @pytest.mark.parametrize("slug", ["gpt-5.6-sol", "gpt-daybreak-blue-latest"])
-    def test_fallback_table_base_slug_stays_272k(self, slug):
+    @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.5", "gpt-6-astra"])
+    def test_fallback_table_base_slug_stays_272k(self, model):
         """Fallback-table resolution for BASE slugs stays at the advertised
         272K — the opt-in rule applies on the offline path too."""
         from agent.model_metadata import get_model_context_length
@@ -674,7 +674,7 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             ctx = get_model_context_length(
-                model=slug,
+                model=model,
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="expired-token",
                 provider="openai-codex",
@@ -689,10 +689,14 @@ class TestCodexOAuthContextLength:
         ("gpt-5.6-sol-900k",              True,  900_000, "gpt-5.6-sol"),
         ("gpt-5.6-terra-900k",            True,  900_000, "gpt-5.6-terra"),
         ("gpt-5.6-luna-900k",             True,  900_000, "gpt-5.6-luna"),
+        ("gpt-6-astra-900k",              True,  900_000, "gpt-6-astra"),
+        ("openai/gpt-6-astra-900k",       True,  900_000, "openai/gpt-6-astra"),
         ("gpt-5.4-900k",                  True,  900_000, "gpt-5.4"),
         ("gpt-daybreak-blue-latest-900k", True,  900_000, "gpt-daybreak-blue-latest"),
         # dated snapshot of a routable 5.6 base
         ("gpt-5.6-sol-2026-07-09-900k",   True,  900_000, "gpt-5.6-sol-2026-07-09"),
+        # dated snapshot of the routable Astra base
+        ("gpt-6-astra-2026-01-01-900k",   True,  900_000, "gpt-6-astra-2026-01-01"),
         # vendor-namespaced variant (display/aux callers) resolves too
         ("openai/gpt-5.6-sol-900k",       True,  900_000, "openai/gpt-5.6-sol"),
         # -pro slugs are not routable on Codex OAuth: never a valid variant,
@@ -703,6 +707,10 @@ class TestCodexOAuthContextLength:
         ("gpt-5.4-mini-900k",             False, 272_000, "gpt-5.4-mini-900k"),
         # arbitrary future family descendants are not auto-eligible
         ("gpt-5.6-nova-900k",             False, 272_000, "gpt-5.6-nova-900k"),
+        # Astra Pro and tier suffixes were never verified: no variant
+        ("gpt-6-astra-pro-900k",          False, 272_000, "gpt-6-astra-pro-900k"),
+        ("gpt-6-astra-fast-900k",         False, 272_000, "gpt-6-astra-fast-900k"),
+        ("gpt-6-astra-flex-900k",         False, 272_000, "gpt-6-astra-flex-900k"),
     ]
 
     @pytest.mark.parametrize("model_id,valid,expected_ctx,wire", _900K_TABLE)
