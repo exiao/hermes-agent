@@ -280,6 +280,14 @@ def _credential_bundle(model, provider, base_url, api_key, api_mode, request_ove
         "request_overrides": request_overrides, "max_output_tokens": max_output_tokens, **extra,
     }
 
+def _delegation_fallback_providers(cfg: dict) -> Optional[List[Dict[str, Any]]]:
+    """Return the normalized fallback chain declared for this delegation call."""
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("fallback_providers"), list):
+        return None
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    return get_fallback_chain(cfg) or None
+
 def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
     """``delegation.base_url`` branch: provider/api_mode from URL heuristics."""
     # Shared URL-based api_mode detector so Anthropic-compatible direct endpoints (/anthropic suffix: Azure AI
@@ -368,15 +376,22 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     explicit_request_overrides = cfg.get("request_overrides") if isinstance(cfg.get("request_overrides"), dict) else None
     is_native_sdk_provider = (values["provider"] or "").strip().lower() in _NATIVE_SDK_PROVIDERS
 
+    fallback_providers = _delegation_fallback_providers(cfg)
     if values["base_url"] and not is_native_sdk_provider:
-        return _direct_endpoint_credentials(values, explicit_request_overrides)
+        resolved = _direct_endpoint_credentials(values, explicit_request_overrides)
+        resolved["fallback_providers"] = fallback_providers
+        return resolved
     if not values["provider"]:
         # Pure inherit; explicit request_overrides still merge OVER the parent's.
-        return _credential_bundle(
+        resolved = _credential_bundle(
             values["model"], None, None, None, None,
             _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides), None,
         )
-    return _runtime_provider_credentials(values, explicit_request_overrides)
+        resolved["fallback_providers"] = fallback_providers
+        return resolved
+    resolved = _runtime_provider_credentials(values, explicit_request_overrides)
+    resolved["fallback_providers"] = fallback_providers
+    return resolved
 
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``

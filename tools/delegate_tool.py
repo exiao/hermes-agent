@@ -323,7 +323,7 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
     )
     if override_provider and not rt.get("fallback_model"):
-        rt["fallback_model"] = _configured_child_fallbacks(delegation_cfg)
+        rt["fallback_model"] = override_fallback_providers
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -472,6 +472,7 @@ def _build_children(
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
         "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
+        "override_fallback_providers": creds.get("fallback_providers"),
         "override_max_tokens": creds.get("max_output_tokens"), "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
     }
