@@ -151,16 +151,24 @@ def _install_fakes(monkeypatch, gateway_run, tmp_path, agent_cls):
 
 
 async def _drain_deferred(runner, timeout=10.0):
-    tasks = getattr(runner, "_deferred_agent_cleanup_tasks", None) or set()
-    if tasks:
-        await asyncio.wait_for(
-            asyncio.gather(*list(tasks), return_exceptions=True), timeout
-        )
+    for attr in (
+        "_deferred_agent_cleanup_tasks",
+        "_deferred_hygiene_persistence_tasks",
+        "_background_tasks",
+    ):
+        tasks = getattr(runner, attr, None) or set()
+        if tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*list(tasks), return_exceptions=True), timeout
+            )
 
 
+@pytest.mark.parametrize(
+    "adoption_timing", ["before_finalizer", "during_refresh", "after_finalizer"]
+)
 @pytest.mark.asyncio
 async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, adoption_timing
 ):
     """A watermark-fenced worker keeps its commit admission at turn-hold
     expiry; its late summary is ADOPTED (committed), not discarded — while
@@ -170,8 +178,18 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     release_worker = threading.Event()
     committed = threading.Event()
     cleanup_done = threading.Event()
+    turn_started = asyncio.Event()
+    allow_turn_finish = asyncio.Event()
+    refresh_started = asyncio.Event()
+    allow_refresh_finish = asyncio.Event()
+    adoption_seen = asyncio.Event()
+    loop_thread_id = threading.get_ident()
+    reset_thread_ids = []
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
+    fake_db.reset_hygiene_failure_streak.side_effect = (
+        lambda _key: reset_thread_ids.append(threading.get_ident())
+    )
 
     class FencedStreamingAgent:
         last_instance = None
@@ -230,9 +248,48 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
 
     adapter = _CaptureAdapter()
     runner = _build_runner(gateway_run, adapter, fake_db)
+    runner.session_store.matching_session_id.return_value = "sess-97963"
+    runner._run_agent.return_value["last_prompt_tokens"] = 90_000
+    if adoption_timing == "before_finalizer":
+        async def _hold_turn(*_args, **_kwargs):
+            turn_started.set()
+            await allow_turn_finish.wait()
+            return {
+                "final_response": "ok",
+                "messages": [],
+                "tools": [],
+                "history_offset": 0,
+                "last_prompt_tokens": 90_000,
+            }
+
+        runner._run_agent = AsyncMock(side_effect=_hold_turn)
+
+    async def _refresh_cache(*_args, **_kwargs):
+        if adoption_timing == "during_refresh":
+            refresh_started.set()
+            await allow_refresh_finish.wait()
+
+    runner._refresh_agent_cache_message_count = AsyncMock(
+        side_effect=_refresh_cache
+    )
+    runner._invalidate_cached_agent_message_count = MagicMock(
+        side_effect=lambda *_args: adoption_seen.set()
+    )
 
     started = time.monotonic()
-    result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
+    event = _make_event()
+    turn_task = asyncio.create_task(runner._handle_message(event))
+    if adoption_timing == "before_finalizer":
+        await asyncio.wait_for(turn_started.wait(), timeout=5)
+        release_worker.set()
+        await asyncio.wait_for(adoption_seen.wait(), timeout=6)
+        allow_turn_finish.set()
+    elif adoption_timing == "during_refresh":
+        await asyncio.wait_for(refresh_started.wait(), timeout=5)
+        release_worker.set()
+        await asyncio.wait_for(adoption_seen.wait(), timeout=6)
+        allow_refresh_finish.set()
+    result = await asyncio.wait_for(turn_task, timeout=15)
     elapsed = time.monotonic() - started
 
     # #90845/#92318 invariant intact: the turn is released at the budget.
@@ -251,7 +308,8 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
 
     # The detached worker finishes late; its commit is ADMITTED (adoption),
     # not refused — the summary attempt is no longer burned.
-    release_worker.set()
+    if adoption_timing == "after_finalizer":
+        release_worker.set()
     await asyncio.wait_for(asyncio.to_thread(committed.wait, 5), timeout=6)
     assert committed.is_set(), (
         "watermark-fenced worker must keep its commit admission after "
@@ -266,10 +324,21 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 5), timeout=6)
     FencedStreamingAgent.last_instance.close.assert_called_once()
 
-    # Successful adoption resets the hygiene failure streak and still never
-    # advances it (the deferral is not a failure).
+    # Successful adoption resets the hygiene failure streak once a matching
+    # turn finalizer consumes the invalidation marker.
     assert not fake_db.increment_hygiene_failure_streak.called
     assert fake_db.reset_hygiene_failure_streak.called
+    assert reset_thread_ids and all(
+        thread_id != loop_thread_id for thread_id in reset_thread_ids
+    ), "deferred SQLite persistence must not block the gateway event loop"
+    if adoption_timing == "before_finalizer":
+        runner._refresh_agent_cache_message_count.assert_not_awaited()
+    else:
+        runner._refresh_agent_cache_message_count.assert_awaited_once()
+    runner.session_store.invalidate_last_prompt_tokens_if_unchanged.assert_called_once()
+    runner._invalidate_cached_agent_message_count.assert_called_with(
+        "agent:main:telegram:dm:12345", ("sess-97963",), "sess-97963"
+    )
     # Deferral notice still reaches the user.
     sent = [m["content"] for m in adapter.sent]
     assert any(
@@ -288,8 +357,13 @@ async def test_turn_hold_kept_admission_arms_flat_retry_only_when_nothing_commit
     """
     worker_started = threading.Event()
     release_worker = threading.Event()
+    loop_thread_id = threading.get_ident()
+    cooldown_thread_ids = []
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
+    fake_db.record_compression_failure_cooldown.side_effect = (
+        lambda *_args: cooldown_thread_ids.append(threading.get_ident())
+    )
 
     class FencedNoCommitAgent:
         def __init__(self, **kwargs):
@@ -347,6 +421,9 @@ async def test_turn_hold_kept_admission_arms_flat_retry_only_when_nothing_commit
         "a kept-admission attempt that ends without committing must restore "
         "the flat turn-hold retry-after spacing"
     )
+    assert cooldown_thread_ids and all(
+        thread_id != loop_thread_id for thread_id in cooldown_thread_ids
+    ), "deferred cooldown persistence must not block the gateway event loop"
     args = fake_db.record_compression_failure_cooldown.call_args[0]
     retry = args[1] - time.time()
     assert retry <= 120, (
@@ -356,6 +433,12 @@ async def test_turn_hold_kept_admission_arms_flat_retry_only_when_nothing_commit
     assert not fake_db.increment_hygiene_failure_streak.called, (
         "turn-hold deferral must never advance the failure streak"
     )
+    assert (
+        runner._session_state(
+            "agent:main:telegram:dm:12345"
+        ).persistent.hygiene_retry_after_monotonic
+        > time.monotonic()
+    ), "retry spacing must be visible before durable persistence finishes"
 
 
 @pytest.mark.asyncio
@@ -429,3 +512,101 @@ async def test_turn_hold_without_watermark_fence_still_cancels(
     # Legacy path still records the flat retry-after immediately.
     assert fake_db.record_compression_failure_cooldown.called
     assert not fake_db.increment_hygiene_failure_streak.called
+
+
+def test_late_adoption_invalidates_only_matching_cached_conversation():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._agent_cache_lock = threading.Lock()
+    original_agent = object()
+    replacement_agent = object()
+    key = "agent:main:telegram:dm:12345"
+    runner._agent_cache = {key: (original_agent, "sig", 12, "sess-97963")}
+
+    assert runner._invalidate_cached_agent_message_count(
+        key, ("sess-97963",), "sess-97963"
+    )
+    assert runner._agent_cache[key] == (
+        original_agent,
+        "sig",
+        -1,
+        "sess-97963",
+    )
+
+    runner._agent_cache[key] = (
+        replacement_agent,
+        "new-sig",
+        7,
+        "replacement",
+    )
+    assert not runner._invalidate_cached_agent_message_count(
+        key, ("sess-97963",), "child"
+    )
+    assert runner._agent_cache[key] == (
+        replacement_agent,
+        "new-sig",
+        7,
+        "replacement",
+    )
+
+    runner._agent_cache[key] = (
+        original_agent,
+        "sig",
+        12,
+        "sess-97963",
+    )
+    assert runner._invalidate_cached_agent_message_count(
+        key, ("sess-97963", "child"), "child"
+    )
+    assert runner._agent_cache[key] == (original_agent, "sig", -1, "child")
+
+
+@pytest.mark.asyncio
+async def test_cache_refresh_preserves_late_hygiene_invalidation():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    key = "agent:main:telegram:dm:12345"
+    sid = "sess-97963"
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {key: (object(), "sig", 12, sid)}
+    runner._session_db = SimpleNamespace(get_session=AsyncMock())
+    marker = ((sid,), sid, 3)
+    runner._peek_session_state = lambda _key: SimpleNamespace(
+        persistent=SimpleNamespace(hygiene_usage_invalidation=marker)
+    )
+
+    await runner._refresh_agent_cache_message_count(key, sid)
+
+    runner._session_db.get_session.assert_not_awaited()
+    assert runner._agent_cache[key][2:] == (-1, sid)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_worker_and_spawned_persistence():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    loop = asyncio.get_running_loop()
+    worker = loop.create_future()
+    persisted = asyncio.Event()
+    runner._deferred_hygiene_worker_futures = {worker}
+    runner._deferred_hygiene_persistence_tasks = set()
+
+    def _worker_done(_future):
+        async def _persist():
+            await asyncio.sleep(0)
+            persisted.set()
+
+        task = asyncio.create_task(_persist())
+        runner._deferred_hygiene_persistence_tasks.add(task)
+        task.add_done_callback(runner._deferred_hygiene_persistence_tasks.discard)
+        task.add_done_callback(
+            lambda _done: runner._deferred_hygiene_worker_futures.discard(worker)
+        )
+
+    worker.add_done_callback(_worker_done)
+    loop.call_soon(worker.set_result, None)
+
+    assert await runner._drain_deferred_hygiene_persistence(timeout=1) == 0
+    assert persisted.is_set()
+    assert not runner._deferred_hygiene_worker_futures
+    assert not runner._deferred_hygiene_persistence_tasks

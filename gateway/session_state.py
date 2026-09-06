@@ -166,6 +166,15 @@ class PersistentState:
     # not). gateway.run mirrors this value to the DB keyed by session_key so
     # the same semantics also survive gateway restarts.
     hygiene_failure_streak: int = 0
+    # Session id + run generation whose prompt-token usage crossed a late
+    # hygiene compaction. Binding both prevents an old compressor from touching
+    # replacement-conversation state under the same routing key.
+    hygiene_usage_invalidation: Optional[
+        tuple[tuple[str, ...], str, int]
+    ] = None
+    # Immediate process-local spacing while the durable cooldown write is
+    # offloaded. Prevents a queued turn from racing through that short window.
+    hygiene_retry_after_monotonic: float = 0.0
 
 
 @dataclass

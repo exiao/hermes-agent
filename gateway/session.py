@@ -3270,6 +3270,46 @@ class SessionStore:
             display_name=peer_display_name,
         )
 
+    def invalidate_last_prompt_tokens_if_unchanged(
+        self,
+        session_key: str,
+        expected_updated_at: datetime,
+        expected_session_ids: tuple[str, ...],
+    ) -> bool:
+        """Clear stale prompt usage unless a newer user turn updated the entry."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if (
+                entry is None
+                or entry.session_id not in expected_session_ids
+                or entry.updated_at != expected_updated_at
+            ):
+                return False
+            entry.last_prompt_tokens = 0
+            peer_session_id = entry.session_id
+            peer_origin = entry.origin
+            peer_display_name = entry.display_name
+        self._save_entry(session_key)
+        self._record_gateway_session_peer(
+            peer_session_id,
+            session_key,
+            peer_origin,
+            display_name=peer_display_name,
+        )
+        return True
+
+    def matching_session_id(
+        self, session_key: str, session_ids: tuple[str, ...]
+    ) -> Optional[str]:
+        """Return the current session id when it is one of the expected ids."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry and entry.session_id in session_ids:
+                return entry.session_id
+            return None
+
     def get_session_metadata(
         self,
         session_key: str,

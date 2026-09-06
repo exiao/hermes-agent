@@ -1295,6 +1295,46 @@ class TestLastPromptTokens:
         store.update_session("k1")  # No last_prompt_tokens arg
         assert entry.last_prompt_tokens == 50000  # unchanged
 
+    def test_invalidate_prompt_tokens_only_if_activity_is_unchanged(self, tmp_path):
+        """A late compaction must not overwrite usage from a newer user turn."""
+        from datetime import datetime, timedelta
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+        store._save_entry = MagicMock()
+        store._record_gateway_session_peer = MagicMock()
+        expected = datetime.now()
+        entry = SessionEntry(
+            session_key="k1",
+            session_id="s1",
+            created_at=expected,
+            updated_at=expected,
+            last_prompt_tokens=90_000,
+        )
+        store._entries = {"k1": entry}
+
+        assert store.invalidate_last_prompt_tokens_if_unchanged(
+            "k1", expected, ("s1",)
+        )
+        assert entry.last_prompt_tokens == 0
+
+        entry.last_prompt_tokens = 42_000
+        entry.updated_at = expected + timedelta(seconds=1)
+        assert not store.invalidate_last_prompt_tokens_if_unchanged(
+            "k1", expected, ("s1",)
+        )
+        assert entry.last_prompt_tokens == 42_000
+
+        entry.updated_at = expected
+        assert not store.invalidate_last_prompt_tokens_if_unchanged(
+            "k1", expected, ("replacement",)
+        )
+        assert store.matching_session_id("k1", ("s1", "child")) == "s1"
+        assert store.matching_session_id("k1", ("replacement",)) is None
+
 
 class TestSessionMetadata:
     """SessionEntry metadata should persist arbitrary lightweight state."""

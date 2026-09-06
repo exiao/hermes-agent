@@ -246,6 +246,44 @@ def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
             logger.debug("hygiene failure streak persistent reset failed: %s", exc)
 
 
+async def _persist_deferred_hygiene_outcome(
+    gateway,
+    *,
+    session_key: str,
+    session_id: str,
+    expected_session_ids: tuple[str, ...],
+    run_generation: int,
+    expected_updated_at: datetime,
+    committed: bool,
+) -> None:
+    """Persist a late hygiene result without blocking the gateway event loop."""
+    if not committed:
+        await asyncio.to_thread(
+            _record_hygiene_cooldown,
+            gateway,
+            session_id,
+            _HYGIENE_TURNHOLD_RETRY_SECONDS,
+            "hygiene compression deferred: turn-hold budget expired and the "
+            "detached attempt did not commit",
+        )
+        return
+
+    # The failure streak belongs to the routing key, not one transcript tip.
+    # Reset it at successful commit time so a restart cannot lose recovery.
+    await asyncio.to_thread(
+        _reset_hygiene_failure_streak, gateway, session_key
+    )
+    matched_session_id = await gateway.async_session_store.matching_session_id(
+        session_key, expected_session_ids
+    )
+    if not matched_session_id:
+        return
+    if gateway._is_session_run_current(session_key, run_generation):
+        await gateway.async_session_store.invalidate_last_prompt_tokens_if_unchanged(
+            session_key, expected_updated_at, expected_session_ids
+        )
+
+
 def hygiene_compaction_recovered(
     *,
     aborted: bool,
@@ -12413,6 +12451,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
+    async def _drain_deferred_hygiene_persistence(
+        self, timeout: float = 25.0
+    ) -> int:
+        """Drain admitted workers and the persistence tasks they create."""
+        deadline = time.monotonic() + timeout
+        while True:
+            tracked = set(
+                getattr(self, "_deferred_hygiene_worker_futures", set())
+            )
+            tracked.update(
+                getattr(self, "_deferred_hygiene_persistence_tasks", set())
+            )
+            pending = {task for task in tracked if not task.done()}
+            if not pending:
+                # A completed worker's callback schedules persistence on the
+                # next loop turn. Yield once before declaring the drain empty.
+                await asyncio.sleep(0)
+                tracked = set(
+                    getattr(self, "_deferred_hygiene_worker_futures", set())
+                )
+                tracked.update(
+                    getattr(self, "_deferred_hygiene_persistence_tasks", set())
+                )
+                pending = {task for task in tracked if not task.done()}
+                if not pending:
+                    return 0
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, _ = await asyncio.wait(pending, timeout=remaining)
+            for task in done:
+                consume_detached_task_result(task)
+            await asyncio.sleep(0)
+
+        logger.warning(
+            "%d deferred hygiene worker/persistence task(s) exceeded the %.0fs "
+            "shutdown drain",
+            len(pending),
+            timeout,
+        )
+        return len(pending)
+
     # Bounded budget for one finalize_session() dispatch (plugin
     # on_session_finalize hooks + core Relay conversation close). Generous
     # enough for a normal trace-export flush, small enough that a wedged
@@ -16966,6 +17046,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if cancel_completion_batches is not None:
                 await cancel_completion_batches()
+
+            # Late hygiene commits have already changed the transcript. Give
+            # their token/cooldown persistence a bounded chance to become
+            # durable before blanket background-task cancellation and exit.
+            await self._drain_deferred_hygiene_persistence()
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
@@ -21666,7 +21751,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # Prefer actual API-reported tokens from the last turn
                 # (stored in session entry) over the rough char-based estimate.
-                _stored_tokens = session_entry.last_prompt_tokens
+                _hyg_state = self._peek_session_state(session_key)
+                _usage_marker = (
+                    _hyg_state.persistent.hygiene_usage_invalidation
+                    if _hyg_state
+                    else None
+                )
+                if _usage_marker and session_entry.session_id not in _usage_marker[0]:
+                    _hyg_state.persistent.hygiene_usage_invalidation = None
+                    _usage_marker = None
+                _usage_invalidated = bool(_usage_marker)
+                _stored_tokens = (
+                    0 if _usage_invalidated else session_entry.last_prompt_tokens
+                )
                 if _stored_tokens > 0:
                     _approx_tokens = _stored_tokens
                     _token_source = "actual"
@@ -21698,6 +21795,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _approx_tokens >= _compress_token_threshold
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
+
+                if _needs_compress:
+                    _retry_state = self._peek_session_state(session_key)
+                    _retry_after = (
+                        _retry_state.persistent.hygiene_retry_after_monotonic
+                        if _retry_state
+                        else 0.0
+                    )
+                    _retry_remaining = _retry_after - time.monotonic()
+                    if _retry_remaining > 0:
+                        logger.info(
+                            "Session hygiene: skipping compression for %s; "
+                            "deferred retry spacing active for %.1fs",
+                            session_entry.session_id,
+                            _retry_remaining,
+                        )
+                        _needs_compress = False
+                    elif _retry_state and _retry_after:
+                        _retry_state.persistent.hygiene_retry_after_monotonic = 0.0
 
                 if _needs_compress:
                     # Use the persistent DB-backed cooldown (same as the
@@ -22093,6 +22209,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _hyg_agent,
                                                 context="session hygiene turn-hold",
                                             )
+                                            if not hasattr(
+                                                self,
+                                                "_deferred_hygiene_worker_futures",
+                                            ):
+                                                self._deferred_hygiene_worker_futures = set()
+                                            _hyg_worker_futures = (
+                                                self._deferred_hygiene_worker_futures
+                                            )
+                                            _hyg_worker_futures.add(_hyg_future)
                                             _hyg_cleanup_deferred = True
                                             # NO retry-after here (#97963 (b)): the
                                             # attempt is still running toward a real
@@ -22119,6 +22244,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _sid=_hyg_deferred_sid,
                                                 _skey=_hyg_deferred_key,
                                                 _agent=_hyg_deferred_agent,
+                                                _worker_futures=_hyg_worker_futures,
                                             ):
                                                 try:
                                                     _exc = _fut.exception()
@@ -22142,6 +22268,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                         )
                                                         != _sid
                                                     )
+                                                _committed_sid = getattr(
+                                                    _agent, "session_id", _sid
+                                                )
+                                                _expected_session_ids = (
+                                                    (_sid,)
+                                                    if _committed_sid == _sid
+                                                    else (_sid, _committed_sid)
+                                                )
+                                                _generation = _gw._session_state(
+                                                    _skey
+                                                ).persistent.run_generation
+                                                if _committed:
+                                                    _state = _gw._session_state(
+                                                        _skey
+                                                    ).persistent
+                                                    _state.hygiene_usage_invalidation = (
+                                                        _expected_session_ids,
+                                                        _committed_sid,
+                                                        _generation,
+                                                    )
+                                                    _gw._invalidate_cached_agent_message_count(
+                                                        _skey,
+                                                        _expected_session_ids,
+                                                        _committed_sid,
+                                                    )
+                                                else:
+                                                    _state = _gw._session_state(
+                                                        _skey
+                                                    ).persistent
+                                                    _state.hygiene_retry_after_monotonic = max(
+                                                        _state.hygiene_retry_after_monotonic,
+                                                        time.monotonic()
+                                                        + _HYGIENE_TURNHOLD_RETRY_SECONDS,
+                                                    )
                                                 if _committed:
                                                     logger.info(
                                                         "Session hygiene compression for "
@@ -22151,32 +22311,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                         "commit boundary (#97963)",
                                                         _sid,
                                                     )
-                                                    try:
-                                                        _reset_hygiene_failure_streak(
-                                                            _gw, _skey
-                                                        )
-                                                    except Exception as _rs_err:
-                                                        logger.debug(
-                                                            "hygiene streak reset after "
-                                                            "deferred adoption failed: %s",
-                                                            _rs_err,
-                                                        )
+                                                _persist_coro = (
+                                                    _persist_deferred_hygiene_outcome(
+                                                        _gw,
+                                                        session_key=_skey,
+                                                        session_id=_sid,
+                                                        expected_session_ids=(
+                                                            _expected_session_ids
+                                                        ),
+                                                        run_generation=_generation,
+                                                        expected_updated_at=(
+                                                            session_entry.updated_at
+                                                        ),
+                                                        committed=_committed,
+                                                    )
+                                                )
+                                                try:
+                                                    _persist_task = asyncio.create_task(
+                                                        _persist_coro
+                                                    )
+                                                except Exception:
+                                                    _persist_coro.close()
+                                                    _worker_futures.discard(_fut)
+                                                    logger.warning(
+                                                        "Could not schedule deferred hygiene "
+                                                        "persistence",
+                                                        exc_info=True,
+                                                    )
                                                 else:
-                                                    # Nothing to adopt (summary failed,
-                                                    # fence refused the commit, or the
-                                                    # attempt was superseded). Restore
-                                                    # the pre-#97963 spacing so
-                                                    # sustained traffic does not spawn
-                                                    # and abandon a fresh compressor
-                                                    # every turn. Flat and
-                                                    # non-escalating: the streak must
-                                                    # not advance for a deferral.
-                                                    _record_hygiene_cooldown(
-                                                        _gw, _sid,
-                                                        _HYGIENE_TURNHOLD_RETRY_SECONDS,
-                                                        "hygiene compression deferred: "
-                                                        "turn-hold budget expired and the "
-                                                        "detached attempt did not commit",
+                                                    if not hasattr(
+                                                        _gw,
+                                                        "_deferred_hygiene_persistence_tasks",
+                                                    ):
+                                                        _gw._deferred_hygiene_persistence_tasks = set()
+                                                    _persist_tasks = (
+                                                        _gw._deferred_hygiene_persistence_tasks
+                                                    )
+                                                    _persist_tasks.add(_persist_task)
+                                                    _persist_task.add_done_callback(
+                                                        _persist_tasks.discard
+                                                    )
+                                                    _persist_task.add_done_callback(
+                                                        consume_detached_task_result
+                                                    )
+                                                    _persist_task.add_done_callback(
+                                                        lambda _done,
+                                                        _workers=_worker_futures,
+                                                        _worker=_fut: _workers.discard(
+                                                            _worker
+                                                        )
                                                     )
 
                                             _hyg_future.add_done_callback(
@@ -23543,11 +23726,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
             # compression decisions.
+            _prompt_tokens = agent_result.get("last_prompt_tokens", 0)
+            _usage_state = self._peek_session_state(session_key)
+            _usage_marker = (
+                _usage_state.persistent.hygiene_usage_invalidation
+                if _usage_state
+                else None
+            )
+            if (
+                _usage_marker
+                and session_entry.session_id in _usage_marker[0]
+                and _usage_marker[2] == run_generation
+            ):
+                _prompt_tokens = 0
             await self.async_session_store.update_session(
                 session_entry.session_key,
-                last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                last_prompt_tokens=_prompt_tokens,
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
+            # The late-summary callback can run while update_session awaits its
+            # worker thread. Recheck afterward so its invalidation cannot be
+            # overwritten by this turn's pre-compaction usage.
+            _usage_state = self._peek_session_state(session_key)
+            _usage_marker_after_write = (
+                _usage_state.persistent.hygiene_usage_invalidation
+                if _usage_state
+                else None
+            )
+            _skip_cache_rebaseline = bool(
+                _usage_marker_after_write
+                and session_entry.session_id in _usage_marker_after_write[0]
+                and _usage_marker_after_write[2] == run_generation
+            )
+            if _skip_cache_rebaseline and _prompt_tokens != 0:
+                await self.async_session_store.update_session(
+                    session_entry.session_key,
+                    last_prompt_tokens=0,
+                    touch_activity=False,
+                )
+            if (
+                _usage_state
+                and _usage_marker_after_write
+                and session_entry.session_id in _usage_marker_after_write[0]
+                and _usage_marker_after_write[2] <= run_generation
+                and _usage_state.persistent.hygiene_usage_invalidation
+                == _usage_marker_after_write
+            ):
+                _usage_state.persistent.hygiene_usage_invalidation = None
 
             # Re-baseline the cached agent's message_count snapshot now that
             # ALL of this turn's transcript writes are done — the agent's
@@ -23566,10 +23791,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compaction-updated session_id (the agent_result session_id swap
             # above), matching this function's documented contract.  Refreshing
             # here makes the guard fire only on a DIFFERENT process's writes.
-            # Fail-safe inside the helper.
-            await self._refresh_agent_cache_message_count(
-                session_key, session_entry.session_id
-            )
+            # Fail-safe inside the helper. A late hygiene compaction deliberately
+            # skips this refresh so its poisoned snapshot forces one safe rebuild.
+            if not _skip_cache_rebaseline:
+                await self._refresh_agent_cache_message_count(
+                    session_key, session_entry.session_id
+                )
+                # A late commit can land while the refresh awaits its DB read.
+                # Re-poison the cache and clear stale usage if that happened.
+                _usage_state = self._peek_session_state(session_key)
+                _marker_after_refresh = (
+                    _usage_state.persistent.hygiene_usage_invalidation
+                    if _usage_state
+                    else None
+                )
+                if (
+                    _marker_after_refresh
+                    and session_entry.session_id in _marker_after_refresh[0]
+                    and _marker_after_refresh[2] == run_generation
+                ):
+                    self._invalidate_cached_agent_message_count(
+                        session_key,
+                        _marker_after_refresh[0],
+                        _marker_after_refresh[1],
+                    )
+                    await self.async_session_store.update_session(
+                        session_entry.session_key,
+                        last_prompt_tokens=0,
+                        touch_activity=False,
+                    )
+                    if (
+                        _usage_state.persistent.hygiene_usage_invalidation
+                        == _marker_after_refresh
+                    ):
+                        _usage_state.persistent.hygiene_usage_invalidation = None
 
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
@@ -29719,12 +29974,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _cache = getattr(self, "_agent_cache", None)
         if not _cache_lock or _cache is None:
             return
+
+        def _late_hygiene_marker():
+            state = self._peek_session_state(session_key)
+            marker = (
+                state.persistent.hygiene_usage_invalidation if state else None
+            )
+            if marker and session_id in marker[0]:
+                return marker
+            return None
+
+        marker = _late_hygiene_marker()
+        if marker:
+            self._invalidate_cached_agent_message_count(
+                session_key, marker[0], marker[1]
+            )
+            return
         try:
             _sess_row = await self._session_db.get_session(session_id)
             _live = _sess_row.get("message_count", 0) if _sess_row else None
         except Exception:
             return
         if _live is None:
+            return
+        marker = _late_hygiene_marker()
+        if marker:
+            self._invalidate_cached_agent_message_count(
+                session_key, marker[0], marker[1]
+            )
             return
         with _cache_lock:
             cached = _cache.get(session_key)
@@ -29753,6 +30030,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _cache[session_key] = (
                             cached[0], cached[1], _live, _snapshot_sid,
                         )
+
+    def _invalidate_cached_agent_message_count(
+        self,
+        session_key: str,
+        expected_session_ids: tuple[str, ...],
+        replacement_session_id: str,
+    ) -> bool:
+        """Force the matching cached agent to rebuild on its next turn."""
+        cache = getattr(self, "_agent_cache", None)
+        lock = getattr(self, "_agent_cache_lock", None)
+        if cache is None or lock is None:
+            return False
+        with lock:
+            cached = cache.get(session_key)
+            if not isinstance(cached, tuple) or len(cached) < 4:
+                return False
+            if cached[3] not in expected_session_ids:
+                return False
+            cache[session_key] = (
+                cached[0], cached[1], -1, replacement_session_id
+            )
+            return True
 
     def _set_pending_turn_sidecar_notes(self, session_key: str, notes: List[str]) -> None:
         """Stage per-turn must-deliver notes for the next agent run (one-shot)."""
