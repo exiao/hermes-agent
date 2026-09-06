@@ -22013,6 +22013,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # would end the live gateway session row.
                                     _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
+                                    _hyg_original_count = len(_hyg_msgs)
+                                    _hyg_original_tokens = _approx_tokens
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence(
@@ -22237,6 +22239,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_deferred_sid = session_entry.session_id
                                             _hyg_deferred_key = session_key
                                             _hyg_deferred_agent = _hyg_agent
+                                            _hyg_deferred_original_count = _hyg_original_count
+                                            _hyg_deferred_original_tokens = _hyg_original_tokens
 
                                             def _hyg_adopt_or_space_retry(
                                                 _fut,
@@ -22245,6 +22249,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _skey=_hyg_deferred_key,
                                                 _agent=_hyg_deferred_agent,
                                                 _worker_futures=_hyg_worker_futures,
+                                                _original_count=_hyg_deferred_original_count,
+                                                _original_tokens=_hyg_deferred_original_tokens,
                                             ):
                                                 try:
                                                     _exc = _fut.exception()
@@ -22255,19 +22261,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _exc = None
                                                     _committed = False
                                                 else:
-                                                    _committed = _exc is None and (
-                                                        bool(
+                                                    try:
+                                                        _result_messages, _ = _fut.result()
+                                                        _new_count = len(_result_messages)
+                                                        _new_tokens = estimate_messages_tokens_rough(
+                                                            _result_messages
+                                                        )
+                                                    except Exception:
+                                                        _committed = False
+                                                    else:
+                                                        _committed_sid = getattr(
+                                                            _agent, "session_id", _sid
+                                                        )
+                                                        _rotated = _committed_sid != _sid
+                                                        _in_place = bool(
                                                             getattr(
                                                                 _agent,
                                                                 "_last_compaction_in_place",
                                                                 False,
                                                             )
                                                         )
-                                                        or getattr(
-                                                            _agent, "session_id", _sid
+                                                        _committed = hygiene_compaction_recovered(
+                                                            aborted=bool(
+                                                                getattr(
+                                                                    getattr(
+                                                                        _agent,
+                                                                        "context_compressor",
+                                                                        None,
+                                                                    ),
+                                                                    "_last_compress_aborted",
+                                                                    False,
+                                                                )
+                                                            ),
+                                                            rotated=_rotated,
+                                                            in_place=_in_place,
+                                                            msg_count=_original_count,
+                                                            new_count=_new_count,
+                                                            approx_tokens=_original_tokens,
+                                                            new_tokens=_new_tokens,
                                                         )
-                                                        != _sid
-                                                    )
                                                 _committed_sid = getattr(
                                                     _agent, "session_id", _sid
                                                 )

@@ -164,11 +164,20 @@ async def _drain_deferred(runner, timeout=10.0):
 
 
 @pytest.mark.parametrize(
-    "adoption_timing", ["before_finalizer", "during_refresh", "after_finalizer"]
+    ("adoption_timing", "material_progress"),
+    [
+        ("before_finalizer", True),
+        ("during_refresh", True),
+        ("after_finalizer", True),
+        # A durable in-place commit is not recovery when it leaves the
+        # transcript unchanged.  This is the late-result regression for the
+        # hygiene failure-streak gate.
+        ("after_finalizer", False),
+    ],
 )
 @pytest.mark.asyncio
 async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
-    monkeypatch, tmp_path, adoption_timing
+    monkeypatch, tmp_path, adoption_timing, material_progress
 ):
     """A watermark-fenced worker keeps its commit admission at turn-hold
     expiry; its late summary is ADOPTED (committed), not discarded — while
@@ -230,14 +239,19 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
             if commit_fence is not None and not commit_fence.begin_commit():
                 return (messages, None)
             try:
+                compacted_messages = (
+                    [{"role": "assistant", "content": "summary"}]
+                    if material_progress
+                    else messages
+                )
                 self._session_db.archive_and_compact(
                     self.session_id,
-                    [{"role": "assistant", "content": "summary"}],
+                    compacted_messages,
                     watermark=6,
                 )
                 self._last_compaction_in_place = True
                 committed.set()
-                return ([{"role": "assistant", "content": "summary"}], None)
+                return (compacted_messages, None)
             finally:
                 if commit_fence is not None:
                     commit_fence.finish_commit()
@@ -298,13 +312,14 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
 
-    # (b) NO retry-after was armed while the attempt is still running —
-    # arming it would block the agent-side preflight from adopting the
-    # finished summary ("same-session cooldown active", #97963).
-    assert not fake_db.record_compression_failure_cooldown.called, (
-        "keep-admission path must not arm the retry-after while the "
-        "detached attempt is still running"
-    )
+    if material_progress:
+        # (b) NO retry-after was armed while the attempt is still running —
+        # arming it would block the agent-side preflight from adopting the
+        # finished summary ("same-session cooldown active", #97963).
+        assert not fake_db.record_compression_failure_cooldown.called, (
+            "keep-admission path must not arm the retry-after while the "
+            "detached attempt is still running"
+        )
 
     # The detached worker finishes late; its commit is ADMITTED (adoption),
     # not refused — the summary attempt is no longer burned.
@@ -324,21 +339,27 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 5), timeout=6)
     FencedStreamingAgent.last_instance.close.assert_called_once()
 
-    # Successful adoption resets the hygiene failure streak once a matching
-    # turn finalizer consumes the invalidation marker.
-    assert not fake_db.increment_hygiene_failure_streak.called
-    assert fake_db.reset_hygiene_failure_streak.called
-    assert reset_thread_ids and all(
-        thread_id != loop_thread_id for thread_id in reset_thread_ids
-    ), "deferred SQLite persistence must not block the gateway event loop"
-    if adoption_timing == "before_finalizer":
-        runner._refresh_agent_cache_message_count.assert_not_awaited()
+    if material_progress:
+        # Successful adoption resets the hygiene failure streak once a matching
+        # turn finalizer consumes the invalidation marker.
+        assert not fake_db.increment_hygiene_failure_streak.called
+        assert fake_db.reset_hygiene_failure_streak.called
+        assert reset_thread_ids and all(
+            thread_id != loop_thread_id for thread_id in reset_thread_ids
+        ), "deferred SQLite persistence must not block the gateway event loop"
+        if adoption_timing == "before_finalizer":
+            runner._refresh_agent_cache_message_count.assert_not_awaited()
+        else:
+            runner._refresh_agent_cache_message_count.assert_awaited_once()
+        runner.session_store.invalidate_last_prompt_tokens_if_unchanged.assert_called_once()
+        runner._invalidate_cached_agent_message_count.assert_called_with(
+            "agent:main:telegram:dm:12345", ("sess-97963",), "sess-97963"
+        )
     else:
-        runner._refresh_agent_cache_message_count.assert_awaited_once()
-    runner.session_store.invalidate_last_prompt_tokens_if_unchanged.assert_called_once()
-    runner._invalidate_cached_agent_message_count.assert_called_with(
-        "agent:main:telegram:dm:12345", ("sess-97963",), "sess-97963"
-    )
+        assert not fake_db.reset_hygiene_failure_streak.called
+        assert fake_db.record_compression_failure_cooldown.called, (
+            "a late commit without material shrinkage must retain retry spacing"
+        )
     # Deferral notice still reaches the user.
     sent = [m["content"] for m in adapter.sent]
     assert any(
