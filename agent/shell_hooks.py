@@ -354,9 +354,9 @@ def re_register_config_hooks() -> None:
     """
     with _registered_lock:
         _registered.clear()
-    from hermes_cli.config import load_config
+    from hermes_cli import config as config_module
 
-    register_from_config(load_config())
+    register_from_config(config_module.load_config())
 
 
 def reset_for_tests() -> None:

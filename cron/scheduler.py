@@ -1377,6 +1377,34 @@ def _consume_interrupted_flag(job_id: str, token: Optional[object] = None) -> bo
         return hit
 
 
+class InactivityBreach:
+    """The idle reading that actually tripped the inactivity watchdog.
+
+    Truthy so existing ``if _inactivity_watchdog_loop(...)`` callers keep
+    working, but it carries ``idle_seconds`` so the caller reports the
+    value that CAUSED the kill instead of re-reading the activity clock.
+    That re-read is what produced the self-contradictory live error
+    "idle for 2s (limit 600s)": the agent resumed between the watchdog's
+    decision and the message being built, so the message quoted a fresh
+    healthy reading that never breached anything.
+    """
+
+    __slots__ = ("idle_seconds", "limit_s")
+
+    def __init__(self, idle_seconds: float, limit_s: float) -> None:
+        self.idle_seconds = float(idle_seconds)
+        self.limit_s = float(limit_s)
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return (
+            f"InactivityBreach(idle_seconds={self.idle_seconds:.0f}, "
+            f"limit_s={self.limit_s:.0f})"
+        )
+
+
 def _inactivity_watchdog_loop(
     *,
     get_idle_seconds: Callable[[], float],
@@ -1384,15 +1412,27 @@ def _inactivity_watchdog_loop(
     poll_s: float,
     stop: threading.Event,
     future_done: Callable[[], bool],
-) -> bool:
+    required_breaches: int = 2,
+):
     """Poll job idle time until the limit, stop, or the watched future completes.
 
     Driven by ``threading.Event.wait`` (a kernel timeout), not asyncio, so a
     blocked event-loop / ``run_job`` thread cannot disable this watchdog the
     way ``asyncio.sleep`` / ``wait_for`` would (family A of #94285 — the
-    4118s-idle-on-a-600s-limit cron hang). Returns True when *limit_s* of
-    inactivity was observed.
+    4118s-idle-on-a-600s-limit cron hang).
+
+    Returns an :class:`InactivityBreach` (truthy) carrying the idle value
+    that tripped it, or ``False`` when no stall was observed.
+
+    The breach must be seen on ``required_breaches`` CONSECUTIVE polls
+    before the job is declared dead. ``get_idle_seconds`` swallows its own
+    exceptions and returns 0.0, so a single anomalous sample is not
+    evidence of a stall; a genuine hang trivially clears the bar because
+    the clock keeps climbing every poll. Any healthy reading resets the
+    streak.
     """
+    consecutive = 0
+    breach_idle = 0.0
     while not stop.wait(poll_s):
         if future_done():
             return False
@@ -1401,7 +1441,15 @@ def _inactivity_watchdog_loop(
         except Exception:
             idle = 0.0
         if idle >= limit_s:
-            return True
+            consecutive += 1
+            # Report the worst reading in the streak, never a later,
+            # smaller one.
+            breach_idle = max(breach_idle, idle)
+            if consecutive >= required_breaches:
+                return InactivityBreach(breach_idle, limit_s)
+        else:
+            consecutive = 0
+            breach_idle = 0.0
     return False
 
 
@@ -6660,14 +6708,19 @@ def run_job(
             nonlocal _inactivity_timeout
             if _cron_inactivity_limit is None:
                 return
-            if _inactivity_watchdog_loop(
+            _breach = _inactivity_watchdog_loop(
                 get_idle_seconds=_idle_seconds,
                 limit_s=_cron_inactivity_limit,
                 poll_s=_POLL_INTERVAL,
                 stop=_watch_stop,
                 future_done=_cron_future.done,
-            ):
-                _inactivity_timeout = True
+            )
+            if _breach:
+                # Keep the idle value that actually tripped the watchdog.
+                # Re-reading the clock in the error path reports whatever
+                # the agent is doing NOW, which produced the impossible
+                # live message "idle for 2s (limit 600s)".
+                _inactivity_timeout = _breach
 
         _watch_thread = threading.Thread(
             target=_watch_inactivity,
@@ -6713,10 +6766,21 @@ def run_job(
                 except Exception:
                     pass
             _last_desc = _activity.get("last_activity_desc", "unknown")
-            _secs_ago = _activity.get("seconds_since_activity", 0)
             _cur_tool = _activity.get("current_tool")
             _iter_n = _activity.get("api_call_count", 0)
             _iter_max = _activity.get("max_iterations", 0)
+
+            # Report the idle reading the WATCHDOG tripped on. The activity
+            # summary above is re-read after the decision, so its
+            # seconds_since_activity can already have been reset by a turn
+            # that resumed — that is how a 600s-limit kill once reported
+            # "idle for 2s". Fall back to the fresh read only if the
+            # watchdog somehow carried nothing.
+            _secs_ago = getattr(
+                _inactivity_timeout,
+                "idle_seconds",
+                _activity.get("seconds_since_activity", 0),
+            )
 
             logger.error(
                 "Job '%s' idle for %.0fs (inactivity limit %.0fs) "

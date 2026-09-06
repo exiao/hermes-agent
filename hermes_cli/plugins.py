@@ -3788,9 +3788,14 @@ class PluginManager:
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
         # In-flight / recently-timed-out hook callbacks. Keyed by
-        # (hook_name, id(cb)) so a stuck policy hook cannot spawn a new
-        # abandoned daemon thread on every subsequent fire.
-        self._hook_running_callbacks: Dict[tuple, object] = {}
+        # (hook_name, id(cb)); the value maps each in-flight invocation's token
+        # to the time it started. A hung policy hook never clears its entry (its
+        # `finally` never runs), so its token ages past the timeout and every
+        # later fire is skipped instead of spawning another abandoned daemon
+        # thread. Invocations YOUNGER than the timeout are healthy concurrency
+        # and are allowed to overlap, which is why this is a per-token age map
+        # rather than a plain "is anything running" flag.
+        self._hook_running_callbacks: Dict[tuple, Dict[object, float]] = {}
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
@@ -5618,10 +5623,21 @@ class PluginManager:
                         suppressed_until = self._hook_timeout_suppressed_until.get(
                             callback_key
                         )
-                        running = callback_key in self._hook_running_callbacks
+                        # Only an invocation that has already outlived the
+                        # timeout counts as "stuck". A second tool call landing
+                        # while the first hook is still legitimately working is
+                        # normal concurrency: blocking it fails the tool closed
+                        # for no reason, which is what made parallel terminal
+                        # calls return "timed out or is still running" with no
+                        # timeout ever recorded in the log.
+                        in_flight = self._hook_running_callbacks.get(callback_key)
+                        stuck = bool(in_flight) and any(
+                            now - started >= timeout
+                            for started in in_flight.values()
+                        )
                         if (
                             suppressed_until is not None and suppressed_until > now
-                        ) or running:
+                        ) or stuck:
                             logger.warning(
                                 "Hook '%s' callback %s skipped after previous "
                                 "timeout or while still running",
@@ -5633,7 +5649,9 @@ class PluginManager:
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
-                        self._hook_running_callbacks[callback_key] = token
+                        self._hook_running_callbacks.setdefault(callback_key, {})[
+                            token
+                        ] = now
 
                     context = contextvars.copy_context()
                     done = threading.Event()
@@ -5656,8 +5674,11 @@ class PluginManager:
                             failure["exc"] = exc
                         finally:
                             with self._hook_timeout_lock:
-                                if self._hook_running_callbacks.get(_key) is _token:
-                                    self._hook_running_callbacks.pop(_key, None)
+                                entries = self._hook_running_callbacks.get(_key)
+                                if entries is not None:
+                                    entries.pop(_token, None)
+                                    if not entries:
+                                        self._hook_running_callbacks.pop(_key, None)
                             done.set()
 
                     thread = threading.Thread(
