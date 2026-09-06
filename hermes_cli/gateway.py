@@ -2522,7 +2522,7 @@ def get_systemd_linger_status() -> tuple[bool | None, str]:
 def _launchd_user_home() -> Path:
     """Real macOS account home; profile mode may repoint ``HOME``."""
     import pwd
-    return Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: macOS-only helper
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — macOS-only launchd helper
 
 
 def _launchd_plist_basename() -> str:
