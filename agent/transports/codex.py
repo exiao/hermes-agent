@@ -11,9 +11,10 @@ import re
 from typing import Any, Callable, Optional
 
 from agent.reasoning_effort import (
-    ACTUAL_RELAY_EFFORTS, XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS, clamp_effort,
+    ACTUAL_RELAY_EFFORTS, ASTRA_UNSUPPORTED_REQUEST_FIELDS, XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS,
+    clamp_effort, is_astra_model,
     # Same declared vocabulary + shared clamp as the main Codex transport (agent.reasoning_effort):
-    # per-model — "max" is gpt-5.6-only, "minimal"/"ultra" always rejected (live-verified, #68365).
+    # per-model — Astra and gpt-5.6 accept max; minimal/ultra always clamp to a supported level.
     codex_supported_efforts,
 )
 from agent.transports.base import ProviderTransport
@@ -543,6 +544,9 @@ class ResponsesApiTransport(ProviderTransport):
         ))
         if params.get("request_overrides"):
             kwargs.update(params["request_overrides"])
+        if is_astra_model(model):
+            for field in ASTRA_UNSUPPORTED_REQUEST_FIELDS:
+                kwargs.pop(field, None)
 
         _bound_prompt_cache_key_field(kwargs)
 
