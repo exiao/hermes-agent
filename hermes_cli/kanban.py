@@ -3102,22 +3102,24 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         delivery_mode = getattr(args, "delivery_mode", None)
         # Slack keys sessions on the workspace scope as well as the chat, and
         # the CLI has no way to persist one (``_wake_scope_id`` recovers it
-        # only from delivery_metadata or the adapter's ephemeral channel map).
-        # So a Slack group/channel sub that looks route-complete here still
-        # cannot prove it will rebuild the inbound session key after a gateway
-        # restart, and its wake would run in an unscoped, context-free session.
-        # Every other platform ignores scope_id in build_session_key, so this
-        # narrows to Slack rather than gating all group subscriptions.
-        slack_needs_scope = (
-            args.platform == "slack"
-            and args.chat_type in ("group", "channel", "thread")
-        )
+        # only from delivery_metadata or the adapter's ephemeral channel map,
+        # which is empty after a gateway restart). So NO fresh Slack
+        # subscription can prove it will rebuild the inbound session key, and
+        # its wake would run in an unscoped, context-free session.
+        #
+        # This covers DMs too, not just group/channel/thread: build_session_key
+        # appends slack_scope_id to the dm_parts list before the chat id
+        # (gateway/session.py), and the adapter stamps scope_id on DM sources,
+        # so an unscoped DM key is just as wrong as an unscoped channel key.
+        # Every other platform ignores scope_id entirely, so this stays
+        # narrowed to Slack rather than gating all subscriptions.
+        slack_needs_scope = args.platform == "slack"
         route_ready = (
             # api_server subscriptions use chat_id as the raw session id;
             # the notifier self-posts to that exact session and does not need
             # gateway chat routing fields.
             args.platform == "api_server"
-            or args.chat_type == "dm"
+            or (not slack_needs_scope and args.chat_type == "dm")
             or (
                 not slack_needs_scope
                 and args.chat_type == "thread"

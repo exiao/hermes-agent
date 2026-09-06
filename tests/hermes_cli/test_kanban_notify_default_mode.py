@@ -207,11 +207,25 @@ def test_slack_thread_with_participant_still_stays_passive(board):
     assert _mode(board, tid) == "notify"
 
 
-def test_slack_dm_still_wakes(board):
-    """A Slack DM keys on the chat id, so it is route-complete without scope."""
+def test_slack_dm_also_stays_passive(board):
+    """Slack DMs are scope-dependent too — the first fix wrongly exempted them.
+
+    build_session_key appends slack_scope_id to dm_parts before the chat id,
+    and the adapter stamps scope_id on DM sources, so an unscoped DM key is
+    just as wrong as an unscoped channel key.
+    """
     tid = kb.create_task(board, title="t", assignee="dev")
     assert _cli_subscribe(tid, [
         "--platform", "slack", "--chat-id", "D123", "--chat-type", "dm",
+    ]) == 0
+    assert _mode(board, tid) == "notify"
+
+
+def test_non_slack_dm_still_wakes(board):
+    """Only Slack carries scope in its key; other DMs are route-complete."""
+    tid = kb.create_task(board, title="t", assignee="dev")
+    assert _cli_subscribe(tid, [
+        "--platform", "signal", "--chat-id", "+15551234", "--chat-type", "dm",
     ]) == 0
     assert _mode(board, tid) == "notify+wake"
 
