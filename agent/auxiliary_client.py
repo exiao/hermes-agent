@@ -3812,7 +3812,13 @@ def _compat_runtime_main() -> Optional[Dict[str, Any]]:
     )
     if values == _RUNTIME_MAIN_COMPAT_SNAPSHOT:
         return None
-    return dict(zip(_MAIN_RUNTIME_FIELDS, values))
+    return {
+        field: value
+        for field, value, previous in zip(
+            _MAIN_RUNTIME_FIELDS, values, _RUNTIME_MAIN_COMPAT_SNAPSHOT
+        )
+        if value != previous
+    }
 
 
 def _runtime_main_value(field: str) -> Any:

@@ -626,8 +626,26 @@ def _neutralize_webbrowser(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _neutralize_macos_keychain_creds(request, monkeypatch):
-    """Default Anthropic credential resolution away from the real macOS Keychain."""
+def _neutralize_macos_keychain_creds(request, monkeypatch, tmp_path):
+    """Default Anthropic credential resolution away from host credentials."""
+    # Claude Code credentials intentionally live under HOME rather than
+    # HERMES_HOME. Keep that lookup hermetic without redirecting HOME itself;
+    # the adapter and credentials modules share this test-only Path seam so
+    # legacy adapter.Path.home patches still target the implementation.
+    try:
+        from agent import anthropic_adapter as _adapter_mod
+        from agent import anthropic_credentials as _credentials_mod
+    except Exception:
+        return None
+
+    class _HermeticCredentialPath:
+        @classmethod
+        def home(cls):
+            return tmp_path
+
+    monkeypatch.setattr(_credentials_mod, "Path", _HermeticCredentialPath)
+    monkeypatch.setattr(_adapter_mod, "Path", _HermeticCredentialPath)
+
     if request.node.get_closest_marker(_ALLOW_MACOS_KEYCHAIN_MARK):
         return None
 

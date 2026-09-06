@@ -355,6 +355,24 @@ def _denied_path_set() -> tuple[frozenset[Path], tuple[Path, ...]]:
     prefixes: list[Path] = []
     for hd in hermes_dirs:
         prefixes.append(hd / "skills" / ".hub")
+        # browser-profile/: the real-profile browsing snapshot
+        # (browser.use_real_profile). A copy of the user's Cookies / Login Data
+        # / Web Data lives here, the same credential class as auth.json, so it
+        # gets the same directory-prefix read deny. A prefix rather than a
+        # finite filename list, so future Chromium files are covered too.
+        #
+        # Resolved HERE, inside the cache, not in `get_read_block_error()`.
+        # It used to loop over that function's own `hermes_dirs`; when this
+        # helper was extracted the loop was left behind reading a name that no
+        # longer existed, and since it runs on EVERY read (not only a denied
+        # one) every read_file and search_files call died with
+        # `NameError: name 'hermes_dirs' is not defined`. Recomputing the bases
+        # in that function would fix the crash but re-walk the filesystem on
+        # every call, which is the cost this cache exists to avoid.
+        try:
+            prefixes.append((hd / "browser-profile").resolve())
+        except Exception:
+            pass
         for name in _CREDENTIAL_FILE_NAMES:
             try:
                 exact.add((hd / name).resolve())
@@ -446,8 +464,9 @@ def get_read_block_error(path: str) -> Optional[str]:
             "terminal tool can still bypass.)"
         )
 
-    # Directory-prefix matches: skills/.hub (prompt-injection carriers) and
-    # anything inside mcp-tokens/ (OAuth token material).
+    # Directory-prefix matches: skills/.hub (prompt-injection carriers),
+    # anything inside mcp-tokens/ (OAuth token material), and browser-profile/
+    # (the copied cookies/logins snapshot).
     for blocked in prefix_blocked:
         try:
             resolved.relative_to(blocked)
@@ -459,38 +478,24 @@ def get_read_block_error(path: str) -> Optional[str]:
                 "and cannot be read directly. (Defense-in-depth \u2014 not a "
                 "security boundary; the terminal tool can still bypass.)"
             )
+        if blocked.name == "browser-profile":
+            if resolved == blocked:
+                return (
+                    f"Access denied: {path} is the Hermes real-profile browser "
+                    "snapshot directory (copied cookies/logins) and cannot be "
+                    "read directly. (Defense-in-depth — not a security "
+                    "boundary; the terminal tool can still bypass.)"
+                )
+            return (
+                f"Access denied: {path} is inside the Hermes real-profile "
+                "browser snapshot (copied cookies/logins) and cannot be read "
+                "directly. (Defense-in-depth — not a security boundary; the "
+                "terminal tool can still bypass.)"
+            )
         return (
             f"Access denied: {path} is an internal Hermes cache file "
             "and cannot be read directly to prevent prompt injection. "
             "Use the skills_list or skill_view tools instead."
-        )
-
-    # browser-profile/: real-profile browsing snapshot (browser.use_real_profile).
-    # A copy of the user's Cookies / Login Data / Web Data lives here — the same
-    # credential class as auth.json, so it gets the same directory-prefix read
-    # deny. Prefix (not a finite filename list) so future Chromium files are
-    # covered too.
-    for hd in hermes_dirs:
-        try:
-            browser_profile = (hd / "browser-profile").resolve()
-        except Exception:
-            continue
-        if resolved == browser_profile:
-            return (
-                f"Access denied: {path} is the Hermes real-profile browser "
-                "snapshot directory (copied cookies/logins) and cannot be read "
-                "directly. (Defense-in-depth — not a security boundary; the "
-                "terminal tool can still bypass.)"
-            )
-        try:
-            resolved.relative_to(browser_profile)
-        except ValueError:
-            continue
-        return (
-            f"Access denied: {path} is inside the Hermes real-profile browser "
-            "snapshot (copied cookies/logins) and cannot be read directly. "
-            "(Defense-in-depth — not a security boundary; the terminal tool "
-            "can still bypass.)"
         )
 
     # Block common secret-bearing project-local .env files anywhere on disk.
