@@ -86,14 +86,37 @@ def add_notify_sub(
     omitting it would key the wake into a different session. ``None`` keeps an
     existing row's value. ``delivery_mode``: ``None`` leaves an existing row
     untouched, an explicit valid value is last-write-wins, unknown falls back
-    to ``"notify"``. New subs start caught up (``last_event_id`` =
-    ``MAX(task_events.id)``) so the notifier never replays history at boot.
+    to the platform default below. New subs start caught up
+    (``last_event_id`` = ``MAX(task_events.id)``) so the notifier never
+    replays history at boot.
+
+    ``platform`` is normalized to a trimmed lowercase name. Adapters already
+    persist it that way, and the notifier lowercases before resolving, so a
+    caller passing ``"Slack"`` used to insert a SECOND logical row under a
+    different primary key and every terminal event was delivered twice.
+    Normalizing at this layer fixes the whole class, including legacy rows a
+    re-subscribe now matches instead of duplicating.
     """
+    platform = (platform or "").strip().lower()
     valid_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
+    # A chat that files a card wants to hear back from the AGENT, not just
+    # a one-line ping — passive 'notify' sends a message and runs no turn,
+    # so the card completes and the conversation stays dead. Every path
+    # that already knew better (the kanban_create tool, /kanban create)
+    # was passing 'notify+wake' explicitly; the paths that forgot
+    # (hermes kanban notify-subscribe, the dashboard home-subscribe route)
+    # inherited passive delivery by accident. Measured 2026-09-05: 1,103
+    # of 1,123 live subscriptions were passive. Defaulting here fixes the
+    # whole class instead of one caller.
+    #
+    # 'tui' is the exception and keeps passive delivery: the TUI poller
+    # (tui_gateway/server.py) posts the completion into the running
+    # session itself and has no wake path to drive.
+    #
     # api_server is stateless: the adapter has no send(), the wake self-post IS
     # the delivery. A plain 'notify' default would leave those subs with no
     # delivery mechanism at all. Explicit modes still win.
-    insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
+    insert_mode = valid_mode or ("notify" if platform == "tui" else "notify+wake")
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
@@ -248,6 +271,15 @@ def remove_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
+    """Delete one subscription; returns whether a row was removed.
+
+    ``platform`` is normalized the same way ``add_notify_sub`` normalizes it,
+    so ``notify-unsubscribe --platform Slack`` removes the row that
+    ``notify-subscribe --platform Slack`` created. Without this the delete is
+    case-sensitive against an already-lowercased row, reports "no such
+    subscription", and leaves it active.
+    """
+    platform = (platform or "").strip().lower()
     with _kb.write_txn(conn):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE,
@@ -409,6 +441,76 @@ def rewind_notify_cursor(
     with _kb.write_txn(conn):
         cur = _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), old_cursor, claimed_cursor)
     return cur.rowcount > 0
+
+
+def resolve_cli_delivery_mode(
+    conn,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str | None,
+    chat_type: str | None,
+    user_id: str | None,
+    user_id_alt: str | None,
+    explicit_mode: str | None,
+) -> str | None:
+    """Delivery mode for a `hermes kanban notify-subscribe` row.
+
+    ``None`` means "leave it to add_notify_sub" — either the caller was
+    explicit, or the row already exists and must keep its mode.
+
+    A wake replays the subscription as a synthetic session, so it is only safe
+    when the stored fields can rebuild the ORIGINATING session key. When they
+    cannot, the notifier falls back to a DM-shaped key and the wake runs an
+    autonomous turn in a fresh, context-free session. Such rows stay passive.
+
+    Slack is the standing exception at EVERY chat type: ``build_session_key``
+    folds a workspace ``scope_id`` into the key (including ``dm_parts``), and
+    the CLI has no flag to persist one — ``_wake_scope_id`` recovers it only
+    from delivery_metadata or the adapter's ephemeral channel map, which is
+    empty after a gateway restart. Every other platform ignores ``scope_id``.
+    """
+    if explicit_mode is not None:
+        return explicit_mode
+
+    slack_needs_scope = platform == "slack"
+    participant = user_id or user_id_alt
+    route_ready = (
+        # api_server uses chat_id as the raw session id and self-posts to it,
+        # so it needs no gateway chat routing fields.
+        platform == "api_server"
+        or (not slack_needs_scope and chat_type == "dm")
+        or (
+            not slack_needs_scope
+            and chat_type == "thread"
+            and thread_id
+            and participant
+        )
+        or (
+            not slack_needs_scope
+            and chat_type in ("group", "channel")
+            and participant
+        )
+    )
+    if route_ready:
+        return None
+
+    # Only a FRESH row is forced passive; an existing row keeps whatever mode
+    # it was given. Legacy rows predate platform normalization, so match them
+    # case-insensitively — otherwise a re-subscribe inserts a second logical
+    # row under the normalized key and the notifier delivers twice.
+    existing = conn.execute(
+        """
+        SELECT 1 FROM kanban_notify_subs
+         WHERE task_id = ?
+           AND TRIM(LOWER(platform)) = ?
+           AND chat_id = ?
+           AND thread_id = ?
+        """,
+        (task_id, platform, chat_id, thread_id or ""),
+    ).fetchone()
+    return "notify" if existing is None else None
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

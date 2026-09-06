@@ -370,17 +370,19 @@ _SPECS = [
         _arg("--chat-type", choices=("dm", "group", "channel", "thread"),
              help="Originating source chat_type, recorded so the active-wake delivery "
                   "modes resolve the operator's real session. Omit to leave an "
-                  "existing sub unchanged (new subs default to 'dm')."),
+                  "existing sub unchanged; fresh route-less subs stay "
+                  "passive until routing data is supplied."),
         _arg("--notifier-profile",
              help="Profile gateway that owns/delivers this subscription (default: active profile)"),
         # choices: single source of truth shared with the DB/watcher enum.
         _arg("--delivery-mode", choices=kbn._NOTIFY_DELIVERY_MODES,
              help="How the kanban-notifier reacts to terminal events for this "
-                  "subscription: 'notify' (passive message only; default), "
+                  "subscription: 'notify' (passive message only), "
                   "'notify+wake' (message AND wake the destination gateway agent so "
-                  "it reads the full board context and replies in its own voice), or "
+                  "it reads the full board context and replies in its own voice; "
+                  "the default), or "
                   "'wake' (wake the agent only, no passive message). Omit to leave an "
-                  "existing subscription's mode unchanged (new subs default to 'notify')."),
+                  "existing subscription's mode unchanged."),
     ], help="Subscribe a gateway source to a task's terminal events (used by /kanban subscribe in the gateway adapter)"),
     _cmd("notify-list", [_arg("task_id", nargs="?"), _json_flag()],
          help="List notification subscriptions (optionally for a single task)"),

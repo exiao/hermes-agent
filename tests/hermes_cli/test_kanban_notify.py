@@ -48,10 +48,12 @@ def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="mode sub task", assignee="worker1")
-        # Fresh sub without a mode -> defaults to "notify".
+        # Fresh sub without a mode -> defaults to "notify+wake" (a chat that
+        # subscribes wants the agent to answer, not just a ping). Passive
+        # delivery is opt-in now, so this test states its mode explicitly.
         kbn.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat1",
-            notifier_profile="owner-a",
+            notifier_profile="owner-a", delivery_mode="notify",
         )
         subs = kbn.list_notify_subs(conn, tid)
         assert len(subs) == 1
@@ -228,7 +230,10 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
     try:
         passive_tid = kb.create_task(conn, title="passive task", assignee="worker1")
         active_tid = kb.create_task(conn, title="active task", assignee="worker1")
-        kbn.add_notify_sub(conn, task_id=passive_tid, platform="telegram", chat_id="chat1")
+        kbn.add_notify_sub(
+            conn, task_id=passive_tid, platform="telegram", chat_id="chat1",
+            delivery_mode="notify",
+        )
         kbn.add_notify_sub(
             conn, task_id=active_tid, platform="telegram", chat_id="chat1",
             delivery_mode="notify+wake",
@@ -298,7 +303,10 @@ async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_hom
             assignee="worker1",
             session_id="origin-session-id",
         )
-        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            delivery_mode="notify",
+        )
         kb.block_task(conn, tid, reason="plain notify block")
     finally:
         conn.close()

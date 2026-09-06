@@ -1731,9 +1731,19 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
         f"gateway.platforms.{platform}.home_channel in config.yaml.")
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
+        existing = conn.execute(
+            """
+            SELECT 1 FROM kanban_notify_subs
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (task_id, platform, home["chat_id"], home["thread_id"] or ""),
+        ).fetchone()
         kbn.add_notify_sub(
             conn, task_id=task_id, platform=platform, chat_id=home["chat_id"],
-            thread_id=home["thread_id"] or None, notifier_profile=_active_profile_name())
+            thread_id=home["thread_id"] or None, notifier_profile=_active_profile_name(),
+            # Dashboard home subscriptions lack the originating session's
+            # routing data, so they must not create a wake with a guessed DM key.
+            delivery_mode="notify" if existing is None else None)
         return {"ok": True, "task_id": task_id, "home_channel": home}
 
 

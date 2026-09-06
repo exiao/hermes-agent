@@ -1053,19 +1053,19 @@ A subscription removes itself automatically once the task reaches `done` or `arc
 
 ### Delivery modes
 
-`--delivery-mode` controls **how** the notifier reacts to a terminal event. Every subscription is in one of three modes (`notify` is the default and the original behavior):
+`--delivery-mode` controls **how** the notifier reacts to a terminal event. Every subscription is in one of three modes (`notify+wake` is the default for new subscriptions):
 
 | Mode | Passive message | Wakes the agent | Use it when |
 |------|-----------------|-----------------|-------------|
-| `notify` | yes | no | You just want a heads-up message in the chat (default). |
-| `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice. Chat-originated auto-subscribes use this. |
+| `notify` | yes | no | You just want a heads-up message in the chat. |
+| `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice (default for new subscriptions). |
 | `wake` | no | yes | You only want the agent to act on the event, with no separate ping. |
 
 A "wake" forges a synthetic inbound message to the destination gateway agent so it takes a normal turn (reads the comment + result, reasons, replies) instead of getting a one-line passive notification. It only fires when the notifier runs inside a live gateway process; otherwise a `notify+wake` subscription still delivers its passive message, while a `wake`-only subscription does nothing in that process.
 
 **Which events wake.** The ones that hand a decision back to the origin: `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `review_requested` (a worker finished the implementation and handed off via `kanban_request_review`) and `block_loop_detected` (the task was routed to `triage` after repeated blocks). `status`, `archived` and `unblocked` are delivered but never wake — they are bookkeeping transitions, not decisions. When a `completed` or `review_requested` event carries a summary, that handoff rides the wake turn, so the woken agent sees what the worker actually did.
 
-`--chat-type` (`dm` | `group` | `channel` | `thread`) records the originating chat's type so a woken turn resolves the operator's **real** session: `build_session_key` keys groups, channels, and threads differently from DMs, so an inaccurate `chat_type` would route the wake into a separate, context-less session. The `/kanban` auto-subscribe and slash-command paths capture this automatically — you only set it by hand when subscribing a chat from a script or cron. Omit it to leave an existing subscription unchanged (new subscriptions default to `dm`).
+`--chat-type` (`dm` | `group` | `channel` | `thread`) records the originating chat's type so a woken turn resolves the operator's **real** session: `build_session_key` keys groups, channels, and threads differently from DMs, so an inaccurate `chat_type` would route the wake into a separate, context-less session. The `/kanban` auto-subscribe and slash-command paths capture this automatically — you only set it by hand when subscribing a chat from a script or cron. Omit it to leave an existing subscription unchanged; fresh route-less CLI subscriptions stay passive until routing data is supplied.
 
 ### Multi-profile setups: delivery is profile-owned
 
