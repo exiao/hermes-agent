@@ -152,3 +152,16 @@ def test_legacy_unnormalized_row_is_matched_not_duplicated(board, stored):
     subs = kbn.list_notify_subs(board, tid)
     assert len(subs) == 1, f're-subscribe duplicated the legacy row: {subs}'
     assert subs[0]['delivery_mode'] == 'notify+wake'
+
+@pytest.mark.parametrize('spelling', ['Slack', '  SLACK  '])
+def test_unsubscribe_matches_the_spelling_used_to_subscribe(board, spelling):
+    """subscribe and unsubscribe must normalize identically, or the delete
+    silently misses an already-lowercased row and leaves it delivering."""
+    tid = kb.create_task(board, title='t', assignee='dev')
+    kbn.add_notify_sub(board, task_id=tid, platform=spelling, chat_id='C1',
+                       chat_type='group', user_id='U1')
+    assert len(kbn.list_notify_subs(board, tid)) == 1
+
+    assert kbn.remove_notify_sub(board, task_id=tid, platform=spelling,
+                                 chat_id='C1', thread_id=None) is True
+    assert kbn.list_notify_subs(board, tid) == []

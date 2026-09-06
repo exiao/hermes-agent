@@ -271,6 +271,15 @@ def remove_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
+    """Delete one subscription; returns whether a row was removed.
+
+    ``platform`` is normalized the same way ``add_notify_sub`` normalizes it,
+    so ``notify-unsubscribe --platform Slack`` removes the row that
+    ``notify-subscribe --platform Slack`` created. Without this the delete is
+    case-sensitive against an already-lowercased row, reports "no such
+    subscription", and leaves it active.
+    """
+    platform = (platform or "").strip().lower()
     with _kb.write_txn(conn):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE,
