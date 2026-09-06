@@ -46,6 +46,19 @@ def test_default_openai_destination_is_enabled_without_explicit_base_url():
     assert capabilities == {"native_compaction": True}
 
 
+def test_astra_direct_and_codex_destinations_are_enabled():
+    assert resolve_native_compaction_capabilities(
+        model="gpt-6-astra-900k",
+        base_url="https://api.openai.com/v1",
+    ) == {"native_compaction": True}
+    assert resolve_native_compaction_capabilities(
+        model="gpt-6-astra-900k",
+        base_url="https://chatgpt.com/backend-api/codex",
+        provider="openai-codex",
+        is_codex_backend=True,
+    ) == {"native_compaction": True}
+
+
 def test_explicit_false_capability_denies_native_payload():
     agent = _agent({"native_compaction": False})
 
