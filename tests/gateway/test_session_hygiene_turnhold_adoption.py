@@ -609,7 +609,7 @@ async def test_shutdown_drains_worker_and_spawned_persistence():
     loop = asyncio.get_running_loop()
     worker = loop.create_future()
     persisted = asyncio.Event()
-    runner._deferred_hygiene_worker_futures = {worker}
+    runner._deferred_hygiene_worker_futures = {worker: MagicMock()}
     runner._deferred_hygiene_persistence_tasks = set()
 
     def _worker_done(_future):
@@ -621,13 +621,77 @@ async def test_shutdown_drains_worker_and_spawned_persistence():
         runner._deferred_hygiene_persistence_tasks.add(task)
         task.add_done_callback(runner._deferred_hygiene_persistence_tasks.discard)
         task.add_done_callback(
-            lambda _done: runner._deferred_hygiene_worker_futures.discard(worker)
+            lambda _done: runner._deferred_hygiene_worker_futures.pop(worker, None)
         )
 
     worker.add_done_callback(_worker_done)
     loop.call_soon(worker.set_result, None)
 
     assert await runner._drain_deferred_hygiene_persistence(timeout=1) == 0
+    assert persisted.is_set()
+    assert not runner._deferred_hygiene_worker_futures
+    assert not runner._deferred_hygiene_persistence_tasks
+
+
+def test_nonblocking_revocation_prevents_future_commit():
+    from agent.conversation_compression import CompressionCommitFence
+
+    fence = CompressionCommitFence()
+    fence.revoke_commit_admission_nonblocking()
+
+    assert fence.is_cancelled
+    assert not fence.begin_commit()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_worker_after_drain_timeout():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    worker = asyncio.get_running_loop().create_future()
+    fence = MagicMock()
+    fence.commit_in_flight = False
+    runner._deferred_hygiene_worker_futures = {worker: fence}
+    runner._deferred_hygiene_persistence_tasks = set()
+
+    try:
+        assert await runner._drain_deferred_hygiene_persistence(timeout=0.01) == 1
+        fence.set_total_ceiling_seconds.assert_called_once_with(0.001)
+        fence.revoke_commit_admission_nonblocking.assert_called_once()
+        fence.revoke_commit_admission.assert_called_once()
+    finally:
+        worker.cancel()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_persistence_spawned_by_cancellation():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    loop = asyncio.get_running_loop()
+    worker = loop.create_future()
+    fence = MagicMock()
+    fence.commit_in_flight = False
+    persisted = asyncio.Event()
+    runner._deferred_hygiene_worker_futures = {worker: fence}
+    runner._deferred_hygiene_persistence_tasks = set()
+
+    def _worker_done(_future):
+        async def _persist():
+            await asyncio.sleep(0.05)
+            persisted.set()
+
+        task = asyncio.create_task(_persist())
+        runner._deferred_hygiene_persistence_tasks.add(task)
+        task.add_done_callback(runner._deferred_hygiene_persistence_tasks.discard)
+        task.add_done_callback(
+            lambda _done: runner._deferred_hygiene_worker_futures.pop(worker, None)
+        )
+
+    worker.add_done_callback(_worker_done)
+    fence.revoke_commit_admission.side_effect = lambda: loop.call_soon_threadsafe(
+        worker.set_result, None
+    )
+
+    assert await runner._drain_deferred_hygiene_persistence(timeout=0.01) == 0
     assert persisted.is_set()
     assert not runner._deferred_hygiene_worker_futures
     assert not runner._deferred_hygiene_persistence_tasks

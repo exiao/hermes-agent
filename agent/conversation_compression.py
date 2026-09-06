@@ -882,6 +882,10 @@ class CompressionCommitFence:
         """
         self._retain_cancelled_lock_until_worker_done = False
 
+    def revoke_commit_admission_nonblocking(self) -> None:
+        """Prevent future commits without running the durable-lock release hook."""
+        self._admission_revoked = True
+
     def revoke_commit_admission(self) -> None:
         """Revoke FUTURE commit admission without blocking on the fence lock.
 
@@ -912,7 +916,7 @@ class CompressionCommitFence:
           worker reaches first. Both are idempotent with the worker's own
           outer cleanup because the DB release is holder-qualified.
         """
-        self._admission_revoked = True
+        self.revoke_commit_admission_nonblocking()
         if self._lock.acquire(blocking=False):
             try:
                 self.release_cancelled_compression_lock()

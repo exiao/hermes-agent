@@ -12455,42 +12455,82 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, timeout: float = 25.0
     ) -> int:
         """Drain admitted workers and the persistence tasks they create."""
-        deadline = time.monotonic() + timeout
-        while True:
-            tracked = set(
-                getattr(self, "_deferred_hygiene_worker_futures", set())
-            )
-            tracked.update(
-                getattr(self, "_deferred_hygiene_persistence_tasks", set())
-            )
-            pending = {task for task in tracked if not task.done()}
-            if not pending:
-                # A completed worker's callback schedules persistence on the
-                # next loop turn. Yield once before declaring the drain empty.
-                await asyncio.sleep(0)
-                tracked = set(
-                    getattr(self, "_deferred_hygiene_worker_futures", set())
-                )
-                tracked.update(
-                    getattr(self, "_deferred_hygiene_persistence_tasks", set())
-                )
-                pending = {task for task in tracked if not task.done()}
-                if not pending:
-                    return 0
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, _ = await asyncio.wait(pending, timeout=remaining)
-            for task in done:
-                consume_detached_task_result(task)
-            await asyncio.sleep(0)
 
-        logger.warning(
-            "%d deferred hygiene worker/persistence task(s) exceeded the %.0fs "
-            "shutdown drain",
-            len(pending),
-            timeout,
+        async def _wait_until(deadline: float) -> set:
+            while True:
+                workers = getattr(
+                    self, "_deferred_hygiene_worker_futures", {}
+                )
+                persistence = getattr(
+                    self, "_deferred_hygiene_persistence_tasks", set()
+                )
+                tracked = set(workers)
+                tracked.update(persistence)
+                live = {task for task in tracked if not task.done()}
+                if not workers and not live:
+                    return set()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return live or set(workers)
+                if live:
+                    done, _ = await asyncio.wait(live, timeout=remaining)
+                    for task in done:
+                        consume_detached_task_result(task)
+                else:
+                    # A done worker stays in the map until its callback creates
+                    # and finishes the persistence task.
+                    await asyncio.sleep(min(0.01, remaining))
+                await asyncio.sleep(0)
+
+        pending = await _wait_until(time.monotonic() + timeout)
+        if not pending:
+            return 0
+
+        worker_fences = getattr(
+            self, "_deferred_hygiene_worker_futures", {}
         )
+        for task in pending:
+            fence = worker_fences.get(task) if isinstance(worker_fences, dict) else None
+            if fence is None:
+                continue
+            try:
+                fence.set_total_ceiling_seconds(0.001)
+                fence.revoke_commit_admission_nonblocking()
+                threading.Thread(
+                    target=fence.revoke_commit_admission,
+                    daemon=True,
+                    name="hygiene-shutdown-revoke",
+                ).start()
+            except Exception:
+                logger.debug(
+                    "Failed to cancel deferred hygiene worker during shutdown",
+                    exc_info=True,
+                )
+
+        pending = await _wait_until(time.monotonic() + 1.0)
+        if pending:
+            commit_pending = {
+                task
+                for task in pending
+                if (
+                    isinstance(worker_fences, dict)
+                    and worker_fences.get(task) is not None
+                    and bool(worker_fences[task].commit_in_flight)
+                )
+            }
+            if commit_pending:
+                # An admitted SessionDB mutation cannot be abandoned safely.
+                # Its write retry budget is 20s; one shared 25s wait keeps DB
+                # teardown behind the commit without making it unbounded.
+                await asyncio.wait(commit_pending, timeout=25.0)
+                pending = await _wait_until(time.monotonic() + 1.0)
+        if pending:
+            logger.warning(
+                "%d deferred hygiene worker/persistence task(s) exceeded the %.0fs "
+                "shutdown drain",
+                len(pending),
+                timeout,
+            )
         return len(pending)
 
     # Bounded budget for one finalize_session() dispatch (plugin
@@ -22215,11 +22255,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 self,
                                                 "_deferred_hygiene_worker_futures",
                                             ):
-                                                self._deferred_hygiene_worker_futures = set()
+                                                self._deferred_hygiene_worker_futures = {}
                                             _hyg_worker_futures = (
                                                 self._deferred_hygiene_worker_futures
                                             )
-                                            _hyg_worker_futures.add(_hyg_future)
+                                            _hyg_worker_futures[_hyg_future] = (
+                                                _hyg_commit_fence
+                                            )
                                             _hyg_cleanup_deferred = True
                                             # NO retry-after here (#97963 (b)): the
                                             # attempt is still running toward a real
@@ -22364,7 +22406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     )
                                                 except Exception:
                                                     _persist_coro.close()
-                                                    _worker_futures.discard(_fut)
+                                                    _worker_futures.pop(_fut, None)
                                                     logger.warning(
                                                         "Could not schedule deferred hygiene "
                                                         "persistence",
@@ -22389,8 +22431,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _persist_task.add_done_callback(
                                                         lambda _done,
                                                         _workers=_worker_futures,
-                                                        _worker=_fut: _workers.discard(
-                                                            _worker
+                                                        _worker=_fut: _workers.pop(
+                                                            _worker, None
                                                         )
                                                     )
 
