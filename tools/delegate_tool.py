@@ -1855,13 +1855,9 @@ def _delegation_fallback_chain(config=None):
     chain = config.get("fallback_providers")
     if not isinstance(chain, list) or not chain:
         return None
-    # Same entry shape the top-level chain uses; drop anything malformed
-    # rather than handing AIAgent a half-built entry.
-    clean = [
-        e for e in chain
-        if isinstance(e, dict) and e.get("provider") and e.get("model")
-    ]
-    return clean or None
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    return get_fallback_chain(config) or None
 
 
 def _build_child_agent(

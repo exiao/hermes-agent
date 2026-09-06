@@ -55,6 +55,18 @@ def test_malformed_entries_are_dropped(monkeypatch):
     ]
 
 
+def test_non_string_entries_are_normalized(monkeypatch):
+    """Fallback activation must not call strip on raw YAML scalars."""
+    _cfg(monkeypatch, {"provider": "meta-ai", "fallback_providers": [
+        {"provider": 123, "model": 456},
+        {"provider": "  xai  ", "model": "  grok-4.6  "},
+    ]})
+    assert _delegation_fallback_chain() == [
+        {"provider": "123", "model": "456"},
+        {"provider": "xai", "model": "grok-4.6"},
+    ]
+
+
 def test_all_entries_malformed_returns_none(monkeypatch):
     _cfg(monkeypatch, {"provider": "meta-ai",
                        "fallback_providers": [{"provider": "anthropic"}]})
