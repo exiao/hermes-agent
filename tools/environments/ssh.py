@@ -298,11 +298,34 @@ class SSHEnvironment(BaseEnvironment):
             )
 
     def _ensure_remote_dirs(self) -> None:
-        """Create base ~/.hermes directory tree on remote in one SSH call."""
-        # Profile-scoped base (this PR) via base's _run_ssh helper.
+        """Create the profile-scoped ~/.hermes tree on remote in one SSH call.
+
+        Also points ``~/.hermes/skills`` at this profile's ``skills/``. Skills
+        advertise literal ``~/.hermes/skills/<name>/scripts/...`` commands in
+        their SKILL.md (48 of them on this install), and the shell expands that
+        tilde itself — exporting HERMES_HOME does not redirect it. Without the
+        link every such command reaches the unscoped shared path, which after
+        this PR holds a stale copy or nothing at all.
+
+        The link is only created when nothing already occupies that path, so a
+        real shared ``skills/`` directory from an older layout is never
+        replaced. ``ln -sfn`` alone would silently retarget a live directory
+        symlink, so the existence test is the guard, not a nicety.
+        """
         base = self._remote_hermes_home
         self._run_ssh(quoted_mkdir_command([base, f"{base}/skills", f"{base}/credentials", f"{base}/cache"]),
                       timeout=10)
+        legacy_skills = f"{self._remote_home}/.hermes/skills"
+        scoped_skills = f"{base}/skills"
+        # `[ -e ]` is false for a dangling symlink, so a link left by a previous
+        # profile is replaced; a real directory or live link is left alone.
+        self._run_ssh(
+            f"if [ ! -e {shlex.quote(legacy_skills)} ]; then "
+            f"rm -f {shlex.quote(legacy_skills)} 2>/dev/null; "
+            f"ln -s {shlex.quote(scoped_skills)} {shlex.quote(legacy_skills)} 2>/dev/null; "
+            f"fi",
+            timeout=10,
+        )
 
     # _get_sync_files provided via iter_sync_files in FileSyncManager init
 

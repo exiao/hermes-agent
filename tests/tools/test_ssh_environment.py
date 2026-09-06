@@ -421,3 +421,47 @@ class TestSSHManifest:
         assert first._sync_manifest_key != second._sync_manifest_key
         assert first._sync_manifest_path != second._sync_manifest_path
         assert first._remote_hermes_home != second._remote_hermes_home
+
+class TestLegacySkillsAlias:
+    """~/.hermes/skills must keep resolving after the profile-scoped move.
+
+    Skills advertise literal ~/.hermes/skills/<name>/scripts/... commands in
+    their SKILL.md and the remote shell expands that tilde itself, so exporting
+    HERMES_HOME does not redirect it.
+    """
+
+    def _env(self, monkeypatch, commands):
+        monkeypatch.setattr(ssh_env.shutil, 'which', lambda _name: '/usr/bin/ssh')
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_establish_connection', lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_detect_remote_home', lambda self: '/home/alice')
+        monkeypatch.setattr(ssh_env.SSHEnvironment, 'init_session', lambda self: None)
+        monkeypatch.setattr(
+            ssh_env, 'FileSyncManager',
+            lambda **kw: type('M', (), {'sync': lambda self, **k: None})(),
+        )
+
+        def _fake_run_ssh(self, remote_cmd, timeout):
+            commands.append(remote_cmd)
+            return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_run_ssh', _fake_run_ssh)
+        return SSHEnvironment(host='example.com', user='alice')
+
+    def test_ensure_remote_dirs_links_legacy_skills_path(self, monkeypatch):
+        commands = []
+        env = self._env(monkeypatch, commands)
+        joined = chr(10).join(commands)
+
+        assert '/home/alice/.hermes/skills' in joined, 'legacy path never referenced'
+        assert 'ln -s' in joined, 'no alias created for the legacy skills path'
+        assert env._remote_hermes_home + '/skills' in joined
+
+    def test_alias_is_guarded_so_a_real_directory_survives(self, monkeypatch):
+        commands = []
+        self._env(monkeypatch, commands)
+        link_cmd = next(c for c in commands if 'ln -s' in c)
+
+        # An unguarded  would clobber a real shared skills/ directory
+        # left by an older layout.
+        assert '[ ! -e' in link_cmd, 'alias is not guarded by an existence test'
+        assert '-sfn' not in link_cmd, 'unguarded force-link would retarget a live tree'
