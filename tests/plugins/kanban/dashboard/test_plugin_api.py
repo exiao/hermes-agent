@@ -1,63 +1,53 @@
-from unittest.mock import MagicMock
-
 from plugins.kanban.dashboard import plugin_api
+from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
-def test_home_subscription_stays_passive_without_session_routing(monkeypatch):
-    captured = {}
-    conn = MagicMock()
-    conn.execute.return_value.fetchone.return_value = None
+def _home(monkeypatch, tmp_path):
+    """Point the dashboard endpoint at a real board file."""
     monkeypatch.setattr(
         plugin_api,
         "_configured_home_channels",
         lambda: [{"platform": "signal", "chat_id": "group:abc", "thread_id": ""}],
     )
     monkeypatch.setattr(plugin_api, "_resolve_board", lambda board: board)
-    monkeypatch.setattr(plugin_api, "_conn", lambda board: conn)
-    monkeypatch.setattr(plugin_api.kanban_db, "get_task", lambda conn, task_id: object())
-    monkeypatch.setattr(
-        plugin_api.kanban_db,
-        "add_notify_sub",
-        lambda conn, **kwargs: captured.update(kwargs),
-    )
+    monkeypatch.setattr(plugin_api, "_conn",
+                        lambda board=None: kbc.connect(db_path=tmp_path / "board.db"))
     monkeypatch.setattr(plugin_api, "_active_profile_name", lambda: "default")
 
-    assert plugin_api.subscribe_home("task-1", "signal") == {
-        "ok": True,
-        "task_id": "task-1",
-        "home_channel": {"platform": "signal", "chat_id": "group:abc", "thread_id": ""},
-    }
-    assert captured["delivery_mode"] == "notify"
+
+def _mode(tmp_path, task_id):
+    conn = kbc.connect(db_path=tmp_path / "board.db")
+    try:
+        return kbn.list_notify_subs(conn, task_id)[0]["delivery_mode"]
+    finally:
+        conn.close()
 
 
-def test_home_resubscribe_preserves_existing_delivery_mode(monkeypatch, tmp_path):
-    conn = kb.connect(db_path=tmp_path / "board.db")
-    task_id = kb.create_task(conn, title="task", assignee="dev")
-    kb.add_notify_sub(
-        conn,
-        task_id=task_id,
-        platform="signal",
-        chat_id="group:abc",
-        chat_type="group",
-        user_id="user-1",
-        delivery_mode="notify+wake",
+def test_home_subscribe_is_passive_but_never_downgrades(monkeypatch, tmp_path):
+    """A home subscription carries no chat_type/user_id, so it cannot rebuild the
+    originating session: a fresh one must stay passive. A re-subscribe must NOT
+    downgrade a row someone deliberately set to notify+wake.
+
+    Driven against a real board file rather than a patched helper. The previous
+    version patched ``plugin_api.kanban_db.add_notify_sub`` while the endpoint
+    calls ``plugin_api.kbn.add_notify_sub``, so the assertion never observed the
+    endpoint at all.
+    """
+    conn = kbc.connect(db_path=tmp_path / "board.db")
+    fresh = kb.create_task(conn, title="fresh", assignee="dev")
+    existing = kb.create_task(conn, title="existing", assignee="dev")
+    kbn.add_notify_sub(
+        conn, task_id=existing, platform="signal", chat_id="group:abc",
+        chat_type="group", user_id="user-1", delivery_mode="notify+wake",
     )
     conn.close()
 
-    monkeypatch.setattr(
-        plugin_api,
-        "_configured_home_channels",
-        lambda: [{"platform": "signal", "chat_id": "group:abc", "thread_id": ""}],
-    )
-    monkeypatch.setattr(plugin_api, "_resolve_board", lambda board: board)
-    monkeypatch.setattr(plugin_api, "_conn", lambda board=None: kb.connect(db_path=tmp_path / "board.db"))
-    monkeypatch.setattr(plugin_api, "_active_profile_name", lambda: "default")
+    _home(monkeypatch, tmp_path)
 
-    assert plugin_api.subscribe_home(task_id, "signal")["ok"] is True
+    assert plugin_api.subscribe_home(fresh, "signal")["ok"] is True
+    assert _mode(tmp_path, fresh) == "notify"
 
-    check = kb.connect(db_path=tmp_path / "board.db")
-    try:
-        assert kb.list_notify_subs(check, task_id)[0]["delivery_mode"] == "notify+wake"
-    finally:
-        check.close()
+    assert plugin_api.subscribe_home(existing, "signal")["ok"] is True
+    assert _mode(tmp_path, existing) == "notify+wake"
