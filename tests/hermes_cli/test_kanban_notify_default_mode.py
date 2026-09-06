@@ -169,3 +169,69 @@ def test_child_inherits_the_parents_mode_not_the_default(board):
                       chat_id="group:abc", delivery_mode="notify")
     child = kb.create_task(board, title="c", assignee="dev", parents=[parent])
     assert _mode(board, child) == "notify"
+
+
+def _cli_subscribe(tid, argv):
+    top = argparse.ArgumentParser(prog="hermes")
+    parser = kanban_cli.build_parser(top.add_subparsers(dest="command"))
+    return kanban_cli.kanban_command(
+        parser.parse_args(["notify-subscribe", tid, *argv])
+    )
+
+
+def test_slack_group_with_participant_still_stays_passive(board):
+    """Slack keys sessions on the workspace scope, which the CLI cannot persist.
+
+    A participant id makes this look route-complete, and on every other
+    platform it is. Slack's session key also carries scope_id, recoverable
+    only from delivery_metadata or the adapter's ephemeral channel map, so
+    after a gateway restart the wake would land in an unscoped, context-free
+    session.
+    """
+    tid = kb.create_task(board, title="t", assignee="dev")
+    assert _cli_subscribe(tid, [
+        "--platform", "slack", "--chat-id", "C123",
+        "--chat-type", "group", "--user-id", "U456",
+    ]) == 0
+    assert _mode(board, tid) == "notify"
+
+
+def test_slack_thread_with_participant_still_stays_passive(board):
+    """Same scope gap on the per-user thread route."""
+    tid = kb.create_task(board, title="t", assignee="dev")
+    assert _cli_subscribe(tid, [
+        "--platform", "slack", "--chat-id", "C123",
+        "--chat-type", "thread", "--thread-id", "1700000.1",
+        "--user-id", "U456",
+    ]) == 0
+    assert _mode(board, tid) == "notify"
+
+
+def test_slack_dm_still_wakes(board):
+    """A Slack DM keys on the chat id, so it is route-complete without scope."""
+    tid = kb.create_task(board, title="t", assignee="dev")
+    assert _cli_subscribe(tid, [
+        "--platform", "slack", "--chat-id", "D123", "--chat-type", "dm",
+    ]) == 0
+    assert _mode(board, tid) == "notify+wake"
+
+
+def test_non_slack_group_with_participant_still_wakes(board):
+    """The Slack carve-out must not gate every other platform's groups."""
+    tid = kb.create_task(board, title="t", assignee="dev")
+    assert _cli_subscribe(tid, [
+        "--platform", "signal", "--chat-id", "group:abc",
+        "--chat-type", "group", "--user-id", "u1",
+    ]) == 0
+    assert _mode(board, tid) == "notify+wake"
+
+
+def test_explicit_wake_still_overrides_the_slack_guard(board):
+    """The guard only sets an implicit default; an operator can still opt in."""
+    tid = kb.create_task(board, title="t", assignee="dev")
+    assert _cli_subscribe(tid, [
+        "--platform", "slack", "--chat-id", "C123",
+        "--chat-type", "group", "--user-id", "U456",
+        "--delivery-mode", "notify+wake",
+    ]) == 0
+    assert _mode(board, tid) == "notify+wake"

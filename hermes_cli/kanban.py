@@ -3100,6 +3100,18 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
         delivery_mode = getattr(args, "delivery_mode", None)
+        # Slack keys sessions on the workspace scope as well as the chat, and
+        # the CLI has no way to persist one (``_wake_scope_id`` recovers it
+        # only from delivery_metadata or the adapter's ephemeral channel map).
+        # So a Slack group/channel sub that looks route-complete here still
+        # cannot prove it will rebuild the inbound session key after a gateway
+        # restart, and its wake would run in an unscoped, context-free session.
+        # Every other platform ignores scope_id in build_session_key, so this
+        # narrows to Slack rather than gating all group subscriptions.
+        slack_needs_scope = (
+            args.platform == "slack"
+            and args.chat_type in ("group", "channel", "thread")
+        )
         route_ready = (
             # api_server subscriptions use chat_id as the raw session id;
             # the notifier self-posts to that exact session and does not need
@@ -3107,12 +3119,14 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             args.platform == "api_server"
             or args.chat_type == "dm"
             or (
-                args.chat_type == "thread"
+                not slack_needs_scope
+                and args.chat_type == "thread"
                 and args.thread_id
                 and (args.user_id or getattr(args, "user_id_alt", None))
             )
             or (
-                args.chat_type in ("group", "channel")
+                not slack_needs_scope
+                and args.chat_type in ("group", "channel")
                 and (args.user_id or getattr(args, "user_id_alt", None))
             )
         )
