@@ -164,20 +164,23 @@ async def _drain_deferred(runner, timeout=10.0):
 
 
 @pytest.mark.parametrize(
-    ("adoption_timing", "material_progress"),
+    ("adoption_timing", "result_progress", "persisted_progress"),
     [
-        ("before_finalizer", True),
-        ("during_refresh", True),
-        ("after_finalizer", True),
+        ("before_finalizer", True, True),
+        ("during_refresh", True, True),
+        ("after_finalizer", True, True),
         # A durable in-place commit is not recovery when it leaves the
-        # transcript unchanged.  This is the late-result regression for the
+        # transcript unchanged. This is the late-result regression for the
         # hygiene failure-streak gate.
-        ("after_finalizer", False),
+        ("after_finalizer", False, False),
+        # The compressor result can look small while post-watermark concurrent
+        # tail keeps the actual committed transcript effectively unchanged.
+        ("after_finalizer", True, False),
     ],
 )
 @pytest.mark.asyncio
 async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
-    monkeypatch, tmp_path, adoption_timing, material_progress
+    monkeypatch, tmp_path, adoption_timing, result_progress, persisted_progress
 ):
     """A watermark-fenced worker keeps its commit admission at turn-hold
     expiry; its late summary is ADOPTED (committed), not discarded — while
@@ -241,7 +244,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
             try:
                 compacted_messages = (
                     [{"role": "assistant", "content": "summary"}]
-                    if material_progress
+                    if result_progress
                     else messages
                 )
                 self._session_db.archive_and_compact(
@@ -262,6 +265,16 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
 
     adapter = _CaptureAdapter()
     runner = _build_runner(gateway_run, adapter, fake_db)
+    initial_history = _make_history(6, content_size=400)
+    committed_history = (
+        [{"role": "assistant", "content": "summary"}]
+        if persisted_progress
+        else initial_history
+    )
+    runner.session_store.load_transcript.side_effect = [
+        initial_history,
+        committed_history,
+    ]
     runner.session_store.matching_session_id.return_value = "sess-97963"
     runner._run_agent.return_value["last_prompt_tokens"] = 90_000
     if adoption_timing == "before_finalizer":
@@ -312,7 +325,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
 
-    if material_progress:
+    if persisted_progress:
         # (b) NO retry-after was armed while the attempt is still running —
         # arming it would block the agent-side preflight from adopting the
         # finished summary ("same-session cooldown active", #97963).
@@ -339,7 +352,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 5), timeout=6)
     FencedStreamingAgent.last_instance.close.assert_called_once()
 
-    if material_progress:
+    if persisted_progress:
         # Successful adoption resets the hygiene failure streak once a matching
         # turn finalizer consumes the invalidation marker.
         assert not fake_db.increment_hygiene_failure_streak.called

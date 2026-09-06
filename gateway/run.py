@@ -251,20 +251,57 @@ async def _persist_deferred_hygiene_outcome(
     *,
     session_key: str,
     session_id: str,
+    committed_session_id: str,
     expected_session_ids: tuple[str, ...],
     run_generation: int,
     expected_updated_at: datetime,
-    committed: bool,
+    commit_applied: bool,
+    aborted: bool,
+    rotated: bool,
+    in_place: bool,
+    original_count: int,
+    original_tokens: int,
 ) -> None:
     """Persist a late hygiene result without blocking the gateway event loop."""
-    if not committed:
+    from agent.model_metadata import estimate_messages_tokens_rough
+
+    recovered = False
+    if commit_applied:
+        try:
+            committed_messages = await gateway.async_session_store.load_transcript(
+                committed_session_id
+            )
+            recovered = hygiene_compaction_recovered(
+                aborted=aborted,
+                rotated=rotated,
+                in_place=in_place,
+                msg_count=original_count,
+                new_count=len(committed_messages),
+                approx_tokens=original_tokens,
+                new_tokens=estimate_messages_tokens_rough(committed_messages),
+            )
+        except Exception:
+            logger.debug(
+                "Could not measure committed late hygiene transcript",
+                exc_info=True,
+            )
+
+    if not recovered:
+        state = gateway._session_state(session_key).persistent
+        state.hygiene_retry_after_monotonic = max(
+            state.hygiene_retry_after_monotonic,
+            time.monotonic() + _HYGIENE_TURNHOLD_RETRY_SECONDS,
+        )
+        marker = state.hygiene_usage_invalidation
+        if marker and marker[0] == expected_session_ids and marker[2] == run_generation:
+            state.hygiene_usage_invalidation = None
         await asyncio.to_thread(
             _record_hygiene_cooldown,
             gateway,
             session_id,
             _HYGIENE_TURNHOLD_RETRY_SECONDS,
-            "hygiene compression deferred: turn-hold budget expired and the "
-            "detached attempt did not commit",
+            "hygiene compression deferred: turn-hold attempt did not materially "
+            "reduce the committed transcript",
         )
         return
 
@@ -21836,6 +21873,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
 
+                if _needs_compress and _usage_marker:
+                    logger.info(
+                        "Session hygiene: skipping compression for %s; "
+                        "late commit recovery verification is pending",
+                        session_entry.session_id,
+                    )
+                    _needs_compress = False
+
                 if _needs_compress:
                     _retry_state = self._peek_session_state(session_key)
                     _retry_after = (
@@ -22294,6 +22339,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _original_count=_hyg_deferred_original_count,
                                                 _original_tokens=_hyg_deferred_original_tokens,
                                             ):
+                                                _committed_sid = _sid
+                                                _rotated = False
+                                                _in_place = False
+                                                _aborted = False
                                                 try:
                                                     _exc = _fut.exception()
                                                 except (
@@ -22303,45 +22352,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _exc = None
                                                     _committed = False
                                                 else:
-                                                    try:
-                                                        _result_messages, _ = _fut.result()
-                                                        _new_count = len(_result_messages)
-                                                        _new_tokens = estimate_messages_tokens_rough(
-                                                            _result_messages
+                                                    _committed_sid = getattr(
+                                                        _agent, "session_id", _sid
+                                                    )
+                                                    _rotated = _committed_sid != _sid
+                                                    _in_place = bool(
+                                                        getattr(
+                                                            _agent,
+                                                            "_last_compaction_in_place",
+                                                            False,
                                                         )
-                                                    except Exception:
-                                                        _committed = False
-                                                    else:
-                                                        _committed_sid = getattr(
-                                                            _agent, "session_id", _sid
-                                                        )
-                                                        _rotated = _committed_sid != _sid
-                                                        _in_place = bool(
+                                                    )
+                                                    _aborted = bool(
+                                                        getattr(
                                                             getattr(
                                                                 _agent,
-                                                                "_last_compaction_in_place",
-                                                                False,
-                                                            )
-                                                        )
-                                                        _committed = hygiene_compaction_recovered(
-                                                            aborted=bool(
-                                                                getattr(
-                                                                    getattr(
-                                                                        _agent,
-                                                                        "context_compressor",
-                                                                        None,
-                                                                    ),
-                                                                    "_last_compress_aborted",
-                                                                    False,
-                                                                )
+                                                                "context_compressor",
+                                                                None,
                                                             ),
-                                                            rotated=_rotated,
-                                                            in_place=_in_place,
-                                                            msg_count=_original_count,
-                                                            new_count=_new_count,
-                                                            approx_tokens=_original_tokens,
-                                                            new_tokens=_new_tokens,
+                                                            "_last_compress_aborted",
+                                                            False,
                                                         )
+                                                    )
+                                                    _committed = (
+                                                        _exc is None
+                                                        and not _aborted
+                                                        and (_rotated or _in_place)
+                                                    )
                                                 _committed_sid = getattr(
                                                     _agent, "session_id", _sid
                                                 )
@@ -22379,10 +22416,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 if _committed:
                                                     logger.info(
                                                         "Session hygiene compression for "
-                                                        "session %s finished after the "
-                                                        "turn-hold was released — summary "
-                                                        "adopted at the watermark-fenced "
-                                                        "commit boundary (#97963)",
+                                                        "session %s committed after the "
+                                                        "turn-hold was released — verifying "
+                                                        "recovery against the persisted "
+                                                        "transcript",
                                                         _sid,
                                                     )
                                                 _persist_coro = (
@@ -22390,6 +22427,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                         _gw,
                                                         session_key=_skey,
                                                         session_id=_sid,
+                                                        committed_session_id=(
+                                                            _committed_sid
+                                                        ),
                                                         expected_session_ids=(
                                                             _expected_session_ids
                                                         ),
@@ -22397,7 +22437,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                         expected_updated_at=(
                                                             session_entry.updated_at
                                                         ),
-                                                        committed=_committed,
+                                                        commit_applied=_committed,
+                                                        aborted=_aborted,
+                                                        rotated=_rotated,
+                                                        in_place=_in_place,
+                                                        original_count=(
+                                                            _original_count
+                                                        ),
+                                                        original_tokens=(
+                                                            _original_tokens
+                                                        ),
                                                     )
                                                 )
                                                 try:
