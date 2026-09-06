@@ -90,6 +90,72 @@ def _existing_profile_homes(profile_homes: list) -> list:
     return live
 
 
+def _fronted_tick_adapters(profile_name, own_adapters, shared_adapters, logger=None):
+    """Adapters a multiplexed SECONDARY profile may deliver cron through.
+
+    A secondary must never ship its cron output through the default profile's
+    bot — that is the isolation rule the caller enforces by handing it only
+    ``profile_adapters[name]``. But that rule assumed the profile's own bot is
+    merely *not connected yet*. It has a permanent hole:
+
+    The documented way to multiplex a secondary is to give it a
+    ``platforms.<p>: {enabled: false}`` block, which stops it starting a
+    DUPLICATE adapter and declares that the shared default-profile adapter
+    fronts it (this is what ``resolve_delivery_transport`` supports via
+    ``allow_disabled_native``, and what
+    ``tests/cron/test_native_adapter_no_profile_config.py`` pins). Such a
+    profile owns no adapter and never will, so it fell through to ``{}`` on
+    every tick, ``allow_disabled_native`` computed False, no transport
+    resolved, and its own ``enabled: false`` block then failed the delivery
+    gate with ``platform 'X' not configured/enabled`` — forever. Observed as
+    983 dropped deliveries in one day across the director/manager profiles.
+
+    So: borrow the shared adapter ONLY for a platform this profile explicitly
+    declares disabled. That is an unambiguous, intentional "I am fronted"
+    signal. A platform the profile enables keeps the strict behavior (its own
+    bot or nothing), so a profile that has — or is still connecting — its own
+    bot can never be mis-routed through the default one.
+    """
+    own = own_adapters or {}
+    shared = shared_adapters or {}
+    if not shared:
+        return own
+
+    try:
+        from gateway.config import load_gateway_config
+
+        # Called inside the profile's set_hermes_home_override() scope, so this
+        # loads THIS profile's config.
+        platforms = getattr(load_gateway_config(), "platforms", None) or {}
+    except Exception as exc:
+        # Never let a config read break the tick; fall back to strict isolation.
+        if logger is not None:
+            logger.debug(
+                "cron: could not read profile '%s' config for fronted-adapter "
+                "check: %s", profile_name, exc,
+            )
+        return own
+
+    borrowed = {}
+    for platform, adapter in shared.items():
+        if platform in own or adapter is None:
+            continue
+        pconfig = platforms.get(platform)
+        if pconfig is not None and getattr(pconfig, "enabled", True) is False:
+            borrowed[platform] = adapter
+            if logger is not None:
+                logger.debug(
+                    "cron: profile '%s' is fronted for %s (enabled: false); "
+                    "delivering via the shared default adapter",
+                    profile_name, getattr(platform, "value", platform),
+                )
+    # Hand back the caller's own map untouched when nothing is fronted, so the
+    # strict-isolation path stays allocation-free and identity-stable.
+    if not borrowed:
+        return own
+    return {**own, **borrowed}
+
+
 class CronScheduler(ABC):
     """Axis-B trigger provider. Decides WHEN a due cron job fires.
 
@@ -741,10 +807,22 @@ class InProcessCronScheduler(CronScheduler):
                                 # (that ships its cron output through the wrong bot),
                                 # so before its adapter connects — map absent or empty
                                 # — it simply does not deliver this tick.
+                                # EXCEPTION (see _fronted_tick_adapters): a
+                                # secondary that sets a platform to
+                                # ``enabled: false`` has declared it is fronted
+                                # by the shared default adapter and will NEVER
+                                # start one of its own, so "wait for its bot to
+                                # connect" never ends and its cron never
+                                # delivers.
                                 if _pname is None or _pname == default_profile:
                                     _tick_adapters = adapters
                                 else:
-                                    _tick_adapters = (profile_adapters or {}).get(_pname) or {}
+                                    _tick_adapters = _fronted_tick_adapters(
+                                        _pname,
+                                        (profile_adapters or {}).get(_pname) or {},
+                                        adapters,
+                                        logger,
+                                    )
                                 cron_tick(
                                     verbose=False,
                                     adapters=_tick_adapters,

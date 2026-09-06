@@ -264,7 +264,11 @@ class TestInactivityWatchdogLoop:
         idle["s"] = 1.0
         watcher.join(timeout=2.0)
         stop.set()
-        assert results == [True]
+        assert len(results) == 1
+        # The loop now returns an InactivityBreach carrying the tripping
+        # idle value instead of a bare True; still truthy, still one fire.
+        assert results[0]
+        assert results[0].idle_seconds >= 0.2
         assert not watcher.is_alive()
 
     def test_stops_when_future_completes_before_idle_limit(self):
@@ -303,6 +307,9 @@ class TestInactivityWatchdogLoop:
         time.sleep(0.4)
         watcher.join(timeout=2.0)
         stop.set()
-        assert result["fired"] is True
+        # Truthy InactivityBreach rather than a bare True; the watchdog
+        # still fires while the caller thread is blocked.
+        assert result["fired"]
+        assert result["fired"].idle_seconds >= 0.15
         assert not watcher.is_alive()
 
