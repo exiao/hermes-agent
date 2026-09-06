@@ -4464,6 +4464,15 @@ def _save_aux_choice(
         entry["model"] = model or ""
         entry["base_url"] = base_url or ""
         entry["api_key"] = api_key or ""
+        if provider == "auto":
+            # Resetting delegation to auto must also drop the pinned-child
+            # fallback chain. That chain is only consulted when a provider is
+            # pinned, so leaving it behind after a reset means the UI reports
+            # "auto" while a stale list is still persisted — and it silently
+            # comes back the moment a provider is pinned again. The global
+            # "reset all to auto" path already clears it; this is the
+            # per-task menu doing the same.
+            entry["fallback_providers"] = []
         save_config(cfg)
         return
 
