@@ -512,7 +512,7 @@ class TestValidateCodex900kVariants:
         assert result["accepted"] is True
         assert result["recognized"] is True
 
-    @pytest.mark.parametrize("alias", ["gpt-5.5-900k", "gpt-5.4-mini-900k", "gpt-5.6-sol-pro-900k"])
+    @pytest.mark.parametrize("alias", ["gpt-5.5-900k", "gpt-5.4-mini-900k", "gpt-5.6-sol-pro-900k", "gpt-6-astra-pro-900k", "gpt-6-astra-fast-900k"])
     def test_ineligible_900k_alias_rejected_not_soft_accepted(self, alias):
         with patch("hermes_cli.models.provider_model_ids", return_value=self._CATALOG):
             result = validate_requested_model(alias, "openai-codex")
@@ -526,6 +526,14 @@ class TestValidateCodex900kVariants:
         with patch("hermes_cli.models.provider_model_ids", return_value=["gpt-5.6-sol"]):
             result = validate_requested_model("gpt-5.6-sol-900k", "openai-codex")
         assert result["accepted"] is True
+
+    def test_valid_astra_variant_missing_from_catalog_still_accepted(self):
+        """Same predicate path for gpt-6-astra: a stale catalog listing only
+        the base slug must not block the verified variant."""
+        with patch("hermes_cli.models.provider_model_ids", return_value=["gpt-6-astra"]):
+            result = validate_requested_model("gpt-6-astra-900k", "openai-codex")
+        assert result["accepted"] is True
+        assert result["recognized"] is True
 
 
 # -- probe_api_models — Cloudflare UA mitigation --------------------------------

@@ -94,6 +94,9 @@ def test_compression_threshold_for_codex_gpt55() -> None:
     assert _compression_threshold_for_model("openai/gpt-5.5", "openai-codex") == 0.85
     assert _is_codex_gpt54_or_gpt55("gpt-daybreak-blue-latest", "openai-codex") is True
     assert _compression_threshold_for_model("gpt-daybreak-blue-latest", "openai-codex") == 0.85
+    assert _is_codex_gpt54_or_gpt55("gpt-6-astra", "openai-codex") is True
+    assert _compression_threshold_for_model("gpt-6-astra", "openai-codex") == 0.85
+    assert _compression_threshold_for_model("gpt-6-astra-900k", "openai-codex") is None
 
 
 @pytest.mark.parametrize(
@@ -103,8 +106,10 @@ def test_compression_threshold_for_codex_gpt55() -> None:
         "gpt-5.6-terra-900k",
         "gpt-5.6-luna-900k",
         "gpt-5.4-900k",
+        "gpt-6-astra-900k",
         "gpt-daybreak-blue-latest-900k",
         "openai/gpt-5.6-sol-900k",
+        "openai/gpt-6-astra-900k",
     ],
 )
 def test_900k_variants_keep_global_threshold(model) -> None:

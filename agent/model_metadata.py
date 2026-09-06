@@ -1439,7 +1439,8 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
 _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.1-codex-max": 272_000, "gpt-5.1-codex-mini": 272_000, "gpt-5.3-codex": 272_000,
     "gpt-5.3-codex-spark": 128_000, "gpt-5.2-codex": 272_000, "gpt-5.4-mini": 272_000,
-    "gpt-5.6-sol": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000, "gpt-daybreak-blue-latest": 272_000,
+    "gpt-5.6-sol": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000, "gpt-6-astra": 272_000,
+    "gpt-daybreak-blue-latest": 272_000,
     "gpt-5.5": 272_000, "gpt-5.4": 272_000, "gpt-5.2": 272_000, "gpt-5": 272_000,
 }
 # Codex OAuth advertises 272K for these families but ACCEPTS ~900K+ (verified live; gpt-5.5 and
@@ -1447,13 +1448,15 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
 # picker variants (a 900K default burned subscription usage); the suffix is stripped before the wire.
 # The bump fires ONLY when the resolved value is exactly the stale 272,000. ``gpt-5.6`` is a FAMILY
 # PREFIX (``-pro`` slugs aren't routable on Codex); ``gpt-5.4`` is EXACT because gpt-5.4-mini enforces 272K.
+# ``gpt-6-astra`` is EXACT (not a ``gpt-6`` prefix): untested Astra Pro / tier (-fast/-flex) slugs must
+# never gain a variant they cannot use.
 _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES: Dict[str, int] = {"gpt-5.6": 900_000}  # sol / terra / luna
-_CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {"gpt-5.4": 900_000, "gpt-daybreak-blue-latest": 900_000}
+_CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {"gpt-5.4": 900_000, "gpt-daybreak-blue-latest": 900_000, "gpt-6-astra": 900_000}
 _CODEX_OAUTH_STALE_ADVERTISED_CTX = 272_000  # the only advertised value the bump may override
 CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"  # picker-only opt-in suffix; never sent on the wire
 # The ONLY bases eligible for ``-900k``: routable, live-verified. No family prefixing (it would synthesize
-# dead ``-pro`` variants); dated snapshots of the 5.6 bases are allowed. gpt-daybreak-blue-latest is a verified Sol alias.
-_CODEX_900K_SNAPSHOT_BASES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+# dead ``-pro`` variants); dated snapshots of the 5.6 and Astra bases are allowed. gpt-daybreak-blue-latest is a verified Sol alias.
+_CODEX_900K_SNAPSHOT_BASES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra")
 _CODEX_900K_ELIGIBLE_BASES = frozenset({*_CODEX_900K_SNAPSHOT_BASES, "gpt-5.4", "gpt-daybreak-blue-latest"})
 _CODEX_900K_SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -1510,6 +1513,14 @@ def _verified_codex_ctx_for_slug(model_bare: str) -> Optional[int]:
     exact = _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT.get(base)
     if exact is not None:
         return exact
+    # Dated snapshots of an exact-verified base (gpt-6-astra-2026-01-01) inherit
+    # the base cap. The bare-suffix check alone would admit non-date suffixes,
+    # so require the date shape used by is_codex_900k_base.
+    for snap_base, snap_ctx in _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT.items():
+        if snap_base == "gpt-5.4":
+            continue  # gpt-5.4-mini enforces 272K; no snapshot inheritance
+        if base.startswith(snap_base + "-") and _CODEX_900K_SNAPSHOT_RE.match(base[len(snap_base) + 1:]):
+            return snap_ctx
     return next((ctx for key, ctx in _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES.items() if base == key or base.startswith((key + "-", key + "."))), None)
 
 

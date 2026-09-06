@@ -258,10 +258,13 @@ del _BEDROCK_URL, _ANTHROPIC_URL, _GOOGLE_URL, _OPUS, _SONNET
 # GPT-5.6 "-pro" high-effort variants bill at the base tier's per-token rates
 # (more tokens per task, not a higher rate); the Hermes-side "-900k" Codex
 # picker variants are the same model with the suffix stripped on the wire.
+# gpt-6-astra-900k aliases the Sol rate row: Codex is subscription-included so
+# the row only feeds cost display, and Astra has no published per-token row yet.
 # The direct Gemini provider emits preview IDs for two models; key the snapshot
 # by both the documented stable name and the emitted ID.
 for _provider, _alias, _canonical in (
     *((("openai", f"{m}-{suffix}", m) for m in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna") for suffix in ("pro", "900k"))),
+    (("openai", "gpt-6-astra-900k", "gpt-5.6-sol")),
     ("google", "gemini-3.1-pro-preview", "gemini-3.1-pro"),
     ("google", "gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite"),
 ):
