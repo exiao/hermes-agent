@@ -228,6 +228,37 @@ def _apply_child_cache_ttl(child) -> None:
         child._cache_ttl = "5m"
 
 
+def _delegation_fallback_chain(config=None):
+    """Explicit fallback chain for a provider-pinned delegation child.
+
+    Read from ``delegation.fallback_providers`` (same shape as the top-level
+    ``fallback_providers``). Returns None when unset, which preserves the
+    fail-loud behaviour a bare pin has always had.
+
+    This exists because ``delegation.provider`` suppresses inheritance of the
+    parent's chain on purpose (#80450: a quiet child must not silently
+    reroute onto the parent's models mid-run). The suppression left a pinned
+    child with no recovery whatsoever, so one upstream 429 ended the run.
+    Naming the chain under ``delegation`` keeps the reroute explicit and
+    scoped to children.
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config, cfg_get
+
+            config = cfg_get(load_config(), "delegation", default=None)
+        except Exception:
+            return None
+    if not isinstance(config, dict):
+        return None
+    chain = config.get("fallback_providers")
+    if not isinstance(chain, list) or not chain:
+        return None
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    return get_fallback_chain(config) or None
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -243,6 +274,7 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
+    override_fallback_providers: Optional[List[Dict[str, Any]]] = None,
     override_max_tokens: Optional[int] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
@@ -291,7 +323,7 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
     )
     if override_provider and not rt.get("fallback_model"):
-        rt["fallback_model"] = _configured_child_fallbacks(delegation_cfg)
+        rt["fallback_model"] = override_fallback_providers
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -440,6 +472,7 @@ def _build_children(
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
         "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
+        "override_fallback_providers": creds.get("fallback_providers"),
         "override_max_tokens": creds.get("max_output_tokens"), "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
     }

@@ -1217,6 +1217,11 @@ DEFAULT_CONFIG = {
     "delegation": {
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        # Fallback chain for PINNED children, same shape as the top-level
+        # "fallback_providers". Only consulted when "provider" is set: a pin
+        # deliberately does NOT inherit the parent chain (#80450), so without
+        # this a single 429 ends the run. Empty (default) = fail loudly.
+        "fallback_providers": [],
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
         "api_key": "",  # key for delegation.base_url (falls back to OPENAI_API_KEY)
         # Wire protocol for delegation.base_url: "chat_completions" | "codex_responses" |

@@ -135,6 +135,13 @@ def _save_aux_choice(task: str, *, provider: str, model: str = "", base_url: str
     cfg = load_config()
     if task == _DELEGATION_TASK_KEY:
         entry = _ensure_dict_section(cfg, "delegation")
+        if provider == "auto":
+            # Resetting delegation to auto must also drop the pinned-child
+            # fallback chain. That chain is only consulted when a provider is
+            # pinned, so leaving it behind after a reset means the UI reports
+            # "auto" while a stale list is still persisted — and it silently
+            # comes back the moment a provider is pinned again.
+            entry["fallback_providers"] = []
         provider = "" if provider == "auto" else provider
     else:
         entry = _ensure_dict_section(_ensure_dict_section(cfg, "auxiliary"), task)
@@ -156,9 +163,9 @@ def _reset_aux_to_auto() -> int:
         if entry.get("provider") not in {None, "", auto}:
             entry["provider"] = auto
             changed = True
-        for field in ("model", "base_url", "api_key"):
+        for field in ("model", "base_url", "api_key", "fallback_providers"):
             if entry.get(field):
-                entry[field] = ""
+                entry[field] = [] if field == "fallback_providers" else ""
                 changed = True
         return changed
 

@@ -129,6 +129,59 @@ def test_save_delegation_auto_stores_empty_provider(tmp_path, monkeypatch):
     assert d["api_key"] == ""
 
 
+def test_save_delegation_auto_clears_the_fallback_chain(tmp_path, monkeypatch):
+    """Per-task reset to auto drops the pinned-child fallback chain.
+
+    The chain is only consulted when delegation.provider is pinned, so a reset
+    that leaves it behind reports "auto" while a stale list stays persisted —
+    and it silently returns the moment a provider is pinned again. The
+    reset-all path already cleared it; this covers the per-task menu.
+    """
+    from hermes_cli.config import load_config as _lc, save_config
+
+    _isolate_home(tmp_path, monkeypatch)
+
+    _save_aux_choice(_DELEGATION_TASK_KEY, provider="meta-ai", model="muse")
+    cfg = _lc()
+    cfg["delegation"]["fallback_providers"] = [
+        {"provider": "openrouter", "model": "meta/muse-spark-1.3-contributor"},
+    ]
+    save_config(cfg)
+    assert _lc()["delegation"]["fallback_providers"], "precondition: chain is set"
+
+    _save_aux_choice(_DELEGATION_TASK_KEY, provider="auto", model="",
+                     base_url="", api_key="")
+
+    d = load_config()["delegation"]
+    assert d["provider"] == ""
+    assert d["fallback_providers"] == []
+
+
+def test_save_delegation_pin_preserves_an_existing_fallback_chain(
+    tmp_path, monkeypatch
+):
+    """Only 'auto' clears the chain — switching pinned providers keeps it.
+
+    Without this, the guard above could be written as an unconditional clear,
+    silently discarding a chain every time the user changes provider.
+    """
+    from hermes_cli.config import load_config as _lc, save_config
+
+    _isolate_home(tmp_path, monkeypatch)
+
+    _save_aux_choice(_DELEGATION_TASK_KEY, provider="meta-ai", model="muse")
+    cfg = _lc()
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5"}]
+    cfg["delegation"]["fallback_providers"] = chain
+    save_config(cfg)
+
+    _save_aux_choice(_DELEGATION_TASK_KEY, provider="openrouter", model="glm")
+
+    d = load_config()["delegation"]
+    assert d["provider"] == "openrouter"
+    assert d["fallback_providers"] == chain
+
+
 def test_reset_aux_clears_delegation_routing_preserves_settings(tmp_path, monkeypatch):
     """Reset-all clears delegation provider/model/base_url/api_key but leaves
     non-routing delegation settings (max_concurrent_children, etc.) alone."""
@@ -139,7 +192,12 @@ def test_reset_aux_clears_delegation_routing_preserves_settings(tmp_path, monkey
     cfg = _lc()
     cfg.setdefault("delegation", {})
     cfg["delegation"].update(
-        {"provider": "openrouter", "model": "x", "max_concurrent_children": 7}
+        {
+            "provider": "openrouter",
+            "model": "x",
+            "fallback_providers": [{"provider": "anthropic", "model": "m"}],
+            "max_concurrent_children": 7,
+        }
     )
     save_config(cfg)
 
@@ -150,6 +208,7 @@ def test_reset_aux_clears_delegation_routing_preserves_settings(tmp_path, monkey
     d = cfg["delegation"]
     assert d["provider"] == ""
     assert d["model"] == ""
+    assert d["fallback_providers"] == []
     assert d["max_concurrent_children"] == 7
 
 
