@@ -1,24 +1,13 @@
 """Profile-scoped credential resolution for multi-profile gateway multiplexing.
 
-The multiplexing gateway serves many profiles from one process. Each profile
-has its own ``.env`` with its own provider keys and platform tokens, so we
-**cannot** union them into the process-global ``os.environ`` (that would leak
-profile A's keys to profile B's turns, and to every subprocess spawned with
-``env=dict(os.environ)``).
-
-This module provides a fail-closed, context-local secret scope:
-
-- ``set_secret_scope(mapping)`` installs the active profile's secrets for the
-  current task (a contextvar, so it propagates into the agent's worker thread
-  via ``copy_context()`` exactly like the HERMES_HOME override).
-- ``get_secret(name)`` reads from that scope. When multiplexing is **active**
-  and no scope is set, it RAISES rather than silently falling back to
-  ``os.environ`` — an un-migrated or newly-added call site fails loud at that
-  exact line instead of leaking another profile's value. When multiplexing is
-  **off** (the default), it transparently reads ``os.environ`` so the
-  single-profile gateway and every non-gateway caller behave exactly as before.
-
-Design rationale lives in ``docs/design/multiplexing-gateway.md`` (Workstream A).
+The multiplexing gateway serves many profiles from one process; each profile's
+``.env`` keys **cannot** be unioned into ``os.environ`` (profile A's keys would
+leak into profile B's turns and subprocesses). This module is a fail-closed,
+context-local secret scope: ``set_secret_scope(mapping)`` installs the active
+profile's secrets for the current task (a contextvar, so it propagates into the
+agent's worker thread via ``copy_context()``); ``get_secret(name)`` reads from
+it and, when multiplexing is active with no scope set, RAISES rather than
+falling back to ``os.environ``. Design: ``docs/design/multiplexing-gateway.md``.
 """
 from __future__ import annotations
 
@@ -29,72 +18,50 @@ from pathlib import Path
 from typing import Dict, Mapping, Optional
 
 
-# ── multiplex-active flag ────────────────────────────────────────────────
-# Process-global: set once at gateway startup when gateway.multiplex_profiles
-# is true. Governs whether get_secret() fails closed on an unscoped read.
-# A plain module global (not a contextvar): it describes the deployment mode,
-# not a per-task value.
+# Process-global (describes the deployment mode, not a per-task value): set once
+# at gateway startup when gateway.multiplex_profiles is true.
 _MULTIPLEX_ACTIVE: bool = False
 
 
 def set_multiplex_active(active: bool) -> None:
-    """Mark whether the process is running as a profile multiplexer.
-
-    Called once at gateway startup. When True, ``get_secret`` fails closed on
-    an unscoped read instead of falling back to ``os.environ``.
-    """
+    """Mark whether the process is a profile multiplexer (get_secret fails closed)."""
     global _MULTIPLEX_ACTIVE
     _MULTIPLEX_ACTIVE = bool(active)
 
 
 def is_multiplex_active() -> bool:
-    """Return whether the process is running as a profile multiplexer."""
     return _MULTIPLEX_ACTIVE
 
 
-# ── the secret scope contextvar ──────────────────────────────────────────
-_SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
-    "_SECRET_SCOPE", default=None
-)
+_SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar("_SECRET_SCOPE", default=None)
 
 
 class UnscopedSecretError(RuntimeError):
-    """Raised when a secret is read in multiplex mode with no scope installed.
+    """A secret was read in multiplex mode with no scope installed.
 
-    This is the fail-closed signal: it means a credential read reached
-    ``get_secret`` without a profile scope active, which in a multiplexer would
-    otherwise leak whichever profile's value happened to be in ``os.environ``.
     The fix is to wrap the call path in ``set_secret_scope(...)`` (the per-turn
-    / per-adapter profile scope), not to widen the allowlist.
+    / per-adapter profile scope), not to widen the global allowlist.
     """
 
 
 def set_secret_scope(secrets: Optional[Mapping[str, str]]) -> Token:
-    """Install the active profile's secret mapping for the current context.
-
-    Returns a token for ``reset_secret_scope``. Pass ``None`` to clear.
-    """
+    """Install the active profile's secret mapping; ``None`` clears. Returns a reset token."""
     return _SECRET_SCOPE.set(secrets)
 
 
 def reset_secret_scope(token: Token) -> None:
-    """Restore the previous secret scope."""
     _SECRET_SCOPE.reset(token)
 
 
 def current_secret_scope() -> Optional[Mapping[str, str]]:
-    """Return the active secret mapping, or None when no scope is installed."""
+    """The active secret mapping, or None when no scope is installed."""
     return _SECRET_SCOPE.get()
 
 
-# ── genuinely-global env vars (NOT per-profile secrets) ──────────────────
-# These are process/deployment-level settings, not profile credentials. They
-# legitimately live in os.environ and must keep reading from it even in
-# multiplex mode — routing them through the fail-closed path would wrongly
-# crash. Anything matching is read from os.environ regardless of scope.
-#
-# Membership test is by exact name OR prefix (see _is_global_env). Keep this
-# list tight: when in doubt a value is a profile secret, not a global.
+# Genuinely-global env vars: process/deployment settings, NOT profile secrets.
+# They keep reading os.environ even in multiplex mode (routing them through the
+# fail-closed path would wrongly crash). Keep this tight — when in doubt a
+# value is a profile secret. Membership is exact name OR prefix.
 _GLOBAL_ENV_EXACT = frozenset({
     # Hermes runtime / deployment
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_GATEWAY_LOCK_DIR",
@@ -106,26 +73,17 @@ _GLOBAL_ENV_EXACT = frozenset({
     "VIRTUAL_ENV", "PYTHONPATH", "SSL_CERT_FILE",
     # Kanban paths (per-board, not per-profile-secret)
     "HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
-    # API-server LISTENER settings — deployment config (Docker compose
-    # ``environment:`` block, systemd ``Environment=``), not profile secrets.
-    # The scoped runner reload (#64674) must keep seeing them or container
-    # deployments silently lose the api_server platform (#69379). NOTE:
-    # API_SERVER_KEY is deliberately NOT here — it IS a credential and stays
-    # profile-scoped.
+    # API-server LISTENER settings — deployment config (compose/systemd env),
+    # which the scoped runner reload must keep seeing or containers silently
+    # lose the api_server platform. API_SERVER_KEY is a credential: NOT here.
+    # See #64674, #69379.
     "API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_PORT",
     "API_SERVER_CORS_ORIGINS",
-    # Relay-connector ROUTING stamps — deployment config injected into the
-    # container/process env by managed deploys (the same shape as the
-    # API_SERVER listener settings above). The scoped runner reload and the
-    # relay-exclusive sweep in gateway/config.py must keep seeing them, and
-    # every reader (gateway.config, gateway.relay.relay_url()/registration/
-    # self-provision) must resolve the SAME value — a scope-dependent split
-    # leaves the adapter registered but the platform absent from config (or
-    # vice versa). Mirrors the non-secret/secret line drawn by the terminal
-    # env blocklist (tools/environments/local.py): routing hints are global;
-    # GATEWAY_RELAY_SECRET / GATEWAY_RELAY_ID / GATEWAY_RELAY_DELIVERY_KEY
-    # and the IDP_* credentials are auth material and deliberately NOT here —
-    # they stay profile-scoped with the fail-closed multiplex guard.
+    # Relay-connector ROUTING stamps injected by managed deploys. Every reader
+    # (gateway.config, relay_url()/registration/self-provision) must resolve
+    # the SAME value or the adapter registers while the platform is absent
+    # from config. GATEWAY_RELAY_SECRET/_ID/_DELIVERY_KEY and IDP_* are auth
+    # material and deliberately stay profile-scoped.
     "GATEWAY_RELAY_URL", "GATEWAY_RELAY_ENDPOINT",
     "GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS",
     "GATEWAY_RELAY_PLATFORMS", "GATEWAY_RELAY_BOT_IDS",
@@ -140,55 +98,33 @@ _GLOBAL_ENV_PREFIXES = (
 
 
 def _is_global_env(name: str) -> bool:
-    """Return True for genuinely process-global (non-profile-secret) env vars."""
-    if name in _GLOBAL_ENV_EXACT:
-        return True
-    return any(name.startswith(p) for p in _GLOBAL_ENV_PREFIXES)
+    """True for genuinely process-global (non-profile-secret) env vars."""
+    return name in _GLOBAL_ENV_EXACT or name.startswith(_GLOBAL_ENV_PREFIXES)
+
+
+def _environ_or(name: str, default: Optional[str]) -> Optional[str]:
+    val = os.environ.get(name)
+    return val if val is not None else default
 
 
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     """Resolve a credential by env-var name, honoring the active profile scope.
 
-    Resolution order:
-
-    1. Genuinely-global vars (``_is_global_env``) always read ``os.environ`` —
-       they are deployment settings, not profile secrets.
-    2. When a secret scope is installed (multiplexed turn), read from it. Under
-       multiplexing the scope is authoritative — an absent key returns
-       ``default`` and we do NOT fall through to ``os.environ``, because in a
-       multiplexer ``os.environ`` may hold another profile's value. When
-       multiplexing is OFF, a scope miss falls through to ``os.environ``:
-       single-profile deployments legitimately provide credentials via the
-       process environment (systemd ``Environment=``, secret-manager wrappers
-       like ``pass-cli run`` / ``op run``, plain shell exports) rather than
-       ``<home>/.env``, and the scope — installed unconditionally around e.g.
-       every cron job — must stay a ``.env`` overlay, not a blindfold.
-    3. No scope installed:
-       - multiplex INACTIVE (default deployment): read ``os.environ`` —
-         identical to the legacy ``os.getenv`` behavior every caller had before.
-       - multiplex ACTIVE: FAIL CLOSED. Raise ``UnscopedSecretError`` so the
-         missing scope is caught loudly instead of leaking a cross-profile value.
+    Global vars always read ``os.environ``. With a scope installed, a miss returns
+    ``default`` under multiplexing (never another profile's ``os.environ`` value)
+    but falls through to ``os.environ`` otherwise — single-profile deployments
+    inject credentials via the process env (systemd, ``op run``), so the scope
+    must stay a ``.env`` overlay, not a blindfold (otherwise cron 401s). With no
+    scope: multiplex INACTIVE reads ``os.environ``; ACTIVE raises (fail closed).
     """
     if _is_global_env(name):
-        val = os.environ.get(name)
-        return val if val is not None else default
-
+        return _environ_or(name, default)
     scope = _SECRET_SCOPE.get()
     if scope is not None:
         val = scope.get(name)
         if val is not None:
             return val
-        if _MULTIPLEX_ACTIVE:
-            return default
-        # Multiplex off: the scope is an overlay over the process environment,
-        # not an isolation boundary — there is no other profile to leak from.
-        # Without this fallthrough, credentials injected only into the process
-        # environment vanish inside any set_secret_scope(...) block (the cron
-        # scheduler installs one around every job), so cron jobs send a
-        # placeholder API key and 401 while interactive turns keep working.
-        val = os.environ.get(name)
-        return val if val is not None else default
-
+        return default if _MULTIPLEX_ACTIVE else _environ_or(name, default)
     if _MULTIPLEX_ACTIVE:
         raise UnscopedSecretError(
             f"get_secret({name!r}) called with no profile secret scope active "
@@ -198,27 +134,14 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
             f"profile's value. See docs/design/multiplexing-gateway.md "
             f"(Workstream A)."
         )
-
-    val = os.environ.get(name)
-    return val if val is not None else default
+    return _environ_or(name, default)
 
 
 def _strip_inline_comment(value: str) -> str:
-    """Strip a dotenv-style inline comment from a raw ``.env`` value.
-
-    Mirrors python-dotenv (1.2.2) semantics, verified empirically:
-
-    - Quoted values: scan for the matching close quote
-      (backslash-escape-aware for double quotes, since ``save_env_value``
-      writes ``\\"``/``\\\\`` escapes). Everything through the close quote is
-      kept; a trailing ``# ...`` remainder after it is discarded, so
-      ``KEY="has # inside" # trailing`` yields ``has # inside``. Non-comment
-      trailing junk leaves the value untouched (lenient, unlike dotenv's
-      hard parse error).
-    - Unquoted values: truncate only at a ``#`` PRECEDED BY WHITESPACE, so
-      ``KEY=foo#bar`` keeps ``foo#bar`` while ``KEY=value # comment`` keeps
-      ``value``. A value that *starts* with ``#`` (``KEY=#leading``) is kept.
-    """
+    """Strip a dotenv-style inline comment (python-dotenv semantics): quoted values
+    scan to the matching close quote (backslash-aware for double quotes) and drop a
+    trailing ``# ...``, else stay untouched; unquoted values truncate only at a
+    ``#`` PRECEDED BY WHITESPACE (``foo#bar`` survives, ``value # c`` → ``value``)."""
     value = value.strip()
     if not value:
         return value
@@ -231,42 +154,22 @@ def _strip_inline_comment(value: str) -> str:
                 i += 2  # skip the escaped character
                 continue
             if ch == quote:
-                remainder = value[i + 1:].lstrip()
-                if remainder.startswith("#"):
-                    return value[: i + 1]
-                return value
+                return value[: i + 1] if value[i + 1:].lstrip().startswith("#") else value
             i += 1
         return value  # unterminated quote: leave as-is
     return re.split(r"\s+#", value, maxsplit=1)[0].strip()
 
 
 def load_env_file(env_path: Path) -> Dict[str, str]:
-    """Parse a ``.env`` file into a plain dict WITHOUT touching ``os.environ``.
-
-    Used to load a profile's secrets into an isolated mapping for
-    ``set_secret_scope``. Parses the small KEY=VALUE subset Hermes writes
-    itself (``export`` prefix, ``#`` comments — full-line and
-    dotenv-compatible inline, matching quotes with the
-    writer's ``\\"``/``\\\\`` escapes reversed — the same semantics as
-    ``hermes_cli.config._parse_env_value``) but never mutates the process
-    environment — that isolation is the whole point.
-
-    Encoding is ``utf-8-sig`` so a leading UTF-8 BOM (Windows Notepad /
-    PowerShell ``Set-Content -Encoding UTF8``) does not prefix the first
-    key as ``\\ufeffNAME`` and make ``get_secret('NAME')`` miss under scope.
-    """
+    """Parse a ``.env`` file into a dict WITHOUT touching ``os.environ``: ``export``
+    prefix, ``#`` comments, and the writer's quote escapes reversed via the canonical
+    ``_parse_env_value``. ``utf-8-sig`` so a BOM doesn't prefix the first key."""
     secrets: Dict[str, str] = {}
     try:
         text = env_path.read_text(encoding="utf-8-sig")
     except (FileNotFoundError, OSError, UnicodeDecodeError):
         return secrets
 
-    # Parse values with the canonical Hermes parser: save_env_value
-    # escapes " and \ inside double quotes, and every other reader
-    # (load_env, python-dotenv) reverses those escapes. Stripping only
-    # the outer quotes here would corrupt credentials containing "
-    # or \ — they work interactively but fail in scoped (cron /
-    # multiplex) resolution.
     from hermes_cli.config import _parse_env_value
 
     for raw in text.splitlines():
@@ -275,255 +178,142 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
             continue
         if line.startswith("export "):
             line = line[len("export "):].lstrip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
+        key, sep, value = line.partition("=")
         key = key.strip()
-        if not key:
-            continue
-        secrets[key] = _parse_env_value(_strip_inline_comment(value))
-
+        if sep and key:
+            secrets[key] = _parse_env_value(_strip_inline_comment(value))
     return secrets
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a resolved profile-secret mapping from ``<home>/.env``.
+    """Build an isolated, resolved secret mapping for one profile home.
 
-    Direct ``op://`` references are resolved for this profile before the mapping
-    is installed. Passing the raw reference through ``get_secret`` would send the
-    reference string itself as an API key; falling back to process ``os.environ``
-    would be worse because that value may belong to another profile. Failed
-    references are omitted so callers fail closed rather than authenticating with
-    either unsafe value.
-
-    Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
-    global vars are intentionally NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` directly, so the scope holds only profile secrets.
+    Named profiles inherit the shared root ``.env`` as a base layer but never
+    the gateway process environment. The default profile owns that process
+    environment. External sources resolve against this private mapping, so
+    their bootstrap credentials cannot cross profile boundaries.
     """
     home = Path(hermes_home)
     is_named_profile = home.parent.name == "profiles"
-    # Named profiles inherit the shared root ``~/.hermes/.env`` as a base layer,
-    # then override with their own ``.env`` — mirroring ``load_hermes_dotenv``'s
-    # root-then-profile merge so a profile with an empty (or partial) ``.env``
-    # still sees shared root secrets (e.g. OPENAI_API_KEY, CPE_GITHUB_TOKEN)
-    # through the scope. The default/root home resolves to itself, so no base
-    # layer is added there. Resolve the root from the home being built (NOT the
-    # process HERMES_HOME) so a custom/isolated home can't inherit an unrelated
-    # ~/.hermes/.env.
     secrets: Dict[str, str] = {}
-    # Default/process-owner base layer. Under gateway.multiplex_profiles the
-    # default profile ALSO runs inside a secret scope (``_profile_runtime_scope``
-    # installs one for every profile), and once any scope is installed
-    # ``get_secret`` is authoritative — it no longer falls back to os.environ.
-    # The default profile IS the process owner, so its own shell/systemd
-    # environment (e.g. a ``OPENAI_API_KEY`` exported in the gateway's shell
-    # rather than written to ``.env``) legitimately belongs to it; dropping it
-    # would make provider credentials vanish from ``/model`` and runtime
-    # resolution the moment multiplexing is enabled. Seed the default scope with
-    # the process env as the lowest layer (below ``.env`` / sources, which still
-    # override), excluding genuinely-global vars (``get_secret`` reads those from
-    # os.environ directly). Named profiles are a hard isolation boundary and get
-    # NO os.environ seed — they must never borrow the gateway/default identity.
+
     if not is_named_profile:
-        for _k, _v in os.environ.items():
-            if _v is None or _v == "":
-                continue
-            if _is_global_env(_k):
-                continue
-            # Leave 1Password auth/session plumbing to the dedicated op path
-            # below (it passes token_value=None + include_process_auth=True for
-            # the default profile so the `op` binary uses its own shell/desktop
-            # session). Seeding OP_SERVICE_ACCOUNT_TOKEN / OP_SESSION_* / OP_*
-            # here would flip that to an explicit-token fetch and change the
-            # documented auth contract. Secret-source bootstrap vars (e.g.
-            # BWS_ACCESS_TOKEN) are likewise overlaid by their own pass below.
-            if _k.startswith("OP_") or _k in ("OP_SERVICE_ACCOUNT_TOKEN",):
-                continue
-            secrets[_k] = _v
-    try:
-        from hermes_constants import get_default_hermes_root
+        secrets.update(
+            (name, value)
+            for name, value in os.environ.items()
+            if value and not _is_global_env(name) and not name.startswith("OP_")
+        )
 
-        root_home = Path(get_default_hermes_root(home))
-        root_env = root_home / ".env"
-        if root_env.resolve() != (home / ".env").resolve() and root_env.exists():
-            secrets.update(load_env_file(root_env))
-    except Exception:  # noqa: BLE001 — never block scope build on root resolution
-        pass
-    secrets.update(load_env_file(home / ".env"))  # profile .env overrides root
+    if is_named_profile:
+        try:
+            from hermes_constants import get_default_hermes_root
 
-    # Secret sources normally populate os.environ. Resolve them into this
-    # isolated mapping instead so a multiplexed scope can remain authoritative.
-    registry_resolved: set = set()
+            root_env = Path(get_default_hermes_root(home)) / ".env"
+            if root_env.resolve() != (home / ".env").resolve():
+                secrets.update(load_env_file(root_env))
+        except Exception:
+            pass
+    secrets.update(load_env_file(home / ".env"))
+
+    # ``.op.env`` carries 1Password bootstrap auth. It is local to this home
+    # and lower precedence than a value explicitly written to ``.env``.
+    for name, value in load_env_file(home / ".op.env").items():
+        secrets.setdefault(name, value)
+
+    registry_resolved: set[str] = set()
     try:
         from hermes_cli.env_loader import _load_secrets_config
-        from agent.secret_sources.registry import apply_all, list_sources
+        from agent.secret_sources.registry import apply_all
 
         sources_cfg = _load_secrets_config(home)
-        source_values = dict(secrets)
-        # A named profile (``<home>/profiles/<name>``) is a genuine isolation
-        # boundary under gateway.multiplex_profiles — it must never read the
-        # gateway/default profile's process ``os.environ``. The default profile
-        # IS the process owner, so its own shell/systemd environment is in-scope
-        # (no cross-profile leak). Two behaviours key off this:
-        # 1. Default-profile bootstrap preservation. A source reaches its vault
-        # with a bootstrap credential (e.g. Bitwarden's ``BWS_ACCESS_TOKEN``,
-        # exposed via ``protected_env_vars``) that a documented setup supplies
-        # from the shell / systemd environment rather than ``.env``. Because
-        # ``apply_all`` runs with an isolated ``environ`` (the parsed ``.env``
-        # only), such a token would be invisible and the source would report
-        # NOT_CONFIGURED, dropping its secrets from the default scope. For the
-        # default profile only — the same scope that keeps 1Password's
-        # ``include_process_auth`` shell fallback — overlay those bootstrap
-        # vars from ``os.environ`` when ``.env`` did not already define them.
-        # Named profiles are deliberately NOT seeded.
-        if not is_named_profile:
-            for src in list_sources():
-                src_cfg = sources_cfg.get(src.name)
-                src_cfg = src_cfg if isinstance(src_cfg, dict) else {}
-                if not src.is_enabled(src_cfg):
-                    continue
-                try:
-                    bootstrap_vars = src.protected_env_vars(src_cfg)
-                except Exception:  # noqa: BLE001
-                    bootstrap_vars = frozenset()
-                for var in bootstrap_vars:
-                    if var in source_values:
-                        continue
-                    shell_val = os.environ.get(var)
-                    if shell_val is not None and shell_val != "":
-                        source_values[var] = shell_val
-        # 2. Scoped fail-closed applies to NAMED profiles only. There, a legacy
-        # source whose fetch() cannot consume ``environ`` is rejected rather
-        # than run against the process env (another profile's). The default
-        # profile keeps such legacy sources working — running them env-less
-        # reads its own owner environment, the exact bootstrap re-seeded above.
         report = apply_all(
-            sources_cfg, home, environ=source_values, scoped=is_named_profile
+            sources_cfg, home, environ=secrets, scoped=is_named_profile
         )
-        # Names the secret-source registry actually applied into the scope, per
-        # its own provenance (authoritative even when the resolved value happens
-        # to equal a plaintext already in .env). These must not be dropped by
-        # the fail-closed pass below if the redundant manual op fetch transiently
-        # fails, since the registry already supplied a valid credential.
-        provenance = getattr(report, "provenance", None)
-        if isinstance(provenance, dict):
-            registry_resolved.update(provenance.keys())
-        secrets = source_values
+        registry_resolved.update(report.provenance)
     except Exception:
-        pass
+        sources_cfg = {}
 
-    raw_op_refs = {
+    # Resolve direct ``op://`` values and the configured 1Password mapping in
+    # one pass. Configured mappings win when override_existing is enabled.
+    raw_refs = {
         name: value
         for name, value in secrets.items()
         if isinstance(value, str) and value.strip().startswith("op://")
     }
-
-    op_cfg: Dict[str, object] = {}
-    try:
-        from hermes_cli.env_loader import _load_secrets_config
-
-        sources_cfg = _load_secrets_config(home)
-        candidate = sources_cfg.get("onepassword")
-        if isinstance(candidate, dict):
-            op_cfg = candidate
-    except Exception:
-        op_cfg = {}
-
-    configured_refs: Dict[str, str] = {}
-    if op_cfg.get("enabled"):
-        configured = op_cfg.get("env")
-        if isinstance(configured, dict):
-            configured_refs = {
-                str(name): str(value)
-                for name, value in configured.items()
-                if isinstance(name, str)
-                and isinstance(value, str)
-                and value.strip().startswith("op://")
-            }
+    op_cfg = sources_cfg.get("onepassword")
+    op_cfg = op_cfg if isinstance(op_cfg, dict) else {}
+    configured_refs = {}
+    if op_cfg.get("enabled") and isinstance(op_cfg.get("env"), dict):
+        configured_refs = {
+            str(name): str(value)
+            for name, value in op_cfg["env"].items()
+            if isinstance(value, str) and value.strip().startswith("op://")
+        }
     override_existing = bool(op_cfg.get("override_existing", True))
     op_refs = (
-        {**raw_op_refs, **configured_refs}
+        {**raw_refs, **configured_refs}
         if override_existing
-        else {**configured_refs, **raw_op_refs}
+        else {**configured_refs, **raw_refs}
     )
-
     if op_refs:
         resolved: Dict[str, str] = {}
         try:
+            from agent.secret_sources.base import (
+                reset_source_environment,
+                set_source_environment,
+            )
             from agent.secret_sources.onepassword import fetch_onepassword_secrets
 
-            token_env = str(
-                op_cfg.get("service_account_token_env")
-                or "OP_SERVICE_ACCOUNT_TOKEN"
-            )
-            bootstrap = load_env_file(home / ".op.env")
-            profile_auth_values = {**bootstrap, **secrets}
-            auth_env = {
-                name: value
-                for name, value in profile_auth_values.items()
-                if name in {"OP_ACCOUNT", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN"}
-                or name.startswith("OP_SESSION_")
-            }
-            local_token = str(
-                secrets.get(token_env) or bootstrap.get(token_env) or ""
-            ).strip()
-            include_process_auth = home.parent.name != "profiles"
-            # A default/profile-owner scope may keep the legacy shell/desktop
-            # auth fallback. Named profiles pass an explicit empty token and
-            # disable process auth so they can never borrow the gateway's
-            # 1Password identity.
-            token_value: Optional[str] = (
-                local_token if local_token else (None if include_process_auth else "")
-            )
+            token = set_source_environment(secrets)
             try:
-                cache_ttl = float(str(op_cfg.get("cache_ttl_seconds", 300)))
-            except (TypeError, ValueError):
-                cache_ttl = 300.0
-            resolved, _warnings = fetch_onepassword_secrets(
-                references=op_refs,
-                account=str(op_cfg.get("account") or ""),
-                token_env=token_env,
-                token_value=token_value,
-                # Named profiles must not inherit the gateway process's
-                # OP_SESSION_*/OP_CONNECT identity. The default profile still
-                # keeps desktop-session behavior.
-                include_process_auth=include_process_auth,
-                auth_env=auth_env,
-                binary_path=str(op_cfg.get("binary_path") or ""),
-                cache_ttl_seconds=cache_ttl,
-                home_path=home,
-            )
+                token_env = str(
+                    op_cfg.get("service_account_token_env")
+                    or "OP_SERVICE_ACCOUNT_TOKEN"
+                )
+                local_token = str(secrets.get(token_env) or "").strip()
+                include_process_auth = not is_named_profile
+                resolved, _warnings = fetch_onepassword_secrets(
+                    references=op_refs,
+                    account=str(op_cfg.get("account") or ""),
+                    token_env=token_env,
+                    token_value=(
+                        local_token
+                        if local_token
+                        else (None if include_process_auth else "")
+                    ),
+                    include_process_auth=include_process_auth,
+                    auth_env={
+                        name: value
+                        for name, value in secrets.items()
+                        if name in {"OP_ACCOUNT", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN"}
+                        or name.startswith("OP_SESSION_")
+                    },
+                    binary_path=str(op_cfg.get("binary_path") or ""),
+                    cache_ttl_seconds=float(op_cfg.get("cache_ttl_seconds", 300)),
+                    home_path=home,
+                )
+            finally:
+                reset_source_environment(token)
         except Exception:
-            # A missing/unauthenticated source must not turn a reference string
-            # into a credential or leak the process/default profile's value.
             resolved = {}
-        for name, value in resolved.items():
-            rendered = str(value or "")
-            if rendered.strip() and (
-                override_existing or name not in secrets or name in raw_op_refs
-            ):
-                secrets[name] = rendered
-        fail_closed_names = set(raw_op_refs)
+        secrets.update((name, value) for name, value in resolved.items() if value)
+        fail_closed = set(raw_refs)
         if override_existing:
-            fail_closed_names.update(configured_refs)
-        for name in fail_closed_names:
-            if name in resolved or name in registry_resolved:
-                # Either the manual op fetch resolved it, or the secret-source
-                # registry (apply_all) already resolved it into a concrete
-                # credential. A transient manual-refetch failure must not drop
-                # a value the registry successfully supplied.
-                continue
-            secrets.pop(name, None)
+            fail_closed.update(configured_refs)
+        for name in fail_closed:
+            if name not in resolved and name not in registry_resolved:
+                secrets.pop(name, None)
 
+    # Preserve the upstream per-home source snapshot contract. A gateway may
+    # hydrate sources off-thread before building this scope.
     try:
         from hermes_cli.env_loader import get_secret_source_values
-        external_secrets = get_secret_source_values(home)
+
+        secrets.update(get_secret_source_values(home))
     except Exception:
-        external_secrets = {}
+        pass
 
-    for key, value in external_secrets.items():
+    for key in list(secrets):
         if _is_global_env(key):
-            continue
-        secrets[key] = value
-
+            secrets.pop(key, None)
     return secrets

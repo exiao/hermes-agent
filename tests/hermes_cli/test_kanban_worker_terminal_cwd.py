@@ -31,21 +31,47 @@ def _make_task(kb):
     )
 
 
-def _spawn(kb, monkeypatch, workspace: str) -> dict:
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured: dict = {}
 
     class FakeProc:
         pid = 4242
 
     def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_make_task(kb), workspace)
+    kbd._default_spawn(_make_task(kb), workspace)
     return captured
+
+
+def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
+    """A real, absolute workspace dir is pinned as TERMINAL_CWD."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert captured["env"]["TERMINAL_CWD"] == str(workspace)
+    assert captured["cwd"] == str(workspace)
+    assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
 def _setup(tmp_path, monkeypatch, profile_terminal: str, root_terminal: str, env: dict):
@@ -108,7 +134,7 @@ def test_worker_spawn_cwd(
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    got = _spawn(kb, monkeypatch, str(workspace))
+    got = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
     for key, want in (("TERMINAL_CWD", want_cwd), ("HERMES_KANBAN_WORKSPACE", want_ws)):
         if want is ABSENT:
@@ -136,7 +162,7 @@ def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path
     _setup(tmp_path, monkeypatch, "", "", {"TERMINAL_CWD": "/pre/existing/anchor"})
     from hermes_cli import kanban_db as kb
 
-    got = _spawn(kb, monkeypatch, str(tmp_path / "does-not-exist"))
+    got = _capture_spawn_env(kb, monkeypatch, str(tmp_path / "does-not-exist"))
 
     assert got["env"]["TERMINAL_CWD"] == "/pre/existing/anchor"
 
@@ -173,7 +199,7 @@ def test_inherited_terminal_config_vars_scrubbed(monkeypatch, tmp_path):
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    got = _spawn(kb, monkeypatch, str(workspace))
+    got = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
     for key in LEAKED:
         assert key not in got["env"], f"{key} leaked into the worker env"
@@ -192,7 +218,7 @@ def test_explicit_terminal_env_preserved_when_root_has_no_terminal_section(
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    got = _spawn(kb, monkeypatch, str(workspace))
+    got = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
     assert got["env"]["TERMINAL_ENV"] == "modal"
     assert got["env"]["TERMINAL_MODAL_IMAGE"] == "im-operatorExplicit123"
@@ -214,7 +240,7 @@ def test_env_only_remote_drops_a_host_shaped_cwd(monkeypatch, tmp_path):
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    got = _spawn(kb, monkeypatch, str(workspace))
+    got = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
     assert "TERMINAL_CWD" not in got["env"]
 
@@ -226,14 +252,14 @@ def test_spawn_dir_fallback_is_private_not_shared_tmp(monkeypatch, tmp_path):
     so launching in /tmp would load a pre-existing /tmp/AGENTS.md into the
     worker's system prompt -- the opposite of the isolation this dir provides.
     """
-    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
     def _refuse(*_a, **_kw):
         raise OSError("read-only board directory")
 
-    monkeypatch.setattr(kb.Path, "mkdir", _refuse)
+    monkeypatch.setattr(kbd.Path, "mkdir", _refuse)
 
-    got = kb._remote_worker_spawn_dir()
+    got = kbd._remote_worker_spawn_dir()
 
     assert got != Path(tempfile.gettempdir())
     assert got.is_dir()
