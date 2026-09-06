@@ -3101,8 +3101,16 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             return 1
         delivery_mode = getattr(args, "delivery_mode", None)
         route_ready = (
-            args.chat_type == "dm"
-            or (args.chat_type == "thread" and args.thread_id)
+            # api_server subscriptions use chat_id as the raw session id;
+            # the notifier self-posts to that exact session and does not need
+            # gateway chat routing fields.
+            args.platform == "api_server"
+            or args.chat_type == "dm"
+            or (
+                args.chat_type == "thread"
+                and args.thread_id
+                and (args.user_id or getattr(args, "user_id_alt", None))
+            )
             or (
                 args.chat_type in ("group", "channel")
                 and (args.user_id or getattr(args, "user_id_alt", None))

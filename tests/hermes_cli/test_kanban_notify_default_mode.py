@@ -119,6 +119,33 @@ def test_cli_group_subscribe_without_participant_stays_passive(board):
     assert _mode(board, tid) == "notify"
 
 
+def test_cli_thread_subscribe_without_participant_stays_passive(board):
+    """A per-user thread wake needs the participant used in its session key."""
+    tid = kb.create_task(board, title="t", assignee="dev")
+    top = argparse.ArgumentParser(prog="hermes")
+    parser = kanban_cli.build_parser(top.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "notify-subscribe", tid,
+        "--platform", "signal", "--chat-id", "group:abc",
+        "--chat-type", "thread", "--thread-id", "thread-1",
+    ])
+    assert kanban_cli.kanban_command(args) == 0
+    assert _mode(board, tid) == "notify"
+
+
+def test_cli_api_server_subscribe_wakes_raw_session(board):
+    """The API adapter wakes by self-posting to chat_id as its raw session id."""
+    tid = kb.create_task(board, title="t", assignee="dev")
+    top = argparse.ArgumentParser(prog="hermes")
+    parser = kanban_cli.build_parser(top.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "notify-subscribe", tid,
+        "--platform", "api_server", "--chat-id", "raw-session-1",
+    ])
+    assert kanban_cli.kanban_command(args) == 0
+    assert _mode(board, tid) == "notify+wake"
+
+
 def test_cli_resubscribe_without_chat_type_keeps_existing_mode(board):
     """Route-less re-subscribe must preserve an intentional wake mode."""
     tid = kb.create_task(board, title="t", assignee="dev")
