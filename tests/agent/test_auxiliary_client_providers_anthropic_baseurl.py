@@ -29,7 +29,7 @@ def _run_try_anthropic(tmp_path, monkeypatch, config: dict):
             "agent.auxiliary_client._select_pool_entry", return_value=(False, None)
         ),
         patch(
-            "agent.anthropic_adapter.resolve_anthropic_token",
+            "agent.anthropic_credentials.resolve_anthropic_token",
             return_value="***",
         ),
         patch("agent.anthropic_adapter.build_anthropic_client") as mock_build,

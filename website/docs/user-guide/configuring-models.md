@@ -57,7 +57,7 @@ Prompt caches are keyed to the model serving the request, so any mid-conversatio
 
 ### Unattended data-training tiers
 
-Models such as `muse-spark-1.2-contributor` are discounted because the vendor may train on your prompts and completions. Interactive model selection always shows a confirmation prompt. Non-interactive startup paths such as Kanban workers and cron agents fail closed because they cannot ask that question.
+Models with a `-contributor` suffix (e.g. `muse-spark-1.2-contributor`, `muse-spark-1.3-contributor`) are discounted because the vendor may train on your prompts and completions. Interactive model selection always shows a confirmation prompt. Non-interactive startup paths such as Kanban workers and cron agents fail closed because they cannot ask that question.
 
 If training on the unattended workload's data is acceptable, record a persistent acknowledgement:
 
@@ -233,6 +233,17 @@ omitted, Hermes keeps its normal provider and model capability detection.
 :::note Legacy format
 Older configs used a top-level `custom_providers:` list (with `base_url` instead of `api`). It still works and is auto-migrated to the `providers:` dict on `hermes update` (config v12).
 :::
+
+### Nous Portal: which wire carries Claude
+
+Nous Portal serves its `anthropic/*` models on two routes: OpenAI-compatible `/v1/chat/completions` and the native Anthropic Messages wire `/v1/messages`. `nous.anthropic_wire` picks one:
+
+```yaml
+nous:
+  anthropic_wire: chat     # default. "native" = the Anthropic Messages wire
+```
+
+`chat` is the default for now. The native wire is the better transport (signed thinking blocks pass through unchanged, native `cache_control` scopes), but in concurrent tool loops it currently re-writes the previous turn's prompt cache on 14–20% of consecutive calls, which is 15–20% of a fan-out's cache-write bill; the chat route measured 0 on the same test. Set `native` to opt back in (for example once the portal-side fix has shipped). Only `anthropic/*` models are affected; everything else on Nous already uses chat/completions.
 
 ## When does it take effect?
 

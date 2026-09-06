@@ -26,7 +26,7 @@ def _load_helper():
 
     src = (pathlib.Path(__file__).resolve().parents[2] / "run_agent.py").read_text()
     m = re.search(
-        r"(    def _announce_or_buffer_fallback\(self.*?)\n    def _buffer_vprint",
+        r"(    def _announce_or_buffer_fallback\(self.*?)(?=\n    (?:async )?def )",
         src,
         re.S,
     )
