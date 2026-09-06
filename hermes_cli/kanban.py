@@ -3100,6 +3100,9 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
         delivery_mode = getattr(args, "delivery_mode", None)
+        # Adapters persist platform names in lowercase. Normalize CLI input
+        # before routing decisions and before looking up an existing row.
+        platform = args.platform.strip().lower()
         # Slack keys sessions on the workspace scope as well as the chat, and
         # the CLI has no way to persist one (``_wake_scope_id`` recovers it
         # only from delivery_metadata or the adapter's ephemeral channel map,
@@ -3113,12 +3116,12 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         # so an unscoped DM key is just as wrong as an unscoped channel key.
         # Every other platform ignores scope_id entirely, so this stays
         # narrowed to Slack rather than gating all subscriptions.
-        slack_needs_scope = args.platform == "slack"
+        slack_needs_scope = platform == "slack"
         route_ready = (
             # api_server subscriptions use chat_id as the raw session id;
             # the notifier self-posts to that exact session and does not need
             # gateway chat routing fields.
-            args.platform == "api_server"
+            platform == "api_server"
             or (not slack_needs_scope and args.chat_type == "dm")
             or (
                 not slack_needs_scope
@@ -3138,7 +3141,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
                 SELECT 1 FROM kanban_notify_subs
                  WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
                 """,
-                (args.task_id, args.platform, args.chat_id, args.thread_id or ""),
+                (args.task_id, platform, args.chat_id, args.thread_id or ""),
             ).fetchone()
             if existing is None:
                 # Without the originating chat type, a wake would use the DB's
@@ -3148,7 +3151,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
                 delivery_mode = "notify"
         kb.add_notify_sub(
             conn, task_id=args.task_id,
-            platform=args.platform, chat_id=args.chat_id,
+            platform=platform, chat_id=args.chat_id,
             chat_type=args.chat_type,
             thread_id=args.thread_id, user_id=args.user_id,
             user_id_alt=getattr(args, "user_id_alt", None),

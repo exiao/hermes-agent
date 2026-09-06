@@ -221,6 +221,17 @@ def test_slack_dm_also_stays_passive(board):
     assert _mode(board, tid) == "notify"
 
 
+def test_platform_names_are_normalized_before_slack_routing(board):
+    """Case differences must not bypass Slack's scope guard."""
+    tid = kb.create_task(board, title="t", assignee="dev")
+    assert _cli_subscribe(tid, [
+        "--platform", "Slack", "--chat-id", "C123",
+        "--chat-type", "group", "--user-id", "U456",
+    ]) == 0
+    assert _mode(board, tid) == "notify"
+    assert kb.list_notify_subs(board, tid)[0]["platform"] == "slack"
+
+
 def test_non_slack_dm_still_wakes(board):
     """Only Slack carries scope in its key; other DMs are route-complete."""
     tid = kb.create_task(board, title="t", assignee="dev")
