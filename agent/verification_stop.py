@@ -112,15 +112,17 @@ def _surface_is_excluded(agent_cfg: Any, runtime_platform: str | None = None) ->
         return False
 
     try:
-        from gateway.session_context import get_session_env
+        from gateway.session_context import get_session_env, get_session_source
     except Exception:  # gateway package unreachable (CLI, tests)
         def get_session_env(name: str, default: str = "") -> str:
             return os.environ.get(name, default)
 
+        get_session_source = get_session_env
+
     platform = runtime_platform or os.getenv("HERMES_PLATFORM") or get_session_env(
         "HERMES_SESSION_PLATFORM", ""
     )
-    source = get_session_env("HERMES_SESSION_SOURCE", "")
+    source = get_session_source("")
     return any(str(i or "").strip().lower() in excluded for i in (platform, source))
 
 
