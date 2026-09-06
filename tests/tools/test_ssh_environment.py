@@ -465,3 +465,41 @@ class TestLegacySkillsAlias:
         # left by an older layout.
         assert '[ ! -e' in link_cmd, 'alias is not guarded by an existence test'
         assert '-sfn' not in link_cmd, 'unguarded force-link would retarget a live tree'
+
+class TestSyncBackExclusions:
+    def test_manifest_is_excluded_from_sync_back(self, monkeypatch, tmp_path):
+        """The manifest is controller bookkeeping; pulling it back would drop a
+        .sync-manifest.json into the host hermes home on every cleanup."""
+        captured = {}
+
+        monkeypatch.setattr(ssh_env.shutil, 'which', lambda _name: '/usr/bin/ssh')
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_establish_connection', lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_detect_remote_home', lambda self: '/home/alice')
+        monkeypatch.setattr(ssh_env.SSHEnvironment, '_ensure_remote_dirs', lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, 'init_session', lambda self: None)
+        monkeypatch.setattr(
+            ssh_env, 'FileSyncManager',
+            lambda **kw: type('M', (), {'sync': lambda self, **k: None})(),
+        )
+        env = SSHEnvironment(host='example.com', user='alice')
+
+        def _fake_run(cmd, **kwargs):
+            captured['cmd'] = cmd
+            return type('R', (), {'returncode': 0, 'stderr': b''})()
+
+        monkeypatch.setattr(ssh_env.subprocess, 'run', _fake_run)
+        env._ssh_bulk_download(tmp_path / 'out.tar')
+
+        tar_cmd = captured['cmd'][-1]
+        assert '.sync-manifest.json' in tar_cmd, 'manifest not excluded from sync-back'
+        assert '.sync-manifest.*' in tar_cmd, 'mktemp manifest siblings not excluded'
+        assert 'venvs' in tar_cmd, 'existing venvs exclusion was dropped'
+
+
+class TestSnapshotDoesNotPinHermesHome:
+    def test_hermes_home_is_excluded_from_the_session_snapshot(self):
+        """_run_bash exports the scoped value per command, but the snapshot is
+        sourced first — a remote login profile exporting its own HERMES_HOME
+        would otherwise win forever and defeat profile isolation."""
+        assert 'HERMES_HOME' in SSHEnvironment._additional_profile_scoped_passthrough_names(
+            SSHEnvironment.__new__(SSHEnvironment))

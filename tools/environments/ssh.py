@@ -31,6 +31,13 @@ _BULK_UPLOAD_MIN_TIMEOUT = 120
 _BULK_UPLOAD_MAX_TIMEOUT = 1800
 _BULK_UPLOAD_BYTES_PER_SEC = 2_000_000
 _SYNC_BACK_EXCLUDE_DIRS = ("venvs",)
+# The manifest is controller-side bookkeeping that this environment WRITES to the
+# remote; pulling it back is never wanted. It has no pushed hash, so
+# _infer_host_path() would map it by remote-root prefix and drop a
+# ".sync-manifest.json" into $HERMES_HOME on every cleanup — creating an internal
+# artifact on the controller, or overwriting a user file of that name. The
+# mktemp siblings (.sync-manifest.XXXXXX) are excluded for the same reason.
+_SYNC_BACK_EXCLUDE_GLOBS = (".sync-manifest.json", ".sync-manifest.*")
 
 
 def _tar_stderr_is_only_concurrent_change(stderr: str) -> bool:
@@ -86,6 +93,20 @@ class SSHEnvironment(BaseEnvironment):
     # Passthrough values are re-forwarded on every command (see _run_bash), so like docker/local
     # they stay out of the remote snapshot under multiplex.
     _profile_scoped_passthrough = True
+
+    def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
+        """Keep HERMES_HOME out of the session snapshot.
+
+        ``_run_bash`` exports the profile-scoped value ahead of every command,
+        but the snapshot is sourced FIRST by ``_wrap_command``. A remote login
+        profile that exports its own ``HERMES_HOME`` (or an earlier command
+        that persisted one) would otherwise be captured once and then win on
+        every later command, pointing the agent at the unscoped shared tree
+        while files sync under the scoped root — silently defeating this
+        environment's profile isolation. Excluding the name means the snapshot
+        never carries it and the per-command export is always the live value.
+        """
+        return ("HERMES_HOME",)
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
@@ -445,8 +466,15 @@ class SSHEnvironment(BaseEnvironment):
         # "is a link to an absolute path" and fail the attempt outright.
         # Excluding it fixes both the timeout and the hard error.
         exclude_args = " ".join(
-            f"--exclude={shlex.quote(f'{rel_base}/{directory}')}"
-            for directory in _SYNC_BACK_EXCLUDE_DIRS)
+            [
+                f"--exclude={shlex.quote(f'{rel_base}/{directory}')}"
+                for directory in _SYNC_BACK_EXCLUDE_DIRS
+            ]
+            + [
+                f"--exclude={shlex.quote(pattern)}"
+                for pattern in _SYNC_BACK_EXCLUDE_GLOBS
+            ]
+        )
         ssh_cmd = self._build_ssh_command() + [
             f"tar cf - -C / {exclude_args} {shlex.quote(rel_base)}"]
         with open(dest, "wb") as f:
