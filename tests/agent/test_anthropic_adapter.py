@@ -394,7 +394,7 @@ class TestResolveAnthropicToken:
             raise AssertionError("read_claude_code_credentials must not be called when suppressed")
 
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", _boom
+            "agent.anthropic_credentials.read_claude_code_credentials", _boom
         )
         assert resolve_anthropic_token() is None
         assert calls["n"] == 0
@@ -561,10 +561,10 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+            "agent.anthropic_credentials._resolve_anthropic_pool_token", lambda **_: None
         )
         ss.set_multiplex_active(False)
         scope_token = ss.set_secret_scope({})
@@ -581,7 +581,7 @@ class TestResolveAnthropicToken:
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-SERVICE-ENV")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials",
+            "agent.anthropic_credentials.read_claude_code_credentials",
             lambda: {
                 "accessToken": "sk-ant-oat01-GLOBAL-CLAUDE",
                 "refreshToken": "refresh-global",
@@ -589,10 +589,10 @@ class TestResolveAnthropicToken:
             },
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter.is_claude_code_token_valid", lambda _: True
+            "agent.anthropic_credentials.is_claude_code_token_valid", lambda _: True
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter._resolve_anthropic_pool_token",
+            "agent.anthropic_credentials._resolve_anthropic_pool_token",
             lambda **_: "sk-ant-oat01-GLOBAL-POOL",
         )
         ss.set_multiplex_active(False)
@@ -613,7 +613,7 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials",
+            "agent.anthropic_credentials.read_claude_code_credentials",
             lambda: {
                 "accessToken": "sk-ant-oat01-REFRESHABLE-CLAUDE",
                 "refreshToken": "refresh-global",
@@ -621,7 +621,7 @@ class TestResolveAnthropicToken:
             },
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter.is_claude_code_token_valid", lambda _: True
+            "agent.anthropic_credentials.is_claude_code_token_valid", lambda _: True
         )
         ss.set_multiplex_active(False)
         scope_token = ss.set_secret_scope(
@@ -649,7 +649,7 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
         )
 
         # Secondary profile B's isolated secret scope.
@@ -692,11 +692,11 @@ class TestResolveAnthropicToken:
             "source": "file",
         }
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials",
+            "agent.anthropic_credentials.read_claude_code_credentials",
             lambda: global_creds,
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+            "agent.anthropic_credentials.is_claude_code_token_valid", lambda c: True
         )
         # Active scope belongs to a NON-default profile (profile B), so the
         # host-global ~/.claude credential is not this profile's and must be
@@ -749,11 +749,11 @@ class TestResolveAnthropicToken:
             "source": "file",
         }
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials",
+            "agent.anthropic_credentials.read_claude_code_credentials",
             lambda: global_creds,
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+            "agent.anthropic_credentials.is_claude_code_token_valid", lambda c: True
         )
         # Active scope belongs to a NON-default profile.
         monkeypatch.setattr(
@@ -844,7 +844,7 @@ class TestResolveAnthropicToken:
         )
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials",
+            "agent.anthropic_credentials.read_claude_code_credentials",
             lambda: {
                 "accessToken": "sk-ant-oat01-GLOBAL-CLAUDE",
                 "refreshToken": "refresh-global",
@@ -852,7 +852,7 @@ class TestResolveAnthropicToken:
             },
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+            "agent.anthropic_credentials.is_claude_code_token_valid", lambda c: True
         )
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
@@ -874,7 +874,7 @@ class TestResolveAnthropicToken:
         from agent import secret_scope as ss
 
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
         )
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
@@ -886,7 +886,7 @@ class TestResolveAnthropicToken:
             return "sk-ant-oat01-PROFILE-MANUAL"
 
         monkeypatch.setattr(
-            "agent.anthropic_adapter._resolve_anthropic_pool_token", _pool_token
+            "agent.anthropic_credentials._resolve_anthropic_pool_token", _pool_token
         )
         ss.set_multiplex_active(True)
         scope_token = ss.set_secret_scope(
@@ -916,7 +916,7 @@ class TestResolveAnthropicToken:
         from agent import secret_scope as ss
 
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
         )
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "default"
@@ -928,7 +928,7 @@ class TestResolveAnthropicToken:
             return "sk-ant-oat01-DEFAULT-MANUAL"
 
         monkeypatch.setattr(
-            "agent.anthropic_adapter._resolve_anthropic_pool_token", _pool_token
+            "agent.anthropic_credentials._resolve_anthropic_pool_token", _pool_token
         )
         ss.set_multiplex_active(True)
         scope_token = ss.set_secret_scope(
@@ -967,7 +967,7 @@ class TestResolveAnthropicToken:
         )
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials",
+            "agent.anthropic_credentials.read_claude_code_credentials",
             lambda: {
                 "accessToken": "sk-ant-oat01-GLOBAL-CLAUDE",
                 "refreshToken": "refresh-global",
@@ -975,7 +975,7 @@ class TestResolveAnthropicToken:
             },
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+            "agent.anthropic_credentials.is_claude_code_token_valid", lambda c: True
         )
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
@@ -1025,7 +1025,7 @@ class TestResolveAnthropicToken:
         )
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
         )
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
@@ -1066,11 +1066,11 @@ class TestResolveAnthropicToken:
             "source": "file",
         }
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials",
+            "agent.anthropic_credentials.read_claude_code_credentials",
             lambda: global_creds,
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter.is_claude_code_token_valid", lambda c: True
+            "agent.anthropic_credentials.is_claude_code_token_valid", lambda c: True
         )
         # Active scope belongs to the DEFAULT profile (owner of ~/.claude).
         monkeypatch.setattr(
@@ -1103,10 +1103,10 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+            "agent.anthropic_credentials._resolve_anthropic_pool_token", lambda **_: None
         )
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "default"
@@ -1140,10 +1140,10 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+            "agent.anthropic_credentials._resolve_anthropic_pool_token", lambda **_: None
         )
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "default"
@@ -1169,10 +1169,10 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+            "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
         )
         monkeypatch.setattr(
-            "agent.anthropic_adapter._resolve_anthropic_pool_token", lambda **_: None
+            "agent.anthropic_credentials._resolve_anthropic_pool_token", lambda **_: None
         )
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "profileB"
