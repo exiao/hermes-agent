@@ -135,3 +135,20 @@ def test_child_inherits_the_parents_mode_not_the_default(board):
                        chat_id="group:abc", delivery_mode="notify")
     child = kb.create_task(board, title="c", assignee="dev", parents=[parent])
     assert _mode(board, child) == "notify"
+
+@pytest.mark.parametrize('stored', ['Slack', '  SLACK  '])
+def test_legacy_unnormalized_row_is_matched_not_duplicated(board, stored):
+    """Rows created before platform normalization stored --platform verbatim.
+    A re-subscribe must find them case-insensitively; matching only the
+    normalized key would insert a SECOND logical row and the notifier, which
+    lowercases both, would then deliver twice."""
+    tid = kb.create_task(board, title='legacy', assignee='dev')
+    kbn.add_notify_sub(board, task_id=tid, platform=stored, chat_id='C1',
+                       chat_type='group', user_id='U1', delivery_mode='notify+wake')
+
+    assert _subscribe(tid, ['--platform', 'slack', '--chat-id', 'C1',
+                            '--chat-type', 'group', '--user-id', 'U1']) == 0
+
+    subs = kbn.list_notify_subs(board, tid)
+    assert len(subs) == 1, f're-subscribe duplicated the legacy row: {subs}'
+    assert subs[0]['delivery_mode'] == 'notify+wake'
