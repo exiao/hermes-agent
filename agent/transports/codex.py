@@ -547,6 +547,11 @@ class ResponsesApiTransport(ProviderTransport):
         if is_astra_model(model):
             for field in ASTRA_UNSUPPORTED_REQUEST_FIELDS:
                 kwargs.pop(field, None)
+            extra_body = kwargs.get("extra_body")
+            if isinstance(extra_body, dict):
+                kwargs["extra_body"] = {
+                    key: value for key, value in extra_body.items() if key not in ASTRA_UNSUPPORTED_REQUEST_FIELDS
+                }
 
         _bound_prompt_cache_key_field(kwargs)
 

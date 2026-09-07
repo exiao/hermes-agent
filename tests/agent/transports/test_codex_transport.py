@@ -79,6 +79,13 @@ class TestCodexBuildKwargs:
             "top_p": 0.5,
             "top_logprobs": 3,
             "logprobs": True,
+            "extra_body": {
+                "temperature": 0.3,
+                "top_p": 0.4,
+                "top_logprobs": 2,
+                "logprobs": False,
+                "prompt_cache_key": "keep-me",
+            },
         }
         kw = transport.build_kwargs(
             model="gpt-6-astra-900k",
@@ -87,13 +94,15 @@ class TestCodexBuildKwargs:
             is_codex_backend=True,
             request_overrides=overrides,
         )
-        assert not overrides.keys() & kw.keys()
+        assert not {"temperature", "top_p", "top_logprobs", "logprobs"} & kw.keys()
+        assert kw["extra_body"] == {"prompt_cache_key": "keep-me"}
 
         # The preflight is the final transport boundary and must also strip
         # fields supplied by a caller that bypasses the normal builder.
         kw.update(overrides)
         normalized = transport.preflight_kwargs(kw)
-        assert not overrides.keys() & normalized.keys()
+        assert not {"temperature", "top_p", "top_logprobs", "logprobs"} & normalized.keys()
+        assert normalized["extra_body"] == {"prompt_cache_key": "keep-me"}
 
     def test_other_models_keep_temperature_override(self, transport):
         kw = transport.build_kwargs(

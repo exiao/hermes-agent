@@ -827,6 +827,10 @@ def _preflight_codex_api_kwargs(
     # field, and the SDK serializes extra_body without per-field checks.
     extra_body = _optional_dict(api_kwargs, "extra_body")
     if extra_body:
+        if is_astra_model(model):
+            extra_body = {
+                key: value for key, value in extra_body.items() if key not in ASTRA_UNSUPPORTED_REQUEST_FIELDS
+            }
         normalized["extra_body"] = dict(extra_body)
     stream = api_kwargs.get("stream")
     if not allow_stream and "stream" in api_kwargs:
