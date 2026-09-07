@@ -995,6 +995,7 @@ def _commit_tool_result(
             tool_use_id=tool_call_id,
             env=get_active_env(effective_task_id),
             config=budget,
+            task_id=effective_task_id,
         )
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
 
@@ -1029,7 +1030,10 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     steer marker is never truncated/discarded when enforcement replaces a result."""
     if num_tools <= 0:
         return
-    enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
+    enforce_turn_budget(
+        messages[-num_tools:], env=get_active_env(effective_task_id), config=budget,
+        task_id=effective_task_id,
+    )
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 
