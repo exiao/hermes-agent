@@ -110,6 +110,48 @@ def test_repair_create_converges_across_connections_and_reopens_after_done(kanba
         )
 
 
+def test_repair_dedup_preserves_new_findings_on_canonical_owner(kanban_home):
+    first = json.loads(kc.run_slash(
+        "create 'repair example/repo#391' --assignee pr-babysitter "
+        "--body 'Fix failing import' --json"
+    ))
+    second = json.loads(kc.run_slash(
+        "create 'repair example/repo#391' --assignee pr-babysitter "
+        "--body 'NEW FINDING: preserve deleted event payload' --json"
+    ))
+    assert second["id"] == first["id"]
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, first["id"])
+        comments = kb.list_comments(conn, first["id"])
+    assert task is not None
+    assert task.body == "Fix failing import"
+    assert [comment.body for comment in comments] == [
+        "NEW FINDING: preserve deleted event payload"
+    ]
+    repeated = json.loads(kc.run_slash(
+        "create 'repair example/repo#391' --assignee pr-babysitter "
+        "--body 'NEW FINDING: preserve deleted event payload' --json"
+    ))
+    assert repeated["id"] == first["id"]
+    with kbc.connect_closing() as conn:
+        assert len(kb.list_comments(conn, first["id"])) == 1
+
+
+def test_repair_claim_derives_identity_for_legacy_hand_routed_cards(kanban_home):
+    with kbc.connect_closing() as conn:
+        owner = kb.create_task(
+            conn, title="repair example/repo#391", assignee="pr-babysitter",
+            body="Fix failing import",
+        )
+        legacy = kb.create_task(
+            conn, title="repair example/repo#391", assignee="pr-babysitter",
+            body="Fix failing import", idempotency_key="manual:example/repo#391",
+        )
+        assert owner != legacy
+        assert kb.claim_task(conn, owner) is not None
+        assert kb.claim_task(conn, legacy) is None
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     # Anchor the worktree target inside a real git repo so it clears the
     # create-time repo-root guard; the target dir itself need not exist yet.

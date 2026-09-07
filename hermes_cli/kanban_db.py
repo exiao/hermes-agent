@@ -1362,6 +1362,29 @@ def _active_task_for_key(conn: sqlite3.Connection, key: Optional[str]) -> Option
     return row["id"] if row else None
 
 
+def _preserve_duplicate_finding(
+    conn: sqlite3.Connection, task_id: str, body: Optional[str], author: Optional[str], now: int,
+) -> None:
+    """Keep a new non-duplicate request attached to its canonical owner."""
+    finding = (body or "").strip()
+    if not finding:
+        return
+    task = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if task is None or finding == (task["body"] or "").strip():
+        return
+    if conn.execute(
+        "SELECT 1 FROM task_comments WHERE task_id = ? AND body = ? LIMIT 1",
+        (task_id, finding),
+    ).fetchone():
+        return
+    comment_author = (author or "kanban").strip() or "kanban"
+    _insert_comment(conn, task_id, comment_author, finding, now)
+    _append_event(
+        conn, task_id, "commented",
+        {"author": comment_author, "len": len(finding), "reason": "duplicate_finding"},
+    )
+
+
 def _derive_babysit_idempotency_key(
     title: Optional[str], body: Optional[str], workspace_path: Optional[str]
 ) -> Optional[str]:
@@ -1623,6 +1646,7 @@ def create_task(
                 # detector create two cards before either writer commits.
                 existing_id = _active_task_for_key(conn, idempotency_key)
                 if existing_id is not None:
+                    _preserve_duplicate_finding(conn, existing_id, body, created_by, now)
                     return existing_id
                 task_status = _initial_task_status(conn, parents, initial_status, triage)
                 # Project worktree: fresh dir under the repo + deterministic
@@ -2478,22 +2502,29 @@ def _active_repair_claim_owner(conn: sqlite3.Connection, task_id: str) -> Option
     because only canonical ``pr-babysitter`` repair keys participate.
     """
     task = conn.execute(
-        "SELECT assignee, idempotency_key FROM tasks WHERE id = ?", (task_id,)
+        "SELECT assignee, title, body, workspace_path, idempotency_key "
+        "FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
-    if (
-        task is None
-        or task["assignee"] != "pr-babysitter"
-        or not str(task["idempotency_key"] or "").startswith("babysit:")
-    ):
+    if task is None or task["assignee"] != "pr-babysitter":
         return None
-    owner = conn.execute(
-        "SELECT id FROM tasks "
-        "WHERE idempotency_key = ? AND id != ? "
+    identity = _derive_babysit_idempotency_key(
+        task["title"], task["body"], task["workspace_path"]
+    ) or _canonicalize_babysit_key(task["idempotency_key"])
+    if not identity or not identity.startswith("babysit:"):
+        return None
+    owners = conn.execute(
+        "SELECT id, title, body, workspace_path, idempotency_key FROM tasks "
+        "WHERE assignee = 'pr-babysitter' AND id != ? "
         "AND status = 'running' AND claim_lock IS NOT NULL "
-        "ORDER BY started_at ASC, id ASC LIMIT 1",
-        (task["idempotency_key"], task_id),
-    ).fetchone()
-    return owner["id"] if owner else None
+        "ORDER BY started_at ASC, id ASC", (task_id,),
+    ).fetchall()
+    for owner in owners:
+        owner_identity = _derive_babysit_idempotency_key(
+            owner["title"], owner["body"], owner["workspace_path"]
+        ) or _canonicalize_babysit_key(owner["idempotency_key"])
+        if owner_identity == identity:
+            return owner["id"]
+    return None
 
 
 def claim_task(
