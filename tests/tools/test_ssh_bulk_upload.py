@@ -82,6 +82,20 @@ class TestSSHBulkUpload:
         assert "-chf" in popen_commands[0]
         assert "tar xf -" in popen_commands[1][-1]
 
+    def test_bulk_upload_recreates_deleted_remote_root(self, mock_env, tmp_path, monkeypatch):
+        """A missing remote root is recreated before tar extraction."""
+        source = tmp_path / "payload.txt"
+        source.write_text("payload")
+        remote_base = tmp_path / "remote" / ".hermes"
+        mock_env._remote_hermes_home = str(remote_base)
+        monkeypatch.setattr(mock_env, "_build_ssh_command", lambda: ["bash", "-c"])
+
+        mock_env._ssh_bulk_upload(
+            [(str(source), str(remote_base / "skills" / "payload.txt"))]
+        )
+
+        assert (remote_base / "skills" / "payload.txt").read_text() == "payload"
+
     def test_staging_symlinks_mirror_remote_layout(self, mock_env, tmp_path):
         """Staged file in staging dir should mirror the remote path structure.
 
