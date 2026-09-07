@@ -964,3 +964,56 @@ def test_non_push_wake_carries_coordinator_profile(monkeypatch):
     )
 
     assert captured == {"text": "wake", "session_id": "session-1", "profile": "coordinator"}
+
+
+def test_mixed_batch_wakes_each_events_owner(tmp_path, monkeypatch):
+    """A coordinator blocker must not redirect a later completion to its profile."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "mixed-routing.db"))
+    kb.init_db()
+    tid = _create_coordinator_block()
+    with kbc.connect_closing() as conn:
+        assert kb.unblock_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="completed after repair")
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert [event.source.profile for event in adapter.handled] == ["coordinator", "default"]
+    assert "completed after repair" not in adapter.handled[0].text
+    assert "completed after repair" in adapter.handled[1].text
+    assert len(adapter.sent) == 1
+    assert _unseen_terminal_events(tid) == []
+
+
+def test_coordinator_retry_does_not_replay_delivered_completion(tmp_path, monkeypatch):
+    """Retry from the last settled group, including across notifier restarts."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "mixed-retry.db"))
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="repaired task", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default", delivery_mode="notify+wake",
+            delivery_metadata={"agent_owned_blockers": True, "coordinator_profile": "coordinator"},
+        )
+        # Completion followed by a new blocked repair round before the next tick.
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "completed", {"summary": "first round done"})
+        assert kb.block_task(conn, tid, owner="coordinator", reason="repair next round", kind="needs_input")
+
+    class CoordinatorUnavailable(RecordingAdapter):
+        async def handle_message(self, event):
+            if event.source.profile == "coordinator":
+                raise RuntimeError("coordinator unavailable")
+            await super().handle_message(event)
+
+    adapter = CoordinatorUnavailable()
+    for _ in range(3):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "default"
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["blocked"]
+    recovered = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert recovered.sent == []
+    assert [ev.source.profile for ev in recovered.handled] == ["coordinator"]
+    assert _unseen_terminal_events(tid) == []

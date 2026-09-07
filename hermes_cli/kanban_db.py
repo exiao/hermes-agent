@@ -3229,9 +3229,8 @@ def block_task(
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     if owner is not None and owner not in VALID_BLOCK_OWNERS:
         raise ValueError(f"block owner must be one of {sorted(VALID_BLOCK_OWNERS)} or None")
-    # Keep omitted ownership distinct from an explicit human decision. The
-    # notifier applies the coordinator-assessment opt-in only to this unknown
-    # value, while legacy subscriptions retain their existing alert behavior.
+    # Only explicit coordinator ownership can suppress the passive alert.
+    # Omitted ownership retains the human escalation path.
     effective_owner = owner
     with write_txn(conn):
         cur_row = conn.execute(

@@ -399,7 +399,7 @@ class _KanbanNotification:
 
     def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict) -> None:
         self.runner = runner
-        self.d = d
+        self.d = dict(d)
         self.platform_cls = platform_cls
         self.sub_fail_counts = sub_fail_counts
         self.sub = sub = d["sub"]
@@ -655,12 +655,40 @@ class _KanbanNotification:
         from gateway.wake import adapter_supports_push
         self.is_push_adapter = adapter_supports_push(adapter)
 
+        events = self.d["events"]
+        self.coordinator_blockers = {
+            ev.id for ev in events if _is_coordinator_blocker(ev, self.sub, self.runner)
+        }
+        # Keep the full claim while delivering contiguous groups to their own
+        # profile. A failed group rewinds only to the last delivered group, so
+        # a coordinator outage cannot replay earlier completion notifications.
+        groups: list[list[Any]] = []
+        coordinator = None
+        for ev in events:
+            owner = ev.id in self.coordinator_blockers
+            if not groups or (ev.kind in _EVENT_FORMATTERS and owner != coordinator):
+                groups.append([])
+                coordinator = owner
+            groups[-1].append(ev)
+        for group in groups:
+            self.d["events"] = group
+            self.wake_handoff = self.wake_review_detail = self.synth = ""
+            self.wake_owner = False
+            if not await self._deliver_events():
+                return
+            self.d["old_cursor"] = group[-1].id
+            self.coordinator_blockers.difference_update(ev.id for ev in group)
+        await self.advance()
+        if self.task and self.task.status == "archived":
+            await self.unsub()
+
+    async def _deliver_events(self) -> bool:
         if not await self._send_pings():
-            return
+            return False
         # All text pings delivered (or skipped for non-push / wake-only).
         self.build_wake_text()
         wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
-        coordinator_wake = bool(self.coordinator_blockers)
+        coordinator_wake = self.wake_owner
 
         # Non-push self-post, or wake-only push sub: the wake IS the delivery
         # and must succeed BEFORE the cursor advances.
@@ -674,20 +702,16 @@ class _KanbanNotification:
                     else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
                     _wk_err,
                 )
-                return
+                return False
 
-        # Delivery complete: advance the cursor (the dedup mechanism).
-        await self.advance()
         if not is_push:
             self.clear_failures()
         if is_push and self.send_passive and wake_kinds and not coordinator_wake:
-            # notify+wake: text ping was the delivery and the cursor has
-            # advanced; the wake stays best-effort, but log at WARNING so a
+            # notify+wake: text ping was the delivery; the wake stays
+            # best-effort, but log at WARNING so a
             # persistently failing wake is visible.
             try:
                 await self.wake()
             except Exception as _wk_err:
                 logger.warning("kanban notifier: wakeup injection failed for %s: %s", self.task_id, _wk_err, exc_info=True)
-        # Unsubscribe only on archive; ``done`` is reversible.
-        if self.task and self.task.status == "archived":
-            await self.unsub()
+        return True

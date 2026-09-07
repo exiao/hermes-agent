@@ -801,6 +801,7 @@ hermes kanban log <id> [--tail BYTES]                  # worker log from ~/.herm
 hermes kanban notify-subscribe <id>                    # gateway bridge hook (used by /kanban in the gateway)
         --platform <name> --chat-id <id> [--thread-id <id>] [--user-id <id>]
         [--chat-type dm|group|channel|thread] [--delivery-mode notify|notify+wake|wake]
+        [--agent-owned-blockers] [--coordinator-profile <profile>]
 hermes kanban notify-list [<id>] [--json]
 hermes kanban notify-unsubscribe <id>
         --platform <name> --chat-id <id> [--thread-id <id>]
@@ -1060,6 +1061,18 @@ A subscription removes itself automatically once the task reaches `done` or `arc
 | `notify` | yes | no | You just want a heads-up message in the chat. |
 | `notify+wake` | yes | yes | You also want the destination agent to take a real turn — read the board context and reply in its own voice (default for new subscriptions). |
 | `wake` | no | yes | You only want the agent to act on the event, with no separate ping. |
+
+To route routine repairs to an assistant first, subscribe with `--agent-owned-blockers`
+and `--coordinator-profile <profile>` in `notify+wake` or `wake` mode. Only blockers
+explicitly marked `owner="coordinator"` take this route; omitted or human ownership
+keeps the normal human alert. Cross-profile routing requires multiplexing and a
+coordinator profile included in the gateway's served profiles. Invalid or unserved
+targets keep the human alert.
+
+Coordinator blockers suppress the passive ping and retry until their wake succeeds.
+Completion and review events still wake the subscription's original profile, even
+when they arrive in the same polling batch. A failed coordinator wake does not replay
+completion notifications already delivered earlier in that batch.
 
 A "wake" forges a synthetic inbound message to the destination gateway agent so it takes a normal turn (reads the comment + result, reasons, replies) instead of getting a one-line passive notification. It only fires when the notifier runs inside a live gateway process; otherwise a `notify+wake` subscription still delivers its passive message, while a `wake`-only subscription does nothing in that process.
 

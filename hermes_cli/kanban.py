@@ -1113,37 +1113,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             return _err(f"no such task: {args.task_id}")
-        # Adapters persist platform names in lowercase; normalize before both
-        # the routing decision and the row lookup.
-        platform = args.platform.strip().lower()
-        user_id_alt = getattr(args, "user_id_alt", None)
-        # Routing policy lives in kanban_db_notify, not in this facade.
-        delivery_mode = kbn.resolve_cli_delivery_mode(
-            conn,
-            task_id=args.task_id,
-            platform=platform,
-            chat_id=args.chat_id,
-            thread_id=args.thread_id,
-            chat_type=args.chat_type,
-            user_id=args.user_id,
-            user_id_alt=user_id_alt,
-            explicit_mode=getattr(args, "delivery_mode", None),
-        )
-        delivery_metadata = {}
-        if getattr(args, "agent_owned_blockers", False):
-            delivery_metadata["agent_owned_blockers"] = True
-        if getattr(args, "coordinator_profile", None):
-            delivery_metadata["coordinator_profile"] = args.coordinator_profile.strip()
-        kbn.add_notify_sub(
-            conn, task_id=args.task_id,
-            platform=platform, chat_id=args.chat_id,
-            chat_type=args.chat_type,
-            thread_id=args.thread_id, user_id=args.user_id,
-            user_id_alt=user_id_alt,
-            notifier_profile=args.notifier_profile or _profile_author(),
-            delivery_mode=delivery_mode,
-            delivery_metadata=delivery_metadata or None,
-        )
+        kbn.subscribe_from_cli(conn, args, notifier_profile=args.notifier_profile or _profile_author())
     print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
           + f" to {args.task_id}")
     return 0

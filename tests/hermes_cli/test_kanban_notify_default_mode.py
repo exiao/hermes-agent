@@ -141,7 +141,7 @@ def test_coordinator_blocker_opt_in_persists_with_the_existing_subscription(boar
     tid = kb.create_task(board, title="agent-owned blocker", assignee="dev")
     assert _subscribe(tid, [
         "--platform", "signal", "--chat-id", "+1555", "--chat-type", "dm",
-        "--agent-owned-blockers", "--coordinator-profile", "coordinator",
+        "--agent-owned-blockers", "--coordinator-profile", " Coordinator ",
     ]) == 0
     subs = kbn.list_notify_subs(board, tid)
     assert len(subs) == 1
@@ -164,7 +164,7 @@ def test_coordinator_blocker_opt_in_preserves_existing_delivery_metadata(board):
 
     assert _subscribe(tid, [
         "--platform", "slack", "--chat-id", "C1",
-        "--agent-owned-blockers", "--coordinator-profile", "coordinator",
+        "--agent-owned-blockers", "--coordinator-profile", " Coordinator ",
     ]) == 0
 
     subs = kbn.list_notify_subs(board, tid)
