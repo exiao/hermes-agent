@@ -26,6 +26,12 @@ class RecordingAdapter:
         self.handled.append(event)
 
 
+class FailingWakeAdapter(RecordingAdapter):
+    async def handle_message(self, event):
+        self.handled.append(event)
+        raise RuntimeError("simulated coordinator wake failure")
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -518,6 +524,37 @@ def _unseen_terminal_events_for(tid, chat_id):
         conn.close()
 
 
+def _create_coordinator_block(*, owner="coordinator", reason="supply an SSH-readable file", loop=False):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="evidence handoff",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kbn.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            notifier_profile="default",
+            delivery_mode="notify+wake",
+            delivery_metadata={
+                "agent_owned_blockers": True,
+                "coordinator_profile": "coordinator",
+            },
+        )
+        assert kb.block_task(conn, tid, reason=reason, kind="needs_input", owner=owner)
+        if loop:
+            assert kb.unblock_task(conn, tid)
+            assert kb.block_task(conn, tid, reason=reason, kind="needs_input", owner=owner)
+        return tid
+    finally:
+        conn.close()
+
+
 def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch):
     """One bad subscription must not block delivery for all others.
 
@@ -620,6 +657,103 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
         _, remaining = kbn.unseen_events_for_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
             kinds=["block_loop_detected"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_opted_in_coordinator_blocker_wakes_owner_without_passive_alert(tmp_path, monkeypatch):
+    """An explicit coordinator handoff is wake-only, including loop escalation."""
+    db_path = tmp_path / "coordinator-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_coordinator_block(loop=True)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], "routine coordinator repair must not page the adapter"
+    assert len(adapter.handled) == 1
+    wake = adapter.handled[0]
+    assert wake.source.profile == "coordinator"
+    assert tid in wake.text
+    assert "Coordinator-owned blocker" in wake.text
+    assert "supply an SSH-readable file" in wake.text
+    assert "routed to triage" in wake.text
+    conn = kbc.connect()
+    try:
+        _, remaining = kbn.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["blocked", "block_loop_detected"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_human_or_ambiguous_block_stays_visible_on_opted_in_subscription(tmp_path, monkeypatch):
+    """The opt-in never turns an unowned or human-owned decision into a retry."""
+    db_path = tmp_path / "human-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_coordinator_block(owner="human", reason="permission denied for the production vault")
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+    assert "permission denied" in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+    assert tid in adapter.handled[0].text
+
+
+def test_ambiguous_block_defaults_to_human_escalation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ambiguous-block.db"))
+    kb.init_db()
+    _create_coordinator_block(owner=None, reason="Should I retry or ask for a decision?")
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+
+
+def test_coordinator_wake_failure_rewinds_for_retry(tmp_path, monkeypatch):
+    """A suppressed passive alert is never considered delivered before its wake."""
+    db_path = tmp_path / "coordinator-wake-retry.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_coordinator_block()
+
+    failing = FailingWakeAdapter()
+    runner = _make_runner(failing)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert failing.sent == []
+    assert len(failing.handled) == 1
+    conn = kbc.connect()
+    try:
+        _, remaining = kbn.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["blocked"],
+        )
+    finally:
+        conn.close()
+    assert len(remaining) == 1
+
+    healthy = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(healthy)))
+    assert healthy.sent == []
+    assert len(healthy.handled) == 1
+    assert tid in healthy.handled[0].text
+    conn = kbc.connect()
+    try:
+        _, remaining = kbn.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["blocked"],
         )
     finally:
         conn.close()

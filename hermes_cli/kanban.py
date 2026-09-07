@@ -1129,6 +1129,11 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             user_id_alt=user_id_alt,
             explicit_mode=getattr(args, "delivery_mode", None),
         )
+        delivery_metadata = {}
+        if getattr(args, "agent_owned_blockers", False):
+            delivery_metadata["agent_owned_blockers"] = True
+        if getattr(args, "coordinator_profile", None):
+            delivery_metadata["coordinator_profile"] = args.coordinator_profile.strip()
         kbn.add_notify_sub(
             conn, task_id=args.task_id,
             platform=platform, chat_id=args.chat_id,
@@ -1137,6 +1142,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             user_id_alt=user_id_alt,
             notifier_profile=args.notifier_profile or _profile_author(),
             delivery_mode=delivery_mode,
+            delivery_metadata=delivery_metadata or None,
         )
     print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
           + f" to {args.task_id}")

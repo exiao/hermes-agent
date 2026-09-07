@@ -194,6 +194,17 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "Omit only if none apply."
             ),
         },
+        "owner": {
+            "type": "string",
+            "enum": ["coordinator", "human"],
+            "description": (
+                "Who owns the next action. Use 'coordinator' only for a routine "
+                "repair or evidence handoff the coordinating assistant can resolve "
+                "within existing authority; use 'human' for scope, spend, "
+                "permission, production, policy, or ambiguous decisions. Omit "
+                "to preserve the safe human-escalation default."
+            ),
+        },
     },
     ["reason"],
 )

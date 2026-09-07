@@ -136,6 +136,21 @@ def test_child_inherits_the_parents_mode_not_the_default(board):
     child = kb.create_task(board, title="c", assignee="dev", parents=[parent])
     assert _mode(board, child) == "notify"
 
+
+def test_coordinator_blocker_opt_in_persists_with_the_existing_subscription(board):
+    tid = kb.create_task(board, title="agent-owned blocker", assignee="dev")
+    assert _subscribe(tid, [
+        "--platform", "signal", "--chat-id", "+1555", "--chat-type", "dm",
+        "--agent-owned-blockers", "--coordinator-profile", "coordinator",
+    ]) == 0
+    subs = kbn.list_notify_subs(board, tid)
+    assert len(subs) == 1
+    assert subs[0]["delivery_mode"] == "notify+wake"
+    assert subs[0]["delivery_metadata"] == {
+        "agent_owned_blockers": True,
+        "coordinator_profile": "coordinator",
+    }
+
 @pytest.mark.parametrize('stored', ['Slack', '  SLACK  '])
 def test_legacy_unnormalized_row_is_matched_not_duplicated(board, stored):
     """Rows created before platform normalization stored --platform verbatim.

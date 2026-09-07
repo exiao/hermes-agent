@@ -218,6 +218,7 @@ _notifier_module._EVENT_FORMATTERS.update({
         f"✖ {n.head} worker crashed (pid gone) — {n.title}{_failure_detail(ev.payload)}", None, None),
     "timed_out": lambda ev, n: (
         f"⏱ {n.head} timed out — {n.title}{_failure_detail(ev.payload)}", None, None),
+    "block_loop_detected": _notifier_module._fmt_block_loop,
 })
 
 
