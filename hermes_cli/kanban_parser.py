@@ -383,6 +383,12 @@ _SPECS = [
                   "the default), or "
                   "'wake' (wake the agent only, no passive message). Omit to leave an "
                   "existing subscription's mode unchanged."),
+        _arg("--agent-owned-blockers", action="store_true",
+             help="Opt this subscription into coordinator-only wakes for explicitly "
+                  "coordinator-owned blockers; other events keep their delivery mode"),
+        _arg("--coordinator-profile",
+             help="Agent profile that owns opted-in coordinator blockers; defaults to "
+                  "the subscription's notifier profile"),
     ], help="Subscribe a gateway source to a task's terminal events (used by /kanban subscribe in the gateway adapter)"),
     _cmd("notify-list", [_arg("task_id", nargs="?"), _json_flag()],
          help="List notification subscriptions (optionally for a single task)"),

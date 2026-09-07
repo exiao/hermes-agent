@@ -256,6 +256,73 @@ def _first_line(text: str, limit: int) -> str:
     return lines[0][:limit] if lines else text[:limit]
 
 
+_COORDINATOR_BLOCK_KINDS = frozenset(("blocked", "block_loop_detected"))
+_AGENT_OWNED_BLOCKERS_KEY = "agent_owned_blockers"
+_COORDINATOR_PROFILE_KEY = "coordinator_profile"
+
+
+def _coordinator_profile_is_served(sub: dict, runner: Any) -> bool:
+    """Reject coordinator targets that this gateway cannot route."""
+    target = _coordinator_profile(sub)
+    owner = str(sub.get("notifier_profile") or "").strip()
+    if not target or target == owner:
+        return True
+    config = getattr(runner, "config", None)
+    if config is None:
+        return True
+    if not getattr(config, "multiplex_profiles", False):
+        return False
+    try:
+        from hermes_cli.profiles import profiles_to_serve
+        served = {
+            name for name, _ in profiles_to_serve(
+                multiplex=True,
+                profile_allowlist=getattr(config, "multiplex_profile_allowlist", None),
+            )
+        }
+    except Exception:
+        return False
+    return target in served
+
+
+def _is_coordinator_blocker(ev: Any, sub: dict, runner: Any = None) -> bool:
+    """Return true only for an explicit, routable coordinator handoff.
+
+    Block kind and reason text are deliberately ignored: an ambiguous or
+    permission-related block stays visible unless both the event owner and the
+    subscription opt in to the coordinator wake contract. A single-profile
+    gateway cannot honor a different coordinator profile, so it keeps the
+    blocker on the originating human path instead of suppressing it.
+    """
+    payload = getattr(ev, "payload", None) or {}
+    metadata = sub.get("delivery_metadata")
+    if not _coordinator_profile_is_served(sub, runner):
+        return False
+    return (
+        getattr(ev, "kind", "") in _COORDINATOR_BLOCK_KINDS
+        and "owner" in payload
+        and payload.get("owner") == "coordinator"
+        and isinstance(metadata, dict)
+        and metadata.get(_AGENT_OWNED_BLOCKERS_KEY) is True
+        and (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake")
+    )
+
+
+def _coordinator_profile(sub: dict) -> str:
+    metadata = sub.get("delivery_metadata")
+    profile = metadata.get(_COORDINATOR_PROFILE_KEY) if isinstance(metadata, dict) else None
+    return str(profile or sub.get("notifier_profile") or "").strip()
+
+
+def _fmt_block_loop(ev, n) -> tuple:
+    return (
+        f"🛑 {n.head} routed to TRIAGE — needs a human decision"
+        f"{_clip(ev, 'recurrences', ' (blocked {}x for the same cause)', 200)}{_clip(ev, 'reason', ': {}', 160)}",
+        None,
+        None,
+    )
+
+
 def _fmt_completed(ev, n) -> tuple:
     # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
     wake_handoff = None
@@ -312,11 +379,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "changes_requested": _fmt_changes_requested,
     # Re-blocked for the same cause past the limit and routed to `triage` for a
     # human. It emits no blocked/status event, so ping loudly here.
-    "block_loop_detected": lambda ev, n: (
-        f"🛑 {n.head} routed to TRIAGE — needs a human decision"
-        f"{_clip(ev, 'recurrences', ' (blocked {}x for the same cause)', 200)}{_clip(ev, 'reason', ': {}', 160)}",
-        None, None,
-    ),
+    "block_loop_detected": _fmt_block_loop,
 }
 
 
@@ -336,7 +399,7 @@ class _KanbanNotification:
 
     def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict) -> None:
         self.runner = runner
-        self.d = d
+        self.d = dict(d)
         self.platform_cls = platform_cls
         self.sub_fail_counts = sub_fail_counts
         self.sub = sub = d["sub"]
@@ -358,6 +421,9 @@ class _KanbanNotification:
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
+        self.coordinator_blockers: set[int] = set()
+        self.wake_owner = False
+        self.wake_profile = self.sub_profile
         self.plat: Any = None
         self.adapter: Any = None
         self.is_push_adapter = True
@@ -380,15 +446,21 @@ class _KanbanNotification:
         self.sub_fail_counts.pop(self.sub_key, None)
 
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
-        """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
-        fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
+        """Bump failures; drop ordinary subs at the limit, but keep coordinator-only wakes retriable."""
+        fails = min(self.sub_fail_counts.get(self.sub_key, 0) + 1, MAX_SEND_FAILURES)
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
-        if fails >= MAX_SEND_FAILURES:
+        if fails >= MAX_SEND_FAILURES and not self.coordinator_blockers:
             logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
             await self.unsub()
             self.clear_failures()
         else:
+            if fails >= MAX_SEND_FAILURES:
+                logger.warning(
+                    "kanban notifier: retaining coordinator subscription %s on %s after %d "
+                    "consecutive wake failures",
+                    self.task_id, self.platform_str, fails,
+                )
             await self.rewind()
 
     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
@@ -399,6 +471,7 @@ class _KanbanNotification:
 
     def format_event(self, ev: Any) -> Optional[str]:
         """Render one event; accumulates wake handoff/review detail. None → silent kind."""
+        payload = getattr(ev, "payload", None) or {}
         formatter = _EVENT_FORMATTERS.get(ev.kind)
         if formatter is None:
             return None
@@ -407,6 +480,18 @@ class _KanbanNotification:
             self.wake_handoff = handoff
         if review_detail is not None:
             self.wake_review_detail = review_detail
+        if _is_coordinator_blocker(ev, self.sub, self.runner):
+            self.coordinator_blockers.add(ev.id)
+            self.wake_owner = True
+            reason = _safe_review_reason(_payload(ev, "reason"))
+            if payload.get("owner") == "coordinator":
+                self.wake_handoff = (
+                    f"Coordinator-owned blocker: {reason or 'the task requires routine repair'}"
+                )
+            else:
+                self.wake_handoff = (
+                    f"Coordinator assessment required: {reason or 'the block owner is unknown'}"
+                )
         return msg
 
     def build_wake_text(self) -> None:
@@ -415,6 +500,7 @@ class _KanbanNotification:
         self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
         if not self.wake_kinds:
             return
+        self.wake_profile = _coordinator_profile(self.sub) if self.wake_owner else self.sub_profile
         if self.is_push_adapter:
             self.session_key = getattr(task, "session_id", None) or ""
         else:
@@ -436,6 +522,15 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
+        if self.wake_owner:
+            synth += (
+                "\nOwner: coordinating assistant. Resolve this routine repair or assess the unknown owner "
+                "within existing authority; "
+                "if a concrete scope, spend, permission, production, or policy decision is required, "
+                "escalate it to the human instead of retrying or approving it. If no user-facing reply is "
+                "needed after the repair, reply exactly NO_REPLY (or [SILENT]) so the routine notice is not "
+                "echoed to the human."
+            )
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
 
     def _log_woke(self) -> None:
@@ -447,7 +542,7 @@ class _KanbanNotification:
         from gateway.wake import deliver_wake
         sub = self.sub
         if not self.is_push_adapter:
-            await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key)
+            await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, profile=self.wake_profile)
             self._log_woke()
             return
         from gateway.session import SessionSource
@@ -468,7 +563,7 @@ class _KanbanNotification:
         _source = SessionSource(
             platform=self.plat, chat_id=sub["chat_id"], chat_type=_chat_type or "group",
             thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"), user_id_alt=sub.get("user_id_alt"),
-            profile=self.sub_profile or None, scope_id=_wake_scope_id(self.adapter, sub),
+            profile=self.wake_profile or None, scope_id=_wake_scope_id(self.adapter, sub),
         )
         await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source)
         self._log_woke()
@@ -501,9 +596,20 @@ class _KanbanNotification:
 
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        # Discover coordinator blockers before sending ordinary events. If an earlier
+        # passive send fails, the batch must still be retained for the later mandatory wake.
+        self.coordinator_blockers.update(
+            ev.id for ev in self.d["events"] if _is_coordinator_blocker(ev, self.sub, self.runner)
+        )
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
+                continue
+            if ev.id in self.coordinator_blockers:
+                logger.debug(
+                    "kanban notifier: suppressing passive coordinator blocker for %s",
+                    self.task_id,
+                )
                 continue
             # Non-push adapters (api_server) always report SendResult(success=False)
             # from send(); treating that as failure would drop the sub forever and
@@ -549,15 +655,44 @@ class _KanbanNotification:
         from gateway.wake import adapter_supports_push
         self.is_push_adapter = adapter_supports_push(adapter)
 
+        events = self.d["events"]
+        self.coordinator_blockers = {
+            ev.id for ev in events if _is_coordinator_blocker(ev, self.sub, self.runner)
+        }
+        # Keep the full claim while delivering contiguous groups to their own
+        # profile. A failed group rewinds only to the last delivered group, so
+        # a coordinator outage cannot replay earlier completion notifications.
+        groups: list[list[Any]] = []
+        coordinator = None
+        for ev in events:
+            owner = ev.id in self.coordinator_blockers
+            if not groups or (ev.kind in _EVENT_FORMATTERS and owner != coordinator):
+                groups.append([])
+                coordinator = owner
+            groups[-1].append(ev)
+        for group in groups:
+            self.d["events"] = group
+            self.wake_handoff = self.wake_review_detail = self.synth = ""
+            self.wake_owner = False
+            if not await self._deliver_events():
+                return
+            self.d["old_cursor"] = group[-1].id
+            self.coordinator_blockers.difference_update(ev.id for ev in group)
+        await self.advance()
+        if self.task and self.task.status == "archived":
+            await self.unsub()
+
+    async def _deliver_events(self) -> bool:
         if not await self._send_pings():
-            return
+            return False
         # All text pings delivered (or skipped for non-push / wake-only).
         self.build_wake_text()
         wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
+        coordinator_wake = self.wake_owner
 
         # Non-push self-post, or wake-only push sub: the wake IS the delivery
         # and must succeed BEFORE the cursor advances.
-        if wake_kinds and (not self.send_passive if is_push else bool(self.session_key)):
+        if wake_kinds and (coordinator_wake or (not self.send_passive if is_push else bool(self.session_key))):
             try:
                 await self.wake()
                 self.clear_failures()
@@ -567,20 +702,16 @@ class _KanbanNotification:
                     else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
                     _wk_err,
                 )
-                return
+                return False
 
-        # Delivery complete: advance the cursor (the dedup mechanism).
-        await self.advance()
         if not is_push:
             self.clear_failures()
-        if is_push and self.send_passive and wake_kinds:
-            # notify+wake: text ping was the delivery and the cursor has
-            # advanced; the wake stays best-effort, but log at WARNING so a
+        if is_push and self.send_passive and wake_kinds and not coordinator_wake:
+            # notify+wake: text ping was the delivery; the wake stays
+            # best-effort, but log at WARNING so a
             # persistently failing wake is visible.
             try:
                 await self.wake()
             except Exception as _wk_err:
                 logger.warning("kanban notifier: wakeup injection failed for %s: %s", self.task_id, _wk_err, exc_info=True)
-        # Unsubscribe only on archive; ``done`` is reversible.
-        if self.task and self.task.status == "archived":
-            await self.unsub()
+        return True

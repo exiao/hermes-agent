@@ -117,9 +117,21 @@ def add_notify_sub(
     # the delivery. A plain 'notify' default would leave those subs with no
     # delivery mechanism at all. Explicit modes still win.
     insert_mode = valid_mode or ("notify" if platform == "tui" else "notify+wake")
-    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
+        metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+        if metadata_json is not None:
+            existing = conn.execute(
+                "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+                key,
+            ).fetchone()
+            existing_metadata = _decode_notify_delivery_metadata(
+                existing["delivery_metadata"] if existing else None,
+            )
+            requested_metadata = _decode_notify_delivery_metadata(delivery_metadata)
+            metadata_json = _encode_notify_delivery_metadata(
+                {**existing_metadata, **requested_metadata},
+            )
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -134,7 +146,8 @@ def add_notify_sub(
                 insert_mode, metadata_json, int(time.time()), task_id,
             ),
         )
-        # chat_type / delivery_mode / delivery_metadata are last-write-wins;
+        # chat_type / delivery_mode are last-write-wins. Delivery metadata
+        # merges so enabling a routing opt-in cannot erase platform context.
         # user_id_alt and notifier_profile only self-heal legacy rows lacking one.
         for column, value, fill_only in (
             ("chat_type", chat_type, False),
@@ -150,6 +163,33 @@ def add_notify_sub(
                 f"UPDATE kanban_notify_subs SET {column} = ? " + _SUB_KEY_WHERE + guard,
                 (value, *key),
             )
+
+
+def subscribe_from_cli(conn: sqlite3.Connection, args: Any, *, notifier_profile: str) -> None:
+    """Persist CLI routing options without losing the subscription's platform metadata."""
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    platform = args.platform.strip().lower()
+    metadata: dict[str, Any] = {}
+    if getattr(args, "agent_owned_blockers", False):
+        metadata["agent_owned_blockers"] = True
+    coordinator = getattr(args, "coordinator_profile", None)
+    if coordinator is not None:
+        coordinator = normalize_profile_name(coordinator)
+        validate_profile_name(coordinator)
+        metadata["coordinator_profile"] = coordinator
+    user_id_alt = getattr(args, "user_id_alt", None)
+    delivery_mode = resolve_cli_delivery_mode(
+        conn, task_id=args.task_id, platform=platform, chat_id=args.chat_id,
+        thread_id=args.thread_id, chat_type=args.chat_type, user_id=args.user_id,
+        user_id_alt=user_id_alt, explicit_mode=getattr(args, "delivery_mode", None),
+    )
+    add_notify_sub(
+        conn, task_id=args.task_id, platform=platform, chat_id=args.chat_id,
+        thread_id=args.thread_id, chat_type=args.chat_type, user_id=args.user_id,
+        user_id_alt=user_id_alt, notifier_profile=notifier_profile,
+        delivery_mode=delivery_mode, delivery_metadata=metadata or None,
+    )
 
 
 def _notify_profile_filter(

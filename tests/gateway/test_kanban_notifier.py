@@ -1,9 +1,9 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
-
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _release_singleton_lock,
@@ -24,6 +24,12 @@ class RecordingAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+
+
+class FailingWakeAdapter(RecordingAdapter):
+    async def handle_message(self, event):
+        self.handled.append(event)
+        raise RuntimeError("simulated coordinator wake failure")
 
 
 class DisconnectedAdapters(dict):
@@ -518,6 +524,37 @@ def _unseen_terminal_events_for(tid, chat_id):
         conn.close()
 
 
+def _create_coordinator_block(*, owner="coordinator", reason="supply an SSH-readable file", loop=False):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="evidence handoff",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kbn.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            notifier_profile="default",
+            delivery_mode="notify+wake",
+            delivery_metadata={
+                "agent_owned_blockers": True,
+                "coordinator_profile": "coordinator",
+            },
+        )
+        assert kb.block_task(conn, tid, reason=reason, kind="needs_input", owner=owner)
+        if loop:
+            assert kb.unblock_task(conn, tid)
+            assert kb.block_task(conn, tid, reason=reason, kind="needs_input", owner=owner)
+        return tid
+    finally:
+        conn.close()
+
+
 def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch):
     """One bad subscription must not block delivery for all others.
 
@@ -620,6 +657,147 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
         _, remaining = kbn.unseen_events_for_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
             kinds=["block_loop_detected"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_opted_in_coordinator_blocker_wakes_owner_without_passive_alert(tmp_path, monkeypatch):
+    """An explicit coordinator handoff is wake-only, including loop escalation."""
+    db_path = tmp_path / "coordinator-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_coordinator_block(loop=True)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], "routine coordinator repair must not page the adapter"
+    assert len(adapter.handled) == 1
+    wake = adapter.handled[0]
+    assert wake.source.profile == "coordinator"
+    assert tid in wake.text
+    assert "Coordinator-owned blocker" in wake.text
+    assert "supply an SSH-readable file" in wake.text
+    assert "routed to triage" in wake.text
+    assert "NO_REPLY" in wake.text
+    assert "[SILENT]" in wake.text
+    conn = kbc.connect()
+    try:
+        _, remaining = kbn.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["blocked", "block_loop_detected"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_human_or_ambiguous_block_stays_visible_on_opted_in_subscription(tmp_path, monkeypatch):
+    """The opt-in never turns an unowned or human-owned decision into a retry."""
+    db_path = tmp_path / "human-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_coordinator_block(owner="human", reason="permission denied for the production vault")
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+    assert "permission denied" in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+    assert tid in adapter.handled[0].text
+
+
+def test_omitted_blocker_stays_on_human_path_when_opted_in(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ambiguous-block.db"))
+    kb.init_db()
+    tid = _create_coordinator_block(owner=None, reason="Should I retry or ask for a decision?")
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "default"
+    assert tid in adapter.handled[0].text
+
+
+def test_cross_profile_coordinator_wake_stays_visible_on_single_profile_gateway(tmp_path, monkeypatch):
+    """A single-profile gateway must not suppress a cross-profile blocker."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "single-profile-cross-profile.db"))
+    kb.init_db()
+    tid = _create_coordinator_block()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "default"
+    assert tid in adapter.handled[0].text
+
+def test_ambiguous_block_keeps_legacy_human_alert_without_opt_in(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "legacy-ambiguous-block.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="ambiguous legacy", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.block_task(conn, tid, reason="Should I retry or ask for a decision?", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+    assert tid in adapter.sent[0]["text"]
+
+
+def test_coordinator_wake_failure_rewinds_for_retry(tmp_path, monkeypatch):
+    """A suppressed passive alert is never considered delivered before its wake."""
+    db_path = tmp_path / "coordinator-wake-retry.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_coordinator_block()
+
+    failing = FailingWakeAdapter()
+    runner = _make_runner(failing)
+    for _ in range(12):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert failing.sent == []
+    assert len(failing.handled) == 12
+    conn = kbc.connect()
+    try:
+        assert len(kbn.list_notify_subs(conn, tid)) == 1
+        _, remaining = kbn.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["blocked"],
+        )
+    finally:
+        conn.close()
+    assert len(remaining) == 1
+
+    healthy = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(healthy)))
+    assert healthy.sent == []
+    assert len(healthy.handled) == 1
+    assert tid in healthy.handled[0].text
+    conn = kbc.connect()
+    try:
+        _, remaining = kbn.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["blocked"],
         )
     finally:
         conn.close()
@@ -747,3 +925,95 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_unserved_coordinator_profile_stays_on_human_path(monkeypatch):
+    from gateway.kanban_watchers_notifier import _is_coordinator_blocker
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profiles_to_serve", lambda **_kwargs: [("default", None)])
+    ev = SimpleNamespace(kind="blocked", id=1, payload={"owner": "coordinator"})
+    sub = {
+        "notifier_profile": "default",
+        "delivery_mode": "notify+wake",
+        "delivery_metadata": {"agent_owned_blockers": True, "coordinator_profile": "missing"},
+    }
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True, multiplex_profile_allowlist=None)
+    )
+
+    assert _is_coordinator_blocker(ev, sub, runner) is False
+
+
+def test_non_push_wake_carries_coordinator_profile(monkeypatch):
+    from gateway import wake
+
+    captured = {}
+
+    async def fake_self_post(adapter, *, text, session_id, profile=""):
+        captured.update(text=text, session_id=session_id, profile=profile)
+
+    class ApiAdapter:
+        supports_async_delivery = False
+
+    monkeypatch.setattr(wake, "_self_post_chat_completion", fake_self_post)
+    asyncio.run(
+        wake.deliver_wake(
+            ApiAdapter(), text="wake", session_id="session-1", profile="coordinator"
+        )
+    )
+
+    assert captured == {"text": "wake", "session_id": "session-1", "profile": "coordinator"}
+
+
+def test_mixed_batch_wakes_each_events_owner(tmp_path, monkeypatch):
+    """A coordinator blocker must not redirect a later completion to its profile."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "mixed-routing.db"))
+    kb.init_db()
+    tid = _create_coordinator_block()
+    with kbc.connect_closing() as conn:
+        assert kb.unblock_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="completed after repair")
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert [event.source.profile for event in adapter.handled] == ["coordinator", "default"]
+    assert "completed after repair" not in adapter.handled[0].text
+    assert "completed after repair" in adapter.handled[1].text
+    assert len(adapter.sent) == 1
+    assert _unseen_terminal_events(tid) == []
+
+
+def test_coordinator_retry_does_not_replay_delivered_completion(tmp_path, monkeypatch):
+    """Retry from the last settled group, including across notifier restarts."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "mixed-retry.db"))
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="repaired task", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            notifier_profile="default", delivery_mode="notify+wake",
+            delivery_metadata={"agent_owned_blockers": True, "coordinator_profile": "coordinator"},
+        )
+        # Completion followed by a new blocked repair round before the next tick.
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "completed", {"summary": "first round done"})
+        assert kb.block_task(conn, tid, owner="coordinator", reason="repair next round", kind="needs_input")
+
+    class CoordinatorUnavailable(RecordingAdapter):
+        async def handle_message(self, event):
+            if event.source.profile == "coordinator":
+                raise RuntimeError("coordinator unavailable")
+            await super().handle_message(event)
+
+    adapter = CoordinatorUnavailable()
+    for _ in range(3):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "default"
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["blocked"]
+    recovered = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert recovered.sent == []
+    assert [ev.source.profile for ev in recovered.handled] == ["coordinator"]
+    assert _unseen_terminal_events(tid) == []
