@@ -63,15 +63,21 @@ class TestSSHBulkUpload:
             (str(f2), "/home/testuser/.hermes/skills/b/b.txt"),
         ]
 
-        mock_run = MagicMock(return_value=subprocess.CompletedProcess([], 0))
-        with patch.object(subprocess, "run", mock_run), \
-             patch.object(subprocess, "Popen", side_effect=lambda *a, **kw: _mock_proc()):
+        popen_commands = []
+
+        def make_proc(command, **_kwargs):
+            popen_commands.append(command)
+            return _mock_proc()
+
+        with patch.object(subprocess, "run") as mock_run, \
+             patch.object(subprocess, "Popen", side_effect=make_proc):
             mock_env._ssh_bulk_upload(files)
 
-        assert all(
-            "mkdir -p" not in " ".join(call.args[0])
-            for call in mock_run.call_args_list
-        )
+        mock_run.assert_not_called()
+        assert len(popen_commands) == 2
+        assert "-chf" in popen_commands[0]
+        assert "tar xf -" in popen_commands[1][-1]
+        assert "mkdir -p" not in popen_commands[1][-1]
 
     def test_staging_symlinks_mirror_remote_layout(self, mock_env, tmp_path):
         """Staged file in staging dir should mirror the remote path structure.

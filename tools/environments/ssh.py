@@ -427,16 +427,6 @@ class SSHEnvironment(BaseEnvironment):
                                   f"File sync over SSH to {self.host}", what="the connection")
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
 
-    def _remote_supports_gzip(self) -> bool:
-        cmd = self._build_ssh_command() + ["command -v gzip >/dev/null 2>&1"]
-        try:
-            result = subprocess.run(
-                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return result.returncode == 0
-
     def _ssh_bulk_download(self, dest: Path) -> None:
         """Download remote .hermes/ as a tar archive."""
         # Tar from / with the full path so archive entries keep absolute paths
