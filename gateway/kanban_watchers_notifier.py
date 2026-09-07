@@ -261,15 +261,22 @@ _AGENT_OWNED_BLOCKERS_KEY = "agent_owned_blockers"
 _COORDINATOR_PROFILE_KEY = "coordinator_profile"
 
 
-def _is_coordinator_blocker(ev: Any, sub: dict) -> bool:
-    """Return true only for an explicit, opted-in coordinator handoff.
+def _is_coordinator_blocker(ev: Any, sub: dict, runner: Any = None) -> bool:
+    """Return true only for an explicit, routable coordinator handoff.
 
     Block kind and reason text are deliberately ignored: an ambiguous or
     permission-related block stays visible unless both the event owner and the
-    subscription opt in to the coordinator wake contract.
+    subscription opt in to the coordinator wake contract. A single-profile
+    gateway cannot honor a different coordinator profile, so it keeps the
+    blocker on the originating human path instead of suppressing it.
     """
     payload = getattr(ev, "payload", None) or {}
     metadata = sub.get("delivery_metadata")
+    target = _coordinator_profile(sub)
+    owner = str(sub.get("notifier_profile") or "").strip()
+    config = getattr(runner, "config", None)
+    if target and target != owner and config is not None and getattr(config, "multiplex_profiles", None) is False:
+        return False
     return (
         getattr(ev, "kind", "") in _COORDINATOR_BLOCK_KINDS
         and "owner" in payload
@@ -452,7 +459,7 @@ class _KanbanNotification:
             self.wake_handoff = handoff
         if review_detail is not None:
             self.wake_review_detail = review_detail
-        if _is_coordinator_blocker(ev, self.sub):
+        if _is_coordinator_blocker(ev, self.sub, self.runner):
             self.coordinator_blockers.add(ev.id)
             self.wake_owner = True
             reason = _safe_review_reason(_payload(ev, "reason"))

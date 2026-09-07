@@ -2,8 +2,7 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
-
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _release_singleton_lock,
@@ -726,6 +725,23 @@ def test_omitted_blocker_stays_on_human_path_when_opted_in(tmp_path, monkeypatch
     assert adapter.handled[0].source.profile == "default"
     assert tid in adapter.handled[0].text
 
+
+def test_cross_profile_coordinator_wake_stays_visible_on_single_profile_gateway(tmp_path, monkeypatch):
+    """A single-profile gateway must not suppress a cross-profile blocker."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "single-profile-cross-profile.db"))
+    kb.init_db()
+    tid = _create_coordinator_block()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "default"
+    assert tid in adapter.handled[0].text
 
 def test_ambiguous_block_keeps_legacy_human_alert_without_opt_in(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "legacy-ambiguous-block.db"))
