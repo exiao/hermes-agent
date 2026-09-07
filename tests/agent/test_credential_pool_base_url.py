@@ -96,12 +96,20 @@ def test_swap_credential_prefers_configured_proxy_over_entry_base_url(tmp_path, 
     agent._anthropic_client = MagicMock()
     agent._is_anthropic_oauth = False
 
-    # Entry seeded with the canonical Anthropic URL (the bug-trigger shape)
-    entry = MagicMock()
-    entry.runtime_api_key = "claude-code-oauth-token"
-    entry.runtime_base_url = "https://api.anthropic.com"
-    entry.base_url = "https://api.anthropic.com"
-    entry.access_token = "claude-code-oauth-token"
+    # Entry seeded with the canonical Anthropic URL (the bug-trigger shape).
+    # Use the real type so runtime_base_url remains derived from base_url.
+    from agent.credential_pool import PooledCredential
+
+    entry = PooledCredential(
+        provider="anthropic",
+        id="entry",
+        label="entry",
+        auth_type="oauth",
+        priority=0,
+        source="test",
+        access_token="claude-code-oauth-token",
+        base_url="https://api.anthropic.com",
+    )
 
     with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
         mock_build.return_value = MagicMock()

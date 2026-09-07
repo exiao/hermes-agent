@@ -1230,12 +1230,13 @@ class AIAgent(
             import copy
 
             entry = copy.copy(entry)
-            # Upstream's decomposed lifecycle now prefers ``runtime_base_url``
-            # over ``base_url``.  Updating only the latter leaves the stale
-            # pool endpoint authoritative and silently bypasses the configured
-            # provider proxy during rotation.
-            entry.runtime_base_url = configured_base
+            # ``runtime_base_url`` is a derived, read-only property on current
+            # PooledCredential.  Updating ``base_url`` updates that property for
+            # every provider except Nous, whose runtime route derives from
+            # ``inference_base_url`` first.
             entry.base_url = configured_base
+            if getattr(entry, "provider", None) == "nous":
+                entry.inference_base_url = configured_base
         super()._swap_credential(entry)
 
     _restore_primary_runtime = _forward("agent.agent_runtime_helpers", "restore_primary_runtime")
