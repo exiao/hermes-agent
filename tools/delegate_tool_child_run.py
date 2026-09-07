@@ -8,6 +8,8 @@ import contextvars
 import json
 import threading
 import time
+from pathlib import Path
+from hermes_constants import get_hermes_home
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
 from agent.interrupt_compat import request_hard_interrupt
@@ -330,6 +332,18 @@ def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_i
         )
     return None
 
+def _cleanup_audit_evidence(child: Any) -> None:
+    """Remove parent-owned audit exports after the child no longer needs them."""
+    audit_root = (get_hermes_home() / "audit" / "delegation").resolve()
+    for raw_path in getattr(child, "_audit_evidence_paths", ()):
+        try:
+            path = Path(raw_path).resolve()
+            path.relative_to(audit_root)
+            path.unlink(missing_ok=True)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+
+
 def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     """Hand ``child.close()`` to a Future done-callback and drain its transports.
 
@@ -340,7 +354,11 @@ def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     sweep + one delayed re-sweep for a connection opened in between; a worker that still won't settle keeps its
     resources until process exit.
     """
-    child_future.add_done_callback(lambda _done: _close_child(child, "Failed to close timed-out child after worker exit"))
+    def _close_finished_child(_done: Any) -> None:
+        _close_child(child, "Failed to close timed-out child after worker exit")
+        _cleanup_audit_evidence(child)
+
+    child_future.add_done_callback(_close_finished_child)
     # Bounded drain (#94248 native half): the deferred close above only fires once the abandoned worker
     # unwinds, but that worker is typically parked inside an in-flight OpenSSL read (Codex / httpx). Never
     # hard-close that transport from this thread — releasing FDs under a live SSL read is the #29507/#70773
@@ -812,6 +830,7 @@ class _ChildRun:
         # processes, httpx clients) so subagent subprocesses don't outlive the delegation.
         if not close_deferred:
             _close_child(child, "Failed to close child agent after delegation")
+            _cleanup_audit_evidence(child)
 
         # The AIAgent turn boundary normally closes the child scope itself. This fallback covers failures before that
         # boundary starts, but must not pop a scope while a timed-out child worker is still unwinding.

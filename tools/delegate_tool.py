@@ -316,12 +316,19 @@ def _build_child_agent(
         inherited_tools = {
             name for toolset_name in child_toolsets for name in resolve_toolset(toolset_name)
         }
-        # Registry/MCP toolsets are extensions whose capabilities are not known to this
-        # module. Treat them as command-capable until an explicit safe classification exists.
+        builtin_tools = {
+            name for definition in TOOLSETS.values() for name in definition.get("tools", [])
+        }
+        # Registry/MCP tools are extensions whose capabilities are not known to this
+        # module. Treat the tool itself as command-capable until an explicit safe
+        # classification exists, including a plugin merged into a built-in toolset.
+        unclassified_tools = inherited_tools - builtin_tools - command_tools
         extension_toolsets = {
             name for name in child_toolsets if name not in TOOLSETS or _is_mcp_toolset(name)
         }
-        if (inherited_tools & command_tools or extension_toolsets) and not command_child_isolation_available():
+        if (
+            inherited_tools & command_tools or unclassified_tools or extension_toolsets
+        ) and not command_child_isolation_available():
             raise ValueError(
                 "delegate_task child command access requires an external isolated terminal backend; "
                 "use role='audit' for evidence-only analysis or configure Docker/Singularity/Modal/Daytona "

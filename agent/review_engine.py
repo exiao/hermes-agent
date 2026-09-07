@@ -154,7 +154,7 @@ def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
 
 def _export_audit_evidence(snapshot: List[Dict[str, str]]) -> Path:
     """Export the parent's selected conversation evidence before spawning an audit child."""
-    directory = get_hermes_home() / "cache" / "delegation" / "audit"
+    directory = get_hermes_home() / "audit" / "delegation"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{uuid.uuid4().hex}.json"
     path.touch(mode=0o600)

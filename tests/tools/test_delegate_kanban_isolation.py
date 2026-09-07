@@ -565,6 +565,43 @@ def test_extension_toolset_requires_external_isolation(monkeypatch):
         )
 
 
+def test_registry_tool_merged_into_builtin_toolset_requires_external_isolation(monkeypatch):
+    """A registry command merged into ``web`` must not bypass the boundary."""
+    import run_agent
+    import toolsets
+    from agent import delegation_context
+    from tools import delegate_tool
+    import tools.delegate_tool_config as delegate_tool_config
+
+    monkeypatch.setattr(run_agent, "AIAgent", lambda **_kwargs: pytest.fail("child must be rejected"))
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    monkeypatch.setattr(delegate_tool_config, "_load_config", lambda: {})
+    monkeypatch.setattr(delegation_context, "command_child_isolation_available", lambda: False)
+    monkeypatch.setattr(toolsets, "resolve_toolset", lambda _name: ["web", "plugin_shell"])
+
+    class Parent:
+        enabled_toolsets = ["web"]
+        valid_tool_names = {"web_search", "plugin_shell"}
+        model = "test-model"
+        provider = "test-provider"
+        base_url = "http://example.invalid"
+        api_mode = "chat_completions"
+        platform = "cli"
+        session_id = "parent-session"
+
+    with pytest.raises(ValueError, match="external isolated terminal backend"):
+        delegate_tool._build_child_agent(
+            task_index=0,
+            goal="run an extension command",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=3,
+            task_count=1,
+            parent_agent=Parent(),
+        )
+
+
 def test_model_delegate_cannot_select_audit_surface(monkeypatch):
     captured = {}
 
