@@ -179,3 +179,17 @@ def test_remote_setup_failure_does_not_advertise_host_path(monkeypatch, tmp_path
     assert "Full output saved to:" not in result
     assert "Full output could not be saved to sandbox" in result
     assert (tmp_path / ".hermes" / "cache" / "spillover" / "call-failed-session.txt").exists()
+
+
+def test_terminal_config_failure_keeps_canonical_copy_fail_closed(monkeypatch, tmp_path):
+    _configure_remote(monkeypatch, tmp_path, lambda *args, **kwargs: None)
+    monkeypatch.setenv("TERMINAL_SSH_PORT", "not-a-port")
+
+    result = _commit(
+        FakeAgent(), "config-failure-session", "synthetic_tool", "x" * 4_000,
+        BudgetConfig(tool_overrides={"synthetic_tool": 1_000}),
+    )
+
+    assert "Full output saved to:" not in result
+    assert "Full output could not be saved to sandbox" in result
+    assert (tmp_path / ".hermes" / "cache" / "spillover" / "call-config-failure-session.txt").exists()

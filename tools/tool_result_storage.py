@@ -88,11 +88,15 @@ def _resolve_persistence_env(env, task_id: str | None):
     """
     if env is not None or not task_id:
         return env, True
-    from tools.terminal_tool import _get_env_config
-    if _get_env_config().get("env_type", "local") in ("", "local"):
-        return None, True
-    from tools.terminal_tool_lifecycle import ensure_task_env
-    env = ensure_task_env(task_id)
+    try:
+        from tools.terminal_tool import _get_env_config
+        if _get_env_config().get("env_type", "local") in ("", "local"):
+            return None, True
+        from tools.terminal_tool_lifecycle import ensure_task_env
+        env = ensure_task_env(task_id)
+    except Exception as exc:
+        logger.debug("Terminal backend resolution failed: %s", exc)
+        return None, False
     return env, env is not None
 
 
