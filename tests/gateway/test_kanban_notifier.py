@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 from gateway.config import GatewayConfig, Platform
 from gateway.kanban_watchers_common import (
@@ -924,3 +925,42 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_unserved_coordinator_profile_stays_on_human_path(monkeypatch):
+    from gateway.kanban_watchers_notifier import _is_coordinator_blocker
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profiles_to_serve", lambda **_kwargs: [("default", None)])
+    ev = SimpleNamespace(kind="blocked", id=1, payload={"owner": "coordinator"})
+    sub = {
+        "notifier_profile": "default",
+        "delivery_mode": "notify+wake",
+        "delivery_metadata": {"agent_owned_blockers": True, "coordinator_profile": "missing"},
+    }
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True, multiplex_profile_allowlist=None)
+    )
+
+    assert _is_coordinator_blocker(ev, sub, runner) is False
+
+
+def test_non_push_wake_carries_coordinator_profile(monkeypatch):
+    from gateway import wake
+
+    captured = {}
+
+    async def fake_self_post(adapter, *, text, session_id, profile=""):
+        captured.update(text=text, session_id=session_id, profile=profile)
+
+    class ApiAdapter:
+        supports_async_delivery = False
+
+    monkeypatch.setattr(wake, "_self_post_chat_completion", fake_self_post)
+    asyncio.run(
+        wake.deliver_wake(
+            ApiAdapter(), text="wake", session_id="session-1", profile="coordinator"
+        )
+    )
+
+    assert captured == {"text": "wake", "session_id": "session-1", "profile": "coordinator"}

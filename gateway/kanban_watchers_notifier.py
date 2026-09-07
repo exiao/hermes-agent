@@ -261,6 +261,30 @@ _AGENT_OWNED_BLOCKERS_KEY = "agent_owned_blockers"
 _COORDINATOR_PROFILE_KEY = "coordinator_profile"
 
 
+def _coordinator_profile_is_served(sub: dict, runner: Any) -> bool:
+    """Reject coordinator targets that this gateway cannot route."""
+    target = _coordinator_profile(sub)
+    owner = str(sub.get("notifier_profile") or "").strip()
+    if not target or target == owner:
+        return True
+    config = getattr(runner, "config", None)
+    if config is None:
+        return True
+    if not getattr(config, "multiplex_profiles", False):
+        return False
+    try:
+        from hermes_cli.profiles import profiles_to_serve
+        served = {
+            name for name, _ in profiles_to_serve(
+                multiplex=True,
+                profile_allowlist=getattr(config, "multiplex_profile_allowlist", None),
+            )
+        }
+    except Exception:
+        return False
+    return target in served
+
+
 def _is_coordinator_blocker(ev: Any, sub: dict, runner: Any = None) -> bool:
     """Return true only for an explicit, routable coordinator handoff.
 
@@ -272,10 +296,7 @@ def _is_coordinator_blocker(ev: Any, sub: dict, runner: Any = None) -> bool:
     """
     payload = getattr(ev, "payload", None) or {}
     metadata = sub.get("delivery_metadata")
-    target = _coordinator_profile(sub)
-    owner = str(sub.get("notifier_profile") or "").strip()
-    config = getattr(runner, "config", None)
-    if target and target != owner and config is not None and getattr(config, "multiplex_profiles", None) is False:
+    if not _coordinator_profile_is_served(sub, runner):
         return False
     return (
         getattr(ev, "kind", "") in _COORDINATOR_BLOCK_KINDS
@@ -521,7 +542,7 @@ class _KanbanNotification:
         from gateway.wake import deliver_wake
         sub = self.sub
         if not self.is_push_adapter:
-            await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key)
+            await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, profile=self.wake_profile)
             self._log_woke()
             return
         from gateway.session import SessionSource
@@ -575,6 +596,11 @@ class _KanbanNotification:
 
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        # Discover coordinator blockers before sending ordinary events. If an earlier
+        # passive send fails, the batch must still be retained for the later mandatory wake.
+        self.coordinator_blockers.update(
+            ev.id for ev in self.d["events"] if _is_coordinator_blocker(ev, self.sub, self.runner)
+        )
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
