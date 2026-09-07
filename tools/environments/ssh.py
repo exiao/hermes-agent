@@ -365,6 +365,9 @@ class SSHEnvironment(BaseEnvironment):
             return
 
         base = self._remote_hermes_home
+        self._run_ssh_checked(
+            quoted_mkdir_command([base]), 30, "remote mkdir failed",
+            f"Remote directory setup on {self.host}")
 
         # Symlink staging avoids fragile GNU tar --transform rules. On Windows
         # without Developer Mode symlink creation raises OSError winerror 1314;

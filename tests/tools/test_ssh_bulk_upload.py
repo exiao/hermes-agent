@@ -52,8 +52,8 @@ class TestSSHBulkUpload:
             mock_run.assert_not_called()
             mock_popen.assert_not_called()
 
-    def test_bulk_upload_does_not_emit_parent_mkdir_command(self, mock_env, tmp_path):
-        """Tar creates nested directories without an unbounded remote command."""
+    def test_bulk_upload_recreates_base_before_tar(self, mock_env, tmp_path):
+        """Tar creates nested directories after the bounded base mkdir."""
         f1 = tmp_path / "a.txt"
         f1.write_text("aaa")
         f2 = tmp_path / "b.txt"
@@ -69,15 +69,18 @@ class TestSSHBulkUpload:
             popen_commands.append(command)
             return _mock_proc()
 
-        with patch.object(subprocess, "run") as mock_run, \
+        with patch.object(
+            subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")
+        ) as mock_run, \
              patch.object(subprocess, "Popen", side_effect=make_proc):
             mock_env._ssh_bulk_upload(files)
 
-        mock_run.assert_not_called()
+        mock_run.assert_called_once()
+        mkdir_cmd = mock_run.call_args.args[0]
+        assert "mkdir -p /home/testuser/.hermes" in mkdir_cmd[-1]
         assert len(popen_commands) == 2
         assert "-chf" in popen_commands[0]
         assert "tar xf -" in popen_commands[1][-1]
-        assert "mkdir -p" not in popen_commands[1][-1]
 
     def test_staging_symlinks_mirror_remote_layout(self, mock_env, tmp_path):
         """Staged file in staging dir should mirror the remote path structure.
