@@ -250,7 +250,34 @@ Certain tools are blocked for subagents even when the parent has them:
 - `send_message` — no cross-platform side effects
 - `cronjob` — no scheduling more work in the parent's name
 
-Both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work.
+Leaf and orchestrator roles retain `execute_code` (programmatic tool calling) so normal children can batch mechanical work; audit children do not.
+
+### Read-only audit children
+
+Trusted parent code can create an evidence-only child with `role="audit"` and
+`evidence_paths=[...]` (the latter is a parent-side API argument, not a model-facing
+field). The model-facing delegate path strips both the audit role and evidence paths,
+so a child cannot select or widen this surface itself:
+
+```python
+delegate_task(
+    goal="Summarize the selected traces and identify anomalies",
+    role="audit",
+    evidence_paths=["/tmp/exported-traces"],
+)
+```
+
+The child receives only `audit_read_file`. The dispatcher resolves every requested
+path, follows symlinks before checking it against the supplied evidence roots, and
+refuses directories, special files, escapes, writes, command execution, browser
+Python, tool-search re-entry, and nested delegation. Parents should export only the
+traces needed for the audit and keep the export outside live board state.
+
+When a delegated child belongs to a Kanban worker, command-capable children require
+an external Docker, Singularity, Modal, or Daytona boundary with no host workspace or
+volume mount. Local execution and host-mounted Docker paths fail closed before child
+code runs. Removing `HERMES_DELEGATED_CHILD_CONTEXT` is not authorization and cannot
+restore the unavailable command surface.
 
 ## Max Iterations
 

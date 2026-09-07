@@ -57,7 +57,7 @@ from tools.delegate_tool_results import (  # noqa: F401
     _apply_summary_budget, _build_child_preserving_parent_tools, _run_child_lifecycle, _summarize_tool_arguments,
 )
 
-_ROLES = frozenset({"leaf", "orchestrator"})
+_ROLES = frozenset({"leaf", "orchestrator", "audit"})
 
 _TOOLSET_ALIASES = {
     "shellexec": "terminal", "shell": "terminal", "bash": "terminal",
@@ -121,6 +121,8 @@ def _resolve_child_toolsets(parent_agent, toolsets, effective_role):
     """Fork-safe child surface: normalize aliases, intersect, then apply exact deny toolsets."""
     from tools.delegate_tool_toolsets import (
         DEFAULT_TOOLSETS, _blocked_toolsets_for_role, _strip_blocked_tools)
+    if effective_role == "audit":
+        return ["audit"], [name for name in TOOLSETS if name != "audit"]
     parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
     if parent_enabled is not None:
         parent_toolsets = set(parent_enabled)
@@ -175,7 +177,7 @@ def _configured_child_fallbacks(config: dict) -> Optional[List[Dict[str, str]]]:
 # Nested delegation is granted by depth/role in _build_child_agent, never by the
 # model naming toolsets (there is no model-facing toolsets argument).
 def _normalize_role(r: Optional[str]) -> str:
-    """'leaf' | 'orchestrator'; None/empty/unknown -> 'leaf' (unknown warns)."""
+    """'leaf' | 'orchestrator' | 'audit'; None/empty/unknown -> 'leaf' (unknown warns)."""
     r_norm = str(r).strip().lower() if r else "leaf"
     if r_norm not in _ROLES:
         logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
@@ -281,6 +283,7 @@ def _build_child_agent(
     override_acp_args: Optional[List[str]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    evidence_paths: Optional[List[str]] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -291,7 +294,11 @@ def _build_child_agent(
     # depth budget remains below max_spawn_depth. The `role` arg is ignored.
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
     max_spawn = _get_max_spawn_depth()
-    effective_role = "orchestrator" if _get_orchestrator_enabled() and child_depth < max_spawn else "leaf"
+    requested_role = _normalize_role(role)
+    effective_role = (
+        "audit" if requested_role == "audit" else
+        "orchestrator" if _get_orchestrator_enabled() and child_depth < max_spawn else "leaf"
+    )
 
     # One subagent_id shared by the progress callback, spawn_requested event and
     # the live registry; parent_id is set when THIS parent is itself a subagent.
@@ -300,6 +307,21 @@ def _build_child_agent(
 
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    if effective_role != "audit":
+        from agent.delegation_context import command_child_isolation_available
+        from toolsets import resolve_toolset
+
+        command_tools = {"terminal", "process_manage", "read_file", "write_file", "patch", "search_files",
+                         "execute_code", "browser_exec", "browser_cdp", "delegate_task"}
+        inherited_tools = {
+            name for toolset_name in child_toolsets for name in resolve_toolset(toolset_name)
+        }
+        if inherited_tools & command_tools and not command_child_isolation_available():
+            raise ValueError(
+                "delegate_task child command access requires an external isolated terminal backend; "
+                "use role='audit' for evidence-only analysis or configure Docker/Singularity/Modal/Daytona "
+                "without host mounts"
+            )
     child_prompt = _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
@@ -333,7 +355,8 @@ def _build_child_agent(
     parent_sid = getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
     build_context = delegated_child_kanban_env() if os.environ.get("HERMES_KANBAN_TASK") else nullcontext()
-    with delegated_child_context(), build_context:
+    child_surface = "audit" if effective_role == "audit" else "normal"
+    with delegated_child_context(surface=child_surface, evidence_paths=evidence_paths), build_context:
         try:
             child = AIAgent(
                 **rt, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),
@@ -364,6 +387,8 @@ def _build_child_agent(
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
+    child._delegate_surface = "audit" if effective_role == "audit" else "normal"
+    child._audit_evidence_paths = tuple(evidence_paths or ())
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -487,7 +512,8 @@ def _build_children(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                evidence_paths=t.get("evidence_paths"), **overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -514,6 +540,7 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, action: Optional[str] = None, subagent_id: Optional[str] = None,
     message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
+    evidence_paths: Optional[List[str]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -572,6 +599,9 @@ def delegate_task(
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if err:
         return tool_error(err)
+    if evidence_paths is not None:
+        for task in task_list:
+            task.setdefault("evidence_paths", list(evidence_paths))
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
@@ -758,13 +788,34 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     the intercept is bypassed. Direct Python callers keep the synchronous default."""
     return not getattr(parent_agent, "_delegate_depth", 0) > 0
 
-_MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
+_MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args", "evidence_paths"}
 
 def _strip_model_hidden_task_fields(tasks: Any) -> Any:
-    """Drop trusted-config-only task fields from model-supplied tasks (same list object back when nothing changed)."""
-    if not isinstance(tasks, list) or not any(isinstance(t, dict) and _MODEL_HIDDEN_TASK_FIELDS & t.keys() for t in tasks):
+    """Drop trusted-config-only fields and audit role from model-supplied tasks."""
+    if not isinstance(tasks, list):
         return tasks
-    return [{k: v for k, v in t.items() if k not in _MODEL_HIDDEN_TASK_FIELDS} if isinstance(t, dict) else t for t in tasks]
+    needs_scrub = any(
+        isinstance(task, dict)
+        and (_MODEL_HIDDEN_TASK_FIELDS & task.keys() or str(task.get("role") or "").strip().lower() == "audit")
+        for task in tasks
+    )
+    if not needs_scrub:
+        return tasks
+    scrubbed = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            scrubbed.append(task)
+            continue
+        cleaned = {key: value for key, value in task.items() if key not in _MODEL_HIDDEN_TASK_FIELDS}
+        if str(cleaned.get("role") or "").strip().lower() == "audit":
+            cleaned.pop("role")
+        scrubbed.append(cleaned)
+    return scrubbed
+
+
+def _model_role(value: Any) -> Optional[str]:
+    """Keep trusted audit-role selection out of model-supplied delegate calls."""
+    return None if str(value or "").strip().lower() == "audit" else value
 
 
 registry.register(
@@ -773,7 +824,7 @@ registry.register(
     schema=DELEGATE_TASK_SCHEMA,
     handler=lambda args, **kw: delegate_task(
         goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
-        max_iterations=args.get("max_iterations"), role=args.get("role"),
+        max_iterations=args.get("max_iterations"), role=_model_role(args.get("role")),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         parent_agent=kw.get("parent_agent"),

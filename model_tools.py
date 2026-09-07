@@ -19,6 +19,7 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from agent.kanban_ownership import delegated_child_masks_kanban_ownership
+from agent.delegation_context import audit_tool_allowed, audit_tool_rejection, is_audit_child_context, is_delegated_child_context
 from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, discover_builtin_tools, registry, tool_error
 from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
@@ -43,11 +44,11 @@ _WARNED_DISABLED_BUNDLES: set = set()
 
 
 def _is_delegated_child_context() -> bool:
-    try:
-        from agent.delegation_context import is_delegated_child_context
-        return is_delegated_child_context()
-    except Exception:
-        return False
+    return is_delegated_child_context()
+
+
+def _is_audit_child_context() -> bool:
+    return is_audit_child_context()
 
 
 def _is_dispatcher_owned_worker() -> bool:
@@ -284,7 +285,7 @@ def _tool_defs_cache_key(
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), _worker_needs_kanban_tools(),
         bool(skip_tool_search_assembly),
-        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        _is_delegated_child_context(), _is_audit_child_context(), _is_dispatcher_owned_worker(), profile_scope,
     )
 
 
@@ -457,6 +458,8 @@ _TOOL_SEARCH_LISTING_FORMS = {
 def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
                               quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
+    if _is_audit_child_context():
+        skip_tool_search_assembly = True
     tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
     # Registry returns only tools whose check_fn passes.
     filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
@@ -840,6 +843,11 @@ def handle_function_call(
         _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
                                   **asdict(ids), middleware_trace=list(trace), **extra)
         return result
+
+    if not audit_tool_allowed(function_name):
+        return _emit(tool_error(audit_tool_rejection(function_name)), duration_ms=_elapsed_ms(start),
+                     status="blocked", error_type="audit_surface_denied",
+                     error_message=audit_tool_rejection(function_name))
 
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit

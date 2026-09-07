@@ -1306,7 +1306,20 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         parent = _make_mock_parent()
         parent.enabled_toolsets = ["terminal", "kanban"]
 
-        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_deadbeef"}), \
+        import tools.terminal_tool as terminal_tool
+        import tools.terminal_tool_backends as terminal_tool_backends
+        safe_docker = {
+            "env_type": "docker",
+            "host_cwd": None,
+            "docker_mount_cwd_to_workspace": False,
+            "docker_volumes": [],
+            "docker_forward_env": [],
+            "docker_env": {},
+            "docker_extra_args": [],
+        }
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_deadbeef", "TERMINAL_ENV": "docker"}), \
+                patch.object(terminal_tool, "_get_env_config", return_value=safe_docker), \
+                patch.dict(terminal_tool_backends._REQUIREMENT_CHECKERS, {"docker": lambda _config: True}), \
                 patch("run_agent.AIAgent") as MockAgent:
             MockAgent.return_value = MagicMock()
             _build_child_agent(

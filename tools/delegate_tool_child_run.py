@@ -655,7 +655,17 @@ class _ChildRun:
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            surface = getattr(child, "_delegate_surface", "normal")
+            if surface not in {"normal", "audit"}:
+                surface = "normal"
+            evidence_paths = getattr(child, "_audit_evidence_paths", ())
+            if not isinstance(evidence_paths, (list, tuple)):
+                evidence_paths = ()
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or ""),
+                surface=surface,
+                evidence_paths=evidence_paths,
+            ):
                 return child.run_conversation(
                     user_message=self.goal, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )

@@ -132,6 +132,57 @@ def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monk
     assert "kanban" in captured["disabled_toolsets"]
 
 
+def test_build_audit_child_uses_evidence_surface(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            from agent.delegation_context import is_audit_child_context
+
+            captured.update(kwargs)
+            captured["audit_context"] = is_audit_child_context()
+            self.valid_tool_names = {"audit_read_file"}
+            self.session_id = "audit-session"
+
+    import run_agent
+    from tools import delegate_tool
+    import tools.delegate_tool_config as delegate_tool_config
+
+    evidence = tmp_path / "trace.txt"
+    evidence.write_text("trace\n", encoding="utf-8")
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    monkeypatch.setattr(delegate_tool_config, "_load_config", lambda: {})
+
+    class Parent:
+        enabled_toolsets = ["terminal", "file"]
+        valid_tool_names = {"terminal", "read_file", "write_file"}
+        model = "test-model"
+        provider = "test-provider"
+        base_url = "http://example.invalid"
+        api_mode = "chat_completions"
+        platform = "cli"
+        session_id = "parent-session"
+
+    child = delegate_tool._build_child_agent(
+        task_index=0,
+        goal="summarize evidence",
+        context=None,
+        toolsets=None,
+        model=None,
+        max_iterations=3,
+        task_count=1,
+        parent_agent=Parent(),
+        role="audit",
+        evidence_paths=[str(evidence)],
+    )
+
+    assert captured["enabled_toolsets"] == ["audit"]
+    assert captured["audit_context"] is True
+    assert child._delegate_surface == "audit"
+    assert child._audit_evidence_paths == (str(evidence),)
+
+
 def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     monkeypatch,
     tmp_path,
@@ -337,3 +388,175 @@ def test_child_marker_does_not_persist_into_shared_bash_snapshot(monkeypatch, tm
         assert "MARKER=[unset]" in parent["output"], parent
     finally:
         env.cleanup()
+
+
+def test_audit_child_reads_only_parent_supplied_evidence(monkeypatch, tmp_path):
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    allowed = evidence / "trace.txt"
+    allowed.write_text("selected trace\nsecond line\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret outside evidence\n", encoding="utf-8")
+    (evidence / "escape.txt").symlink_to(outside)
+
+    from agent.delegation_context import delegated_child_context
+    from tools.audit_tool import audit_read_file
+
+    with delegated_child_context(surface="audit", evidence_paths=[str(evidence)]):
+        result = json.loads(audit_read_file(str(allowed)))
+        escaped = json.loads(audit_read_file(str(evidence / "escape.txt")))
+        missing = json.loads(audit_read_file(str(outside)))
+
+    assert result["content"] == "1|selected trace\n2|second line\n"
+    assert escaped["error"]
+    assert missing["error"]
+
+
+def test_audit_child_dispatch_refuses_execution_and_mutation_routes(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from agent.delegation_context import delegated_child_context
+    import model_tools
+
+    with delegated_child_context(surface="audit", evidence_paths=[str(home)]):
+        results = [
+            model_tools.handle_function_call("execute_code", {"code": "print('no')"}),
+            model_tools.handle_function_call("write_file", {"path": str(home / "x"), "content": "no"}),
+            model_tools.handle_function_call("delegate_task", {"goal": "spawn another child"}),
+        ]
+
+    assert all("audit children may only read" in result for result in results)
+    assert not (home / "x").exists()
+
+
+def test_audit_child_tool_definitions_are_read_only(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.audit_tool  # noqa: F401 - register the audit surface
+    from agent.delegation_context import delegated_child_context
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    with delegated_child_context(surface="audit", evidence_paths=[str(home)]):
+        definitions = get_tool_definitions(enabled_toolsets=["audit"], quiet_mode=True)
+
+    assert {item["function"]["name"] for item in definitions} == {"audit_read_file"}
+
+
+def test_worker_command_children_fail_closed_without_external_isolation(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/protected-test-board")
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    from agent.delegation_context import command_child_isolation_available, delegated_child_context
+
+    with delegated_child_context():
+        assert command_child_isolation_available() is False
+
+
+def test_worker_command_children_fail_closed_when_board_uses_default_path(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    from agent.delegation_context import command_child_isolation_available, delegated_child_context
+
+    with delegated_child_context():
+        assert command_child_isolation_available() is False
+
+
+def test_worker_command_child_build_fails_before_agent_init(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/protected-test-board")
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    created = []
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            created.append(True)
+
+    import run_agent
+    from tools import delegate_tool
+    import tools.delegate_tool_config as delegate_tool_config
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    monkeypatch.setattr(delegate_tool_config, "_load_config", lambda: {})
+
+    class Parent:
+        enabled_toolsets = ["terminal"]
+        valid_tool_names = {"terminal"}
+        model = "test-model"
+        provider = "test-provider"
+        base_url = "http://example.invalid"
+        api_mode = "chat_completions"
+        platform = "cli"
+        session_id = "parent-session"
+
+    with pytest.raises(ValueError, match="external isolated terminal backend"):
+        delegate_tool._build_child_agent(
+            task_index=0,
+            goal="run a command",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=3,
+            task_count=1,
+            parent_agent=Parent(),
+        )
+
+    assert created == []
+
+
+def test_model_delegate_cannot_select_audit_surface(monkeypatch):
+    captured = {}
+
+    def fake_delegate_task(**kwargs):
+        captured.update(kwargs)
+        return "{}"
+
+    import run_agent
+    from tools import delegate_tool
+
+    monkeypatch.setattr(delegate_tool, "delegate_task", fake_delegate_task)
+    parent = type("Parent", (), {"_delegate_depth": 0})()
+    run_agent.AIAgent._dispatch_delegate_task(
+        parent,
+        {
+            "role": "audit",
+            "tasks": [{
+                "goal": "read evidence",
+                "role": "audit",
+                "evidence_paths": ["/protected/board"],
+            }],
+        },
+    )
+
+    assert captured["role"] is None
+    assert "evidence_paths" not in captured["tasks"][0]
+    assert "role" not in captured["tasks"][0]
+
+
+def test_worker_command_children_accept_unmounted_docker_boundary(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/protected-test-board")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    from agent.delegation_context import command_child_isolation_available, delegated_child_context
+    import tools.terminal_tool as terminal_tool
+    from tools import terminal_tool_backends
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "docker", "host_cwd": None, "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": [], "docker_forward_env": [],
+    })
+    monkeypatch.setitem(terminal_tool_backends._REQUIREMENT_CHECKERS, "docker", lambda _config: True)
+    with delegated_child_context():
+        assert command_child_isolation_available() is True

@@ -29,6 +29,7 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.delegation_context import audit_tool_allowed, audit_tool_rejection
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
@@ -424,6 +425,8 @@ def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _Parse
     scope_block = None
     if parse_error is None:
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
+        if not audit_tool_allowed(name):
+            scope_block = audit_tool_rejection(name)
     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
 
 
