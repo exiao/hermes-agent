@@ -52,48 +52,49 @@ class TestSSHBulkUpload:
             mock_run.assert_not_called()
             mock_popen.assert_not_called()
 
-    def test_mkdir_batched_into_single_call(self, mock_env, tmp_path):
-        """All parent directories should be created in one SSH call."""
-        # Create test files
+    def test_bulk_upload_recreates_base_before_tar(self, mock_env, tmp_path):
+        """Tar creates nested directories after the bounded base mkdir."""
         f1 = tmp_path / "a.txt"
         f1.write_text("aaa")
         f2 = tmp_path / "b.txt"
         f2.write_text("bbb")
-
         files = [
-            (str(f1), "/home/testuser/.hermes/skills/a.txt"),
-            (str(f2), "/home/testuser/.hermes/credentials/b.txt"),
+            (str(f1), "/home/testuser/.hermes/skills/a/a.txt"),
+            (str(f2), "/home/testuser/.hermes/skills/b/b.txt"),
         ]
 
-        # Mock subprocess.run for mkdir and Popen for tar pipe
-        mock_run = MagicMock(return_value=subprocess.CompletedProcess([], 0))
+        popen_commands = []
 
-        def make_proc(cmd, **kwargs):
-            m = MagicMock()
-            m.stdout = MagicMock()
-            m.returncode = 0
-            m.poll.return_value = 0
-            m.communicate.return_value = (b"", b"")
-            m.stderr = MagicMock()
-            m.stderr.read.return_value = b""
-            return m
+        def make_proc(command, **_kwargs):
+            popen_commands.append(command)
+            return _mock_proc()
 
-        with patch.object(subprocess, "run", mock_run), \
+        with patch.object(
+            subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")
+        ) as mock_run, \
              patch.object(subprocess, "Popen", side_effect=make_proc):
             mock_env._ssh_bulk_upload(files)
 
-        # The gzip capability probe is also a run; count mkdir calls only.
-        mkdir_calls = [
-            call.args[0] for call in mock_run.call_args_list
-            if "mkdir -p" in " ".join(call.args[0])
-        ]
-        assert len(mkdir_calls) == 1
-        mkdir_cmd = mkdir_calls[0]
-        # Should contain mkdir -p with both parent dirs
-        mkdir_str = " ".join(mkdir_cmd)
-        assert "mkdir -p" in mkdir_str
-        assert "/home/testuser/.hermes/skills" in mkdir_str
-        assert "/home/testuser/.hermes/credentials" in mkdir_str
+        mock_run.assert_called_once()
+        mkdir_cmd = mock_run.call_args.args[0]
+        assert "mkdir -p /home/testuser/.hermes" in mkdir_cmd[-1]
+        assert len(popen_commands) == 2
+        assert "-chf" in popen_commands[0]
+        assert "tar xf -" in popen_commands[1][-1]
+
+    def test_bulk_upload_recreates_deleted_remote_root(self, mock_env, tmp_path, monkeypatch):
+        """A missing remote root is recreated before tar extraction."""
+        source = tmp_path / "payload.txt"
+        source.write_text("payload")
+        remote_base = tmp_path / "remote" / ".hermes"
+        mock_env._remote_hermes_home = str(remote_base)
+        monkeypatch.setattr(mock_env, "_build_ssh_command", lambda: ["bash", "-c"])
+
+        mock_env._ssh_bulk_upload(
+            [(str(source), str(remote_base / "skills" / "payload.txt"))]
+        )
+
+        assert (remote_base / "skills" / "payload.txt").read_text() == "payload"
 
     def test_staging_symlinks_mirror_remote_layout(self, mock_env, tmp_path):
         """Staged file in staging dir should mirror the remote path structure.
