@@ -1,9 +1,8 @@
 """Tool result persistence -- preserves large outputs instead of truncating. Layers against
 context overflow: (1) per-tool caps inside each tool; (2) ``maybe_persist_tool_result`` —
 output over the tool's threshold is persisted and replaced by a preview + path; canonical home
-is ALWAYS host-side ``$HERMES_HOME/cache/spillover/{id}.txt`` (works for sessions that never
-ran a terminal), remote backends get the translated in-sandbox path (probed for readability)
-else a copy in the sandbox temp dir; (3) ``enforce_turn_budget``."""
+is host-side ``$HERMES_HOME/cache/spillover/{id}.txt`` and oversized remote results lazily
+bring up the configured backend before selecting a sandbox-readable path; (3) ``enforce_turn_budget``."""
 
 import hashlib
 import logging
@@ -78,6 +77,27 @@ def _is_host_side_env(env) -> bool:
         return isinstance(env, LocalEnvironment)
     except Exception:
         return False
+
+
+def _resolve_persistence_env(env, task_id: str | None):
+    """Resolve a cold task's configured backend before advertising a spill path.
+
+    ``None`` means local when the terminal backend is local, but it also means
+    remote initialization failed. Keep those cases distinct so a remote task
+    never receives a host-only recovery path.
+    """
+    if env is not None or not task_id:
+        return env, True
+    try:
+        from tools.terminal_tool import _get_env_config
+        if _get_env_config().get("env_type", "local") in ("", "local"):
+            return None, True
+        from tools.terminal_tool_lifecycle import ensure_task_env
+        env = ensure_task_env(task_id)
+    except Exception as exc:
+        logger.debug("Terminal backend resolution failed: %s", exc)
+        return None, False
+    return env, env is not None
 
 
 def _write_to_spillover(content: str, filename: str):
@@ -191,7 +211,9 @@ def extract_persisted_path(content: str) -> str | None:
 
 def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, env=None,
                               config: BudgetConfig = DEFAULT_BUDGET,
-                              threshold: int | float | None = None) -> str:
+                              threshold: int | float | None = None,
+                              task_id: str | None = None,
+                              allow_host_side_fallback: bool | None = None) -> str:
     """Layer 2: persist an oversized result, return preview + path. ``threshold`` overrides
     ``config.resolve_threshold(tool_name)``; falls back to inline truncation when no write
     location succeeds."""
@@ -199,6 +221,8 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
         threshold = config.resolve_threshold(tool_name)
     if threshold == float("inf") or len(content) <= threshold:
         return content
+    if allow_host_side_fallback is None:
+        env, allow_host_side_fallback = _resolve_persistence_env(env, task_id)
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
@@ -209,13 +233,13 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
 
     # Always persist host-side first: cache/spillover is the single canonical home.
     host_path = _write_to_spillover(content, filename)
-    host_side = _is_host_side_env(env)
+    host_side = allow_host_side_fallback and _is_host_side_env(env)
     if host_side and host_path is not None:
         return _persisted(host_path)
     if not host_side:
         # Remote backend: reference the mounted/synced path when the sandbox can actually read
         # it, else write into the sandbox temp dir (containers without the spillover mount).
-        visible = _sandbox_visible_spillover_path(host_path, env) if host_path else None
+        visible = _sandbox_visible_spillover_path(host_path, env) if host_path and env is not None else None
         if visible is not None:
             return _persisted(visible, f" [host: {host_path}]")
         remote_path = f"{_resolve_storage_dir(env)}/{filename}"
@@ -231,7 +255,8 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
 
 
 def enforce_turn_budget(tool_messages: list[dict], env=None,
-                        config: BudgetConfig = DEFAULT_BUDGET) -> list[dict]:
+                        config: BudgetConfig = DEFAULT_BUDGET,
+                        task_id: str | None = None) -> list[dict]:
     """Layer 3: persist the largest non-persisted results first until the turn's aggregate is
     under budget. Mutates the list in-place and returns it."""
     sizes = [len(msg.get("content", "")) for msg in tool_messages]
@@ -240,6 +265,7 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
                   if PERSISTED_OUTPUT_TAG not in tool_messages[i].get("content", "")]
     if total_size <= config.turn_budget:
         return tool_messages
+    env, allow_host_side_fallback = _resolve_persistence_env(env, task_id)
     for idx, size in sorted(candidates, key=lambda x: x[1], reverse=True):
         if total_size <= config.turn_budget:
             break
@@ -247,7 +273,8 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
         tool_use_id = tool_messages[idx].get("tool_call_id", f"budget_{idx}")
         replacement = maybe_persist_tool_result(
             content=content, tool_name=_BUDGET_TOOL_NAME, tool_use_id=tool_use_id,
-            env=env, config=config, threshold=0)
+            env=env, config=config, threshold=0,
+            allow_host_side_fallback=allow_host_side_fallback)
         if replacement != content:
             total_size += len(replacement) - size
             tool_messages[idx]["content"] = replacement
