@@ -152,6 +152,27 @@ def test_repair_claim_derives_identity_for_legacy_hand_routed_cards(kanban_home)
         assert kb.claim_task(conn, legacy) is None
 
 
+def test_repair_claim_prefers_explicit_canonical_key(kanban_home):
+    with kbc.connect_closing() as conn:
+        owner = kb.create_task(
+            conn,
+            title="Babysit PR",
+            body="Related context other/repo#2",
+            assignee="pr-babysitter",
+            idempotency_key="babysit:ex/repo#1",
+        )
+        legacy = kb.create_task(
+            conn,
+            title="ex/repo#1 repair",
+            body="Fix the reported failure",
+            assignee="pr-babysitter",
+            idempotency_key="manual:ex/repo#1",
+        )
+        assert owner != legacy
+        assert kb.claim_task(conn, owner) is not None
+        assert kb.claim_task(conn, legacy) is None
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     # Anchor the worktree target inside a real git repo so it clears the
     # create-time repo-root guard; the target dir itself need not exist yet.

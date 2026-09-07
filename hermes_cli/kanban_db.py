@@ -1386,9 +1386,13 @@ def _preserve_duplicate_finding(
 
 
 def _derive_babysit_idempotency_key(
-    title: Optional[str], body: Optional[str], workspace_path: Optional[str]
+    title: Optional[str], body: Optional[str], workspace_path: Optional[str],
+    idempotency_key: Optional[str] = None,
 ) -> Optional[str]:
     """Derive one canonical key for all create paths targeting a GitHub PR."""
+    explicit_key = _canonicalize_babysit_key(idempotency_key)
+    if explicit_key and explicit_key.startswith("babysit:"):
+        return explicit_key
     title, body = title or "", body or ""
     url_re = r"(?:^|[/@\s])github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/pull/(\d+)"
     ref_re = r"(?<![\w./-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)"
@@ -2508,7 +2512,7 @@ def _active_repair_claim_owner(conn: sqlite3.Connection, task_id: str) -> Option
     if task is None or task["assignee"] != "pr-babysitter":
         return None
     identity = _derive_babysit_idempotency_key(
-        task["title"], task["body"], task["workspace_path"]
+        task["title"], task["body"], task["workspace_path"], task["idempotency_key"]
     ) or _canonicalize_babysit_key(task["idempotency_key"])
     if not identity or not identity.startswith("babysit:"):
         return None
@@ -2520,7 +2524,7 @@ def _active_repair_claim_owner(conn: sqlite3.Connection, task_id: str) -> Option
     ).fetchall()
     for owner in owners:
         owner_identity = _derive_babysit_idempotency_key(
-            owner["title"], owner["body"], owner["workspace_path"]
+            owner["title"], owner["body"], owner["workspace_path"], owner["idempotency_key"]
         ) or _canonicalize_babysit_key(owner["idempotency_key"])
         if owner_identity == identity:
             return owner["id"]
