@@ -9,6 +9,7 @@ override), and the shared dispatch-note formatter.
 import json
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -256,6 +257,33 @@ def test_start_review_dispatches_background_and_completes(monkeypatch):
             continue
     assert evt is not None and evt["type"] == "async_delegation"
     assert evt["results"][0]["summary"] == "REVIEW: looks good"
+
+
+def test_review_audit_exports_parent_evidence_and_selects_audit_surface(monkeypatch, tmp_path):
+    import tools.delegate_tool as dt
+
+    seen = {}
+
+    def fake_delegate_task(**kwargs):
+        seen.update(kwargs)
+        return json.dumps({"status": "dispatched", "delegation_id": "audit-1"})
+
+    monkeypatch.setattr(re_mod, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(re_mod, "_load_review_credentials_cfg", lambda: None)
+    monkeypatch.setattr(dt, "delegate_task", fake_delegate_task)
+
+    result = start_review(
+        _fake_parent(),
+        [{"role": "user", "content": "audit this conversation"}],
+        "audit for permission bypasses",
+    )
+
+    assert result["status"] == "dispatched"
+    assert seen["role"] == "audit"
+    assert seen["evidence_paths"]
+    evidence = json.loads(Path(seen["evidence_paths"][0]).read_text(encoding="utf-8"))
+    assert evidence == [{"role": "user", "text": "audit this conversation"}]
+    assert "permission bypasses" in seen["context"]
 
 
 def test_start_review_rejects_empty_conversation():

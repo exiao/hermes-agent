@@ -17,6 +17,8 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -32,6 +34,14 @@ from tools.delegate_tool import (
     _resolve_delegation_credentials,
 )
 from hermes_state import SessionDB
+
+
+@pytest.fixture(autouse=True)
+def _mock_external_child_boundary(monkeypatch):
+    """Legacy construction tests use mocked children, not a real terminal backend."""
+    from agent import delegation_context
+
+    monkeypatch.setattr(delegation_context, "command_child_isolation_available", lambda: True)
 
 
 def _make_mock_parent(depth=0):

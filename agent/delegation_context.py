@@ -104,15 +104,6 @@ def command_child_isolation_available() -> bool:
     """Whether a command-enabled delegated child has an external filesystem boundary."""
     if is_audit_child_context():
         return False
-    # A parent dispatcher worker may evaluate this before entering the child
-    # ContextVar. Ordinary user-created children without a claim keep legacy behavior.
-    if not is_delegated_child_context() and not os.environ.get("HERMES_KANBAN_TASK"):
-        return True
-    # User-created delegated children outside a dispatcher worker do not inherit
-    # a board claim. Preserve their existing coding behavior; worker children need
-    # an external boundary because same-user local execution is not one.
-    if not os.environ.get("HERMES_KANBAN_TASK"):
-        return True
     try:
         from tools.terminal_tool import _get_env_config
         config = _get_env_config()

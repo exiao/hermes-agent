@@ -289,7 +289,7 @@ def _build_child_agent(
     inheritance so children can run on a different provider:model pair."""
     import uuid as _uuid
     from run_agent import AIAgent
-    from agent.delegation_context import delegated_child_context
+    from agent.delegation_context import canonicalize_evidence_paths, delegated_child_context
     # Role is depth-derived: a child may delegate iff the kill switch is on and
     # depth budget remains below max_spawn_depth. The `role` arg is ignored.
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
@@ -316,7 +316,12 @@ def _build_child_agent(
         inherited_tools = {
             name for toolset_name in child_toolsets for name in resolve_toolset(toolset_name)
         }
-        if inherited_tools & command_tools and not command_child_isolation_available():
+        # Registry/MCP toolsets are extensions whose capabilities are not known to this
+        # module. Treat them as command-capable until an explicit safe classification exists.
+        extension_toolsets = {
+            name for name in child_toolsets if name not in TOOLSETS or _is_mcp_toolset(name)
+        }
+        if (inherited_tools & command_tools or extension_toolsets) and not command_child_isolation_available():
             raise ValueError(
                 "delegate_task child command access requires an external isolated terminal backend; "
                 "use role='audit' for evidence-only analysis or configure Docker/Singularity/Modal/Daytona "
@@ -356,7 +361,8 @@ def _build_child_agent(
     child_session_db = _open_child_session_db(parent_agent)
     build_context = delegated_child_kanban_env() if os.environ.get("HERMES_KANBAN_TASK") else nullcontext()
     child_surface = "audit" if effective_role == "audit" else "normal"
-    with delegated_child_context(surface=child_surface, evidence_paths=evidence_paths), build_context:
+    canonical_evidence_paths = canonicalize_evidence_paths(evidence_paths)
+    with delegated_child_context(surface=child_surface, evidence_paths=canonical_evidence_paths), build_context:
         try:
             child = AIAgent(
                 **rt, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),
@@ -388,7 +394,7 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._delegate_surface = "audit" if effective_role == "audit" else "normal"
-    child._audit_evidence_paths = tuple(evidence_paths or ())
+    child._audit_evidence_paths = canonical_evidence_paths
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.

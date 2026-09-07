@@ -14,7 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -148,12 +152,65 @@ def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
     return cfg
 
 
+def _export_audit_evidence(snapshot: List[Dict[str, str]]) -> Path:
+    """Export the parent's selected conversation evidence before spawning an audit child."""
+    directory = get_hermes_home() / "cache" / "delegation" / "audit"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{uuid.uuid4().hex}.json"
+    path.touch(mode=0o600)
+    path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def start_audit(parent_agent, messages: List[Dict[str, Any]], user_prompt: str = "") -> Dict[str, Any]:
+    """Dispatch an evidence-only review selected by the parent via ``/review audit``."""
+    if parent_agent is None:
+        raise ValueError("No active agent — send a message first.")
+    snapshot = snapshot_recent_messages(messages)
+    if not snapshot:
+        raise ValueError("Nothing to audit yet — the conversation is empty.")
+    evidence_path = _export_audit_evidence(snapshot)
+    focus = user_prompt.strip()
+    goal = "Summarize the parent-exported evidence and identify concrete anomalies."
+    context = (
+        "You are an evidence-only audit child. Read the exported evidence with audit_read_file; "
+        f"the parent supplied exactly this file: {evidence_path}."
+    )
+    if focus:
+        context += f" Focus the audit on: {focus}"
+    credentials_cfg = _load_review_credentials_cfg()
+
+    from tools.delegate_tool import delegate_task
+    raw = delegate_task(
+        goal=goal,
+        context=context,
+        role="audit",
+        evidence_paths=[str(evidence_path)],
+        background=True,
+        parent_agent=parent_agent,
+        credentials_cfg=credentials_cfg,
+    )
+    try:
+        result = json.loads(raw)
+    except Exception:
+        result = None
+    if isinstance(result, dict) and result.get("error"):
+        raise ValueError(str(result["error"]))
+    if not isinstance(result, dict):
+        raise ValueError(f"Audit dispatch failed: {raw!r}")
+    result.setdefault("review_model", (credentials_cfg or {}).get("model") or "")
+    return result
+
+
 def start_review(parent_agent, messages: List[Dict[str, Any]], user_prompt: str = "") -> Dict[str, Any]:
     """Dispatch the reviewer subagent; returns the parsed ``delegate_task`` dict (``status: "dispatched"`` +
     ``delegation_id``, or the synchronous result on channels without async completions). Raises ValueError
     when there is nothing to review or the dispatch is rejected/errored."""
     if parent_agent is None:
         raise ValueError("No active agent — send a message first.")
+    prompt = user_prompt.strip()
+    if prompt.lower() == "audit" or prompt.lower().startswith("audit "):
+        return start_audit(parent_agent, messages, prompt[5:].strip())
     snapshot = snapshot_recent_messages(messages)
     if not snapshot:
         raise ValueError("Nothing to review yet — the conversation is empty.")

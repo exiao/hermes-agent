@@ -91,6 +91,8 @@ def test_delegated_child_context_suppresses_env_gated_kanban_tools(monkeypatch, 
 def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monkeypatch):
     """Child construction must fail closed even if the parent exposes kanban."""
     captured = {}
+    from agent import delegation_context
+    monkeypatch.setattr(delegation_context, "command_child_isolation_available", lambda: True)
 
     class FakeAgent:
         def __init__(self, **kwargs):
@@ -460,6 +462,19 @@ def test_worker_command_children_fail_closed_without_external_isolation(monkeypa
         assert command_child_isolation_available() is False
 
 
+def test_default_session_command_children_fail_closed_without_external_isolation(monkeypatch, tmp_path):
+    """The original interactive session path must not bypass the boundary."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    from agent.delegation_context import command_child_isolation_available
+
+    assert command_child_isolation_available() is False
+
+
 def test_worker_command_children_fail_closed_when_board_uses_default_path(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
@@ -513,6 +528,41 @@ def test_worker_command_child_build_fails_before_agent_init(monkeypatch):
         )
 
     assert created == []
+
+
+def test_extension_toolset_requires_external_isolation(monkeypatch):
+    """A registry/MCP extension is unsafe until its capability is classified."""
+    import run_agent
+    from agent import delegation_context
+    from tools import delegate_tool
+    import tools.delegate_tool_config as delegate_tool_config
+
+    monkeypatch.setattr(run_agent, "AIAgent", lambda **_kwargs: pytest.fail("child must be rejected"))
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    monkeypatch.setattr(delegate_tool_config, "_load_config", lambda: {})
+    monkeypatch.setattr(delegation_context, "command_child_isolation_available", lambda: False)
+
+    class Parent:
+        enabled_toolsets = ["plugin-shell"]
+        valid_tool_names = {"plugin_shell"}
+        model = "test-model"
+        provider = "test-provider"
+        base_url = "http://example.invalid"
+        api_mode = "chat_completions"
+        platform = "cli"
+        session_id = "parent-session"
+
+    with pytest.raises(ValueError, match="external isolated terminal backend"):
+        delegate_tool._build_child_agent(
+            task_index=0,
+            goal="run an extension command",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=3,
+            task_count=1,
+            parent_agent=Parent(),
+        )
 
 
 def test_model_delegate_cannot_select_audit_surface(monkeypatch):
