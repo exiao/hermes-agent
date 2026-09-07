@@ -197,8 +197,9 @@ def ensure_task_env(task_id: Optional[str] = None):
     """
     from tools.terminal_tool import (
         _active_environments, _creation_locks, _creation_locks_lock, _env_lock,
-        _get_env_config, _last_activity, _resolve_container_task_id,
-        _resolve_task_host_cwd, _select_image, _start_cleanup_thread, resolve_task_overrides,
+        _get_env_config, _is_container_backend, _is_unusable_container_cwd,
+        _last_activity, _resolve_container_task_id, _resolve_task_host_cwd,
+        _select_image, _start_cleanup_thread, get_session_cwd, resolve_task_overrides,
     )
     config = _get_env_config()
     env_type = config["env_type"]
@@ -224,11 +225,16 @@ def ensure_task_env(task_id: Optional[str] = None):
         existing = get_active_env(effective_task_id)
         if existing is not None:
             return existing
+        overrides = resolve_task_overrides(task_id)
+        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+        host_cwd = _resolve_task_host_cwd(config, task_id)
+        if _is_container_backend(env_type) and _is_unusable_container_cwd(cwd):
+            cwd = "/workspace" if host_cwd else config["cwd"]
         try:
             new_env = _create_configured_env(
-                config, env_type, image=image, cwd=config["cwd"],
+                config, env_type, image=image, cwd=cwd,
                 timeout=config["timeout"], task_id=effective_task_id,
-                host_cwd=_resolve_task_host_cwd(config, task_id),
+                host_cwd=host_cwd,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort bring-up
             logger.warning(

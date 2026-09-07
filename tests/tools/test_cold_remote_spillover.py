@@ -130,6 +130,25 @@ def test_cold_executor_spill_is_readable_by_real_file_route(monkeypatch, tmp_pat
     assert len(remote.commands) >= 3
 
 
+def test_cold_executor_uses_the_session_cwd_for_environment_creation(monkeypatch, tmp_path):
+    remote = FakeRemoteEnvironment()
+    created = []
+
+    def factory(*args, **kwargs):
+        created.append(kwargs)
+        return remote
+
+    _configure_remote(monkeypatch, tmp_path, factory)
+    terminal_tool.record_session_cwd("cwd-session", "/session/workspace")
+
+    _commit(
+        FakeAgent(), "cwd-session", "synthetic_tool", "x" * 4_000,
+        BudgetConfig(tool_overrides={"synthetic_tool": 1_000}),
+    )
+
+    assert created[0]["cwd"] == "/session/workspace"
+
+
 def test_aggregate_overflow_uses_the_cold_remote_file_route(monkeypatch, tmp_path):
     remote = FakeRemoteEnvironment()
     _configure_remote(monkeypatch, tmp_path, lambda *args, **kwargs: remote)
