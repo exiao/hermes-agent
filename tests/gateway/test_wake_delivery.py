@@ -53,12 +53,12 @@ def test_adapter_supports_push_default_true():
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
 
 
-async def _serve(handler):
+async def _serve(handler, path="/v1/chat/completions"):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
 
     app = web.Application()
-    app.router.add_post("/v1/chat/completions", handler)
+    app.router.add_post(path, handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -67,7 +67,8 @@ async def _serve(handler):
     return runner, port
 
 
-def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
+@pytest.mark.parametrize("profile", ["", "coordinator"])
+def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch, profile):
     """The self-post carries the RAW session id header + bearer auth and a
     single user message with stream=false — the exact entry point real
     gateway turns use."""
@@ -82,10 +83,11 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
         return web.json_response({"choices": [{"message": {"content": "ok"}}]})
 
     async def run():
-        runner, port = await _serve(handler)
+        path = f"/p/{profile}/v1/chat/completions" if profile else "/v1/chat/completions"
+        runner, port = await _serve(handler, path)
         try:
             adapter = ApiServerLikeAdapter(host="0.0.0.0", port=port, key="sekrit")
-            await deliver_wake(adapter, text="task done — wake", session_id="raw-sid-42")
+            await deliver_wake(adapter, text="task done — wake", session_id="raw-sid-42", profile=profile)
         finally:
             await runner.cleanup()
 
