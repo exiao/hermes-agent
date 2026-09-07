@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Ty
 
 from agent.message_sanitization import deterministic_call_id
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.reasoning_effort import ASTRA_UNSUPPORTED_REQUEST_FIELDS, is_astra_model
 
 logger = logging.getLogger(__name__)
 
@@ -793,6 +794,8 @@ def _preflight_codex_api_kwargs(
     model = api_kwargs.get("model")
     if not _nonblank(model):
         raise ValueError("Codex Responses request 'model' must be a non-empty string.")
+    if is_astra_model(model):
+        api_kwargs = {key: value for key, value in api_kwargs.items() if key not in ASTRA_UNSUPPORTED_REQUEST_FIELDS}
     instructions = _str_or_empty(api_kwargs.get("instructions")).strip() or DEFAULT_AGENT_IDENTITY
     if sanitize_harmony_tokens:
         instructions = _neutralize_harmony_tokens(instructions)
@@ -824,6 +827,10 @@ def _preflight_codex_api_kwargs(
     # field, and the SDK serializes extra_body without per-field checks.
     extra_body = _optional_dict(api_kwargs, "extra_body")
     if extra_body:
+        if is_astra_model(model):
+            extra_body = {
+                key: value for key, value in extra_body.items() if key not in ASTRA_UNSUPPORTED_REQUEST_FIELDS
+            }
         normalized["extra_body"] = dict(extra_body)
     stream = api_kwargs.get("stream")
     if not allow_stream and "stream" in api_kwargs:

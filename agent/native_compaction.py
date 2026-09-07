@@ -1,9 +1,9 @@
-"""Native OpenAI Responses server-side compaction — gpt-5.6 on direct OpenAI routes only.
+"""Native OpenAI Responses server-side compaction — supported model families on direct routes.
 
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` makes the server
 summarize older context into an opaque ``compaction`` item once the input crosses N tokens.
-Deliberately narrow (live-verified): gpt-5.6 only (5.1/5.2 fail server-side with no
-structured rejection) on api.openai.com or the ChatGPT Codex backend. The local compressor
+Deliberately narrow: gpt-5.6 and Astra on api.openai.com or the ChatGPT Codex backend. Other
+model families fail server-side with no structured rejection. The local compressor
 stays armed as fallback (native threshold clamped below the local trigger); compaction items
 ride the ``codex_reasoning_items`` sidecar. No transport imports (shared gate, no cycles).
 """
@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from agent.context_compressor import is_compaction_summary_message
 from agent.message_content import flatten_message_text
+from agent.reasoning_effort import ASTRA_MODEL_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -23,13 +24,14 @@ logger = logging.getLogger(__name__)
 LOCAL_TRIGGER_SAFETY_MARGIN = 8_192
 # Fallback when automatic mode has no local trigger to follow.
 DEFAULT_COMPACT_THRESHOLD = 200_000
-# Substring match so dated snapshots and variants (gpt-5.6-mini) stay eligible.
-_ELIGIBLE_MODEL_MARKER = "gpt-5.6"
+# Substring match so dated snapshots and variants (gpt-5.6-mini, Astra-900k) stay eligible.
+_ELIGIBLE_MODEL_MARKERS = ("gpt-5.6", ASTRA_MODEL_MARKER)
 
 
 def is_native_compaction_model(model: Optional[str]) -> bool:
-    """True when the model is in the gpt-5.6 family."""
-    return _ELIGIBLE_MODEL_MARKER in (model or "").lower()
+    """True when the model is in a native-compaction-supported family."""
+    normalized = (model or "").lower()
+    return any(marker in normalized for marker in _ELIGIBLE_MODEL_MARKERS)
 
 
 def resolve_native_compaction_capabilities(

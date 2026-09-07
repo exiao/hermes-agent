@@ -16,6 +16,7 @@ supported vocabulary. The policy under test:
 import pytest
 
 from agent.reasoning_effort import (
+    CODEX_ASTRA_EFFORTS,
     CODEX_GPT56_EFFORTS,
     EFFORT_LADDER,
     GLM52_EFFORTS,
@@ -28,7 +29,7 @@ from agent.reasoning_effort import (
     kimi_supported_efforts,
     requested_effort,
 )
-from hermes_constants import VALID_REASONING_EFFORTS
+from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort, resolve_reasoning_config
 
 
 class TestLadderContract:
@@ -160,6 +161,14 @@ class TestCodexVocabulary:
         assert clamp_effort("ultra", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("minimal", CODEX_LEGACY_EFFORTS) == "low"
 
+    def test_astra_variants_keep_published_max_and_clamp_minimal(self):
+        from agent.reasoning_effort import codex_supported_efforts
+
+        assert codex_supported_efforts("gpt-6-astra") is CODEX_ASTRA_EFFORTS
+        assert codex_supported_efforts("openai/gpt-6-astra-900k") is CODEX_ASTRA_EFFORTS
+        assert clamp_effort("max", CODEX_ASTRA_EFFORTS) == "max"
+        assert clamp_effort("minimal", CODEX_ASTRA_EFFORTS) == "low"
+
 
 class TestRequestedEffort:
     def test_extracts_effort(self):
@@ -171,3 +180,23 @@ class TestRequestedEffort:
         assert requested_effort({"enabled": False, "effort": "high"}) is None
         assert requested_effort("not-a-dict") is None
         assert requested_effort({"effort": ""}) is None
+
+
+class TestAstraConfigResolution:
+    def test_parser_keeps_enabled_levels_and_explicit_disable(self):
+        assert parse_reasoning_effort("minimal") == {"enabled": True, "effort": "minimal"}
+        assert parse_reasoning_effort("max") == {"enabled": True, "effort": "max"}
+        assert parse_reasoning_effort("none") == {"enabled": False}
+
+    def test_raw_per_model_override_matches_astra_context_variant(self):
+        cfg = {
+            "model": {"default": "gpt-6-astra-900k"},
+            "agent": {
+                "reasoning_effort": "low",
+                "reasoning_overrides": {"gpt-6-astra-900k": "max"},
+            },
+        }
+        assert resolve_reasoning_config(cfg, cfg["model"]["default"]) == {
+            "enabled": True,
+            "effort": "max",
+        }

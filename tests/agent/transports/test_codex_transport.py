@@ -58,6 +58,61 @@ class TestCodexBuildKwargs:
         )
         assert kw["model"] == "gpt-5.6-sol"
 
+    @pytest.mark.parametrize(
+        ("requested", "wire"),
+        [("minimal", "low"), ("medium", "medium"), ("max", "max")],
+    )
+    def test_astra_reasoning_uses_model_vocabulary(self, transport, requested, wire):
+        kw = transport.build_kwargs(
+            model="gpt-6-astra-900k",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"enabled": True, "effort": requested},
+        )
+        assert kw["model"] == "gpt-6-astra"
+        assert kw["reasoning"]["effort"] == wire
+
+    def test_astra_sampling_overrides_are_removed_at_wire_boundary(self, transport):
+        overrides = {
+            "temperature": 0.2,
+            "top_p": 0.5,
+            "top_logprobs": 3,
+            "logprobs": True,
+            "extra_body": {
+                "temperature": 0.3,
+                "top_p": 0.4,
+                "top_logprobs": 2,
+                "logprobs": False,
+                "prompt_cache_key": "keep-me",
+            },
+        }
+        kw = transport.build_kwargs(
+            model="gpt-6-astra-900k",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            request_overrides=overrides,
+        )
+        assert not {"temperature", "top_p", "top_logprobs", "logprobs"} & kw.keys()
+        assert kw["extra_body"] == {"prompt_cache_key": "keep-me"}
+
+        # The preflight is the final transport boundary and must also strip
+        # fields supplied by a caller that bypasses the normal builder.
+        kw.update(overrides)
+        normalized = transport.preflight_kwargs(kw)
+        assert not {"temperature", "top_p", "top_logprobs", "logprobs"} & normalized.keys()
+        assert normalized["extra_body"] == {"prompt_cache_key": "keep-me"}
+
+    def test_other_models_keep_temperature_override(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            request_overrides={"temperature": 0.2},
+        )
+        assert kw["temperature"] == 0.2
+
 
 
 
