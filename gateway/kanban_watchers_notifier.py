@@ -272,6 +272,7 @@ def _is_coordinator_blocker(ev: Any, sub: dict) -> bool:
     metadata = sub.get("delivery_metadata")
     return (
         getattr(ev, "kind", "") in _COORDINATOR_BLOCK_KINDS
+        and "owner" in payload
         and payload.get("owner") == "coordinator"
         and isinstance(metadata, dict)
         and metadata.get(_AGENT_OWNED_BLOCKERS_KEY) is True
@@ -417,15 +418,21 @@ class _KanbanNotification:
         self.sub_fail_counts.pop(self.sub_key, None)
 
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
-        """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
-        fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
+        """Bump failures; drop ordinary subs at the limit, but keep coordinator-only wakes retriable."""
+        fails = min(self.sub_fail_counts.get(self.sub_key, 0) + 1, MAX_SEND_FAILURES)
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
-        if fails >= MAX_SEND_FAILURES:
+        if fails >= MAX_SEND_FAILURES and not self.coordinator_blockers:
             logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
             await self.unsub()
             self.clear_failures()
         else:
+            if fails >= MAX_SEND_FAILURES:
+                logger.warning(
+                    "kanban notifier: retaining coordinator subscription %s on %s after %d "
+                    "consecutive wake failures",
+                    self.task_id, self.platform_str, fails,
+                )
             await self.rewind()
 
     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
@@ -436,6 +443,7 @@ class _KanbanNotification:
 
     def format_event(self, ev: Any) -> Optional[str]:
         """Render one event; accumulates wake handoff/review detail. None → silent kind."""
+        payload = getattr(ev, "payload", None) or {}
         formatter = _EVENT_FORMATTERS.get(ev.kind)
         if formatter is None:
             return None
@@ -448,9 +456,14 @@ class _KanbanNotification:
             self.coordinator_blockers.add(ev.id)
             self.wake_owner = True
             reason = _safe_review_reason(_payload(ev, "reason"))
-            self.wake_handoff = (
-                f"Coordinator-owned blocker: {reason or 'the task requires routine repair'}"
-            )
+            if payload.get("owner") == "coordinator":
+                self.wake_handoff = (
+                    f"Coordinator-owned blocker: {reason or 'the task requires routine repair'}"
+                )
+            else:
+                self.wake_handoff = (
+                    f"Coordinator assessment required: {reason or 'the block owner is unknown'}"
+                )
         return msg
 
     def build_wake_text(self) -> None:
@@ -483,9 +496,12 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
         if self.wake_owner:
             synth += (
-                "\nOwner: coordinating assistant. Resolve this routine repair within existing authority; "
+                "\nOwner: coordinating assistant. Resolve this routine repair or assess the unknown owner "
+                "within existing authority; "
                 "if a concrete scope, spend, permission, production, or policy decision is required, "
-                "escalate it to the human instead of retrying or approving it."
+                "escalate it to the human instead of retrying or approving it. If no user-facing reply is "
+                "needed after the repair, reply exactly NO_REPLY (or [SILENT]) so the routine notice is not "
+                "echoed to the human."
             )
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
 

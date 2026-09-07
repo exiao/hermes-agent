@@ -91,8 +91,8 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
-# The default is deliberately human: only an explicit coordinator handoff may
-# suppress a passive decision alert.
+# An omitted owner remains unknown so an opted-in subscription can ask the
+# coordinator to assess it; legacy subscriptions still use the passive alert.
 VALID_BLOCK_OWNERS = {"coordinator", "human"}
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
@@ -3229,7 +3229,10 @@ def block_task(
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     if owner is not None and owner not in VALID_BLOCK_OWNERS:
         raise ValueError(f"block owner must be one of {sorted(VALID_BLOCK_OWNERS)} or None")
-    effective_owner = owner or "human"
+    # Keep omitted ownership distinct from an explicit human decision. The
+    # notifier applies the coordinator-assessment opt-in only to this unknown
+    # value, while legacy subscriptions retain their existing alert behavior.
+    effective_owner = owner
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3272,7 +3275,7 @@ def block_task(
 
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int, owner: str,
+    prev_kind: Optional[str], prev_recurrences: int, owner: Optional[str],
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 

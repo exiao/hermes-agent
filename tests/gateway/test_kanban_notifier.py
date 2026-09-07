@@ -682,6 +682,8 @@ def test_opted_in_coordinator_blocker_wakes_owner_without_passive_alert(tmp_path
     assert "Coordinator-owned blocker" in wake.text
     assert "supply an SSH-readable file" in wake.text
     assert "routed to triage" in wake.text
+    assert "NO_REPLY" in wake.text
+    assert "[SILENT]" in wake.text
     conn = kbc.connect()
     try:
         _, remaining = kbn.unseen_events_for_sub(
@@ -710,16 +712,38 @@ def test_human_or_ambiguous_block_stays_visible_on_opted_in_subscription(tmp_pat
     assert tid in adapter.handled[0].text
 
 
-def test_ambiguous_block_defaults_to_human_escalation(tmp_path, monkeypatch):
+def test_omitted_blocker_stays_on_human_path_when_opted_in(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ambiguous-block.db"))
     kb.init_db()
-    _create_coordinator_block(owner=None, reason="Should I retry or ask for a decision?")
+    tid = _create_coordinator_block(owner=None, reason="Should I retry or ask for a decision?")
 
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
     assert len(adapter.sent) == 1
     assert "DECISION NEEDED" in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.profile == "default"
+    assert tid in adapter.handled[0].text
+
+
+def test_ambiguous_block_keeps_legacy_human_alert_without_opt_in(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "legacy-ambiguous-block.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="ambiguous legacy", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.block_task(conn, tid, reason="Should I retry or ask for a decision?", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "DECISION NEEDED" in adapter.sent[0]["text"]
+    assert tid in adapter.sent[0]["text"]
 
 
 def test_coordinator_wake_failure_rewinds_for_retry(tmp_path, monkeypatch):
@@ -731,11 +755,14 @@ def test_coordinator_wake_failure_rewinds_for_retry(tmp_path, monkeypatch):
 
     failing = FailingWakeAdapter()
     runner = _make_runner(failing)
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    for _ in range(12):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert failing.sent == []
-    assert len(failing.handled) == 1
+    assert len(failing.handled) == 12
     conn = kbc.connect()
     try:
+        assert len(kbn.list_notify_subs(conn, tid)) == 1
         _, remaining = kbn.unseen_events_for_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
             kinds=["blocked"],

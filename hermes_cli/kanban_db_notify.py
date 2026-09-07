@@ -117,9 +117,21 @@ def add_notify_sub(
     # the delivery. A plain 'notify' default would leave those subs with no
     # delivery mechanism at all. Explicit modes still win.
     insert_mode = valid_mode or ("notify" if platform == "tui" else "notify+wake")
-    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
+        metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+        if metadata_json is not None:
+            existing = conn.execute(
+                "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+                key,
+            ).fetchone()
+            existing_metadata = _decode_notify_delivery_metadata(
+                existing["delivery_metadata"] if existing else None,
+            )
+            requested_metadata = _decode_notify_delivery_metadata(delivery_metadata)
+            metadata_json = _encode_notify_delivery_metadata(
+                {**existing_metadata, **requested_metadata},
+            )
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -134,7 +146,8 @@ def add_notify_sub(
                 insert_mode, metadata_json, int(time.time()), task_id,
             ),
         )
-        # chat_type / delivery_mode / delivery_metadata are last-write-wins;
+        # chat_type / delivery_mode are last-write-wins. Delivery metadata
+        # merges so enabling a routing opt-in cannot erase platform context.
         # user_id_alt and notifier_profile only self-heal legacy rows lacking one.
         for column, value, fill_only in (
             ("chat_type", chat_type, False),
