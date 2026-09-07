@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -24,7 +26,7 @@ def kanban_home(tmp_path, monkeypatch):
     # Seed the profile dirs that CLI create tests route to. `hermes kanban
     # create` now validates --assignee against list_profiles_on_disk(), so the
     # fake assignees these tests use must exist as profiles on disk.
-    for _name in ("alice", "bob", "broken-model", "orig", "x"):
+    for _name in ("alice", "bob", "broken-model", "orig", "pr-babysitter", "x"):
         _pdir = home / "profiles" / _name
         _pdir.mkdir(parents=True, exist_ok=True)
         (_pdir / "config.yaml").write_text("model: {}\n")
@@ -58,6 +60,54 @@ def test_run_slash_create_and_list(kanban_home):
     out = kc.run_slash("list")
     assert "ship feature" in out
     assert "alice" in out
+
+
+def test_repair_create_converges_across_connections_and_reopens_after_done(kanban_home):
+    """The shared create path serializes same-PR writers, while a later round
+    gets a new card after the canonical repair is complete."""
+    barrier = threading.Barrier(4)
+
+    def create(title):
+        barrier.wait()
+        with kbc.connect_closing() as conn:
+            return kb.create_task(conn, title=title, assignee="pr-babysitter")
+
+    titles = (
+        "manual exiao/hermes-agent#391 repair",
+        "scheduled exiao/hermes-agent#391 repair",
+        "manual exiao/hermes-agent#392 repair",
+        "scheduled exiao/hermes-agent#392 repair",
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        created = list(pool.map(create, titles))
+
+    assert created[0] == created[1]
+    assert created[2] == created[3]
+    assert created[0] != created[2]
+
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+        return 4242
+
+    with kbc.connect_closing() as conn:
+        result = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+    assert {task_id for task_id, _, _ in result.spawned} == {created[0], created[2]}
+    assert set(spawned) == {created[0], created[2]}
+
+    assert "Completed" in kc.run_slash(f"complete {created[0]}")
+    next_round = json.loads(
+        kc.run_slash(
+            "create 'new finding exiao/hermes-agent#391' "
+            "--assignee pr-babysitter --json"
+        )
+    )
+    assert next_round["id"] != created[0]
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, next_round["id"]).idempotency_key == (
+            "babysit:exiao/hermes-agent#391"
+        )
 
 
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):

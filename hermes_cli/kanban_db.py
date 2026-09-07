@@ -88,6 +88,10 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+# A completed/archived/cancelled repair releases its PR ownership so a later
+# actionable finding can start a fresh round. The board has no cancelled status
+# today, but imported/legacy rows may still carry it.
+_REPAIR_TERMINAL_STATUS_SQL = "'done', 'archived', 'cancelled'"
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
@@ -1334,6 +1338,30 @@ def _canonicalize_babysit_key(key: Optional[str]) -> Optional[str]:
     return f"babysit:{match.group(1).lower()}#{int(match.group(2))}" if match else key
 
 
+def _active_task_for_key(conn: sqlite3.Connection, key: Optional[str]) -> Optional[str]:
+    """Return the canonical active task for one idempotency key.
+
+    Callers must hold ``write_txn``. Keeping the lookup inside the existing
+    SQLite writer boundary makes create-vs-create races converge without a
+    second lock service or a unique constraint that would also constrain task
+    history.
+    """
+    if not key:
+        return None
+    status_filter = (
+        f"status NOT IN ({_REPAIR_TERMINAL_STATUS_SQL})"
+        if key.startswith("babysit:") else "status != 'archived'"
+    )
+    row = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE idempotency_key = ? AND " + status_filter + " "
+        "ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'review' THEN 1 ELSE 2 END, "
+        "created_at ASC, id ASC LIMIT 1",
+        (key,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
 def _derive_babysit_idempotency_key(
     title: Optional[str], body: Optional[str], workspace_path: Optional[str]
 ) -> Optional[str]:
@@ -1579,14 +1607,6 @@ def create_task(
         idempotency_key = _derive_babysit_idempotency_key(
             title, body, workspace_path or project_repo)
     idempotency_key = _canonicalize_babysit_key(idempotency_key)
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     effective_max_runtime = (
         max_runtime_seconds if max_runtime_seconds is not None
         else _default_max_runtime_seconds())
@@ -1598,6 +1618,12 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                # This read must share the same IMMEDIATE transaction as the
+                # insert. A pre-transaction read lets a manual create and the
+                # detector create two cards before either writer commits.
+                existing_id = _active_task_for_key(conn, idempotency_key)
+                if existing_id is not None:
+                    return existing_id
                 task_status = _initial_task_status(conn, parents, initial_status, triage)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -2444,6 +2470,32 @@ def _claim_and_open_run(
     return run_id
 
 
+def _active_repair_claim_owner(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return another running babysitter task for the same PR, if any.
+
+    Creation normally prevents this state, but the claim boundary also guards
+    older boards and hand-routed cards. Read-only/QA tasks are unaffected
+    because only canonical ``pr-babysitter`` repair keys participate.
+    """
+    task = conn.execute(
+        "SELECT assignee, idempotency_key FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if (
+        task is None
+        or task["assignee"] != "pr-babysitter"
+        or not str(task["idempotency_key"] or "").startswith("babysit:")
+    ):
+        return None
+    owner = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE idempotency_key = ? AND id != ? "
+        "AND status = 'running' AND claim_lock IS NOT NULL "
+        "ORDER BY started_at ASC, id ASC LIMIT 1",
+        (task["idempotency_key"], task_id),
+    ).fetchone()
+    return owner["id"] if owner else None
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
@@ -2457,6 +2509,13 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        owner_id = _active_repair_claim_owner(conn, task_id)
+        if owner_id is not None:
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "repair_owner_active", "owner_task_id": owner_id},
+            )
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2490,6 +2549,13 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        owner_id = _active_repair_claim_owner(conn, task_id)
+        if owner_id is not None:
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "repair_owner_active", "owner_task_id": owner_id},
+            )
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "

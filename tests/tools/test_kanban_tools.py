@@ -76,7 +76,7 @@ def worker_env(monkeypatch, tmp_path):
     # real profiles on disk for their happy paths to succeed.
     profiles_root = home / "profiles"
     for _name in (
-        "test-worker", "peer", "factory", "qa", "reviewer", "worker", "linguist", "a", "x",
+        "test-worker", "peer", "factory", "pr-babysitter", "qa", "reviewer", "worker", "linguist", "a", "x",
     ):
         _pdir = profiles_root / _name
         _pdir.mkdir(parents=True, exist_ok=True)
@@ -558,6 +558,29 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def test_create_repair_reuses_active_pr_card(worker_env):
+    """The worker tool shares the same canonical PR ownership as the CLI."""
+    from tools import kanban_tools as kt
+
+    first = json.loads(kt._handle_create({
+        "title": "manual exiao/hermes-agent#391 repair",
+        "assignee": "pr-babysitter",
+    }))
+    second = json.loads(kt._handle_create({
+        "title": "scheduled exiao/hermes-agent#391 repair",
+        "assignee": "pr-babysitter",
+    }))
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second["task_id"] == first["task_id"]
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, first["task_id"]).idempotency_key == (
+            "babysit:exiao/hermes-agent#391"
+        )
 
 
 def test_create_default_child_isolates_materialized_scratch_workspace(
