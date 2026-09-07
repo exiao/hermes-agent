@@ -175,7 +175,6 @@ class TestSSHBulkDownload:
         ssh_proc.communicate.return_value = (b"", b"")
         ssh_proc.returncode = 0
 
-        monkeypatch.setattr(ssh_env, "unique_parent_dirs", lambda _files: [])
         monkeypatch.setattr(ssh_mock_env, "_remote_supports_gzip", lambda: False)
         with patch.object(
             subprocess,
@@ -183,7 +182,7 @@ class TestSSHBulkDownload:
             side_effect=[tar_proc, ssh_proc],
         ) as mock_popen:
             ssh_mock_env._ssh_bulk_upload(
-                [(str(source), "/home/testuser/.hermes/payload.txt")]
+                [(str(source), f"{ssh_mock_env._remote_hermes_home}/payload.txt")]
             )
 
         tar_command = mock_popen.call_args_list[0].args[0]

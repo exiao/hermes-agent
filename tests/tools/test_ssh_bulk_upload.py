@@ -52,48 +52,26 @@ class TestSSHBulkUpload:
             mock_run.assert_not_called()
             mock_popen.assert_not_called()
 
-    def test_mkdir_batched_into_single_call(self, mock_env, tmp_path):
-        """All parent directories should be created in one SSH call."""
-        # Create test files
+    def test_bulk_upload_does_not_emit_parent_mkdir_command(self, mock_env, tmp_path):
+        """Tar creates nested directories without an unbounded remote command."""
         f1 = tmp_path / "a.txt"
         f1.write_text("aaa")
         f2 = tmp_path / "b.txt"
         f2.write_text("bbb")
-
         files = [
-            (str(f1), "/home/testuser/.hermes/skills/a.txt"),
-            (str(f2), "/home/testuser/.hermes/credentials/b.txt"),
+            (str(f1), "/home/testuser/.hermes/skills/a/a.txt"),
+            (str(f2), "/home/testuser/.hermes/skills/b/b.txt"),
         ]
 
-        # Mock subprocess.run for mkdir and Popen for tar pipe
         mock_run = MagicMock(return_value=subprocess.CompletedProcess([], 0))
-
-        def make_proc(cmd, **kwargs):
-            m = MagicMock()
-            m.stdout = MagicMock()
-            m.returncode = 0
-            m.poll.return_value = 0
-            m.communicate.return_value = (b"", b"")
-            m.stderr = MagicMock()
-            m.stderr.read.return_value = b""
-            return m
-
         with patch.object(subprocess, "run", mock_run), \
-             patch.object(subprocess, "Popen", side_effect=make_proc):
+             patch.object(subprocess, "Popen", side_effect=lambda *a, **kw: _mock_proc()):
             mock_env._ssh_bulk_upload(files)
 
-        # The gzip capability probe is also a run; count mkdir calls only.
-        mkdir_calls = [
-            call.args[0] for call in mock_run.call_args_list
-            if "mkdir -p" in " ".join(call.args[0])
-        ]
-        assert len(mkdir_calls) == 1
-        mkdir_cmd = mkdir_calls[0]
-        # Should contain mkdir -p with both parent dirs
-        mkdir_str = " ".join(mkdir_cmd)
-        assert "mkdir -p" in mkdir_str
-        assert "/home/testuser/.hermes/skills" in mkdir_str
-        assert "/home/testuser/.hermes/credentials" in mkdir_str
+        assert all(
+            "mkdir -p" not in " ".join(call.args[0])
+            for call in mock_run.call_args_list
+        )
 
     def test_staging_symlinks_mirror_remote_layout(self, mock_env, tmp_path):
         """Staged file in staging dir should mirror the remote path structure.
