@@ -1617,18 +1617,20 @@ def test_dispatch_respawn_guard_allows_pr_babysitter_with_pr_comment(
     kanban_home, all_assignees_spawnable
 ):
     """A babysitter's target PR URL is progress, not duplicate-PR evidence."""
+    from hermes_cli import kanban_db_connect, kanban_db_dispatch
+
     spawned_ids = []
 
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="fix-pr", assignee="pr-babysitter")
         kb.add_comment(
             conn, t, "pr-babysitter",
             "Reproduced the failure on https://github.com/exiao/repo/pull/99",
         )
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kanban_db_dispatch.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert t in spawned_ids
     assert (t, "active_pr") not in res.respawn_guarded
