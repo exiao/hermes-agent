@@ -19,7 +19,7 @@ behavioral RED (unfixed: no execution) / GREEN (fixed: re-dispatched) for the
 new recovery path.
 
 This file drives the REAL `tick()` end-to-end against a throwaway HERMES_HOME:
-  tick 1 -> script EAGAINs (subprocess.run raises OSError 11) -> failed exec row
+  tick 1 -> script EAGAINs (subprocess.Popen raises OSError 11) -> failed exec row
   tick 2 -> substrate recovered (script runs clean) -> job MUST fire again
 """
 from __future__ import annotations
