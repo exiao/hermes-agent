@@ -383,6 +383,7 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
         extra_prompt=None,
         cancel_event=None,
         execution_id=None,
+        adapters=None,
     ):
         assert execution_id == job["execution_id"]
         assert lost_seen.wait(timeout=2)
@@ -554,6 +555,8 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
     monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+    clock = iter((0.0, 0.01, 0.03))
+    monkeypatch.setattr(scheduler.time, "monotonic", lambda: next(clock))
 
     assert scheduler.run_one_job(job) is True
     assert calls >= 3
