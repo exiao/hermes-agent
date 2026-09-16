@@ -18,6 +18,7 @@ import {
   createBoundedMessageStore,
   createExpiringCache,
   appendMediaFailureNote,
+  isFatalCloseCode,
   reconnectPlan,
   extractBridgeEvent,
   inboundReadReceiptKeys,
@@ -98,6 +99,17 @@ import {
     'a first 405 after transient failures stays on the normal retry schedule');
   assert.equal(firstHandshakeRejection.handshakeFailures, 1);
   console.log('  ✓ a first 405 does not inherit transient failure history');
+}
+
+// -- fatal close codes -----------------------------------------------------
+{
+  for (const reason of [401, 403, 405]) {
+    assert.equal(isFatalCloseCode(reason), true, `close code ${reason} must stop reconnecting`);
+  }
+  for (const reason of [408, 428, 500, 515, undefined]) {
+    assert.equal(isFatalCloseCode(reason), false, `close code ${reason} must stay reconnectable`);
+  }
+  console.log('  ✓ 401/403/405 stop reconnecting; transient codes keep retrying');
 }
 
 // -- inbound read receipts ------------------------------------------------
