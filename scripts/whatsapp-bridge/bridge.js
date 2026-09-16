@@ -47,6 +47,7 @@ import {
   extractBridgeEvent,
   inboundReadReceiptKeys,
   inferMediaType,
+  isFatalCloseCode,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
@@ -596,10 +597,10 @@ async function startSocket() {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
 
-      if (reason === DisconnectReason.loggedOut) {
+      if (reason === DisconnectReason.loggedOut || isFatalCloseCode(reason)) {
         emitPairEvent({ event: 'error', error: 'logged_out', reason });
         if (!PAIR_JSON) {
-          console.log('❌ Logged out. Delete session and restart to re-authenticate.');
+          console.log(`❌ WhatsApp session rejected (code ${reason}). Delete session and restart to re-authenticate.`);
         }
         process.exit(1);
       } else {

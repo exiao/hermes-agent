@@ -18,6 +18,12 @@ const RECONNECT_MAX_MS = 5 * 60 * 1000;
 const RECONNECT_GIVEUP_AFTER = 10;
 const RECONNECT_LONG_MS = 12 * 60 * 60 * 1000;
 
+export const FATAL_CLOSE_CODES = new Set([401, 403, 405]);
+
+export function isFatalCloseCode(reason) {
+  return FATAL_CLOSE_CODES.has(reason);
+}
+
 /**
  * Return the next reconnect delay and consecutive-failure count without
  * importing the live bridge (which creates a socket and HTTP server).
