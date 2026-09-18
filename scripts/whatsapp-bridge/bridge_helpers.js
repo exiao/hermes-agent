@@ -98,7 +98,14 @@ export function createBoundedMessageStore(limit = 512) {
     return msg;
   }
 
-  return { remember, get };
+  function getMessage(key) {
+    const msg = byId.get(key?.id);
+    // Do not return another chat's payload if IDs collide.
+    if (!key?.remoteJid || msg?.key?.remoteJid !== key.remoteJid) return undefined;
+    return get(key.id).message || undefined;
+  }
+
+  return { remember, get, getMessage };
 }
 
 /**
@@ -740,35 +747,4 @@ export function createReconnectScheduler(startFn, {
     }, delayMs);
   }
   return scheduleReconnect;
-}
-
-/**
- * Version resolution guard. fetchLatestBaileysVersion() is a plain fetch to
- * raw.githubusercontent.com with no AbortSignal; a stalled connection can
- * pend forever and wedge the reconnect path (the scheduler above cannot
- * retry past an await that never settles). Bound the fetch and fall back to
- * the last known-good version, or the Baileys default before first success.
- */
-export function createVersionResolver(fetchVersionFn, {
-  timeoutMs = 15000,
-  log = console.log,
-} = {}) {
-  let cachedVersion = null;
-  return async function resolveVersion() {
-    let timer = null;
-    try {
-      const { version } = await Promise.race([
-        fetchVersionFn(),
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('version fetch timed out')), timeoutMs);
-        }),
-      ]);
-      cachedVersion = version;
-    } catch (err) {
-      log(`⚠️  Baileys version fetch failed (${err?.message || err}); using ${cachedVersion ? 'cached version' : 'library default'}.`);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-    return cachedVersion;
-  };
 }

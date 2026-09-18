@@ -19,12 +19,13 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, DisconnectReason, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
+import { useSqliteAuthState } from './auth_state.js';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, existsSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -38,7 +39,6 @@ import { createAntiban } from './antiban.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
-  createVersionResolver,
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
@@ -276,7 +276,12 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
       );
     });
     try {
-      return await Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise]);
+      const sending = sock.sendMessage(chatId, payload, options).then(sent => {
+        // Keep actual payloads even when acceptance arrives after our HTTP timeout.
+        rememberSentMessage(sent, payload);
+        return sent;
+      });
+      return await Promise.race([sending, timeoutPromise]);
     } finally {
       clearTimeout(timer);
       // Keep the cooldown for the next group send, not the whole queue: a
@@ -382,21 +387,7 @@ function getContextInfo(messageContent) {
 
 mkdirSync(SESSION_DIR, { recursive: true });
 
-// Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
-function buildLidMap() {
-  const map = {};
-  try {
-    for (const f of readdirSync(SESSION_DIR)) {
-      const m = f.match(/^lid-mapping-(\d+)\.json$/);
-      if (!m) continue;
-      const phone = m[1];
-      const lid = JSON.parse(readFileSync(path.join(SESSION_DIR, f), 'utf8'));
-      if (lid) map[String(lid)] = phone;
-    }
-  } catch {}
-  return map;
-}
-let lidToPhone = buildLidMap();
+let authStore;
 
 const logger = pino({ level: 'warn' });
 
@@ -533,11 +524,10 @@ function emitPairEvent(event) {
 }
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
-const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
 async function startSocket() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const version = await getWAVersion();
+  authStore ||= await useSqliteAuthState(SESSION_DIR);
+  const { state, saveCreds } = authStore;
 
   // Socket event subscriptions do not observe membership changes during a
   // disconnect, so snapshots tied to the previous socket must not survive a
@@ -546,7 +536,6 @@ async function startSocket() {
   _groupMetaCache.clear();
   _groupMetaInFlight.clear();
   sock = makeWASocket({
-    ...(version ? { version } : {}),
     auth: state,
     logger,
     printQRInTerminal: false,
@@ -557,16 +546,14 @@ async function startSocket() {
     // sock.groupMetadata on every group send. Prevents groupMetadata bursts
     // from tripping WhatsApp's rate-overlimit (ban vector). See cache note above.
     cachedGroupMetadata: async (jid) => getCachedGroupMetadata(jid) || _groupMetaInFlight.get(jid),
-    // Required for Baileys 7.x: without this, incoming messages that need
-    // E2EE session re-establishment are silently dropped (msg.message === null)
-    getMessage: async (key) => {
-      // We don't maintain a message store, so return a placeholder.
-      // This is enough for Baileys to complete the retry handshake.
-      return { conversation: '' };
-    },
+    // A missing cache entry is a genuine miss, never an empty replacement.
+    getMessage: async (key) => messageStore.getMessage(key),
   });
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  sock.ev.on('creds.update', () => {
+    try { saveCreds(); }
+    catch { logger.fatal('WhatsApp credential persistence failed; stopping bridge'); process.exit(1); }
+  });
 
   // Keep the group-metadata cache correct across membership changes. A stale
   // participant snapshot could misroute a group send, so drop the cached entry
@@ -583,7 +570,17 @@ async function startSocket() {
   });
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    const { connection, lastDisconnect, qr, reachoutTimeLock } = update;
+    // Passive server event only: no polling, alerts, or diagnostic sends.
+    if (reachoutTimeLock) {
+      console.log(JSON.stringify({
+        ts: Date.now(),
+        event: 'account_restriction',
+        isActive: reachoutTimeLock.isActive === true,
+        enforcementType: reachoutTimeLock.enforcementType,
+        timeEnforcementEnds: reachoutTimeLock.timeEnforcementEnds,
+      }));
+    }
 
     if (qr) {
       if (PAIR_JSON) {
@@ -772,7 +769,7 @@ async function startSocket() {
             fromMe: true,
             fromOwnerEnabled: FORWARD_OWNER_MESSAGES,
             recentlySent: recentlySentIds,
-            allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
+            allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR, authStore.getLidMapping),
             messageId: msg.key.id,
             chatId,
           });
@@ -835,7 +832,7 @@ async function startSocket() {
           } catch {}
           continue;
         }
-        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR, authStore.getLidMapping)) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -1051,7 +1048,6 @@ app.post('/send', async (req, res) => {
         textLength: chunks[i].length,
       });
       trackSentMessageId(sent);
-      messageStore.remember(sent);
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {
         await sleep(CHUNK_DELAY_MS);
@@ -1197,7 +1193,6 @@ app.post('/send-media', async (req, res) => {
       textLength: (caption || '').length,
     });
     trackSentMessageId(sent);
-    messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1221,7 +1216,6 @@ app.post('/send-poll', async (req, res) => {
     const payload = buildPollPayload({ question, options, selectableCount });
     const sent = await sendWithTimeout(chatId, payload);
     trackSentMessageId(sent);
-    rememberSentMessage(sent, payload);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1243,7 +1237,6 @@ app.post('/send-location', async (req, res) => {
     const payload = buildLocationPayload({ latitude, longitude, name, address });
     const sent = await sendWithTimeout(chatId, payload);
     trackSentMessageId(sent);
-    messageStore.remember(sent);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(400).json({ error: err.message });
