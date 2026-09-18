@@ -78,3 +78,10 @@ test('matchesAllowedUser rejects everyone when allowlist is empty (#8389)', () =
     rmSync(sessionDir, { recursive: true, force: true });
   }
 });
+
+// Migrated storage is authoritative; never resurrect a removed legacy mapping.
+{
+  const allowed = parseAllowedUsers('15550001111');
+  assert.equal(matchesAllowedUser('999@lid', allowed, '/unused', id => id === '999' ? '15550001111' : null), true);
+  assert.equal(matchesAllowedUser('999@lid', allowed, '/unused', () => null), false);
+}

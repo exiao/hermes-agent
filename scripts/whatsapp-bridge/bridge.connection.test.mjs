@@ -15,6 +15,12 @@ test('bridge honors backoff, reconnects, and stops on forbidden credentials', as
   const session = mkdtempSync(join(tmpdir(), 'bridge-connection-'));
   const sockets = [];
   let server;
+  const restrictions = [];
+  const originalLog = console.log;
+  mock.method(console, "log", (...args) => {
+    if (String(args[0]).includes("account_restriction")) restrictions.push(JSON.parse(args[0]));
+    else originalLog(...args);
+  });
   mock.module('express', { defaultExport: Object.assign(() => {
     const app = express();
     const listen = app.listen.bind(app);
@@ -24,12 +30,13 @@ test('bridge honors backoff, reconnects, and stops on forbidden credentials', as
   const { default: defaultExport, ...namedExports } = baileys;
   mock.module('@whiskeysockets/baileys', { defaultExport, namedExports: {
     ...namedExports,
-    useMultiFileAuthState: async () => ({ state: {}, saveCreds: async () => {} }),
-    fetchLatestBaileysVersion: async () => ({ version: [2, 3000, 0] }),
-    makeWASocket: () => {
+    fetchLatestBaileysVersion: async () => { throw new Error("must use bundled version"); },
+    makeWASocket: config => {
+      assert.equal(config.version, undefined);
       const socket = {
         ev: new EventEmitter(),
-        sendMessage: async () => ({ key: { id: 'receipt-test-id', fromMe: true, remoteJid: '15551234567@s.whatsapp.net' } }),
+        config,
+        sendMessage: async (jid, payload) => ({ key: { id: 'receipt-test-id', fromMe: true, remoteJid: jid }, message: { conversation: payload.text } }),
       };
       sockets.push(socket);
       return socket;
@@ -87,6 +94,15 @@ test('bridge honors backoff, reconnects, and stops on forbidden credentials', as
     assert.equal(sent.status, 200);
     assert.equal(sent.body.messageId, 'receipt-test-id');
     const socket = sockets.at(-1);
+    assert.deepEqual(await socket.config.getMessage({ id: 'receipt-test-id', remoteJid: '15551234567@s.whatsapp.net' }), { conversation: 'receipt test' });
+    assert.equal(await socket.config.getMessage({ id: 'missing', remoteJid: '15551234567@s.whatsapp.net' }), undefined);
+    assert.equal(await socket.config.getMessage({ id: 'receipt-test-id', remoteJid: 'other@s.whatsapp.net' }), undefined);
+    socket.ev.emit('connection.update', { reachoutTimeLock: { isActive: true, enforcementType: 'test', timeEnforcementEnds: new Date('2030-01-01T00:00:00Z'), secret: 'not-logged' } });
+    assert.equal(restrictions.at(-1).isActive, true);
+    assert.equal(restrictions.at(-1).timeEnforcementEnds, '2030-01-01T00:00:00.000Z');
+    assert.equal(restrictions.at(-1).secret, undefined);
+    socket.ev.emit('connection.update', { reachoutTimeLock: { isActive: false } });
+    assert.equal(restrictions.at(-1).isActive, false);
     socket.ev.emit('messages.update', [{ key: { id: 'receipt-test-id', fromMe: false }, update: { status: 4 } }]);
     assert.equal((await jsonRequest('GET', '/message-status/receipt-test-id')).body.delivered, false);
     socket.ev.emit('messages.update', [{ key: { id: 'receipt-test-id', fromMe: true }, update: { status: 2 } }]);
