@@ -767,16 +767,18 @@ class TestVoiceChannelCommands:
         """Timeout cleanup disables auto-TTS on the bound (joined) adapter."""
         from gateway.config import Platform
 
-        default_adapter = MagicMock()
+        default_adapter = MagicMock(_auto_tts_disabled_chats=set(), _auto_tts_enabled_chats={"999"})
         runner.adapters[Platform.DISCORD] = default_adapter
         runner._voice_mode["discord:999"] = "all"
 
-        bound_adapter = MagicMock()
-        with patch.object(runner, "_set_adapter_auto_tts_disabled") as mock_disable:
-            runner._handle_voice_timeout_cleanup("999", adapter=bound_adapter)
+        bound_adapter = MagicMock(_owner_profile=None, _auto_tts_disabled_chats=set(), _auto_tts_enabled_chats={"999"})
+        runner._handle_voice_timeout_cleanup("999", adapter=bound_adapter)
 
         assert runner._voice_mode["discord:999"] == "off"
-        mock_disable.assert_called_once_with(bound_adapter, "999", disabled=True)
+        assert bound_adapter._auto_tts_disabled_chats == {"999"}
+        assert bound_adapter._auto_tts_enabled_chats == set()
+        assert default_adapter._auto_tts_disabled_chats == set()
+        assert default_adapter._auto_tts_enabled_chats == {"999"}
 
     # -- _get_guild_id --
 

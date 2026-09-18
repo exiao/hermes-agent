@@ -554,7 +554,7 @@ async def test_dm_topic_table_stream_uses_send_rich_message():
 
     adapter._bot.send_message_draft.assert_awaited()
     draft_kwargs = adapter._bot.send_message_draft.call_args.kwargs
-    assert draft_kwargs["text"] == TOPIC_TABLE
+    assert draft_kwargs["text"] == TOPIC_TABLE.strip()  # stream frames trim outer whitespace
     assert draft_kwargs["message_thread_id"] == 20189
     rich_endpoints = [call.args[0] for call in adapter._bot.do_api_request.await_args_list]
     # Invariant, not a frozen call list: the persistent final goes through

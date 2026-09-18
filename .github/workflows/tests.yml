@@ -13,9 +13,13 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
-    # Run the full suite on one runner. Match test-file concurrency to its
-    # actual CPUs, including forks that override HUGE_RUNNER with a smaller host.
+    name: Run tests (${{ matrix.slice }}/4)
+    # Preserve full discovery while keeping the fork's standard runners within
+    # the job deadline. Each file belongs to exactly one deterministic slice.
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4]
     runs-on: ${{ vars.HUGE_RUNNER || 'ubuntu-latest-96-core' }}
     timeout-minutes: 30
     steps:
@@ -92,7 +96,7 @@ jobs:
         # set is identical to the list the removed matrix job used to pass in.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh --jobs "$(nproc)"
+          scripts/run_tests.sh --jobs "$(nproc)" --slice "${{ matrix.slice }}/4"
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
