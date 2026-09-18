@@ -264,6 +264,9 @@ def test_skip_memory_still_loads_store_when_memory_tool_enabled():
 
     assert a._memory_store is store
     memory_store_cls.assert_called_once()
+    store_kwargs = memory_store_cls.call_args.kwargs
+    assert store_kwargs["memory_enabled"] is True
+    assert store_kwargs["user_profile_enabled"] is True
     store.load_from_disk.assert_called_once()
     assert a._memory_enabled is False
     assert a._user_profile_enabled is False

@@ -1247,7 +1247,9 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                 MemoryStore, get_builtin_memory_config, get_builtin_memory_store_flags,
             )
             mem_config = get_builtin_memory_config(_agent_cfg)
-            agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(_agent_cfg)
+            store_memory_enabled, store_user_profile_enabled = get_builtin_memory_store_flags(_agent_cfg)
+            agent._memory_enabled = store_memory_enabled
+            agent._user_profile_enabled = store_user_profile_enabled
             if skip_memory:
                 # ``skip_memory`` suppresses prompt injection, while the store may still
                 # be required by the explicitly enabled memory tool.
@@ -1262,8 +1264,8 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
-                    memory_enabled=agent._memory_enabled,
-                    user_profile_enabled=agent._user_profile_enabled,
+                    memory_enabled=store_memory_enabled,
+                    user_profile_enabled=store_user_profile_enabled,
                 )
                 agent._memory_store.load_from_disk()
 
