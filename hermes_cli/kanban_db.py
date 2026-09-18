@@ -2414,6 +2414,10 @@ def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool
         "AND kind IN ('completed', 'archived', 'status') ORDER BY id",
         tuple(parents),
     ).fetchall():
+        # complete_task only emits this after a non-terminal -> done transition,
+        # even when a legacy caller reopened the row without a status event.
+        if event["kind"] == "completed" and event["id"] > wait_id:
+            return False
         if event["kind"] in {"completed", "archived"}:
             is_terminal = True
         else:
