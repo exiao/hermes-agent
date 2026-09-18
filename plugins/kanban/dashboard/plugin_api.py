@@ -366,7 +366,9 @@ def _compute_task_diagnostics(
         ).fetchall():
             runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
-    graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
+    graph_by_task: dict[str, dict] = {}
+    for chunk in _sqlite_chunks(row_ids, _SQLITE_IN_CHUNK_SIZE):
+        graph_by_task.update(kanban_db.task_graph_contexts(conn, chunk))
     out: dict[str, list[dict]] = {}
     for r in rows:
         tid = r["id"]
@@ -824,7 +826,9 @@ def _compute_board(
     # window-function query (avoids N+1 ``latest_summary`` calls
     # for boards with hundreds of tasks). Truncated to a card-size
     # preview here — the full text is available via /tasks/:id.
-    summary_map = kanban_db.latest_summaries(conn, task_ids)
+    summary_map: dict[str, str] = {}
+    for chunk in _sqlite_chunks(task_ids, _SQLITE_IN_CHUNK_SIZE):
+        summary_map.update(kanban_db.latest_summaries(conn, chunk))
 
     for t in tasks:
         full = summary_map.get(t.id)

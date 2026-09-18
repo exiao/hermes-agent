@@ -567,7 +567,6 @@ def test_board_chunks_returned_task_id_queries(client, monkeypatch):
 
     module = _load_plugin_module()
     monkeypatch.setattr(module, "_SQLITE_IN_CHUNK_SIZE", 3)
-    monkeypatch.setattr(kb, "_SQLITE_IN_CHUNK_SIZE", 3)
 
     conn = kbc.connect()
     ids = _seed_done_tasks(client, 8)

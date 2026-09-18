@@ -1653,6 +1653,8 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked" and initial_status == "blocked":
+                    _append_event(conn, task_id, "blocked", {"reason": "initial_status"})
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
@@ -2276,22 +2278,28 @@ def _synthesize_ended_run(
 # --- Dependency resolution (todo -> ready) ---
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the newest ``blocked``/``unblocked`` event is ``blocked`` — an
-    explicit ``kanban_block`` that must wait for an operator. A breaker trip
-    emits ``gave_up`` (not ``blocked``) and so auto-recovers, as does a task
-    with no such event at all (direct DB edit).
+    """True when the newest status-bearing event parks the task for an operator.
 
-    See #28712.
-    Returns ``False`` when there is no such event at all (e.g. the task was set to ``status='blocked'`` by
-    the circuit breaker or by direct DB manipulation) — preserves the pre-#28712 auto-recover semantics for
-    that path.
+    ``created(status=blocked)`` is included for legacy boards that predate the
+    explicit blocked event. ``promoted_manual``, ``unblocked`` and status moves
+    out of blocked release that creation-time park; breaker events remain
+    auto-recoverable.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN "
+        "('blocked', 'unblocked', 'created', 'promoted_manual', 'status') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if not row:
+        return False
+    kind = row["kind"]
+    if kind == "blocked":
+        return True
+    if kind in ("unblocked", "promoted_manual"):
+        return False
+    payload = _json_dict(row["payload"])
+    return payload.get("status") == "blocked" or payload.get("requested_status") == "blocked"
 
 
 def _latest_event(
@@ -3769,6 +3777,11 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        next_title = title.strip() if title is not None else existing["title"]
+        next_body = body if body is not None else existing["body"]
+        next_assignee = assignee if assignee is not None else existing["assignee"]
+        if _is_spec_less(next_title, next_body, next_assignee):
+            return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -4540,9 +4553,20 @@ def _migrate_with_fork_columns(conn: sqlite3.Connection) -> None:
     terminal_ts = (
         "CASE WHEN status = 'archived' THEN COALESCE(archived_at, completed_at) "
         "ELSE completed_at END")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_terminal_window ON tasks("
+    expected_index_sql = (
+        "CREATE INDEX idx_tasks_terminal_window ON tasks("
         f"status, ({terminal_ts} IS NULL), {terminal_ts} DESC, created_at DESC, id DESC)")
+    existing_index = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_tasks_terminal_window'"
+    ).fetchone()
+    if existing_index is None:
+        conn.execute(expected_index_sql)
+    elif re.sub(r"\s+", "", existing_index[0]).casefold() != re.sub(
+        r"\s+", "", expected_index_sql
+    ).casefold():
+        conn.execute("DROP INDEX idx_tasks_terminal_window")
+        conn.execute(expected_index_sql)
 
 
 _kanban_db_connect._migrate_add_optional_columns = _migrate_with_fork_columns

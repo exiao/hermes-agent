@@ -39,13 +39,18 @@ def test_liveness_true_when_gateway_process_holds_runtime_lock(tmp_path, monkeyp
         "print('READY', flush=True)\n"
         "sys.stdin.read()\n"
     )
+    child_env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parents[2])
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (repo_root, child_env.get("PYTHONPATH", "")) if value
+    )
     process = subprocess.Popen(
         [sys.executable, str(gateway_script)],
         cwd=Path(__file__).resolve().parents[2],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
-        env=os.environ.copy(),
+        env=child_env,
     )
     ready = []
     reader = threading.Thread(target=lambda: ready.append(process.stdout.readline()))
