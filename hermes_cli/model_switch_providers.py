@@ -287,6 +287,8 @@ def _auth_store_has_provider(*keys: str) -> bool:
 
 def _raw_pool_usable(hermes_id: str) -> bool:
     """Section-1 pool check: only consult the pool when auth.json lists a raw entry."""
+    if _named_profile_scope_without_local_pool(hermes_id):
+        return False
     try:
         from hermes_cli.auth import _load_auth_store
         store = _load_auth_store()
@@ -298,11 +300,38 @@ def _raw_pool_usable(hermes_id: str) -> bool:
 
 
 def _pool_usable(slug: str) -> bool:
+    if _named_profile_scope_without_local_pool(slug):
+        return False
     try:
         return _credential_pool_is_usable(slug)
     except Exception as exc:
         logger.debug("Credential pool check failed for %s: %s", slug, exc)
-        return False
+    return False
+
+
+def _named_profile_scope_without_local_pool(provider: str) -> bool:
+    """Prevent a named profile from triggering process-global credential-pool auto-seeding.
+
+    Explicit credentials already present in the active profile's auth store are checked separately;
+    this gate only suppresses ``load_pool``'s ambient singleton/env seeding path. The default profile
+    remains the owner of those process-level fallbacks, including when it is scoped under multiplex.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+        from hermes_constants import get_hermes_home, get_process_hermes_home
+        if not (is_multiplex_active() and current_secret_scope() is not None):
+            return False
+        home = get_hermes_home().resolve()
+        if home == get_process_hermes_home().resolve():
+            return False
+        from hermes_cli.auth import _load_auth_store
+        store = _load_auth_store()
+        pool = store.get("credential_pool", {}) if isinstance(store, dict) else {}
+        return not (isinstance(pool, dict) and pool.get(provider))
+    except Exception:
+        # A qualifying secondary scope must fail closed if its local auth store cannot be read;
+        # allowing load_pool() here would re-enter ambient singleton/env auto-seeding.
+        return True
 
 
 def _overlay_has_env_creds(pid: str, hermes_slug: str, overlay, read_env) -> bool:
@@ -688,10 +717,10 @@ class _PickerBuild:
 
 def _lap_builtin_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None:
     """Section 1: models.dev-mapped providers with api_key auth."""
-    from hermes_cli.model_switch import _declared_model_ids
+    from hermes_cli.model_switch import _declared_model_ids, _scoped_key_env
     from agent.models_dev import get_provider_info
     for hermes_id, mdev_id, pconfig, env_vars in _iter_builtin_candidates(data, b.excluded, b.seen_slugs):
-        if not (_any_env(env_vars) or _raw_pool_usable(hermes_id)):
+        if not (_any_env(env_vars, _scoped_key_env) or _raw_pool_usable(hermes_id)):
             continue
         model_ids = _live_or_curated_ids(hermes_id, b.curated)
         # A providers.<built-in>.models block extends the discovered catalog; section 3 cannot
@@ -713,7 +742,8 @@ def _overlay_has_creds(b: _PickerBuild, pid: str, hermes_slug: str, overlay) -> 
     if overlay.auth_type == "aws_sdk":
         has_creds = _has_aws_sdk_creds_for_listing(hermes_slug, b.current_provider)
     else:
-        has_creds = _overlay_has_env_creds(pid, hermes_slug, overlay, os.environ.get)
+        from hermes_cli.model_switch import _scoped_key_env
+        has_creds = _overlay_has_env_creds(pid, hermes_slug, overlay, _scoped_key_env)
     # External-process providers (copilot-acp) hold no key/token/pool entry by design — the
     # spawned ACP subprocess brings its own auth. "Configured" means the executable resolves.
     # "Configured" means the executable resolves, which is exactly what get_auth_status() reports for them;
@@ -733,7 +763,7 @@ def _overlay_has_creds(b: _PickerBuild, pid: str, hermes_slug: str, overlay) -> 
         # Full auto-seeding pool check catches external stores (Codex CLI ~/.codex/auth.json)
         # not yet in auth.json.
         try:
-            if _credential_pool_is_usable(hermes_slug):
+            if _pool_usable(hermes_slug):
                 has_creds = True
             elif b.for_picker:
                 # Show providers whose pool is entirely in cooldown: limits are per-model for
@@ -799,7 +829,8 @@ def _lap_canonical_rows(b: _PickerBuild) -> None:
         cp_config = PROVIDER_REGISTRY.get(cp.slug)
         has_creds = False
         if cp_config and cp_config.api_key_env_vars:
-            lit = {ev for ev in cp_config.api_key_env_vars if os.environ.get(ev)}
+            from hermes_cli.model_switch import _scoped_key_env
+            lit = {ev for ev in cp_config.api_key_env_vars if _scoped_key_env(ev)}
             has_creds = bool(lit)
             # A regional "-cn" twin lit only by key vars shared with its non-CN sibling is a
             # phantom row: hide it unless it is the current provider, and only when it has a

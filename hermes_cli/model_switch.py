@@ -522,7 +522,9 @@ def resolve_persist_behavior(
         return False
     if isinstance(model_cfg, dict):
         if not (model_cfg.get("default") or model_cfg.get("provider")):
-            return True
+            # A fresh config with no route persists the first selection by default, but an
+            # explicit false is an opt-out even before a default/provider has been written.
+            return bool(model_cfg.get("persist_switch_by_default", True))
         if explicit_provider:
             return False
         return bool(model_cfg.get("persist_switch_by_default", False))
@@ -1271,13 +1273,15 @@ def _creds_for_switched_provider(st: _Switch) -> Optional[ModelSwitchResult]:
         # Key reads go through the per-profile secret scope (multiplexed gateway).
         ukey = _entry_configured_key(ucfg, _scoped_key_env)
         st.validation_headers = _extra_headers_from_config(ucfg)
-        st.base_url_from_provider_config = st.target_provider == "anthropic"
         try:
             st.resolve_runtime(
                 requested=st.target_provider, explicit_api_key=ukey or None, explicit_base_url=user_pdef.base_url)
             st.api_key, st.base_url = st.api_key or ukey, st.base_url or user_pdef.base_url
         except Exception:
             st.api_key, st.base_url, st.api_mode = ukey, user_pdef.base_url, ""
+        # The user-provider entry owns this endpoint even when runtime resolution reports its
+        # generic provider provenance. Preserve that distinction for config write-through.
+        st.base_url_from_provider_config = st.base_url_from_provider_config or st.target_provider == "anthropic"
     elif st.target_provider == "custom" and st.current_base_url:
         st.api_key, st.base_url = st.current_api_key, st.current_base_url
         st.api_mode = determine_api_mode(st.target_provider, st.base_url)

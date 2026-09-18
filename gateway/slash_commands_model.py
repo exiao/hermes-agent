@@ -172,7 +172,7 @@ class GatewayModelCommandsMixin:
     # ----------------------------------------------------------------- /model
 
     async def _perform_model_switch(
-        self, ctx: _ModelSwitchContext, raw_input: str, explicit_provider, source
+        self, ctx: _ModelSwitchContext, raw_input: str, explicit_provider, source, profile_home=None
     ):
         """Resolve a /model switch off-loop. Returns ``(result, None)`` or ``(None, error_text)``."""
         from gateway.run import _load_gateway_config
@@ -181,9 +181,16 @@ class GatewayModelCommandsMixin:
         skew_error = _model_switch_skew_guard()
         if skew_error:
             return None, skew_error
+        def _switch_model_scoped(**kwargs):
+            if profile_home is None:
+                return switch_model(**kwargs)
+            from gateway.run import _profile_runtime_scope
+            with _profile_runtime_scope(profile_home):
+                return switch_model(**kwargs)
+
         # Off-loop: switch_model() can hit a synchronous models.dev fetch (15s) on a cold cache.
         result = await asyncio.to_thread(
-            switch_model, raw_input=raw_input, current_provider=ctx.current_provider,
+            _switch_model_scoped, raw_input=raw_input, current_provider=ctx.current_provider,
             current_model=ctx.current_model, current_base_url=ctx.current_base_url,
             current_api_key=ctx.current_api_key, is_global=ctx.persist_global,
             explicit_provider=explicit_provider, user_providers=ctx.user_provs,
@@ -400,7 +407,8 @@ class GatewayModelCommandsMixin:
         if adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None:
             async def _picker_switch(model_id: str, provider_slug: str) -> str:
                 # The picker callback binds the raw event source (pre-normalization).
-                result, error = await self._perform_model_switch(ctx, model_id, provider_slug, event.source)
+                result, error = await self._perform_model_switch(
+                    ctx, model_id, provider_slug, event.source, profile_home=profile_home)
                 if error is not None:
                     return error
                 return await self._commit_model_switch(result, ctx, source=event.source, picker=True)
@@ -509,7 +517,8 @@ class GatewayModelCommandsMixin:
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         if not request.target and not request.explicit_provider:
             return await self._model_listing_reply(event, ctx, profile_home)
-        result, error = await self._perform_model_switch(ctx, request.target, request.explicit_provider, source)
+        result, error = await self._perform_model_switch(
+            ctx, request.target, request.explicit_provider, source, profile_home=profile_home)
         if error is not None:
             return error
         guard_fired, guard_reply = await self._model_selection_guard_reply(event, ctx, result)
