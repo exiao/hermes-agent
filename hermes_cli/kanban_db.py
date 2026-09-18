@@ -1703,11 +1703,12 @@ def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -
         return None
 
 
-def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
-    conn.execute(
+def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    cur = conn.execute(
         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
         (parent_id, child_id),
     )
+    return cur.rowcount == 1
 
 
 def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]:
@@ -1905,16 +1906,17 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
-        _link(conn, parent_id, child_id)
+        linked = _link(conn, parent_id, child_id)
         # If child was ready but parent is not yet done, demote child to todo.
         if _task_status(conn, parent_id) != "done":
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (child_id,),
             )
-        _append_event(
-            conn, child_id, "linked", {"parent": parent_id, "child": child_id},
-        )
-        _inherit_notify_subs(conn, child_id, (parent_id,))
+        if linked:
+            _append_event(
+                conn, child_id, "linked", {"parent": parent_id, "child": child_id},
+            )
+            _inherit_notify_subs(conn, child_id, (parent_id,))
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -2304,6 +2306,102 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return payload.get("status") == "blocked" or payload.get("requested_status") == "blocked"
 
 
+def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Keep a dependency-wait parked until the graph shows real progress."""
+    wait = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? "
+        "AND kind = 'dependency_wait' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if wait is None:
+        return False
+    wait_id = wait["id"]
+
+    # Explicit unblock, task completion, or a terminal direct-status move
+    # starts a new task lifecycle; later promotions do not.
+    for event in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind IN ('unblocked', 'completed', 'archived', 'status')",
+        (task_id, wait_id),
+    ).fetchall():
+        if event["kind"] != "status":
+            return False
+        if _json_dict(event["payload"]).get("status") in {"done", "archived"}:
+            return False
+
+    parents = [
+        row["parent_id"]
+        for row in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)
+        ).fetchall()
+    ]
+    placeholders = ",".join("?" * len(parents))
+    if not parents:
+        # A post-wait unlink/delete is deliberate graph repair; no edge at all
+        # without that event is the loop this guard is meant to stop.
+        return not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+            "AND kind = 'unlinked' LIMIT 1",
+            (task_id, wait_id),
+        ).fetchone()
+
+    # Replay parent terminal/non-terminal transitions. A terminal event alone
+    # is insufficient when the parent was already terminal at wait time.
+    terminal: dict[str, bool] = {}
+    for event in conn.execute(
+        f"SELECT id, task_id, kind, payload FROM task_events "
+        f"WHERE task_id IN ({placeholders}) "
+        "AND kind IN ('completed', 'archived', 'status') ORDER BY id",
+        tuple(parents),
+    ).fetchall():
+        if event["kind"] in {"completed", "archived"}:
+            is_terminal = True
+        else:
+            status = _json_dict(event["payload"]).get("status")
+            if status is None:
+                continue
+            is_terminal = status in {"done", "archived"}
+        was_terminal = terminal.get(event["task_id"], False)
+        terminal[event["task_id"]] = is_terminal
+        if is_terminal and not was_terminal and event["id"] > wait_id:
+            return False
+
+    # Linking an already-terminal parent after the wait is explicit graph
+    # repair. Idempotent links do not emit this event.
+    linked = []
+    for event in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind = 'linked'",
+        (task_id, wait_id),
+    ).fetchall():
+        parent = _json_dict(event["payload"]).get("parent")
+        if parent:
+            linked.append(parent)
+    if linked:
+        marks = ",".join("?" * len(linked))
+        if conn.execute(
+            f"SELECT 1 FROM tasks WHERE id IN ({marks}) "
+            "AND status IN ('done', 'archived') LIMIT 1",
+            tuple(linked),
+        ).fetchone():
+            return False
+
+    # Removing an unresolved edge releases the wait when every remaining edge
+    # is terminal. The post-wait event distinguishes repair from a stale wait.
+    unlinked = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind = 'unlinked' LIMIT 1",
+        (task_id, wait_id),
+    ).fetchone()
+    if unlinked and not conn.execute(
+        f"SELECT 1 FROM tasks WHERE id IN ({placeholders}) "
+        "AND status NOT IN ('done', 'archived') LIMIT 1",
+        tuple(parents),
+    ).fetchone():
+        return False
+    return True
+
+
 def _latest_event(
     conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
@@ -2359,6 +2457,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
+                continue
+            if cur_status == "todo" and _dependency_wait_should_park(conn, task_id):
+                # A dependency wait with no newly resolved parent must remain
+                # parked; promoting it would immediately re-run the worker
+                # that just declared the dependency unavailable.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -3244,10 +3347,35 @@ def block_task(
     effective_owner = owner
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, block_kind, block_recurrences, current_run_id "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        db_current_run = cur_row["current_run_id"]
+        if (
+            expected_run_id is not None
+            and cur_row["status"] == "running"
+            and db_current_run is not None
+            and int(expected_run_id) != int(db_current_run)
+        ):
+            owns_run = conn.execute(
+                "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
+                "AND status = 'running' AND ended_at IS NULL LIMIT 1",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if owns_run:
+                conn.execute(
+                    "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
+                    "ended_at = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                    (int(time.time()), int(expected_run_id), task_id),
+                )
+                _append_event(
+                    conn, task_id, "block_run_reconciled",
+                    {"worker_run_id": int(expected_run_id), "current_run_id": db_current_run},
+                )
+                expected_run_id = db_current_run
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
@@ -4019,6 +4147,15 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    children = conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ? AND child_id != ?",
+        (task_id, task_id),
+    ).fetchall()
+    for child in children:
+        _append_event(
+            conn, child["child_id"], "unlinked",
+            {"parent": task_id, "child": child["child_id"]},
+        )
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))

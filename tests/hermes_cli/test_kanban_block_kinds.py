@@ -23,6 +23,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
 
 @pytest.fixture
@@ -235,7 +236,7 @@ def test_dependency_rerun_after_status_done_not_parked(kanban_home: Path) -> Non
         kb.block_task(conn, tid, reason="wait", kind="dependency")
         assert kb.get_task(conn, tid).status == "todo"
         # Operator drags the parked card straight to 'done' on the board.
-        assert kb.set_status_direct(conn, tid, "done")
+        assert _set_status_direct(conn, tid, "done")
         assert kb.get_task(conn, tid).status == "done"
         # Reopen it back into todo and run the gate — the terminal 'status'
         # move must supersede the stale dependency_wait.
@@ -437,7 +438,7 @@ def test_dependency_reopened_parent_recompletion_after_wait_promotes(
         kb.claim_task(conn, parent, claimer="worker")
         kb.complete_task(conn, parent, result="done")
         # Parent is reopened (dashboard drag done -> ready).
-        assert kb.set_status_direct(conn, parent, "ready")
+        assert _set_status_direct(conn, parent, "ready")
         # Child dependency-blocks while the reopened parent is in flight.
         kb.block_task(conn, child, reason="wait on reopened parent", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
@@ -477,7 +478,7 @@ def test_dependency_parent_reopened_after_wait_then_recompletes_promotes(
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "todo"
         # Repair: reopen the already-done parent AFTER the wait, then re-complete.
-        assert kb.set_status_direct(conn, parent, "ready")
+        assert _set_status_direct(conn, parent, "ready")
         kb.claim_task(conn, parent, claimer="worker")
         kb.complete_task(conn, parent, result="repaired")
         kb.recompute_ready(conn)
@@ -596,7 +597,7 @@ def test_dependency_parent_marked_done_via_status_after_wait_promotes(
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "todo"
         # Parent is dragged straight to 'done' on the board after the wait.
-        assert kb.set_status_direct(conn, parent, "done")
+        assert _set_status_direct(conn, parent, "done")
         assert kb.get_task(conn, child).status == "ready", (
             "a parent marked done via set_status_direct after the wait is a "
             "genuine new resolution and must release the park"
@@ -706,4 +707,3 @@ def test_completion_clears_block_memory(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
-
