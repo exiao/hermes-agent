@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import express from 'express';
-import { get } from 'node:http';
+import { get, request } from 'node:http';
 import * as baileys from '@whiskeysockets/baileys';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -27,12 +27,17 @@ test('bridge honors backoff, reconnects, and stops on forbidden credentials', as
     useMultiFileAuthState: async () => ({ state: {}, saveCreds: async () => {} }),
     fetchLatestBaileysVersion: async () => ({ version: [2, 3000, 0] }),
     makeWASocket: () => {
-      const socket = { ev: new EventEmitter() };
+      const socket = {
+        ev: new EventEmitter(),
+        sendMessage: async () => ({ key: { id: 'receipt-test-id', fromMe: true, remoteJid: '15551234567@s.whatsapp.net' } }),
+      };
       sockets.push(socket);
       return socket;
     },
   } });
   const argv = process.argv;
+  const antiban = process.env.WHATSAPP_ANTIBAN;
+  process.env.WHATSAPP_ANTIBAN = '0';
   process.argv = [...argv.slice(0, 2), '--port', '0', '--session', session, '--mode', 'bot'];
   try {
     mock.timers.enable({ apis: ['setTimeout'] });
@@ -63,6 +68,43 @@ test('bridge honors backoff, reconnects, and stops on forbidden credentials', as
       }).on('error', reject);
     });
     assert.equal((await health()).status, 'connected');
+    const jsonRequest = (method, path, body) => new Promise((resolve, reject) => {
+      const req = request({
+        hostname: '127.0.0.1',
+        port: server.address().port,
+        path,
+        method,
+        headers: body ? { 'content-type': 'application/json' } : {},
+      }, response => {
+        let bodyText = '';
+        response.on('data', chunk => { bodyText += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode, body: JSON.parse(bodyText) }));
+      });
+      req.on('error', reject);
+      req.end(body ? JSON.stringify(body) : undefined);
+    });
+    const sent = await jsonRequest('POST', '/send', { chatId: '15551234567@s.whatsapp.net', message: 'receipt test' });
+    assert.equal(sent.status, 200);
+    assert.equal(sent.body.messageId, 'receipt-test-id');
+    const socket = sockets.at(-1);
+    socket.ev.emit('messages.update', [{ key: { id: 'receipt-test-id', fromMe: false }, update: { status: 4 } }]);
+    assert.equal((await jsonRequest('GET', '/message-status/receipt-test-id')).body.delivered, false);
+    socket.ev.emit('messages.update', [{ key: { id: 'receipt-test-id', fromMe: true }, update: { status: 2 } }]);
+    await tick();
+    assert.deepEqual((await jsonRequest('GET', '/message-status/receipt-test-id')).body, {
+      messageId: 'receipt-test-id', status: 'server_ack', delivered: false,
+    });
+    socket.ev.emit('message-receipt.update', [{
+      key: { id: 'receipt-test-id', fromMe: true }, receipt: { receiptTimestamp: 123 },
+    }]);
+    assert.deepEqual((await jsonRequest('GET', '/message-status/receipt-test-id')).body, {
+      messageId: 'receipt-test-id', status: 'delivered', delivered: true,
+    });
+    socket.ev.emit('messages.update', [{ key: { id: 'inbound-id', fromMe: false }, update: { status: 4 } }]);
+    socket.ev.emit('message-receipt.update', [{
+      key: { id: 'inbound-id', fromMe: false }, receipt: { receiptTimestamp: 123 },
+    }]);
+    assert.equal((await jsonRequest('GET', '/message-status/inbound-id')).status, 404);
     close(403);
     mock.timers.tick(24 * 60 * 60 * 1000);
     await tick();
@@ -72,6 +114,8 @@ test('bridge honors backoff, reconnects, and stops on forbidden credentials', as
     mock.restoreAll();
     mock.timers.reset();
     process.argv = argv;
+    if (antiban === undefined) delete process.env.WHATSAPP_ANTIBAN;
+    else process.env.WHATSAPP_ANTIBAN = antiban;
     if (server) {
       server.closeAllConnections();
       await new Promise(resolve => server.close(resolve));
