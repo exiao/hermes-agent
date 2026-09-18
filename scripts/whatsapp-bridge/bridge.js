@@ -32,6 +32,7 @@ import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
+import { createDeliveryReceiptTracker } from './delivery_receipts.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import { createAntiban } from './antiban.js';
 import {
@@ -332,6 +333,7 @@ function rememberSentMessage(sent, payload) {
 
 function trackSentMessageId(sent) {
   rememberSentId(sent?.key?.id);
+  deliveryReceipts.register(sent);
 }
 
 function normalizeWhatsAppId(value) {
@@ -412,6 +414,7 @@ const MAX_QUEUE_SIZE = 100;
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
+const deliveryReceipts = createDeliveryReceiptTracker();
 
 function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
   const selected = [];
@@ -658,6 +661,7 @@ async function startSocket() {
 
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates || []) {
+      if (key?.fromMe === true) deliveryReceipts.updateStatus(key.id, update?.status);
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
       const pollCreation = messageStore.get(pollCreationId);
@@ -704,6 +708,13 @@ async function startSocket() {
         aggregation,
       });
       enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
+    }
+  });
+
+  sock.ev.on('message-receipt.update', (updates) => {
+    for (const { key, receipt } of updates || []) {
+      if (key?.fromMe !== true) continue;
+      deliveryReceipts.updateReceipt(key?.id, receipt);
     }
   });
 
@@ -1307,6 +1318,12 @@ app.get('/chat/:id', async (req, res) => {
     isGroup,
     participants: [],
   });
+});
+
+app.get('/message-status/:id', (req, res) => {
+  const status = deliveryReceipts.get(req.params.id);
+  if (!status) return res.status(404).json({ error: 'Unknown message id' });
+  return res.json(status);
 });
 
 // Health check
