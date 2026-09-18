@@ -1247,9 +1247,12 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                 MemoryStore, get_builtin_memory_config, get_builtin_memory_store_flags,
             )
             mem_config = get_builtin_memory_config(_agent_cfg)
-            agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
-                _agent_cfg
-            )
+            agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(_agent_cfg)
+            if skip_memory:
+                # ``skip_memory`` suppresses prompt injection, while the store may still
+                # be required by the explicitly enabled memory tool.
+                agent._memory_enabled = False
+                agent._user_profile_enabled = False
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if (
                 agent._memory_enabled
