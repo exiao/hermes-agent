@@ -596,7 +596,12 @@ async function startSocket() {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
 
-      if (reason === DisconnectReason.loggedOut) {
+      if (reason === DisconnectReason.forbidden) {
+        // Keep HTTP health available, but do not hammer rejected credentials.
+        emitPairEvent({ event: 'error', error: 'forbidden', reason });
+        console.error('❌ WhatsApp rejected this session (403). Automatic reconnect stopped; check the account and relink manually.');
+        if (PAIR_ONLY) process.exit(1);
+      } else if (reason === DisconnectReason.loggedOut) {
         emitPairEvent({ event: 'error', error: 'logged_out', reason });
         if (!PAIR_JSON) {
           console.log('❌ Logged out. Delete session and restart to re-authenticate.');
@@ -625,7 +630,7 @@ async function startSocket() {
             if (!PAIR_JSON) console.log(`⚠️  Connection closed (reason: ${reason}). Reconnect attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s...`);
           }
         }
-        scheduleReconnect(reason === 515 ? 1000 : 3000);
+        scheduleReconnect(delay);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';

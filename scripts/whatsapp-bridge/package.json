@@ -5,13 +5,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node bridge.js"
+    "start": "node bridge.js",
+    "test": "node --experimental-test-module-mocks --test *.test.mjs"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "7.0.0-rc13",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
     "express": "^4.21.0",
-    "qrcode-terminal": "^0.12.0",
-    "pino": "^9.0.0"
+    "link-preview-js": "3.2.0",
+    "pino": "^9.0.0",
+    "qrcode-terminal": "^0.12.0"
   },
   "overrides": {
     "protobufjs": "^7.5.5",
