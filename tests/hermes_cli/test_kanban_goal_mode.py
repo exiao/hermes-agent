@@ -102,7 +102,7 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
 
 def _db_task(kanban_home, **create_kw):
     """Create a real task row and return its Task view (resolver inputs)."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, **create_kw)
         return kb.get_task(conn, tid)
 
@@ -197,7 +197,7 @@ def _capture_spawn_env(kanban_home, monkeypatch, task, kanban_cfg):
 
 
 def test_spawn_lane_default_sets_goal_env(kanban_home, monkeypatch):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="ci sweep", assignee="dev")
         task = kb.get_task(conn, tid)
     env = _capture_spawn_env(kanban_home, monkeypatch, task, {})
@@ -208,7 +208,7 @@ def test_spawn_lane_default_sets_goal_env(kanban_home, monkeypatch):
 
 
 def test_spawn_worker_max_iterations_for_non_goal_lane(kanban_home, monkeypatch):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="design pass", assignee="designer")
         task = kb.get_task(conn, tid)
     env = _capture_spawn_env(
@@ -219,7 +219,7 @@ def test_spawn_worker_max_iterations_for_non_goal_lane(kanban_home, monkeypatch)
 
 
 def test_spawn_goal_lane_ignores_worker_max_iterations(kanban_home, monkeypatch):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="ci sweep", assignee="dev")
         task = kb.get_task(conn, tid)
     env = _capture_spawn_env(
@@ -233,7 +233,7 @@ def test_spawn_goal_lane_drops_inherited_max_iterations(kanban_home, monkeypatch
     # A HERMES_MAX_ITERATIONS leaking from the dispatcher's own env must NOT
     # raise a goal-mode worker's per-run cap — goal mode keeps the 90 cap.
     monkeypatch.setenv("HERMES_MAX_ITERATIONS", "200")
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="ci sweep", assignee="dev")
         task = kb.get_task(conn, tid)
     env = _capture_spawn_env(kanban_home, monkeypatch, task, {})
@@ -245,7 +245,7 @@ def test_spawn_non_goal_drops_inherited_max_iterations_when_unset(kanban_home, m
     # No config knob → a non-goal worker's per-run cap comes from config/profile,
     # not an ambient HERMES_MAX_ITERATIONS inherited from the dispatcher.
     monkeypatch.setenv("HERMES_MAX_ITERATIONS", "200")
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="design pass", assignee="designer")
         task = kb.get_task(conn, tid)
     env = _capture_spawn_env(kanban_home, monkeypatch, task, {})

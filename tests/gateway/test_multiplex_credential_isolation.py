@@ -833,7 +833,7 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
 
     def _list_copilot_via_canonical(self, monkeypatch, *, pool_has_creds: bool):
         from hermes_cli.model_switch import list_authenticated_providers
-        from hermes_cli.models import ProviderEntry
+        from hermes_cli.models_catalog_static import ProviderEntry
 
         # copilot reaches the canonical cross-check (section 2b) only: no
         # overlay match, no models.dev entry, empty auth store, scoped env

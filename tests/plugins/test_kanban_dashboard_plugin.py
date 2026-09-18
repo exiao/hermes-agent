@@ -245,7 +245,7 @@ def _seed_done_tasks(client, n, *, base_completed_at=1_000_000):
             "/api/plugins/kanban/tasks", json={"title": f"done-{i}"}
         ).json()["task"]["id"]
         ids.append(tid)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with conn:
             for i, tid in enumerate(ids):
@@ -272,7 +272,7 @@ def _seed_done_tasks_for(client, n, assignee, *, base_completed_at=1_000_000):
             json={"title": f"{assignee}-done-{i}", "assignee": assignee},
         ).json()["task"]["id"]
         ids.append(tid)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with conn:
             for i, tid in enumerate(ids):
@@ -312,7 +312,7 @@ def test_board_done_window_stable_at_tie_boundary(client):
     ids = _seed_done_tasks(client, 10)
     # Collapse the whole column onto a single (completed_at, created_at) so the
     # only thing separating cards is the id tiebreaker.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with conn:
             conn.execute(
@@ -441,7 +441,7 @@ def test_archived_window_uses_archive_timestamp_not_completion_timestamp(client)
     """A recently archived old done card must appear in the first archived page."""
 
     hidden_old_archived = _seed_done_tasks(client, 55, base_completed_at=10_000)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with conn:
             for i, tid in enumerate(hidden_old_archived):
@@ -471,7 +471,7 @@ def test_done_window_ignores_stale_archive_timestamp(client):
     """A re-completed card should sort by completed_at, not old archived_at."""
 
     _seed_done_tasks(client, 55, base_completed_at=10_000)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with conn:
             recent = kb.create_task(conn, title="re-completed after archive")
@@ -494,7 +494,7 @@ def test_board_aggregate_queries_are_scoped_to_returned_cards(kanban_home, monke
     """Board aggregates should not scan hidden terminal-card history."""
 
     module = _load_plugin_module()
-    conn = kb.connect()
+    conn = kbc.connect()
     parent = kb.create_task(conn, title="visible parent")
     child = kb.create_task(conn, title="visible child", parents=[parent])
     hidden_done = kb.create_task(conn, title="hidden done history")
@@ -569,7 +569,7 @@ def test_board_chunks_returned_task_id_queries(client, monkeypatch):
     monkeypatch.setattr(module, "_SQLITE_IN_CHUNK_SIZE", 3)
     monkeypatch.setattr(kb, "_SQLITE_IN_CHUNK_SIZE", 3)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     ids = _seed_done_tasks(client, 8)
     for left, right in zip(ids, ids[1:]):
         kb.link_tasks(conn, left, right)
@@ -637,7 +637,7 @@ def test_board_query_param_default_overrides_current_board_pointer(client):
     ).json()["task"]
 
     kb.create_board("other")
-    other_conn = kb.connect(board="other")
+    other_conn = kbc.connect(board="other")
     try:
         kb.create_task(other_conn, title="other-only")
     finally:
@@ -1770,5 +1770,4 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
 

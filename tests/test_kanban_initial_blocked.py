@@ -8,6 +8,7 @@ on a ticket nobody had scheduled. Observed live on t_7a8459f5: created at
 1787773142, promoted and claimed at 1787773146.
 """
 import pytest
+from hermes_cli import kanban_db_connect as kbc
 
 from hermes_cli import kanban_db
 
@@ -15,7 +16,7 @@ from hermes_cli import kanban_db
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    c = kanban_db.connect(tmp_path / "kanban.db")
+    c = kbc.connect(tmp_path / "kanban.db")
     yield c
     c.close()
 

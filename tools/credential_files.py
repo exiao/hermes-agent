@@ -453,7 +453,7 @@ def to_agent_visible_cache_path(host_path: str, container_base: str = "/root/.he
         # Keeping ssh inside _HOME_RELATIVE_BACKENDS here would re-collapse
         # every profile onto one shared path, which is the bug this PR fixes.
         try:
-            from tools.terminal_tool import get_active_env
+            from tools.terminal_tool_lifecycle import get_active_env
             active_env = get_active_env("default")
             container_base = (
                 getattr(active_env, "_remote_hermes_home", None)

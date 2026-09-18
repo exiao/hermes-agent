@@ -135,7 +135,7 @@ def test_terminal_window_index_is_rebuilt_when_expression_changes(tmp_path, monk
     """
     db_path = _setup_home(tmp_path, monkeypatch)
 
-    with kb.connect(db_path) as conn:
+    with kbc.connect(db_path) as conn:
         conn.execute("DROP INDEX idx_tasks_terminal_window")
         conn.execute(
             "CREATE INDEX idx_tasks_terminal_window "
@@ -145,7 +145,7 @@ def test_terminal_window_index_is_rebuilt_when_expression_changes(tmp_path, monk
         )
 
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with kb.connect(db_path) as conn:
+    with kbc.connect(db_path) as conn:
         sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_tasks_terminal_window'"

@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from hermes_cli import kanban_db_connect as kbc
 
 from hermes_cli import kanban_db as kb
 
@@ -73,7 +74,7 @@ def test_is_spec_less_false(title, body, assignee):
 
 
 def test_spec_less_task_routed_to_triage(kanban_home):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="dev task", assignee="dev")
         task = kb.get_task(conn, tid)
@@ -85,7 +86,7 @@ def test_spec_less_task_routed_to_triage(kanban_home):
 
 
 def test_well_specified_task_still_ready(kanban_home):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn,
@@ -102,7 +103,7 @@ def test_well_specified_task_still_ready(kanban_home):
 
 def test_explicit_triage_still_honoured(kanban_home):
     """A normal task created with triage=True stays in triage (no regression)."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn, title="Real work", body="do the thing", assignee="dev", triage=True
@@ -123,7 +124,7 @@ def test_default_assignee_placeholder_routed_to_triage(kanban_home, monkeypatch)
     default assignee inside the guard and key the placeholder check on it.
     """
     monkeypatch.setattr(kb, "_default_assignee", lambda: "default")
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="default task")  # no assignee
         task = kb.get_task(conn, tid)
@@ -139,7 +140,7 @@ def test_decompose_spec_less_child_parked_in_triage(kanban_home):
     the guard is applied there too: spec-less children land in ``triage``,
     well-specified ones promote to ``ready`` as usual.
     """
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         root = kb.create_task(conn, title="rough idea", triage=True)
         children = [
@@ -171,7 +172,7 @@ def test_legit_word_task_title_still_ready(kanban_home, title):
     It must reach a worker lane in ``ready`` — the dropped assignee-independent
     ``endswith(" task")`` catch-all used to wrongly route these to triage.
     """
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title=title, assignee="dev")
         task = kb.get_task(conn, tid)
@@ -187,7 +188,7 @@ def test_decompose_legit_word_task_children_promote(kanban_home):
     body-less task names (Deploy/Migration/Cleanup/Research) promote to
     ``ready`` like any other well-titled child.
     """
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         root = kb.create_task(conn, title="rough idea", triage=True)
         children = [
@@ -225,7 +226,7 @@ def test_spec_less_blocked_placeholder_forced_to_triage(kanban_home):
     (triage) must take precedence over the ``blocked`` initial status, and the
     card must stay out of every worker lane even after an unblock.
     """
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn, title="dev task", assignee="dev", initial_status="blocked"
@@ -254,7 +255,7 @@ def test_specify_title_only_does_not_promote_spec_less(kanban_home):
     create-time guard. The promotion path re-checks ``_is_spec_less`` against
     the post-update values and refuses (stays in triage) when still spec-less.
     """
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="dev task", assignee="dev")
         t0 = kb.get_task(conn, tid)

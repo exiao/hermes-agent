@@ -75,7 +75,7 @@ def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     )
     assert "Created" in out
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tasks = kb.list_tasks(conn)
     task = tasks[0]
     assert task.workspace_kind == "worktree"
@@ -174,7 +174,7 @@ def test_run_slash_session_filter(kanban_home):
     """`hermes kanban list --session <id>` filters by the originating
     chat session id stamped on tasks created from inside an ACP loop."""
     from hermes_cli import kanban_db as kb
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kb.create_task(
             conn, title="from sess-1 a", assignee="alice", session_id="sess-1"
         )
@@ -214,7 +214,7 @@ def test_kanban_list_json_includes_session_id(kanban_home):
 
 
 def test_kanban_list_json_exposes_and_filters_task_identity(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         matching = kb.create_task(
             conn, title="matching", idempotency_key="dedupe-key"
         )
@@ -415,5 +415,4 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
 

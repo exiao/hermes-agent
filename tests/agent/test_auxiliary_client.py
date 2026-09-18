@@ -13,7 +13,6 @@ from agent.auxiliary_client import (
     _NOUS_MODEL,
     CodexAuxiliaryClient,
     get_text_auxiliary_client,
-    get_async_text_auxiliary_client,
     get_available_vision_backends,
     resolve_vision_provider_client,
     resolve_provider_client,

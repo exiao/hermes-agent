@@ -73,7 +73,7 @@ class _BlockingSendAdapter(_NoEditAdapter):
 
 
 def _runner_for(adapter, ctx):
-    from gateway.run import TurnRunner
+    from gateway.run_turn_runner import TurnRunner
 
     class _StubGatewayRunner:
         def _adapter_for_source(self, source):

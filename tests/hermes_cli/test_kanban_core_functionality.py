@@ -531,7 +531,7 @@ def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanba
     """todo -> ready on an unclaimed task must not create any run rows."""
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="x")
         # Force to todo for the sake of the test.
@@ -553,7 +553,7 @@ def test_dashboard_direct_status_change_ready_gate_accepts_archived_parent(kanba
     """
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child")
@@ -574,7 +574,7 @@ def test_dashboard_direct_status_change_ready_gate_accepts_archived_parent(kanba
 
 
 def test_cli_bulk_complete_with_summary_rejects(kanban_home):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         a = kb.create_task(conn, title="a", assignee="worker")
         b = kb.create_task(conn, title="b", assignee="worker")
@@ -595,7 +595,7 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
     )
     assert "per-task" in r.stderr, r.stderr
     # The tasks must still be running (no partial apply).
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, a).status == "running"
         assert kb.get_task(conn, b).status == "running"
@@ -605,7 +605,7 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
 
 def test_cli_bulk_complete_without_summary_still_works(kanban_home):
     """Bulk close with no per-task handoff is allowed — the common case."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         a = kb.create_task(conn, title="a", assignee="worker")
         b = kb.create_task(conn, title="b", assignee="worker")
@@ -620,7 +620,7 @@ def test_cli_bulk_complete_without_summary_still_works(kanban_home):
 def test_completed_event_payload_carries_summary(kanban_home):
     """The 'completed' event must embed the run summary so gateway
     notifiers render structured handoffs without a second SQL hit."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
         kb.claim_task(conn, tid)
@@ -637,7 +637,7 @@ def test_completed_event_payload_carries_summary(kanban_home):
 
 def test_completed_event_payload_summary_none_when_missing(kanban_home):
     """If the caller passes no summary AND no result, payload.summary is None."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
         kb.claim_task(conn, tid)
@@ -853,7 +853,7 @@ def test_pid_alive_detects_zombie(kanban_home):
 
 def test_resolve_workspace_accepts_absolute_dir_path(kanban_home, tmp_path):
     """Legitimate absolute paths are accepted and created."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         abs_path = str(tmp_path / "my-workspace")
         tid = kb.create_task(
@@ -862,7 +862,7 @@ def test_resolve_workspace_accepts_absolute_dir_path(kanban_home, tmp_path):
             workspace_path=abs_path,
         )
         task = kb.get_task(conn, tid)
-        resolved = kb.resolve_workspace(task)
+        resolved = kbw.resolve_workspace(task)
         assert str(resolved) == abs_path
         assert resolved.exists()
     finally:
@@ -871,7 +871,7 @@ def test_resolve_workspace_accepts_absolute_dir_path(kanban_home, tmp_path):
 
 def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
     """Worktree paths also must be absolute when explicitly set."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with pytest.raises(ValueError, match=r"not .*inside a git repo"):
             kb.create_task(
@@ -888,7 +888,7 @@ def test_build_worker_context_caps_prior_attempts(kanban_home):
     the most recent N are shown in full; earlier attempts are summarised
     in a one-line marker so the worker knows more exist without
     blowing the prompt."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="retry", assignee="worker")
         # Force 25 closed runs
@@ -931,7 +931,7 @@ def test_build_worker_context_renders_author_with_safe_framing(kanban_home):
     + "comment from worker" prefix so a misleading HERMES_PROFILE name
     (e.g. "hermes-system", "operator") can't be misread as a system
     directive above the comment body. Defense-in-depth — see #22452."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="worker")
         kb.add_comment(conn, tid, author="hermes-system", body="some note")
@@ -949,7 +949,7 @@ def test_build_worker_context_renders_author_with_safe_framing(kanban_home):
 
 def test_build_worker_context_caps_comments(kanban_home):
     """Same cap for comments — comment-storm tasks stay bounded."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="chatty", assignee="worker")
         for i in range(100):
@@ -977,7 +977,7 @@ def test_build_worker_context_caps_comments(kanban_home):
 def test_build_worker_context_caps_huge_summary(kanban_home):
     """A 1 MB summary on a single prior run must not dominate the
     worker prompt. Per-field cap truncates with a visible ellipsis."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="giant", assignee="worker")
         kb.claim_task(conn, tid)
@@ -1788,5 +1788,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 
