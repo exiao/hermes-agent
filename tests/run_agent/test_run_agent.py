@@ -204,8 +204,9 @@ def test_malformed_memory_config_still_builds_default_store():
             enabled_toolsets=["memory"],
         )
 
-    assert agent._memory_enabled is True
-    assert agent._user_profile_enabled is True
+    # skip_memory suppresses prompt injection; the explicitly requested tool remains usable.
+    assert agent._memory_enabled is False
+    assert agent._user_profile_enabled is False
     assert agent._memory_store is not None
     assert agent._memory_store.memory_enabled is True
     assert agent._memory_store.user_profile_enabled is True
