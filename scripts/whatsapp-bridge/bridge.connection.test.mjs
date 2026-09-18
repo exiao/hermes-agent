@@ -87,6 +87,8 @@ test('bridge honors backoff, reconnects, and stops on forbidden credentials', as
     assert.equal(sent.status, 200);
     assert.equal(sent.body.messageId, 'receipt-test-id');
     const socket = sockets.at(-1);
+    socket.ev.emit('messages.update', [{ key: { id: 'receipt-test-id', fromMe: false }, update: { status: 4 } }]);
+    assert.equal((await jsonRequest('GET', '/message-status/receipt-test-id')).body.delivered, false);
     socket.ev.emit('messages.update', [{ key: { id: 'receipt-test-id', fromMe: true }, update: { status: 2 } }]);
     await tick();
     assert.deepEqual((await jsonRequest('GET', '/message-status/receipt-test-id')).body, {
