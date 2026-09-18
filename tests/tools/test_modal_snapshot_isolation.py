@@ -175,7 +175,13 @@ def _install_modal_test_modules(
                 async def _wait_aio():
                     return purge_exit_code if is_purge else 0
 
-                return types.SimpleNamespace(wait=types.SimpleNamespace(aio=_wait_aio))
+                async def _stderr_aio():
+                    return "purge failed" if is_purge and purge_exit_code else ""
+
+                return types.SimpleNamespace(
+                    wait=types.SimpleNamespace(aio=_wait_aio),
+                    stderr=types.SimpleNamespace(read=types.SimpleNamespace(aio=_stderr_aio)),
+                )
 
             self.exec = types.SimpleNamespace(aio=_exec_aio)
             self.snapshot_filesystem = types.SimpleNamespace(aio=_snapshot_aio)

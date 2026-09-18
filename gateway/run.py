@@ -2027,6 +2027,7 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
         "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+        "container_idle_timeout": "TERMINAL_CONTAINER_IDLE_TIMEOUT",
         "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
         "docker_env": "TERMINAL_DOCKER_ENV",
         "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
