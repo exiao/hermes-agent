@@ -909,24 +909,26 @@ class GatewayShutdownMixin:
                 restart_key = _notice_target_key(
                     restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
                 )
-        notified: set[tuple[str, str, Optional[str]]] = set()
+        notified: set[tuple] = set()
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
                 continue
             source, platform_str, chat_id, thread_id = target
-            dedup_key = _notice_target_key(platform_str, chat_id, thread_id)
+            target_key = _notice_target_key(platform_str, chat_id, thread_id)
+            profile = str(getattr(source, "profile", None) or "default") if source is not None else "default"
+            dedup_key = (*target_key, profile)
             if dedup_key in notified:
                 continue
             try:
                 platform = Platform(platform_str)
-                adapter = self.adapters.get(platform)
+                adapter = self._adapter_for_source(source) if source is not None else self.adapters.get(platform)
                 if not adapter:
                     continue
                 if not self._notice_allowed(platform, "active session"):
                     continue
                 reply_to_message_id = getattr(source, "message_id", None)
-                if reply_to_message_id is None and restart_key == dedup_key:
+                if reply_to_message_id is None and restart_key == target_key:
                     reply_to_message_id = getattr(restart_source, "message_id", None)
                 metadata = self._thread_metadata_for_target(
                     platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
@@ -957,7 +959,7 @@ class GatewayShutdownMixin:
                 continue
             if not self._notice_allowed(platform, "home channel"):
                 continue
-            dedup_key = _notice_target_key(platform.value, home.chat_id, home.thread_id)
+            dedup_key = (*_notice_target_key(platform.value, home.chat_id, home.thread_id), "default")
             if dedup_key in notified:
                 continue
             try:

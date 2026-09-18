@@ -14,6 +14,8 @@ it. These tests pin the precedence contract:
 from __future__ import annotations
 
 import pytest
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -23,7 +25,7 @@ def kb_conn(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     yield kb, conn
     conn.close()
 
@@ -146,7 +148,7 @@ class TestTimeoutEnforcementBehavior:
 
         for tid in (capped, uncapped):
             kb.claim_task(conn, tid)
-            kb._set_worker_pid(conn, tid, 999999)
+            kbd._set_worker_pid(conn, tid, 999999)
             old_started = int(kb.time.time()) - 30
             with kb.write_txn(conn):
                 conn.execute(
@@ -155,7 +157,7 @@ class TestTimeoutEnforcementBehavior:
                     (old_started, tid),
                 )
 
-        timed_out = kb.enforce_max_runtime(
+        timed_out = kbd.enforce_max_runtime(
             conn, signal_fn=lambda _pid, _sig: None
         )
 

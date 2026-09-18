@@ -1330,39 +1330,91 @@ def _is_spec_less(title: str, body: Optional[str], assignee: Optional[str]) -> b
             or bool(who and normalized in {who, f"{who} task"}))
 
 
-def _canonicalize_babysit_key(key: Optional[str]) -> Optional[str]:
-    if not key:
-        return key
-    match = re.fullmatch(r"babysit:([^/]+/[^#]+)#(\d+)", key)
-    return f"babysit:{match.group(1).lower()}#{int(match.group(2))}" if match else key
+def _slug_from_git_remote(workspace_path: Optional[str]) -> Optional[str]:
+    """Resolve an existing or pending worktree's GitHub ``owner/repo`` slug."""
+    if not workspace_path:
+        return None
+    from hermes_cli.kanban_db_workspace import _repo_root_for_worktree_target
+    repo_root = _repo_root_for_worktree_target(Path(workspace_path).expanduser())
+    if repo_root is None:
+        return None
+    try:
+        remote = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if remote.returncode != 0:
+        return None
+    match = re.search(
+        r"(?:https?://(?:[^/@]+@)?|ssh://(?:[^/@]+@)?|git@)"
+        r"github\.com[:/]([^/:]+/[^/]+?)(?:\.git)?/?$",
+        remote.stdout.strip(),
+    )
+    return match.group(1) if match else None
+
+
+def _canonical_babysit_key(slug: str, pr: int) -> str:
+    return f"babysit:{slug.lower()}#{pr}"
 
 
 def _derive_babysit_idempotency_key(
     title: Optional[str], body: Optional[str], workspace_path: Optional[str]
 ) -> Optional[str]:
-    """Derive one canonical key for all create paths targeting a GitHub PR."""
+    """Return a canonical key using explicit PR signals before workspace fallbacks.
+
+    Precedence: title URL, title ``owner/repo#n``, title ``PR #n`` + workspace,
+    body URL, body ``PR #n`` + workspace, body ``owner/repo#n``, then title bare
+    ``#n`` + workspace. The bare number is last because it may be an issue ref.
+    """
     title, body = title or "", body or ""
     url_re = r"(?:^|[/@\s])github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/pull/(\d+)"
     ref_re = r"(?<![\w./-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)"
-    for text in (title, body):
-        match = re.search(url_re, text) or re.search(ref_re, text)
-        if match:
-            return f"babysit:{match.group(1).lower()}#{int(match.group(2))}"
-    pr_match = re.search(r"\bPR\s*#?(\d+)", title, re.IGNORECASE) or re.search(r"#(\d+)", title)
-    if not (pr_match and workspace_path):
-        return None
-    try:
-        from hermes_cli.kanban_db_workspace import _repo_root_for_worktree_target
-        root = _repo_root_for_worktree_target(Path(workspace_path).expanduser())
-        remote = _git_out(root, "remote", "get-url", "origin") if root else None
-        match = re.search(
-            r"(?:https?://(?:[^/@]+@)?|ssh://(?:[^/@]+@)?|git@)github\.com[:/]([^/:]+/[^/]+?)(?:\.git)?/?$",
-            remote or "")
-        if match:
-            return f"babysit:{match.group(1).lower()}#{int(pr_match.group(1))}"
-    except Exception:
-        pass
+    title_url = re.search(url_re, title)
+    title_ref = re.search(ref_re, title)
+    body_url = re.search(url_re, body)
+    body_ref = re.search(ref_re, body)
+    title_pr = re.search(r"\bPR\s*#?(\d+)", title, re.IGNORECASE)
+    body_pr = re.search(r"\bPR\s*#?(\d+)", body, re.IGNORECASE)
+    title_bare = re.search(r"#(\d+)", title)
+
+    if title_url:
+        return _canonical_babysit_key(title_url.group(1), int(title_url.group(2)))
+    if title_ref:
+        return _canonical_babysit_key(title_ref.group(1), int(title_ref.group(2)))
+
+    workspace_slug: Optional[str] = None
+    workspace_resolved = False
+    def workspace() -> Optional[str]:
+        nonlocal workspace_slug, workspace_resolved
+        if not workspace_resolved:
+            workspace_slug = _slug_from_git_remote(workspace_path)
+            workspace_resolved = True
+        return workspace_slug
+
+    if title_pr and workspace():
+        return _canonical_babysit_key(workspace_slug, int(title_pr.group(1)))
+    if body_url:
+        return _canonical_babysit_key(body_url.group(1), int(body_url.group(2)))
+    if body_pr and workspace():
+        return _canonical_babysit_key(workspace_slug, int(body_pr.group(1)))
+    if body_ref:
+        return _canonical_babysit_key(body_ref.group(1), int(body_ref.group(2)))
+    if title_bare and workspace():
+        return _canonical_babysit_key(workspace_slug, int(title_bare.group(1)))
     return None
+
+
+def _canonicalize_babysit_key(key: Optional[str]) -> Optional[str]:
+    """Canonicalize an explicit babysit key; preserve other key formats."""
+    if not key:
+        return key
+    match = re.fullmatch(r"babysit:([^/]+/[^#]+)#(\d+)", key)
+    return (
+        _canonical_babysit_key(match.group(1), int(match.group(2)))
+        if match else key
+    )
 
 
 def _resolve_project_link(
@@ -1406,6 +1458,8 @@ def _resolve_project_link(
         # Concrete path is deferred to the insert loop: a fresh
         # ``<repo>/.worktrees/<task-id>`` keyed on the new task id.
         project_repo = str(project_obj.primary_path)
+        if not _worktree_path_resolvable(project_repo):
+            raise ValueError(f"project primary path {project_repo!r} is not inside a git repo")
     return project_obj.id, project_obj, project_repo, workspace_kind
 
 
@@ -1556,17 +1610,25 @@ def create_task(
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
+    board_default_anchor = False
     if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
         board_default = _board_meta_for(board).get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+            board_default_anchor = workspace_kind == "worktree"
+
+    if board_default_anchor:
+        from hermes_cli.kanban_db_workspace import _repo_root_for_worktree_target
+        repo_root = _repo_root_for_worktree_target(Path(workspace_path))
+        if repo_root is not None:
+            workspace_path = str(repo_root)
 
     # Persistent workspaces must be resolvable now; otherwise the card is an
     # unspawnable row that repeatedly trips the dispatcher failure budget.
     if project_repo is None and workspace_kind in {"dir", "worktree"}:
         if not workspace_path:
             raise ValueError(
-                f"workspace_kind={workspace_kind!r} requires a resolvable workspace_path")
+                f"workspace_kind={workspace_kind!r} requires a workspace_path that resolves")
         candidate = Path(workspace_path).expanduser()
         if not candidate.is_absolute():
             raise ValueError(f"workspace_path must be absolute, got {workspace_path!r}")
@@ -1653,6 +1715,8 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked" and initial_status == "blocked":
+                    _append_event(conn, task_id, "blocked", {"reason": "initial_status"})
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
@@ -1699,11 +1763,12 @@ def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -
         return None
 
 
-def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
-    conn.execute(
+def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    cur = conn.execute(
         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
         (parent_id, child_id),
     )
+    return cur.rowcount == 1
 
 
 def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]:
@@ -1901,16 +1966,17 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
-        _link(conn, parent_id, child_id)
+        linked = _link(conn, parent_id, child_id)
         # If child was ready but parent is not yet done, demote child to todo.
         if _task_status(conn, parent_id) != "done":
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (child_id,),
             )
-        _append_event(
-            conn, child_id, "linked", {"parent": parent_id, "child": child_id},
-        )
-        _inherit_notify_subs(conn, child_id, (parent_id,))
+        if linked:
+            _append_event(
+                conn, child_id, "linked", {"parent": parent_id, "child": child_id},
+            )
+            _inherit_notify_subs(conn, child_id, (parent_id,))
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -2276,22 +2342,128 @@ def _synthesize_ended_run(
 # --- Dependency resolution (todo -> ready) ---
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the newest ``blocked``/``unblocked`` event is ``blocked`` — an
-    explicit ``kanban_block`` that must wait for an operator. A breaker trip
-    emits ``gave_up`` (not ``blocked``) and so auto-recovers, as does a task
-    with no such event at all (direct DB edit).
+    """True when the newest status-bearing event parks the task for an operator.
 
-    See #28712.
-    Returns ``False`` when there is no such event at all (e.g. the task was set to ``status='blocked'`` by
-    the circuit breaker or by direct DB manipulation) — preserves the pre-#28712 auto-recover semantics for
-    that path.
+    ``created(status=blocked)`` is included for legacy boards that predate the
+    explicit blocked event. ``promoted_manual``, ``unblocked`` and status moves
+    out of blocked release that creation-time park; breaker events remain
+    auto-recoverable.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN "
+        "('blocked', 'unblocked', 'created', 'promoted_manual', 'status') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if not row:
+        return False
+    kind = row["kind"]
+    if kind == "blocked":
+        return True
+    if kind in ("unblocked", "promoted_manual"):
+        return False
+    payload = _json_dict(row["payload"])
+    return payload.get("status") == "blocked" or payload.get("requested_status") == "blocked"
+
+
+def _dependency_wait_should_park(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Keep a dependency-wait parked until the graph shows real progress."""
+    wait = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? "
+        "AND kind = 'dependency_wait' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if wait is None:
+        return False
+    wait_id = wait["id"]
+
+    # Explicit unblock, task completion, or a terminal direct-status move
+    # starts a new task lifecycle; later promotions do not.
+    for event in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind IN ('unblocked', 'completed', 'archived', 'status')",
+        (task_id, wait_id),
+    ).fetchall():
+        if event["kind"] != "status":
+            return False
+        if _json_dict(event["payload"]).get("status") in {"done", "archived"}:
+            return False
+
+    parents = [
+        row["parent_id"]
+        for row in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)
+        ).fetchall()
+    ]
+    placeholders = ",".join("?" * len(parents))
+    if not parents:
+        # A post-wait unlink/delete is deliberate graph repair; no edge at all
+        # without that event is the loop this guard is meant to stop.
+        return not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+            "AND kind = 'unlinked' LIMIT 1",
+            (task_id, wait_id),
+        ).fetchone()
+
+    # Replay parent terminal/non-terminal transitions. A terminal event alone
+    # is insufficient when the parent was already terminal at wait time.
+    terminal: dict[str, bool] = {}
+    for event in conn.execute(
+        f"SELECT id, task_id, kind, payload FROM task_events "
+        f"WHERE task_id IN ({placeholders}) "
+        "AND kind IN ('completed', 'archived', 'status') ORDER BY id",
+        tuple(parents),
+    ).fetchall():
+        # complete_task only emits this after a non-terminal -> done transition,
+        # even when a legacy caller reopened the row without a status event.
+        if event["kind"] == "completed" and event["id"] > wait_id:
+            return False
+        if event["kind"] in {"completed", "archived"}:
+            is_terminal = True
+        else:
+            status = _json_dict(event["payload"]).get("status")
+            if status is None:
+                continue
+            is_terminal = status in {"done", "archived"}
+        was_terminal = terminal.get(event["task_id"], False)
+        terminal[event["task_id"]] = is_terminal
+        if is_terminal and not was_terminal and event["id"] > wait_id:
+            return False
+
+    # Linking an already-terminal parent after the wait is explicit graph
+    # repair. Idempotent links do not emit this event.
+    linked = []
+    for event in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind = 'linked'",
+        (task_id, wait_id),
+    ).fetchall():
+        parent = _json_dict(event["payload"]).get("parent")
+        if parent:
+            linked.append(parent)
+    if linked:
+        marks = ",".join("?" * len(linked))
+        if conn.execute(
+            f"SELECT 1 FROM tasks WHERE id IN ({marks}) "
+            "AND status IN ('done', 'archived') LIMIT 1",
+            tuple(linked),
+        ).fetchone():
+            return False
+
+    # Removing an unresolved edge releases the wait when every remaining edge
+    # is terminal. The post-wait event distinguishes repair from a stale wait.
+    unlinked = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind = 'unlinked' LIMIT 1",
+        (task_id, wait_id),
+    ).fetchone()
+    if unlinked and not conn.execute(
+        f"SELECT 1 FROM tasks WHERE id IN ({placeholders}) "
+        "AND status NOT IN ('done', 'archived') LIMIT 1",
+        tuple(parents),
+    ).fetchone():
+        return False
+    return True
 
 
 def _latest_event(
@@ -2349,6 +2521,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
+                continue
+            if cur_status == "todo" and _dependency_wait_should_park(conn, task_id):
+                # A dependency wait with no newly resolved parent must remain
+                # parked; promoting it would immediately re-run the worker
+                # that just declared the dependency unavailable.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -3234,10 +3411,35 @@ def block_task(
     effective_owner = owner
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, block_kind, block_recurrences, current_run_id "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        db_current_run = cur_row["current_run_id"]
+        if (
+            expected_run_id is not None
+            and cur_row["status"] == "running"
+            and db_current_run is not None
+            and int(expected_run_id) != int(db_current_run)
+        ):
+            owns_run = conn.execute(
+                "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
+                "AND status = 'running' AND ended_at IS NULL LIMIT 1",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if owns_run:
+                conn.execute(
+                    "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
+                    "ended_at = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                    (int(time.time()), int(expected_run_id), task_id),
+                )
+                _append_event(
+                    conn, task_id, "block_run_reconciled",
+                    {"worker_run_id": int(expected_run_id), "current_run_id": db_current_run},
+                )
+                expected_run_id = db_current_run
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
@@ -3769,6 +3971,11 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        next_title = title.strip() if title is not None else existing["title"]
+        next_body = body if body is not None else existing["body"]
+        next_assignee = assignee if assignee is not None else existing["assignee"]
+        if _is_spec_less(next_title, next_body, next_assignee):
+            return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -3950,6 +4157,9 @@ def _insert_decomposed_child(
             raise ValueError(
                 f"decompose child {child.get('title')!r}: workspace_kind={child_ws_kind!r} "
                 "requires a resolvable workspace_path or board default_workdir")
+    if child_ws_kind == "worktree" and child_ws_path and not _worktree_path_resolvable(child_ws_path):
+        raise ValueError(
+            f"decompose child {child.get('title')!r}: path {child_ws_path!r} is not inside a git repo")
     new_id = _new_task_id()
     body = child.get("body")
     assignee = _canonical_assignee(child.get("assignee"))
@@ -4001,6 +4211,15 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    children = conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ? AND child_id != ?",
+        (task_id, task_id),
+    ).fetchall()
+    for child in children:
+        _append_event(
+            conn, child["child_id"], "unlinked",
+            {"parent": task_id, "child": child["child_id"]},
+        )
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
@@ -4540,9 +4759,33 @@ def _migrate_with_fork_columns(conn: sqlite3.Connection) -> None:
     terminal_ts = (
         "CASE WHEN status = 'archived' THEN COALESCE(archived_at, completed_at) "
         "ELSE completed_at END")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_terminal_window ON tasks("
+    expected_index_sql = (
+        "CREATE INDEX idx_tasks_terminal_window ON tasks("
         f"status, ({terminal_ts} IS NULL), {terminal_ts} DESC, created_at DESC, id DESC)")
+    existing_index = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_tasks_terminal_window'"
+    ).fetchone()
+    if existing_index is None:
+        conn.execute(expected_index_sql)
+    elif re.sub(r"\s+", "", existing_index[0]).casefold() != re.sub(
+        r"\s+", "", expected_index_sql
+    ).casefold():
+        conn.execute("DROP INDEX idx_tasks_terminal_window")
+        conn.execute(expected_index_sql)
+    # Canonicalize legacy mixed-case babysit keys during the same forced
+    # migration pass that repairs the fork-owned columns. GitHub slugs are
+    # case-insensitive, so old rows must match newly derived keys.
+    for row in conn.execute(
+        "SELECT id, idempotency_key FROM tasks "
+        "WHERE idempotency_key LIKE 'babysit:%'"
+    ).fetchall():
+        canonical = _canonicalize_babysit_key(row["idempotency_key"])
+        if canonical != row["idempotency_key"]:
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+                (canonical, row["id"]),
+            )
 
 
 _kanban_db_connect._migrate_add_optional_columns = _migrate_with_fork_columns

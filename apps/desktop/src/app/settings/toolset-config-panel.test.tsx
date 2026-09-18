@@ -1,3 +1,8 @@
+// Load the component during file setup. The first test otherwise pays the
+// module transform cost inside its 15s test budget when the full UI project is
+// compiling many workers concurrently.
+import './toolset-config-panel'
+
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react'
 import type { ReactElement } from 'react'

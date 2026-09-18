@@ -78,13 +78,13 @@ class TestMcpInterpolationUsesScope:
             ss.reset_secret_scope(tok)
 
     def test_interpolation_unset_keeps_placeholder(self, monkeypatch):
-        from tools.mcp_tool import _interpolate_env_vars
+        from tools.mcp_tool_config import _interpolate_env_vars
         monkeypatch.delenv("UNSET_MCP_VAR", raising=False)
         # multiplex off: unset var keeps literal placeholder (legacy behavior)
         assert _interpolate_env_vars("${UNSET_MCP_VAR}") == "${UNSET_MCP_VAR}"
 
     def test_interpolation_off_reads_environ(self, monkeypatch):
-        from tools.mcp_tool import _interpolate_env_vars
+        from tools.mcp_tool_config import _interpolate_env_vars
         monkeypatch.setenv("MY_MCP_TOKEN", "env-token")
         # multiplex off: legacy os.environ resolution
         assert _interpolate_env_vars("${MY_MCP_TOKEN}") == "env-token"
@@ -801,6 +801,7 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
             monkeypatch.delenv(ev, raising=False)
         default_home = tmp_path / ".hermes"
         default_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
         ss.set_multiplex_active(True)
         tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-default-openai"})
         home_tok = set_hermes_home_override(str(default_home))
@@ -813,6 +814,57 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
             "default profile under multiplexing must still list copilot from its "
             "own pool creds"
         )
+
+    def test_custom_dot_hermes_home_does_not_borrow_default_pool(self, monkeypatch, tmp_path):
+        """A custom secondary home named .hermes is still isolated from the process owner."""
+        from hermes_cli.model_switch_providers import _pool_usable
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        custom_home = tmp_path / "tenant" / ".hermes"
+        custom_home.mkdir(parents=True)
+        ss.set_multiplex_active(True)
+        scope_token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-secondary"})
+        home_token = set_hermes_home_override(str(custom_home))
+        try:
+            monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+            class _Pool:
+                def has_credentials(self):
+                    return True
+
+                def has_available(self):
+                    return True
+
+            monkeypatch.setattr("agent.credential_pool.load_pool", lambda _slug: _Pool())
+            assert not _pool_usable("copilot")
+        finally:
+            reset_hermes_home_override(home_token)
+            ss.reset_secret_scope(scope_token)
+
+    def test_scoped_pool_guard_fails_closed_on_auth_store_error(self, monkeypatch, tmp_path):
+        """A secondary pool check must not fall through to ambient load_pool after auth I/O fails."""
+        from hermes_cli.model_switch_providers import _pool_usable
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        custom_home = tmp_path / "tenant" / "profile"
+        custom_home.mkdir(parents=True)
+        ss.set_multiplex_active(True)
+        scope_token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-secondary"})
+        home_token = set_hermes_home_override(str(custom_home))
+        try:
+            def _auth_store_error():
+                raise OSError("auth store unavailable")
+
+            monkeypatch.setattr("hermes_cli.auth._load_auth_store", _auth_store_error)
+            monkeypatch.setattr(
+                "agent.credential_pool.load_pool",
+                lambda _slug: pytest.fail(
+                    "ambient pool must not be consulted after scoped auth failure"
+                ),
+            )
+            assert not _pool_usable("copilot")
+        finally:
+            reset_hermes_home_override(home_token)
+            ss.reset_secret_scope(scope_token)
 
     def test_single_profile_still_lists_copilot_from_pool(self, monkeypatch):
         """Multiplex off / no scope (CLI/TUI): the pool fallback still runs, so
@@ -833,7 +885,7 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
 
     def _list_copilot_via_canonical(self, monkeypatch, *, pool_has_creds: bool):
         from hermes_cli.model_switch import list_authenticated_providers
-        from hermes_cli.models import ProviderEntry
+        from hermes_cli.models_catalog_static import ProviderEntry
 
         # copilot reaches the canonical cross-check (section 2b) only: no
         # overlay match, no models.dev entry, empty auth store, scoped env

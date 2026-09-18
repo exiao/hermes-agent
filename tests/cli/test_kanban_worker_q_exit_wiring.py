@@ -23,6 +23,7 @@ single-query branch, exercised here through the real ``cli.main()``.
 
 from __future__ import annotations
 
+import queue
 from types import SimpleNamespace
 
 import cli as cli_mod
@@ -71,6 +72,8 @@ def _make_chat_cli(result):
     c._pending_moa_config = None
     c._pending_moa_disable_after_turn = False
     c._prompt_start_time = None
+    c._interrupt_queue = queue.Queue()
+    c._last_failure_reason = None
     c._ensure_runtime_credentials = lambda: True
     c._resolve_turn_agent_config = lambda msg: {
         "signature": "sig",

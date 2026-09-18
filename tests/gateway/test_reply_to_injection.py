@@ -216,7 +216,7 @@ async def test_no_text_reply_injects_generic_pointer():
 
 
 @pytest.mark.asyncio
-async def test_reply_snippet_truncated_to_2000_chars():
+async def test_reply_snippet_preserves_full_text():
     runner = _make_runner()
     source = _source()
     long_text = "x" * 2500
@@ -234,8 +234,8 @@ async def test_reply_snippet_truncated_to_2000_chars():
     )
 
     assert result is not None
-    assert result.startswith('[Replying to: "' + "x" * 2000 + '"]')
-    assert "x" * 2001 not in result
+    assert result.startswith('[Replying to: "' + long_text + '"]')
+    assert result.endswith("follow-up")
 
 
 @pytest.mark.asyncio

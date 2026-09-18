@@ -2027,6 +2027,7 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
         "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+        "container_idle_timeout": "TERMINAL_CONTAINER_IDLE_TIMEOUT",
         "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
         "docker_env": "TERMINAL_DOCKER_ENV",
         "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
@@ -3459,9 +3460,7 @@ def format_reply_pointer(event, message_text: str) -> str:
     if not getattr(event, "reply_to_message_id", None):
         return message_text
     if reply_text := getattr(event, "reply_to_text", None):
-        # The native event already carries the complete quote.  The old fork
-        # merely raised an earlier 500-char cap to 2,000; upstream subsequently
-        # removed the lossy cap altogether so later list items/code survive.
+        # The native event already carries the complete quote; preserve later list items and code.
         reply_snippet = reply_text
         who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
         return f'[Replying to{who}: "{reply_snippet}"]\n\n{message_text}'
@@ -3480,6 +3479,10 @@ def format_reply_pointer(event, message_text: str) -> str:
         if media_paths:
             pointer += f" — local copy: {', '.join(media_paths[:4])}"
         return f"{pointer}]\n\n{message_text}"
+    # Slack uses the thread root as ``reply_to_message_id`` for session routing; with no quoted
+    # text/media it is not an explicit quote and must not become a generic media pointer.
+    if getattr(getattr(event, "source", None), "platform", None) == Platform.SLACK:
+        return message_text
     return (
         "[Replying to a previous message (no text — may have been an image or file)]\n\n"
         f"{message_text}"

@@ -275,11 +275,13 @@ class ModalEnvironment(BaseEnvironment):
                 logger.warning("Modal: failed to restore snapshot %s, retrying with base image: %s",
                                restored_snapshot_id[:20], exc)
                 _delete_direct_snapshot(self._task_id, restored_snapshot_id)
+                restored_snapshot_id = None
                 _create(_resolve_modal_image(image))
             else:
                 if restored_snapshot_id and restored_from_legacy_key:
                     _store_direct_snapshot(self._task_id, restored_snapshot_id)
         except Exception:
+            self._terminate_sandbox_quietly()
             self._worker.stop()
             raise
         logger.info("Modal: sandbox created (task=%s)", self._task_id)

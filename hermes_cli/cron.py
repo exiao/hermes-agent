@@ -63,8 +63,8 @@ def _builtin_gateway_liveness() -> Optional[bool]:
         # ``find_gateway_pids`` excludes the caller and its ancestor chain, so
         # inside the gateway process tree it can hide the ticker itself.
         with contextlib.suppress(Exception):
-            from gateway.status import is_gateway_running
-            if is_gateway_running(cleanup_stale=False):
+            from gateway.status import get_running_pid
+            if get_running_pid(cleanup_stale=False) is not None:
                 return True
         from hermes_cli.gateway import (
             find_gateway_pids, named_profile_served_by_running_multiplexer)

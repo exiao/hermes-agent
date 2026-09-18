@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from hermes_cli import kanban_db_workspace as kbw
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -83,7 +84,7 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
 def test_decompose_applies_default_runtime_cap_to_children(kanban_home, monkeypatch):
     """Direct child inserts must honor the same default as create_task."""
     monkeypatch.setattr(kb, "_default_max_runtime_seconds", lambda: 5400)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = _create_triage(conn, title="fan out work")
         child_ids = kb.decompose_triage_task(
             conn,
@@ -102,7 +103,7 @@ def test_decompose_applies_default_runtime_cap_to_children(kanban_home, monkeypa
 
 
 def test_decompose_returns_none_when_task_missing(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         result = kb.decompose_triage_task(
             conn,
             "nonexistent",
@@ -114,7 +115,7 @@ def test_decompose_returns_none_when_task_missing(kanban_home):
 
 
 def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="already a real task")  # not triage
         result = kb.decompose_triage_task(
             conn,
@@ -127,7 +128,7 @@ def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
 
 
 def test_decompose_empty_children_returns_none(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = _create_triage(conn)
         result = kb.decompose_triage_task(
             conn,
@@ -140,7 +141,7 @@ def test_decompose_empty_children_returns_none(kanban_home):
 
 
 def test_decompose_rejects_self_parent(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="cannot list itself"):
             kb.decompose_triage_task(
@@ -153,7 +154,7 @@ def test_decompose_rejects_self_parent(kanban_home):
 
 
 def test_decompose_rejects_out_of_range_parent(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="not a valid index"):
             kb.decompose_triage_task(
@@ -166,7 +167,7 @@ def test_decompose_rejects_out_of_range_parent(kanban_home):
 
 
 def test_decompose_rejects_cyclic_parents(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = _create_triage(conn)
         with pytest.raises(ValueError, match="cyclic dependency"):
             kb.decompose_triage_task(
@@ -205,7 +206,7 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
 
 def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
     """No regression: a scratch root still fans out into scratch children."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="scratch root", assignee="worker",
             workspace_kind="scratch", triage=True,
@@ -214,7 +215,7 @@ def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
             conn, tid, root_assignee="orchestrator",
             children=[{"title": "s1"}], author="decomposer",
         )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.get_task(conn, child_ids[0])
     assert t.workspace_kind == "scratch"
     assert t.workspace_path is None
@@ -223,7 +224,7 @@ def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
 def test_decompose_per_child_workspace_override(kanban_home):
     """An explicit per-child workspace beats inheritance."""
     proj = "/home/teknium/myproject"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="root", assignee="worker",
             workspace_kind="dir", workspace_path=proj, triage=True,
@@ -237,7 +238,7 @@ def test_decompose_per_child_workspace_override(kanban_home):
             ],
             author="decomposer",
         )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         over = kb.get_task(conn, child_ids[0])
         inh = kb.get_task(conn, child_ids[1])
     assert over.workspace_path == "/other/repo"
@@ -252,7 +253,7 @@ def test_decompose_strips_scheme_prefix_from_child_override(kanban_home, tmp_pat
     landed as scratch + 'worktree:/repo' — a newly malformed row."""
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="root", assignee="worker", triage=True)
         child_ids = kb.decompose_triage_task(
             conn, tid, root_assignee="orchestrator",
@@ -263,7 +264,7 @@ def test_decompose_strips_scheme_prefix_from_child_override(kanban_home, tmp_pat
             author="decomposer",
         )
     assert child_ids is not None
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         wt = kb.get_task(conn, child_ids[0])
         dr = kb.get_task(conn, child_ids[1])
     assert wt is not None
@@ -280,7 +281,7 @@ def test_decompose_strips_prefix_from_inherited_legacy_root(kanban_home, tmp_pat
     (no explicit override) must not copy the malformed value verbatim."""
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="root", assignee="worker", triage=True)
         # Force a malformed persisted root path (bypass create guard).
         with kb.write_txn(conn):
@@ -295,7 +296,7 @@ def test_decompose_strips_prefix_from_inherited_legacy_root(kanban_home, tmp_pat
             author="decomposer",
         )
     assert child_ids is not None
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         inh = kb.get_task(conn, child_ids[0])
     assert inh is not None
     assert inh.workspace_kind == "worktree"
@@ -306,7 +307,7 @@ def test_decompose_rejects_unresolvable_worktree_child_path(kanban_home, tmp_pat
     """A direct child INSERT must not bypass the create-time worktree guard."""
     not_repo = tmp_path / "not-repo"
     not_repo.mkdir()
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="root", assignee="worker", triage=True)
         before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         with pytest.raises(ValueError, match="not inside a git repo"):
@@ -341,13 +342,13 @@ def test_decompose_child_kind_mismatch_no_path_raises_and_rolls_back(kanban_home
     decomposition: no children created, root stays in triage.
     """
     proj = "/home/teknium/myproject"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="codegen root", assignee="worker",
             workspace_kind="dir", workspace_path=proj, triage=True,
         )
         before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        with pytest.raises(ValueError, match="requires a workspace_path"):
+        with pytest.raises(ValueError, match="requires a resolvable workspace_path"):
             kb.decompose_triage_task(
                 conn, tid, root_assignee="orchestrator",
                 children=[
@@ -381,7 +382,7 @@ def test_decompose_legacy_worktree_root_null_path_resolves_board_default(kanban_
     # The dispatcher pins the worker's board via HERMES_KANBAN_BOARD; decompose
     # runs on that active board, so get_current_board() resolves it.
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "legacy-wt-board")
-    with kb.connect(board="legacy-wt-board") as conn:
+    with kbc.connect(board="legacy-wt-board") as conn:
         tid = kb.create_task(
             conn, title="root", assignee="worker", triage=True,
             workspace_kind="scratch", board="legacy-wt-board",
@@ -399,14 +400,14 @@ def test_decompose_legacy_worktree_root_null_path_resolves_board_default(kanban_
             author="decomposer",
         )
     assert child_ids is not None
-    with kb.connect(board="legacy-wt-board") as conn:
+    with kbc.connect(board="legacy-wt-board") as conn:
         inh = kb.get_task(conn, child_ids[0])
     assert inh.workspace_kind == "worktree"
     # Resolved (not rolled back), but path stays NULL so dispatch anchors a
     # per-task worktree under the board-default repo.
     assert inh.workspace_path is None
-    with kb.connect(board="legacy-wt-board") as conn:
-        ws = kb.resolve_workspace(inh, board="legacy-wt-board")
+    with kbc.connect(board="legacy-wt-board") as conn:
+        ws = kbw.resolve_workspace(inh, board="legacy-wt-board")
     assert ws == repo / ".worktrees" / inh.id
 
 
@@ -425,7 +426,7 @@ def test_decompose_worktree_child_subdir_default_keeps_null_path(kanban_home, mo
     subdir.mkdir(parents=True)
     kb.create_board("subdir-wt-board", default_workdir=str(subdir))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "subdir-wt-board")
-    with kb.connect(board="subdir-wt-board") as conn:
+    with kbc.connect(board="subdir-wt-board") as conn:
         tid = kb.create_task(
             conn, title="root", assignee="worker", triage=True,
             workspace_kind="scratch", board="subdir-wt-board",
@@ -442,12 +443,12 @@ def test_decompose_worktree_child_subdir_default_keeps_null_path(kanban_home, mo
             author="decomposer",
         )
     assert child_ids is not None
-    with kb.connect(board="subdir-wt-board") as conn:
+    with kbc.connect(board="subdir-wt-board") as conn:
         inh = kb.get_task(conn, child_ids[0])
         assert inh.workspace_kind == "worktree"
         # NOT the raw subdir default — NULL, so dispatch anchors per-task.
         assert inh.workspace_path is None
-        ws = kb.resolve_workspace(inh, board="subdir-wt-board")
+        ws = kbw.resolve_workspace(inh, board="subdir-wt-board")
     # Isolated per-task worktree under the repo ROOT, not the shared subdir.
     assert ws == repo / ".worktrees" / inh.id
     assert ws != subdir
@@ -464,7 +465,7 @@ def test_decompose_dir_child_subdir_default_persists_path(kanban_home, monkeypat
     subdir.mkdir(parents=True)
     kb.create_board("subdir-dir-board", default_workdir=str(subdir))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "subdir-dir-board")
-    with kb.connect(board="subdir-dir-board") as conn:
+    with kbc.connect(board="subdir-dir-board") as conn:
         tid = kb.create_task(
             conn, title="root", assignee="worker", triage=True,
             workspace_kind="scratch", board="subdir-dir-board",
@@ -481,8 +482,7 @@ def test_decompose_dir_child_subdir_default_persists_path(kanban_home, monkeypat
             author="decomposer",
         )
     assert child_ids is not None
-    with kb.connect(board="subdir-dir-board") as conn:
+    with kbc.connect(board="subdir-dir-board") as conn:
         inh = kb.get_task(conn, child_ids[0])
     assert inh.workspace_kind == "dir"
     assert inh.workspace_path == str(subdir)
-

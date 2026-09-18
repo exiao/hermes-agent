@@ -1,3 +1,5 @@
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 """Regression: blocked-task notifications are self-labeling.
 
 The Signal/Telegram push for a blocked task leads with a header that says — at a
@@ -64,10 +66,10 @@ async def _run_one_notifier_tick(monkeypatch, runner):
 
 
 def _block_subscription(reason, kind=None, title="do the thing"):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title=title, assignee="dev")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
         kb.block_task(conn, tid, reason=reason, kind=kind)
         return tid

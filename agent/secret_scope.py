@@ -195,6 +195,15 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     """
     home = Path(hermes_home)
     is_named_profile = home.parent.name == "profiles"
+    if not is_named_profile and is_multiplex_active():
+        # Tests and custom runners may use a temporary profile home without the canonical
+        # ``<root>/profiles/<name>`` shape. Under multiplex, an explicitly scoped home that is
+        # different from the process owner must still be isolated from process credentials.
+        try:
+            from hermes_constants import get_process_hermes_home
+            is_named_profile = home.resolve() != get_process_hermes_home().resolve()
+        except OSError:
+            is_named_profile = True
     secrets: Dict[str, str] = {}
 
     if not is_named_profile:

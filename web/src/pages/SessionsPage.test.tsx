@@ -4,6 +4,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// Keep module transformation outside the five-second interaction deadline.
+import SessionsPage from "./SessionsPage";
+import { I18nProvider } from "@/i18n";
+import { SystemActionsProvider } from "@/contexts/SystemActions";
+import { ProfileProvider } from "@/contexts/ProfileProvider";
+import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
+
 const apiMocks = vi.hoisted(() => ({
   getSessions: vi.fn(),
   getSessionMessages: vi.fn(),
@@ -61,14 +68,6 @@ async function renderSessionsPage(rows: Record<string, unknown>[]) {
     limit,
     offset: 0,
   }));
-  const [{ default: SessionsPage }, { I18nProvider }, { SystemActionsProvider }, { ProfileProvider }, { PageHeaderProvider }] =
-    await Promise.all([
-      import("./SessionsPage"),
-      import("@/i18n"),
-      import("@/contexts/SystemActions"),
-      import("@/contexts/ProfileProvider"),
-      import("@/contexts/PageHeaderProvider"),
-    ]);
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);

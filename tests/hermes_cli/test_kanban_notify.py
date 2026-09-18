@@ -603,10 +603,10 @@ async def test_notifier_keeps_sub_after_completed_event(kanban_home):
     from gateway.run import GatewayRunner
     from gateway.config import Platform
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="test task", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
         kb.complete_task(conn, tid, result="completed by agent")
     finally:
         conn.close()
@@ -642,9 +642,9 @@ async def test_notifier_keeps_sub_after_completed_event(kanban_home):
     call_msg = fake_adapter.send.call_args[0][1]
     assert "completed" in call_msg
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        subs = kb.list_notify_subs(conn, tid)
+        subs = kbn.list_notify_subs(conn, tid)
     finally:
         conn.close()
     assert len(subs) == 1, "Subscription should survive a reversible completion"
@@ -668,11 +668,11 @@ async def test_notifier_unsubs_after_abnormal_events_with_dispatcher_lock(
     from gateway.run import GatewayRunner
     from gateway.config import Platform
 
-    conn = kb.connect()
+    conn = kbc.connect()
 
     try:
         tid = kb.create_task(conn, title=f"test {kind} task", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
         kb._append_event(conn, tid, kind=kind)
     finally:
         conn.close()
@@ -711,9 +711,9 @@ async def test_notifier_unsubs_after_abnormal_events_with_dispatcher_lock(
     # ...but the subscription survives so a respawn-then-same-event cycle
     # reaches the user too. The cursor (last_event_id) advanced inside
     # the same write txn as the claim, so the same event won't re-fire.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        subs = kb.list_notify_subs(conn, tid)
+        subs = kbn.list_notify_subs(conn, tid)
     finally:
         conn.close()
     assert len(subs) == 1, (
@@ -763,10 +763,10 @@ async def test_notifier_second_blocked_delivers(kanban_home):
         if tick_count >= 6:
             runner._running = False
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="test task", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
 
         # Cycle 1: blocked for one reason
         kb.block_task(conn, tid, reason="first block", kind="needs_input")
@@ -787,7 +787,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
     runner._running = True
     tick_count = 0
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         kb.unblock_task(conn, tid)
         kb.block_task(conn, tid, reason="second block", kind="capability")
@@ -820,7 +820,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
 # Regression: gateway watchers must not double-init the kanban DB.
 #
 # Both the notifier watcher (`_kanban_notifier_watcher`) and the dispatcher
-# tick (`_tick_once_for_board`) used to call `_kb.connect(board=slug)`
+# tick (`_tick_once_for_board`) used to call `kbc.connect(board=slug)`
 # immediately followed by `_kb.init_db(board=slug)`. Since `connect()`
 # already runs the schema + idempotent migration on first open per process,
 # the explicit `init_db()` was redundant — and worse, `init_db()`

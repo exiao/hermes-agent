@@ -537,7 +537,7 @@ class TestToAgentVisiblePathPerBackend:
         staged = self._staged(tmp_path, monkeypatch)
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         monkeypatch.setattr(
-            "tools.terminal_tool.get_active_env",
+            "tools.terminal_tool_lifecycle.get_active_env",
             lambda _: SimpleNamespace(
                 _remote_hermes_home="/home/alice/.hermes/profiles/profile-a"
             ),
@@ -563,7 +563,7 @@ class TestToAgentVisiblePathPerBackend:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         monkeypatch.setattr(
-            "tools.terminal_tool.get_active_env",
+            "tools.terminal_tool_lifecycle.get_active_env",
             lambda _: SimpleNamespace(
                 _remote_hermes_home="/home/alice/.hermes/profiles/profile-a"
             ),

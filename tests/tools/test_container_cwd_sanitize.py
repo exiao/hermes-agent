@@ -169,13 +169,13 @@ class TestFileOpsCwdSanitizedAtCallSite:
             def execute(self, *a, **k):
                 return {"output": "", "exit_code": 0}
 
-        def fake_create_environment(env_type, image, cwd, timeout, **kwargs):
+        def fake_create_environment(config, env_type, image, cwd, timeout, **kwargs):
             captured["cwd"] = cwd
             return _DummyEnv()
 
         monkeypatch.setattr(tt, "_get_env_config", lambda: config)
         monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
-        monkeypatch.setattr("tools.terminal_tool_backends._create_environment", fake_create_environment)
+        monkeypatch.setattr("tools.terminal_tool._create_configured_env", fake_create_environment)
         # Force a fresh environment build.
         monkeypatch.setattr(tt, "_active_environments", {})
         monkeypatch.setattr(tt, "_last_activity", {})

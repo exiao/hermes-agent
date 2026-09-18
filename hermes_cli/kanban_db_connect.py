@@ -439,9 +439,13 @@ def _repairable_index_names(messages: list[str]) -> Optional[list[str]]:
     (caller fails closed; also ``None`` for no messages). First-appearance
     order is preserved so the REINDEX pass is deterministic."""
     names: list[str] = []
-    for raw in messages:
-        message = (raw or "").strip()
-        if not message:
+    # SQLite groups an index-page fragmentation note under a database banner.
+    # REINDEX remains limited to named indexes and must pass a full re-check.
+    lines = (line.strip() for raw in messages for line in (raw or "").splitlines())
+    for message in lines:
+        if not message or message.startswith("*** in database "):
+            continue
+        if re.fullmatch(r"Fragmentation of \d+ bytes reported as \d+ on page \d+", message):
             continue
         for pattern in _REPAIRABLE_INDEX_ERROR_PATTERNS:
             match = pattern.match(message)
@@ -458,22 +462,28 @@ def _repairable_index_names(messages: list[str]) -> Optional[list[str]]:
 def _attempt_index_reindex_repair(path: Path, index_names: list[str]) -> tuple[bool, list[str]]:
     """REINDEX the named indexes (per-index first; bare ``REINDEX`` fallback if
     a parsed name is an internal/auto index), then re-run integrity_check.
-    Returns ``(clean, post_repair_messages)``; never raises. Callers must hold
+    Returns ``(clean, post_repair_messages)``; transient lock errors propagate. Callers must hold
     the board's cross-process init flock so nothing connects mid-repair."""
     try:
         conn = _sqlite_connect(path)
     except sqlite3.Error as exc:
+        if _is_busy_error(exc):
+            raise
         return False, [f"could not reopen for REINDEX: {exc}"]
     try:
         try:
             for name in index_names:
                 escaped = name.replace('"', '""')
                 conn.execute(f'REINDEX "{escaped}"')
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if _is_busy_error(exc):
+                raise
             # Per-index rebuild failed — bare REINDEX rebuilds every index.
             conn.execute("REINDEX")
         messages = _run_integrity_check(conn)
     except sqlite3.Error as exc:
+        if _is_busy_error(exc):
+            raise
         return False, [f"REINDEX failed: {exc}"]
     finally:
         conn.close()

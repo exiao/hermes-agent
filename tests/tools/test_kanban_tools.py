@@ -14,6 +14,9 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_db_workspace as kbw
 
 
 def _init_worktree_ready_repo(path):
@@ -266,7 +269,7 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
 
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
@@ -289,7 +292,7 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
     d = json.loads(out)
     assert d.get("ok") is True
 
-    conn2 = kb.connect()
+    conn2 = kbc.connect()
     try:
         assert kb.get_task(conn2, goal_task_id).status == "done"
     finally:
@@ -319,7 +322,7 @@ def test_complete_goal_mode_allows_when_judge_transport_fails(monkeypatch, tmp_p
 
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
@@ -344,7 +347,7 @@ def test_complete_goal_mode_allows_when_judge_transport_fails(monkeypatch, tmp_p
     d = json.loads(out)
     assert d.get("ok") is True, f"expected fail-open completion, got {d}"
 
-    conn2 = kb.connect()
+    conn2 = kbc.connect()
     try:
         assert kb.get_task(conn2, goal_task_id).status == "done"
     finally:
@@ -567,12 +570,12 @@ def test_create_default_child_isolates_materialized_scratch_workspace(
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         parent = kb.get_task(conn, worker_env)
         assert parent is not None
-        parent_workspace = kb.resolve_workspace(parent)
-        kb.set_workspace_path(conn, worker_env, parent_workspace)
+        parent_workspace = kbw.resolve_workspace(parent)
+        kbw.set_workspace_path(conn, worker_env, parent_workspace)
     finally:
         conn.close()
 
@@ -587,13 +590,13 @@ def test_create_default_child_isolates_materialized_scratch_workspace(
     assert d["workspace_kind"] == "scratch"
     assert d["workspace_path"] is None
     assert d["project_id"] is None
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child is not None
         assert child.workspace_kind == "scratch"
         assert child.workspace_path is None
-        child_workspace = kb.resolve_workspace(child)
+        child_workspace = kbw.resolve_workspace(child)
     finally:
         conn.close()
 
@@ -611,7 +614,7 @@ def test_create_default_child_does_not_implicitly_share_worker_dir(
     from hermes_cli import kanban_db as kb
 
     proj = "/home/teknium/myproject"
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         self_tid = kb.create_task(
             conn, title="dir worker", assignee="test-worker",
@@ -624,7 +627,7 @@ def test_create_default_child_does_not_implicitly_share_worker_dir(
 
     d = json.loads(kt._handle_create({"title": "follow-up", "assignee": "peer"}))
     assert d["ok"] is True
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child is not None
@@ -640,7 +643,7 @@ def test_create_explicit_dir_workspace_shares_parent_path(monkeypatch, worker_en
     from hermes_cli import kanban_db as kb
 
     proj = "/home/teknium/proj"
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         self_tid = kb.create_task(
             conn, title="dir worker", assignee="test-worker",
@@ -658,7 +661,7 @@ def test_create_explicit_dir_workspace_shares_parent_path(monkeypatch, worker_en
     assert d["ok"] is True
     assert d["workspace_kind"] == "dir"
     assert d["workspace_path"] == proj
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child is not None
@@ -681,7 +684,7 @@ def test_create_explicit_scratch_beats_parent_workspace(monkeypatch, worker_env)
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         self_tid = kb.create_task(
             conn, title="dir worker", assignee="test-worker",
@@ -697,7 +700,7 @@ def test_create_explicit_scratch_beats_parent_workspace(monkeypatch, worker_env)
         "workspace_kind": "scratch",
     }))
     assert d["ok"] is True
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child is not None
@@ -714,12 +717,12 @@ def test_create_nested_default_scratch_children_each_get_own_workspace(
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         parent = kb.get_task(conn, worker_env)
         assert parent is not None
-        parent_workspace = kb.resolve_workspace(parent)
-        kb.set_workspace_path(conn, worker_env, parent_workspace)
+        parent_workspace = kbw.resolve_workspace(parent)
+        kbw.set_workspace_path(conn, worker_env, parent_workspace)
     finally:
         conn.close()
 
@@ -732,7 +735,7 @@ def test_create_nested_default_scratch_children_each_get_own_workspace(
         "parents": [child_result["task_id"]],
     }))
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         child = kb.get_task(conn, child_result["task_id"])
         grandchild = kb.get_task(conn, grandchild_result["task_id"])
@@ -741,9 +744,9 @@ def test_create_nested_default_scratch_children_each_get_own_workspace(
         assert child.workspace_path is None
         assert grandchild.workspace_path is None
         workspaces = {
-            kb.resolve_workspace(parent),
-            kb.resolve_workspace(child),
-            kb.resolve_workspace(grandchild),
+            kbw.resolve_workspace(parent),
+            kbw.resolve_workspace(child),
+            kbw.resolve_workspace(grandchild),
         }
     finally:
         conn.close()
@@ -766,7 +769,7 @@ def test_create_default_child_inherits_project_without_reusing_worktree(
             project_conn, name="Isolated Project", folders=[str(repo)],
         )
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         parent_id = kb.create_task(
             conn, title="implementation", assignee="test-worker",
@@ -790,7 +793,7 @@ def test_create_default_child_inherits_project_without_reusing_worktree(
     )
     assert result["project_id"] == parent.project_id
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         child = kb.get_task(conn, result["task_id"])
         assert child is not None
@@ -837,7 +840,7 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
         project_id = pdb.create_project(
             project_conn, name="Cross Profile Project", folders=[str(repo)],
         )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(
             conn,
             title="parent implementation",
@@ -867,7 +870,7 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
 
     assert all(result.get("ok") is True for result in children), children
     child_ids = [result["task_id"] for result in children]
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         child_tasks = [kb.get_task(conn, task_id) for task_id in child_ids]
     for task in child_tasks:
         assert task is not None
@@ -889,7 +892,7 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
         "parents": [child_ids[0]],
     }))
     assert grandchild_result["ok"] is True
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         grandchild = kb.get_task(conn, grandchild_result["task_id"])
     assert grandchild is not None
     assert grandchild.project_id == project_id
@@ -913,7 +916,7 @@ def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     d = json.loads(kt._handle_create({"title": "orch child", "assignee": "peer"}))
     assert d["ok"] is True
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child.workspace_kind == "scratch"
@@ -937,7 +940,7 @@ def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         new_task = kb.get_task(conn, d["task_id"])
         assert new_task.session_id == "acp-sess-abc"
@@ -961,7 +964,7 @@ def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         new_task = kb.get_task(conn, d["task_id"])
         assert new_task.session_id == "explicit-arg"
@@ -983,7 +986,7 @@ def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         new_task = kb.get_task(conn, d["task_id"])
         assert new_task.session_id is None
@@ -1018,7 +1021,7 @@ def test_create_parses_triage_string_false(worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task = kb.get_task(conn, d["task_id"])
         assert task.status == "ready"
@@ -1036,7 +1039,7 @@ def test_create_parses_triage_string_true(worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task = kb.get_task(conn, d["task_id"])
         assert task.status == "triage"
@@ -1074,7 +1077,7 @@ def test_create_accepts_skills_list(worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, d["task_id"])
     assert task.skills == ["translation", "github-code-review"]
 
@@ -1090,7 +1093,7 @@ def test_create_accepts_skills_string(worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, d["task_id"])
     assert task.skills == ["translation"]
 

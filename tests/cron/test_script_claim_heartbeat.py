@@ -379,6 +379,7 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
     def _run_job(
         job,
         *,
+        adapters=None,
         defer_agent_teardown=None,
         extra_prompt=None,
         cancel_event=None,
