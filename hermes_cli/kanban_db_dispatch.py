@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import re
@@ -1213,11 +1214,48 @@ def check_respawn_guard(
     # necessarily contain that URL, so treating it as evidence that the card
     # opened a duplicate permanently prevents blocked babysitters from resuming.
     if row["assignee"] != "pr-babysitter":
-        for c in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-            (task_id, pr_cutoff),
+        own_lane = {
+            _kb._canonical_assignee(candidate)
+            for candidate in [row["assignee"]]
+            + [r["profile"] for r in conn.execute(
+                "SELECT DISTINCT profile FROM task_runs "
+                "WHERE task_id = ? AND profile IS NOT NULL", (task_id,)
+            ).fetchall()]
+            if candidate and str(candidate).strip()
+        }
+        latest_pr_comment_at = None
+        for comment in conn.execute(
+            "SELECT author, body, created_at FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ?", (task_id, pr_cutoff)
         ).fetchall():
-            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            if not (comment["body"] and _RESPAWN_GUARD_PR_URL_RE.search(comment["body"])):
+                continue
+            author = comment["author"]
+            author = _kb._canonical_assignee(author) if author and str(author).strip() else None
+            if author != "worker" and (not own_lane or author not in own_lane):
+                continue
+            timestamp = int(comment["created_at"] or 0)
+            latest_pr_comment_at = max(latest_pr_comment_at or timestamp, timestamp)
+        if latest_pr_comment_at is not None:
+            requeued_after = False
+            for event in conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id = ? AND created_at > ? "
+                "AND kind IN ('status', 'unblocked', 'promoted_manual', 'reclaimed')",
+                (task_id, latest_pr_comment_at),
+            ).fetchall():
+                if event["kind"] in {"unblocked", "promoted_manual"}:
+                    requeued_after = True
+                    break
+                payload = _kb._json_dict(event["payload"])
+                if event["kind"] == "reclaimed":
+                    if payload.get("manual") is True:
+                        requeued_after = True
+                        break
+                elif payload.get("reason") != "parent_reopened":
+                    requeued_after = True
+                    break
+            if not requeued_after:
                 return "active_pr"
 
     return None
@@ -1564,7 +1602,7 @@ def _dispatch_lane_task(
         if claimed.workspace_kind == "worktree":
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
         else:
-            workspace = _kbw.resolve_workspace(claimed, board=board)
+            workspace = _kbw.resolve_workspace(claimed, board=board, conn=conn)
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",

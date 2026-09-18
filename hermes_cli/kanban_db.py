@@ -1330,39 +1330,91 @@ def _is_spec_less(title: str, body: Optional[str], assignee: Optional[str]) -> b
             or bool(who and normalized in {who, f"{who} task"}))
 
 
-def _canonicalize_babysit_key(key: Optional[str]) -> Optional[str]:
-    if not key:
-        return key
-    match = re.fullmatch(r"babysit:([^/]+/[^#]+)#(\d+)", key)
-    return f"babysit:{match.group(1).lower()}#{int(match.group(2))}" if match else key
+def _slug_from_git_remote(workspace_path: Optional[str]) -> Optional[str]:
+    """Resolve an existing or pending worktree's GitHub ``owner/repo`` slug."""
+    if not workspace_path:
+        return None
+    from hermes_cli.kanban_db_workspace import _repo_root_for_worktree_target
+    repo_root = _repo_root_for_worktree_target(Path(workspace_path).expanduser())
+    if repo_root is None:
+        return None
+    try:
+        remote = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if remote.returncode != 0:
+        return None
+    match = re.search(
+        r"(?:https?://(?:[^/@]+@)?|ssh://(?:[^/@]+@)?|git@)"
+        r"github\.com[:/]([^/:]+/[^/]+?)(?:\.git)?/?$",
+        remote.stdout.strip(),
+    )
+    return match.group(1) if match else None
+
+
+def _canonical_babysit_key(slug: str, pr: int) -> str:
+    return f"babysit:{slug.lower()}#{pr}"
 
 
 def _derive_babysit_idempotency_key(
     title: Optional[str], body: Optional[str], workspace_path: Optional[str]
 ) -> Optional[str]:
-    """Derive one canonical key for all create paths targeting a GitHub PR."""
+    """Return a canonical key using explicit PR signals before workspace fallbacks.
+
+    Precedence: title URL, title ``owner/repo#n``, title ``PR #n`` + workspace,
+    body URL, body ``PR #n`` + workspace, body ``owner/repo#n``, then title bare
+    ``#n`` + workspace. The bare number is last because it may be an issue ref.
+    """
     title, body = title or "", body or ""
     url_re = r"(?:^|[/@\s])github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/pull/(\d+)"
     ref_re = r"(?<![\w./-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)"
-    for text in (title, body):
-        match = re.search(url_re, text) or re.search(ref_re, text)
-        if match:
-            return f"babysit:{match.group(1).lower()}#{int(match.group(2))}"
-    pr_match = re.search(r"\bPR\s*#?(\d+)", title, re.IGNORECASE) or re.search(r"#(\d+)", title)
-    if not (pr_match and workspace_path):
-        return None
-    try:
-        from hermes_cli.kanban_db_workspace import _repo_root_for_worktree_target
-        root = _repo_root_for_worktree_target(Path(workspace_path).expanduser())
-        remote = _git_out(root, "remote", "get-url", "origin") if root else None
-        match = re.search(
-            r"(?:https?://(?:[^/@]+@)?|ssh://(?:[^/@]+@)?|git@)github\.com[:/]([^/:]+/[^/]+?)(?:\.git)?/?$",
-            remote or "")
-        if match:
-            return f"babysit:{match.group(1).lower()}#{int(pr_match.group(1))}"
-    except Exception:
-        pass
+    title_url = re.search(url_re, title)
+    title_ref = re.search(ref_re, title)
+    body_url = re.search(url_re, body)
+    body_ref = re.search(ref_re, body)
+    title_pr = re.search(r"\bPR\s*#?(\d+)", title, re.IGNORECASE)
+    body_pr = re.search(r"\bPR\s*#?(\d+)", body, re.IGNORECASE)
+    title_bare = re.search(r"#(\d+)", title)
+
+    if title_url:
+        return _canonical_babysit_key(title_url.group(1), int(title_url.group(2)))
+    if title_ref:
+        return _canonical_babysit_key(title_ref.group(1), int(title_ref.group(2)))
+
+    workspace_slug: Optional[str] = None
+    workspace_resolved = False
+    def workspace() -> Optional[str]:
+        nonlocal workspace_slug, workspace_resolved
+        if not workspace_resolved:
+            workspace_slug = _slug_from_git_remote(workspace_path)
+            workspace_resolved = True
+        return workspace_slug
+
+    if title_pr and workspace():
+        return _canonical_babysit_key(workspace_slug, int(title_pr.group(1)))
+    if body_url:
+        return _canonical_babysit_key(body_url.group(1), int(body_url.group(2)))
+    if body_pr and workspace():
+        return _canonical_babysit_key(workspace_slug, int(body_pr.group(1)))
+    if body_ref:
+        return _canonical_babysit_key(body_ref.group(1), int(body_ref.group(2)))
+    if title_bare and workspace():
+        return _canonical_babysit_key(workspace_slug, int(title_bare.group(1)))
     return None
+
+
+def _canonicalize_babysit_key(key: Optional[str]) -> Optional[str]:
+    """Canonicalize an explicit babysit key; preserve other key formats."""
+    if not key:
+        return key
+    match = re.fullmatch(r"babysit:([^/]+/[^#]+)#(\d+)", key)
+    return (
+        _canonical_babysit_key(match.group(1), int(match.group(2)))
+        if match else key
+    )
 
 
 def _resolve_project_link(
@@ -1558,17 +1610,25 @@ def create_task(
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
+    board_default_anchor = False
     if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
         board_default = _board_meta_for(board).get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+            board_default_anchor = workspace_kind == "worktree"
+
+    if board_default_anchor:
+        from hermes_cli.kanban_db_workspace import _repo_root_for_worktree_target
+        repo_root = _repo_root_for_worktree_target(Path(workspace_path))
+        if repo_root is not None:
+            workspace_path = str(repo_root)
 
     # Persistent workspaces must be resolvable now; otherwise the card is an
     # unspawnable row that repeatedly trips the dispatcher failure budget.
     if project_repo is None and workspace_kind in {"dir", "worktree"}:
         if not workspace_path:
             raise ValueError(
-                f"workspace_kind={workspace_kind!r} requires a resolvable workspace_path")
+                f"workspace_kind={workspace_kind!r} requires a workspace_path that resolves")
         candidate = Path(workspace_path).expanduser()
         if not candidate.is_absolute():
             raise ValueError(f"workspace_path must be absolute, got {workspace_path!r}")
@@ -4709,6 +4769,19 @@ def _migrate_with_fork_columns(conn: sqlite3.Connection) -> None:
     ).casefold():
         conn.execute("DROP INDEX idx_tasks_terminal_window")
         conn.execute(expected_index_sql)
+    # Canonicalize legacy mixed-case babysit keys during the same forced
+    # migration pass that repairs the fork-owned columns. GitHub slugs are
+    # case-insensitive, so old rows must match newly derived keys.
+    for row in conn.execute(
+        "SELECT id, idempotency_key FROM tasks "
+        "WHERE idempotency_key LIKE 'babysit:%'"
+    ).fetchall():
+        canonical = _canonicalize_babysit_key(row["idempotency_key"])
+        if canonical != row["idempotency_key"]:
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+                (canonical, row["id"]),
+            )
 
 
 _kanban_db_connect._migrate_add_optional_columns = _migrate_with_fork_columns

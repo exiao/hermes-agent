@@ -805,7 +805,7 @@ def test_migration_backfills_archived_at_from_latest_archive_event(kanban_home):
             (t, "archived", None, 20_000),
         )
 
-        kb._migrate_add_optional_columns(conn)
+        kbc._migrate_add_optional_columns(conn)
 
         archived_at = conn.execute(
             "SELECT archived_at FROM tasks WHERE id = ?",
@@ -1223,7 +1223,7 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
     """A completed run outside the guard window does not block re-spawn."""
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="old-done", assignee="alice")
-        old_end = int(time.time()) - kb._RESPAWN_GUARD_SUCCESS_WINDOW - 60
+        old_end = int(time.time()) - kbd._RESPAWN_GUARD_SUCCESS_WINDOW - 60
         conn.execute(
             "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
             "VALUES (?, 'done', 'completed', ?, ?)",
@@ -1450,7 +1450,7 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="old-pr", assignee="alice")
-        old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
+        old_ts = int(time.time()) - kbd._RESPAWN_GUARD_PR_WINDOW - 60
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, 'worker', "
@@ -2701,14 +2701,14 @@ def test_worktree_missing_target_skips_direct_git_probe(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     target = repo / ".worktrees" / "my-task"
-    original_git_toplevel = kb._git_toplevel
+    original_git_toplevel = kbw._git_toplevel
     probed: list[Path] = []
 
     def tracking_git_toplevel(path: Path):
         probed.append(path)
         return original_git_toplevel(path)
 
-    monkeypatch.setattr(kb, "_git_toplevel", tracking_git_toplevel)
+    monkeypatch.setattr(kbw, "_git_toplevel", tracking_git_toplevel)
 
     assert kb._worktree_path_resolvable(str(target)) is True
     assert target not in probed
@@ -3425,6 +3425,9 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
         CREATE TABLE tasks (
             id INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'todo',
+            created_at INTEGER NOT NULL DEFAULT 0,
+            completed_at INTEGER,
             tenant TEXT,
             result TEXT,
             idempotency_key TEXT,
@@ -3803,21 +3806,21 @@ def _make_index_corrupt_kanban_db(db_path: Path) -> list[str]:
 
 
 def test_is_index_only_corruption_classifier():
-    assert kb._is_index_only_corruption(
+    assert kbc._repairable_index_names(
         ["wrong # of entries in index idx_notify_task"]
-    )
-    assert kb._is_index_only_corruption(
+    ) == ["idx_notify_task"]
+    assert kbc._repairable_index_names(
         [
-            "row missing from index sqlite_autoindex_kanban_notify_subs_1",
+            "row 1 missing from index sqlite_autoindex_kanban_notify_subs_1",
             "wrong # of entries in index idx_notify_task",
         ]
-    )
+    ) == ["sqlite_autoindex_kanban_notify_subs_1", "idx_notify_task"]
     # Any non-index problem disqualifies the whole set — never a partial repair.
-    assert not kb._is_index_only_corruption(
+    assert not kbc._repairable_index_names(
         ["wrong # of entries in index idx_x", "Page 4 is never used"]
     )
-    assert not kb._is_index_only_corruption(["database disk image is malformed"])
-    assert not kb._is_index_only_corruption([])
+    assert not kbc._repairable_index_names(["database disk image is malformed"])
+    assert not kbc._repairable_index_names([])
 
 
 def test_repairable_index_names_accepts_sqlite_grouped_diagnostics():
@@ -3828,7 +3831,7 @@ def test_repairable_index_names_accepts_sqlite_grouped_diagnostics():
         "wrong # of entries in index idx_notify_task"
     ]
 
-    assert kb._repairable_index_names(messages) == ["idx_notify_task"]
+    assert kbc._repairable_index_names(messages) == ["idx_notify_task"]
 
 
 def test_index_only_corruption_self_heals_and_preserves_rows(tmp_path):
@@ -3839,12 +3842,11 @@ def test_index_only_corruption_self_heals_and_preserves_rows(tmp_path):
     expected = _make_index_corrupt_kanban_db(db_path)
 
     # Precondition: the DB is genuinely index-corrupt right now.
-    problems = kb._integrity_problems(db_path)
-    assert problems is not None, "expected the injected index corruption to register"
-    assert kb._is_index_only_corruption(problems), problems
+    problems, reason = kbc._probe_for_corruption(db_path)
+    assert reason is not None, "expected the injected index corruption to register"
+    assert kbc._repairable_index_names(problems), problems
 
     # Clear the one-shot repair claim so the guard actually attempts repair.
-    kb._REPAIR_ATTEMPTED_PATHS.discard(str(db_path.resolve()))
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
 
     # Opening the DB must now recover it in place, not raise.
@@ -3853,28 +3855,22 @@ def test_index_only_corruption_self_heals_and_preserves_rows(tmp_path):
     assert titles == sorted(expected), "row data must survive the repair"
 
     # DB is clean afterwards and no forensic clone was kept for a recovered DB.
-    assert kb._integrity_problems(db_path) is None
+    assert kbc._probe_integrity(db_path) == ["ok"]
     # A recovered board keeps the pre-repair forensic copy by design.
     assert len(list(tmp_path.glob("*.corrupt.*.bak"))) == 1
 
 
-def test_successful_repair_clears_repair_claim(tmp_path):
-    """After a successful in-place repair the path is discarded from
-    _REPAIR_ATTEMPTED_PATHS, so a genuinely fresh corruption on the same path
-    later can be retried (honors the one-shot-claim contract)."""
+def test_successful_repair_allows_fresh_corruption_to_be_repaired(tmp_path):
+    """A second corruption at the same path must remain recoverable."""
     db_path = tmp_path / "kanban.db"
-    _make_index_corrupt_kanban_db(db_path)
-    resolved = str(db_path.resolve())
-
-    kb._REPAIR_ATTEMPTED_PATHS.discard(resolved)
-    kb._INITIALIZED_PATHS.discard(resolved)
-
-    with kbc.connect(db_path=db_path) as conn:
-        kb.list_tasks(conn)
-
-    # Repair succeeded, so the one-shot claim must have been released.
-    with kb._REPAIR_ATTEMPT_LOCK:
-        assert resolved not in kb._REPAIR_ATTEMPTED_PATHS
+    expected = _make_index_corrupt_kanban_db(db_path)
+    for attempt in range(2):
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with kbc.connect(db_path=db_path) as conn:
+            assert sorted(t.title for t in kb.list_tasks(conn)) == sorted(expected)
+        assert kbc._probe_integrity(db_path) == ["ok"]
+        if attempt == 0:
+            assert _corrupt_an_index_page(db_path)
 
 
 def test_reindex_lock_error_propagates_not_swallowed(tmp_path, monkeypatch):
@@ -3884,7 +3880,7 @@ def test_reindex_lock_error_propagates_not_swallowed(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     _make_index_corrupt_kanban_db(db_path)
 
-    real_connect = kb._sqlite_connect
+    real_connect = kbc._sqlite_connect
 
     class _LockOnReindex:
         def __init__(self, conn):
@@ -3901,10 +3897,10 @@ def test_reindex_lock_error_propagates_not_swallowed(tmp_path, monkeypatch):
     def _wrapped(path, *a, **kw):
         return _LockOnReindex(real_connect(path, *a, **kw))
 
-    monkeypatch.setattr(kb, "_sqlite_connect", _wrapped)
+    monkeypatch.setattr(kbc, "_sqlite_connect", _wrapped)
 
     with pytest.raises(sqlite3.OperationalError):
-        kb._attempt_index_only_repair(db_path)
+        kbc._guard_existing_db_is_healthy(db_path)
 
     # It must NOT have fallen through to dump+reload (no rebuild temp file, and
     # the original corrupt DB is left in place untouched by a destructive swap).
@@ -3919,67 +3915,43 @@ def test_transient_lock_during_repair_releases_claim(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     _make_index_corrupt_kanban_db(db_path)
     resolved = str(db_path.resolve())
-    kb._REPAIR_ATTEMPTED_PATHS.discard(resolved)
     kb._INITIALIZED_PATHS.discard(resolved)
 
     def _boom(_path, _index_names):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(kb, "_attempt_index_reindex_repair", _boom)
+    original_repair = kbc._attempt_index_reindex_repair
+    monkeypatch.setattr(kbc, "_attempt_index_reindex_repair", _boom)
 
     with pytest.raises(sqlite3.OperationalError):
-        kb._guard_existing_db_is_healthy(db_path)
+        kbc._guard_existing_db_is_healthy(db_path)
 
-    # Claim released so a retry can re-attempt the repair.
-    with kb._REPAIR_ATTEMPT_LOCK:
-        assert resolved not in kb._REPAIR_ATTEMPTED_PATHS
+    # The same process can retry successfully once the transient lock clears.
+    monkeypatch.setattr(kbc, "_attempt_index_reindex_repair", original_repair)
+    kbc._guard_existing_db_is_healthy(db_path)
+    assert kbc._probe_integrity(db_path) == ["ok"]
 
 
-def test_dump_reload_lock_error_propagates(tmp_path, monkeypatch):
-    """A transient `database is locked` during the dump+reload fallback must
-    re-raise (not be swallowed by the broad DatabaseError->None handler that
-    would trigger backup+refuse of a recoverable board)."""
+def test_structural_reindex_failure_refuses_destructive_fallback(tmp_path, monkeypatch):
+    """A failed REINDEX leaves the original and forensic backup intact."""
     db_path = tmp_path / "kanban.db"
     _make_index_corrupt_kanban_db(db_path)
-
-    real_connect = kb._sqlite_connect
-
-    class _LockOnIterdump:
-        def __init__(self, conn):
-            self._conn = conn
-
-        def execute(self, sql, *a, **kw):
-            # Force REINDEX to fail structurally so we fall into dump+reload...
-            if sql.strip().upper().startswith("REINDEX"):
-                raise sqlite3.DatabaseError("database disk image is malformed")
-            return self._conn.execute(sql, *a, **kw)
-
-        def iterdump(self):
-            # ...then have the dump raise a transient lock.
-            raise sqlite3.OperationalError("database is locked")
-
-        def __getattr__(self, name):
-            return getattr(self._conn, name)
-
-    def _wrapped(path, *a, **kw):
-        return _LockOnIterdump(real_connect(path, *a, **kw))
-
-    monkeypatch.setattr(kb, "_sqlite_connect", _wrapped)
-
-    with pytest.raises(sqlite3.OperationalError):
-        kb._attempt_index_only_repair(db_path)
-
-    # Rebuild temp must be cleaned up on the transient re-raise.
+    original = db_path.read_bytes()
+    monkeypatch.setattr(kbc, "_attempt_index_reindex_repair",
+                        lambda *_args: (False, ["database disk image is malformed"]))
+    with pytest.raises(kbc.KanbanDbCorruptError) as failure:
+        kbc._guard_existing_db_is_healthy(db_path)
+    assert db_path.read_bytes() == original
+    assert failure.value.backup_path.read_bytes() == original
     assert list(tmp_path.glob("*.rebuild.tmp")) == []
 
 
-def test_repair_quiesces_writers_before_swap(tmp_path, monkeypatch):
-    """The dump+reload repair must acquire an exclusive lock before swapping.
-    A concurrent connection holding a write lock makes the repair re-raise a
-    transient OperationalError (retry later) rather than publishing a rebuilt
-    DB that could drop the other writer's committed rows."""
+def test_repair_refuses_while_another_writer_holds_the_database(tmp_path, monkeypatch):
+    """A writer lock must propagate from the repair helper without replacing the DB."""
     db_path = tmp_path / "kanban.db"
     _make_index_corrupt_kanban_db(db_path)
+    indexes = kbc._repairable_index_names(kbc._probe_integrity(db_path))
+    assert indexes
 
     # Keep the repair's BEGIN EXCLUSIVE from waiting the full default 120s on the
     # blocker — fail fast so the test is quick and deterministic.
@@ -3992,7 +3964,7 @@ def test_repair_quiesces_writers_before_swap(tmp_path, monkeypatch):
     try:
         blocker.execute("BEGIN EXCLUSIVE")
         with pytest.raises(sqlite3.OperationalError):
-            kb._attempt_index_only_repair(db_path)
+            kbc._attempt_index_reindex_repair(db_path, indexes)
         # Nothing was published: no rebuild temp lingering, original untouched.
         assert list(tmp_path.glob("*.rebuild.tmp")) == []
     finally:
@@ -4007,13 +3979,13 @@ def test_repair_preserves_inode_so_idle_handle_writes_survive(tmp_path):
     inode_before = db_path.stat().st_ino
 
     # Bypass the connection guard to hold the pre-repair SQLite handle.
-    idle = kb._sqlite_connect(db_path)
+    idle = kbc._sqlite_connect(db_path)
     try:
         kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-        kb._guard_existing_db_is_healthy(db_path)
+        kbc._guard_existing_db_is_healthy(db_path)
 
         assert db_path.stat().st_ino == inode_before
-        assert kb._integrity_problems(db_path) is None
+        assert kbc._probe_integrity(db_path) == ["ok"]
 
         titles = {row[0] for row in idle.execute("SELECT title FROM tasks")}
         assert set(survivors).issubset(titles)
@@ -4036,7 +4008,7 @@ def test_reused_backup_fills_in_missing_sidecars(tmp_path):
     _write_corrupt_db(db_path)
 
     # First quarantine: no sidecars yet.
-    first = kb._backup_corrupt_db(db_path)
+    first = kbc._backup_corrupt_db(db_path)
     assert first is not None and first.exists()
     assert not (tmp_path / (first.name + "-wal")).exists()
 
@@ -4045,7 +4017,7 @@ def test_reused_backup_fills_in_missing_sidecars(tmp_path):
     wal.write_bytes(b"fake-wal-committed-rows")
 
     # Re-quarantine: same hash → reuses `first`, but must now copy the sidecar.
-    second = kb._backup_corrupt_db(db_path)
+    second = kbc._backup_corrupt_db(db_path)
     assert second == first, "byte-identical corruption should reuse the backup"
     assert (tmp_path / (first.name + "-wal")).exists(), (
         "reused backup must gain the newly-present WAL sidecar"
@@ -4071,9 +4043,9 @@ def test_corrupt_clone_count_is_capped(tmp_path):
             kbc.connect(db_path=db_path)
 
     clones = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
-    assert len(clones) <= kb._MAX_CORRUPT_CLONES, (
+    assert len(clones) <= kbc._CORRUPT_BACKUP_RETENTION, (
         f"clone-storm not bounded: {len(clones)} clones "
-        f"(cap {kb._MAX_CORRUPT_CLONES}): {[c.name for c in clones]}"
+        f"(cap {kbc._CORRUPT_BACKUP_RETENTION}): {[c.name for c in clones]}"
     )
 
 
@@ -4094,7 +4066,7 @@ def test_capped_backup_still_returns_a_forensic_path(tmp_path):
         assert bp is not None and bp.exists()
         seen.append(bp)
     # At most the cap number of distinct forensic clones exist on disk.
-    assert len({p.resolve() for p in seen}) <= kb._MAX_CORRUPT_CLONES
+    assert len({p.resolve() for p in seen}) <= kbc._CORRUPT_BACKUP_RETENTION
 
 
 def test_capped_backup_reuse_still_fills_missing_sidecars(tmp_path):
@@ -4111,7 +4083,7 @@ def test_capped_backup_reuse_still_fills_missing_sidecars(tmp_path):
     _write_corrupt_db(db_path)
 
     # Mint clones up to the cap by mutating the corrupt bytes each open.
-    for i in range(kb._MAX_CORRUPT_CLONES + 3):
+    for i in range(kbc._CORRUPT_BACKUP_RETENTION + 3):
         with db_path.open("r+b") as fh:
             fh.seek(4096)
             fh.write(bytes([i % 256]) * 96)
@@ -4120,7 +4092,7 @@ def test_capped_backup_reuse_still_fills_missing_sidecars(tmp_path):
             kbc.connect(db_path=db_path)
 
     clones = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
-    assert len(clones) == kb._MAX_CORRUPT_CLONES  # cap reached
+    assert len(clones) == kbc._CORRUPT_BACKUP_RETENTION  # cap reached
 
     # A WAL sidecar now appears next to the live corrupt DB. The next quarantine
     # is over cap → it reuses the newest clone, but must copy the sidecar too.
@@ -4130,7 +4102,7 @@ def test_capped_backup_reuse_still_fills_missing_sidecars(tmp_path):
     with db_path.open("r+b") as fh:
         fh.seek(4096)
         fh.write(b"\xab" * 96)  # mutate again so it's still over-cap reuse
-    reused = kb._backup_corrupt_db(db_path)
+    reused = kbc._backup_corrupt_db(db_path)
     assert reused is not None and reused.exists()
     assert (tmp_path / (reused.name + "-wal")).exists(), (
         "capped-reuse backup must gain the newly-present WAL sidecar"

@@ -369,9 +369,16 @@ def _git_current_branch(path: Path) -> Optional[str]:
 
 
 def _is_linked_worktree_checkout(path: Path) -> bool:
+    repo_root = _git_toplevel(path)
     git_dir = _git_dir(path)
     common_dir = _git_common_dir(path)
-    return git_dir is not None and common_dir is not None and git_dir != common_dir
+    return (
+        repo_root is not None
+        and path.resolve(strict=False) == repo_root
+        and git_dir is not None
+        and common_dir is not None
+        and git_dir != common_dir
+    )
 
 
 def _nearest_existing_path(path: Path) -> Path:
@@ -383,6 +390,8 @@ def _nearest_existing_path(path: Path) -> Path:
 
 def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
     current = _nearest_existing_path(path).resolve(strict=False)
+    if current.is_file():
+        return None
     while True:
         repo_root = _git_toplevel(current)
         if repo_root is not None:
@@ -579,7 +588,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task, *, board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     ``scratch``: ``<board-root>/workspaces/<id>/`` — path-stable across the
@@ -590,7 +601,19 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     a concrete path is created/reused, none -> the board's ``default_workdir``
     (raises if unset rather than guessing). Persist via ``set_workspace_path``.
     """
-    kind = task.workspace_kind or "scratch"
+    kind, path = _kb._strip_workspace_scheme(task.workspace_kind, task.workspace_path)
+    kind = kind or "scratch"
+    if kind != task.workspace_kind or path != task.workspace_path:
+        task.workspace_kind = kind
+        task.workspace_path = path
+        if conn is not None:
+            with _kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET workspace_kind = ?, workspace_path = ? WHERE id = ?",
+                    (kind, path, task.id),
+                )
+    task.workspace_kind = kind
+    task.workspace_path = path
     if kind == "worktree":
         return _resolve_worktree_workspace(task, board=board)[0]
     if kind == "scratch" and not task.workspace_path:
