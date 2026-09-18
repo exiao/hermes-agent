@@ -69,7 +69,9 @@ def _seed_board(slug: str = "alpha") -> dict[str, str]:
         )
         ids["worktree"] = kb.create_task(
             conn, title="worktree task", assignee="coder",
-            workspace_kind="worktree", workspace_path="/exporter/repo",
+            # The create-time guard requires a real Git repo. Import still
+            # clears this machine-local path and parks the task on the target.
+            workspace_kind="worktree", workspace_path=str(_WORKTREE),
         )
         kb.add_comment(conn, ids["scratch"], "brooklyn", "a comment")
         kb.link_tasks(conn, ids["scratch"], ids["worktree"])

@@ -873,7 +873,7 @@ def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
     """Worktree paths also must be absolute when explicitly set."""
     conn = kbc.connect()
     try:
-        with pytest.raises(ValueError, match=r"not .*inside a git repo"):
+        with pytest.raises(ValueError, match=r"workspace_path must be absolute"):
             kb.create_task(
                 conn, title="wt", assignee="worker",
                 workspace_kind="worktree",
@@ -1076,7 +1076,8 @@ def test_legacy_db_without_skills_column_migrates(tmp_path):
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             status TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER
         )
     """)
     # task_events is also touched by the migrator for run_id backfill.
@@ -1209,7 +1210,8 @@ def test_legacy_migration_no_legacy_columns_at_all(tmp_path):
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             status TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER
         )
     """)
     # task_events is required: _migrate_add_optional_columns also runs a
