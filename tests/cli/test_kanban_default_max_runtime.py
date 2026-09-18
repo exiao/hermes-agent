@@ -148,7 +148,7 @@ class TestTimeoutEnforcementBehavior:
 
         for tid in (capped, uncapped):
             kb.claim_task(conn, tid)
-            kb._set_worker_pid(conn, tid, 999999)
+            kbd._set_worker_pid(conn, tid, 999999)
             old_started = int(kb.time.time()) - 30
             with kb.write_txn(conn):
                 conn.execute(
