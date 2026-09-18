@@ -575,6 +575,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
+    if requested.exists() and repo_root is not None and requested_resolved != repo_root:
+        raise ValueError(f"task {task.id} worktree path must use the checkout root, not a subdirectory")
     if repo_root is not None and requested_resolved == repo_root:
         return _anchored_worktree(repo_root, task.id, branch_name)
 

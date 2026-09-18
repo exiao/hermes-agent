@@ -2673,6 +2673,11 @@ def test_worktree_existing_linked_worktree_subdir_rejected_at_create(
             )
         after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         assert after == before
+        # Legacy rows can predate the create guard; dispatch must reject those too.
+        legacy = kb.get_task(conn, ok)
+        legacy.workspace_path = str(subdir)
+        with pytest.raises(ValueError, match="checkout root"):
+            kbw.resolve_workspace(legacy, conn=conn)
 
 
 def test_worktree_missing_target_under_file_ancestor_rejected_at_create(
