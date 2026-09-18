@@ -1406,6 +1406,8 @@ def _resolve_project_link(
         # Concrete path is deferred to the insert loop: a fresh
         # ``<repo>/.worktrees/<task-id>`` keyed on the new task id.
         project_repo = str(project_obj.primary_path)
+        if not _worktree_path_resolvable(project_repo):
+            raise ValueError(f"project primary path {project_repo!r} is not inside a git repo")
     return project_obj.id, project_obj, project_repo, workspace_kind
 
 
@@ -3963,6 +3965,9 @@ def _insert_decomposed_child(
             raise ValueError(
                 f"decompose child {child.get('title')!r}: workspace_kind={child_ws_kind!r} "
                 "requires a resolvable workspace_path or board default_workdir")
+    if child_ws_kind == "worktree" and child_ws_path and not _worktree_path_resolvable(child_ws_path):
+        raise ValueError(
+            f"decompose child {child.get('title')!r}: path {child_ws_path!r} is not inside a git repo")
     new_id = _new_task_id()
     body = child.get("body")
     assignee = _canonical_assignee(child.get("assignee"))

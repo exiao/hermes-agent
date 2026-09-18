@@ -348,7 +348,7 @@ def test_decompose_child_kind_mismatch_no_path_raises_and_rolls_back(kanban_home
             workspace_kind="dir", workspace_path=proj, triage=True,
         )
         before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        with pytest.raises(ValueError, match="requires a workspace_path"):
+        with pytest.raises(ValueError, match="requires a resolvable workspace_path"):
             kb.decompose_triage_task(
                 conn, tid, root_assignee="orchestrator",
                 children=[
