@@ -753,6 +753,8 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
         )
 
     monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
+    if vars(_kdb).get("connect") is _orig_connect:
+        monkeypatch.setattr(_kdb, "connect", _guarded_connect)
 
 
 # ── Live state.db write guard ───────────────────────────────────────────────
