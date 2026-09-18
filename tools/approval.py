@@ -46,9 +46,7 @@ from tools.approval_smart import _smart_verdict
 logger = logging.getLogger(__name__)
 
 _get_approval_config = approval_context._get_approval_config
-def _get_approval_mode() -> str:
-    """Read the live context getter so tests and hosted policy patches apply consistently."""
-    return approval_context._get_approval_mode()
+_get_approval_mode = approval_context._get_approval_mode
 _get_cron_approval_mode = approval_context._get_cron_approval_mode
 _get_single_query_approval_mode = approval_context._get_single_query_approval_mode
 _get_unattended_approval_mode = approval_context._get_unattended_approval_mode
