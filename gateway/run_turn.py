@@ -422,6 +422,8 @@ class GatewayTurnMixin:
                 and getattr(session_entry, 'reset_had_activity', False)
                 and platform_name not in policy.notify_exclude_platforms
             )
+            # Cloud API chats are customer-facing, not gateway administration.
+            should_notify = should_notify and source.platform != Platform.WHATSAPP_CLOUD
             adapter = self._adapter_for_source(source) if should_notify else None
             if adapter:
                 notice = (
@@ -1268,7 +1270,7 @@ class GatewayTurnMixin:
                 turn_sidecar_notes.append(_intro_note)
 
         # One-time prompt if no home channel is set (webhooks deliver to configured targets instead).
-        if not source.platform or source.platform in (Platform.LOCAL, Platform.WEBHOOK):
+        if not source.platform or source.platform in (Platform.LOCAL, Platform.WEBHOOK, Platform.WHATSAPP_CLOUD):
             return
         platform_name = source.platform.value
         env_key = _home_target_env_var(platform_name)
