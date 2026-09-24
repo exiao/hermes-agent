@@ -318,7 +318,7 @@ _SAMPLE_INBOUND_TEXT_PAYLOAD = {
                         "messaging_product": "whatsapp",
                         "metadata": {
                             "display_phone_number": "15551797781",
-                            "phone_number_id": "7794189252778687",
+                            "phone_number_id": "1234567890",
                         },
                         "contacts": [
                             {
@@ -439,6 +439,28 @@ class TestWebhookDispatch:
         assert event.source.chat_type == "dm"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("phone_number_id", ["another-number", None])
+    async def test_other_or_unknown_business_number_is_not_dispatched(self, phone_number_id):
+        adapter = _make_adapter(app_secret="key")
+        adapter.handle_message = AsyncMock()
+        payload = json.loads(json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD))
+        metadata = payload["entry"][0]["changes"][0]["value"]["metadata"]
+        if phone_number_id is None:
+            metadata.pop("phone_number_id")
+        else:
+            metadata["phone_number_id"] = phone_number_id
+        body = json.dumps(payload).encode("utf-8")
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": _sign("key", body)})
+        )
+
+        assert response.status == 200
+        adapter.handle_message.assert_not_called()
+        assert adapter._accepted_count == 0
+        assert not adapter._seen_wamids
+
+    @pytest.mark.asyncio
     async def test_dispatch_filters_via_mixin_gating(self):
         adapter = _make_adapter(app_secret="key")
         adapter._dm_policy = "disabled"  # block all DMs
@@ -475,7 +497,7 @@ class TestWebhookDispatch:
                             "field": "messages",
                             "value": {
                                 "messaging_product": "whatsapp",
-                                "metadata": {"phone_number_id": "1"},
+                                "metadata": {"phone_number_id": "1234567890"},
                                 "contacts": [
                                     {"profile": {"name": "U"}, "wa_id": "1555"}
                                 ],
@@ -841,7 +863,7 @@ class TestInboundMediaDispatch:
                     "field": "messages",
                     "value": {
                         "messaging_product": "whatsapp",
-                        "metadata": {"phone_number_id": "1"},
+                        "metadata": {"phone_number_id": "1234567890"},
                         "contacts": [{"profile": {"name": "U"}, "wa_id": "1555"}],
                         "messages": [{
                             "from": "1555",
@@ -1399,4 +1421,3 @@ class TestReplyContextResolution:
         assert event.reply_to_message_id is None
         assert event.reply_to_text is None
         assert event.reply_to_is_own_message is False
-

@@ -757,6 +757,13 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if not isinstance(change, dict) or change.get("field") != "messages":
                     continue  # account_alerts, template_status_update, … — not message ingress
                 value = change.get("value") or {}
+                metadata = value.get("metadata") or {}
+                # A WABA webhook can carry traffic for several business numbers.
+                # Only the configured sender can reply, so never ingest another
+                # number's message (or a payload without a recipient identity).
+                if str(metadata.get("phone_number_id") or "").strip() != self._phone_number_id:
+                    logger.debug("[whatsapp_cloud] ignoring webhook for another phone number")
+                    continue
                 contacts_by_waid = {
                     wa_id: str((contact.get("profile") or {}).get("name") or "").strip()
                     for contact in value.get("contacts") or []
@@ -764,7 +771,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 }
                 for raw_message in value.get("messages") or []:
                     if isinstance(raw_message, dict):
-                        await self._ingest_message(raw_message, contacts_by_waid, value.get("metadata") or {})
+                        await self._ingest_message(raw_message, contacts_by_waid, metadata)
                 for status in value.get("statuses") or []:
                     if isinstance(status, dict):
                         logger.debug("[whatsapp_cloud] status %s for %s", status.get("status"), status.get("id"))
