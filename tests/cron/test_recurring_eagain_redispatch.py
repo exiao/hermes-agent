@@ -19,7 +19,7 @@ behavioral RED (unfixed: no execution) / GREEN (fixed: re-dispatched) for the
 new recovery path.
 
 This file drives the REAL `tick()` end-to-end against a throwaway HERMES_HOME:
-  tick 1 -> script EAGAINs (subprocess.run raises OSError 11) -> failed exec row
+  tick 1 -> script EAGAINs (subprocess.Popen raises OSError 11) -> failed exec row
   tick 2 -> substrate recovered (script runs clean) -> job MUST fire again
 """
 from __future__ import annotations
@@ -78,7 +78,7 @@ class TestEAGAINRecurringRedispatches:
         The script runner spawns via Popen (polling loop for cancel/timeout),
         so the substrate-failure injection point is the Popen constructor.
         """
-        import cron.scheduler as sched_mod
+        from cron import scheduler_script as sched_script
         state = {"n": 0}
 
         class _OkProc:
@@ -100,7 +100,7 @@ class TestEAGAINRecurringRedispatches:
                 raise OSError(11, "Resource temporarily unavailable")
             return _OkProc(argv, **kwargs)
 
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(sched_script.subprocess, "Popen", fake_popen)
         return state
 
     def test_eagain_then_redispatched_on_next_tick(self, wedge_env, monkeypatch, tmp_path):
