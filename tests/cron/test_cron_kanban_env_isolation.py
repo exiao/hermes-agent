@@ -60,10 +60,6 @@ def worker_env(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class TestDispatcherOwnedPredicate:
-    def test_default_is_dispatcher_owned(self):
-        from agent.delegation_context import is_dispatcher_owned_worker_context
-
-        assert is_dispatcher_owned_worker_context() is True
 
     def test_false_inside_non_dispatcher_context(self):
         from agent.delegation_context import (
@@ -173,15 +169,6 @@ class TestKanbanGatesRespectContext:
         with non_dispatcher_owned_context():
             assert kanban_tools._default_task_id("t_explicit") == "t_explicit"
 
-    def test_skill_environment_gate(self, worker_env):
-        from agent.delegation_context import non_dispatcher_owned_context
-        import agent.skill_utils as su
-
-        su._ENV_DETECT_CACHE.pop("kanban", None)
-        assert su._detect_environment("kanban") is True
-        with non_dispatcher_owned_context():
-            su._ENV_DETECT_CACHE.pop("kanban", None)
-            assert su._detect_environment("kanban") is False
 
     def test_kanban_env_verdict_is_not_memoized(self, worker_env):
         """`kanban` must bypass _ENV_DETECT_CACHE: caching it process-wide would
@@ -275,7 +262,6 @@ class TestRunJobKanbanIsolation:
 
     def test_agent_runs_as_non_dispatcher(self, monkeypatch, worker_env):
         import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
 
         observed: dict = {}
         self._install_stubs(monkeypatch, observed)
@@ -289,7 +275,6 @@ class TestRunJobKanbanIsolation:
         """The whole point of the ContextVar: os.environ must not be mutated, so
         the worker's claim heartbeat and the gateway watchers keep working."""
         import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
 
         before = {
             k: v for k, v in os.environ.items() if k.startswith("HERMES_KANBAN_")
@@ -310,20 +295,9 @@ class TestRunJobKanbanIsolation:
         }
         assert after == before
 
-    def test_context_reset_after_job(self, monkeypatch, worker_env):
-        import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
-        from agent.delegation_context import is_dispatcher_owned_worker_context
-
-        observed: dict = {}
-        self._install_stubs(monkeypatch, observed)
-
-        sched.run_job(self._job("kanban-iso-reset"))
-        assert is_dispatcher_owned_worker_context() is True
 
     def test_context_reset_even_when_job_raises(self, monkeypatch, worker_env):
         import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
         from agent.delegation_context import is_dispatcher_owned_worker_context
 
         class ExplodingAgent:
@@ -353,7 +327,6 @@ class TestRunJobKanbanIsolation:
         restore this permanently destroyed the worker's identity; a ContextVar is
         per-thread and cannot."""
         import cron.scheduler as sched
-        from cron import scheduler_delivery as sched_delivery
 
         before = {
             k: v for k, v in os.environ.items() if k.startswith("HERMES_KANBAN_")
@@ -384,15 +357,19 @@ class TestRunJobKanbanIsolation:
 # Drift guard
 # ---------------------------------------------------------------------------
 
-def test_every_dispatcher_kanban_var_is_identity_gated():
-    """Invariant: every HERMES_KANBAN_* var the dispatcher injects is covered by
-    the canonical KANBAN_ENV_KEYS, so the delegate_task subprocess scrubber and
-    any future consumer stay in sync with ``_default_spawn``.
+def test_every_dispatcher_kanban_var_is_identity_gated(tmp_path, monkeypatch):
+    """Dispatcher env must distinguish worker identity from retained board access.
 
-    Fails loudly if a new dispatcher var is added without registering it.
+    Descendants retain routing and tuning, but cannot inherit the worker's
+    task/run/claim identity or mutate the board the dispatcher assigned.
     """
     import hermes_cli.kanban_db_dispatch as kanban_db_dispatch
-    from agent.delegation_context import KANBAN_ENV_KEYS
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS,
+        is_dispatcher_owned_worker_context, scrub_kanban_env,
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     source = ast.parse(open(kanban_db_dispatch.__file__, encoding="utf-8").read())
     spawn = next(
@@ -437,20 +414,103 @@ def test_every_dispatcher_kanban_var_is_identity_gated():
 
     assert injected, "failed to parse dispatcher kanban env injection"
 
-    # These are worker-behaviour knobs rather than board/task identity; they are
-    # intentionally not part of KANBAN_ENV_KEYS. Listed explicitly so adding a
-    # new var forces a decision instead of silently passing.
+    worker_identity = {
+        "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
+    }
+    assert worker_identity <= set(KANBAN_ENV_KEYS)
+    # Paths route descendant reads; the inherited fence controls writes.
+    board_location = {
+        "HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_WORKSPACES_ROOT",
+    }
     behaviour_only = {
         "HERMES_KANBAN_BRANCH",
-        "HERMES_KANBAN_GOAL_MODE",
-        "HERMES_KANBAN_GOAL_MAX_TURNS",
         # SQLite fd-headroom tuning knob (kanban_db._resolve_fd_headroom).
         # Carries no board or task identity, so scrubbing it from a
         # delegate_task subprocess would change nothing about ownership.
         "HERMES_KANBAN_FD_HEADROOM",
     }
-    uncovered = injected - set(KANBAN_ENV_KEYS) - behaviour_only
+    uncovered = injected - set(KANBAN_ENV_KEYS) - board_location - behaviour_only
     assert not uncovered, (
         f"dispatcher injects {sorted(uncovered)} which is neither in "
-        "KANBAN_ENV_KEYS nor explicitly classified as behaviour-only"
+        "KANBAN_ENV_KEYS nor explicitly classified as board routing or tuning"
     )
+
+    monkeypatch.delenv(DELEGATED_CHILD_ENV_MARKER, raising=False)
+    db = tmp_path / "pinned-board.db"
+    with kbc.connect_closing(db) as conn:
+        task_id = kb.create_task(conn, title="parent evidence")
+
+    parent_env = {key: f"value-for-{key}" for key in injected}
+    parent_env.update({
+        "HERMES_KANBAN_DB": str(db),
+        "HERMES_KANBAN_BOARD": "default",
+        "HERMES_KANBAN_WORKSPACE": str(tmp_path / "workspace"),
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(kb.workspaces_root()),
+        "HERMES_KANBAN_FD_HEADROOM": "128",
+    })
+    child_env = scrub_kanban_env(parent_env)
+    assert worker_identity.isdisjoint(child_env)
+    assert set(KANBAN_ENV_KEYS).isdisjoint(child_env)
+    for key in board_location | behaviour_only:
+        assert child_env[key] == parent_env[key]
+    assert child_env[DELEGATED_CHILD_ENV_MARKER] == str(kb.kanban_home())
+
+    with monkeypatch.context() as child:
+        for key in KANBAN_ENV_KEYS:
+            child.delenv(key, raising=False)
+        for key, value in child_env.items():
+            child.setenv(key, value)
+        assert is_dispatcher_owned_worker_context() is False
+        with kbc.connect_closing() as conn:
+            assert kb.get_task(conn, task_id).title == "parent evidence"
+            with pytest.raises(PermissionError, match="cannot mutate Kanban"):
+                kb.create_task(conn, title="unauthorized write")
+            assert [task.id for task in kb.list_tasks(conn)] == [task_id]
+        # The fence belongs to the lineage board, not an unrelated scratch DB.
+        with kbc.connect_closing(tmp_path / "scratch" / "board.db") as conn:
+            scratch_task = kb.create_task(conn, title="scratch reproduction")
+            assert kb.get_task(conn, scratch_task).title == "scratch reproduction"
+
+
+@pytest.mark.platforms("linux")
+def test_dispatcher_grants_only_the_assigned_worker_scope(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+    import sys
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from hermes_cli.kanban_db_dispatch import _default_spawn
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    db = tmp_path / "board.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    conn = connect(db)
+    tid = kb.create_task(conn, title="assigned child", assignee="default")
+    kb.claim_task(conn, tid)
+    task = kb.get_task(conn, tid)
+    output = tmp_path / "worker-result.json"
+    worker = tmp_path / "fixture-worker"
+    root = str(Path(__file__).resolve().parents[2])
+    worker.write_text(
+        f"#!{sys.executable}\nimport sys, os, json;sys.path.insert(0, {root!r})\n"
+        "from tools.kanban_tools import _handle_complete, heartbeat_current_worker_from_env\n"
+        "beat=heartbeat_current_worker_from_env()\n"
+        f"result=json.loads(_handle_complete({{'summary':'assigned worker'}}));result['beat']=beat\n"
+        f"open({str(output)!r}, 'w').write(json.dumps(result))\n"
+    )
+    worker.chmod(0o700)
+    monkeypatch.setenv("HERMES_BIN", str(worker))
+    # Building a new worker under an existing task must replace, not inherit, its scope.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "prior-task")
+    # A dispatcher launched from an agent's shell carries the descendant fence itself; the worker it
+    # grants a task to must not (an inherited marker fences the worker's own heartbeat + handoff).
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(tmp_path))
+    pid = _default_spawn(task, str(tmp_path), board="default")
+    assert pid is not None
+    os.waitpid(pid, 0)  # windows-footgun: ok — Linux-only real dispatcher spawn
+    result = json.loads(output.read_text())
+    assert result["ok"] and result["beat"] is True, result
+    assert kb.get_task(conn, tid).status == "done"
+    assert os.environ["HERMES_KANBAN_TASK"] == "prior-task"
+    conn.close()

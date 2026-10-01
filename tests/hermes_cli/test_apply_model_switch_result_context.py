@@ -59,70 +59,40 @@ def _run_display(monkeypatch, result):
     return captured
 
 
-def test_global_classic_cli_switch_clears_stale_base_url(monkeypatch):
+def test_global_switch_clears_stale_base_url():
     """A persisted native-provider switch must not retain a local OpenAI URL."""
-    import cli as cli_mod
+    from hermes_cli.model_switch import model_selection_config_updates
 
-    saved: list[tuple[str, object]] = []
-    monkeypatch.setattr(cli_mod, "_cprint", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        cli_mod,
-        "save_config_value",
-        lambda key, value: saved.append((key, value)),
-    )
     result = ModelSwitchResult(
-        success=True,
-        new_model="claude-sonnet-4-6",
-        target_provider="anthropic",
-        provider_changed=True,
-        api_key="",
-        base_url="",
-        api_mode="anthropic_messages",
-        warning_message="",
-        provider_label="Anthropic",
-        resolved_via_alias=False,
-        capabilities=None,
-        model_info=None,
-        is_global=True,
+        success=True, new_model="claude-sonnet-4-6", target_provider="anthropic",
+        provider_changed=True, base_url="", api_mode="anthropic_messages", is_global=True,
     )
 
-    cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, True)
+    updates = model_selection_config_updates(
+        result, {"provider": "custom", "base_url": "http://127.0.0.1:8080/v1"})
 
-    assert ("model.base_url", None) in saved
+    assert updates["base_url"] is None
 
 
-def test_global_classic_cli_switch_keeps_provider_scoped_proxy_inherited(monkeypatch):
+def test_global_switch_keeps_provider_scoped_proxy_inherited():
     """A provider-derived proxy must not be frozen into ``model.base_url``.
 
     Once frozen, the runtime no longer knows the loopback URL came from
     ``providers.anthropic`` and correctly rejects it as a stale local endpoint.
     Persisting null preserves the provider-scoped provenance on the next run.
     """
-    import cli as cli_mod
+    from hermes_cli.model_switch import model_selection_config_updates
 
-    saved: list[tuple[str, object]] = []
-    monkeypatch.setattr(cli_mod, "_cprint", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        cli_mod,
-        "save_config_value",
-        lambda key, value: saved.append((key, value)),
-    )
     result = ModelSwitchResult(
-        success=True,
-        new_model="claude-sonnet-4-6",
-        target_provider="anthropic",
-        provider_changed=True,
-        base_url="http://127.0.0.1:18801",
-        api_mode="anthropic_messages",
-        provider_label="Anthropic",
-        is_global=True,
+        success=True, new_model="claude-sonnet-4-6", target_provider="anthropic",
+        provider_changed=True, base_url="http://127.0.0.1:18801",
+        api_mode="anthropic_messages", is_global=True,
     )
     result.base_url_from_provider_config = True
 
-    cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, True)
+    updates = model_selection_config_updates(result, {})
 
-    assert ("model.base_url", None) in saved
-    assert ("model.base_url", "http://127.0.0.1:18801") not in saved
+    assert updates["base_url"] is None
 
 
 def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):
@@ -197,9 +167,8 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     writes = []
     monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        cli_mod,
-        "save_config_value",
-        lambda key, value: writes.append((key, value)),
+        "utils.atomic_roundtrip_yaml_update",
+        lambda path, key, value: writes.append((key, value)),
     )
     cli = _StubCLI()
     cli.model = "shared-model"
@@ -235,7 +204,7 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
             "agent.model_metadata.get_model_context_length",
             return_value=256_000,
         ),
-        patch("hermes_cli.config.load_config_readonly", return_value=configured),
+        patch("hermes_cli.config.read_user_config_raw", return_value=configured),
     ):
         cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
 

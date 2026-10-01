@@ -6,7 +6,9 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 ``block_recurrences`` counter:
 
 * ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
-  never enter the human ``blocked`` bucket a cron would keep unblocking.
+  never enter the human ``blocked`` bucket a cron would keep unblocking —
+  unless no parent is open, in which case the wait can never be satisfied
+  and the block is recorded as ``needs_input`` (sticky, loop-counted).
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
   each same-cause re-block after an unblock increments ``block_recurrences``,
   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
@@ -17,13 +19,16 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from plugins.kanban.dashboard.plugin_api import _set_status_direct
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -36,9 +41,11 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _running_task(conn, title="t"):
-    """Create a task and drive it to ``running`` so block_task can act."""
+def _running_task(conn, title="t", parents=()):
+    """Create a task (linked under ``parents`` first) and drive it to ``running`` so block_task can act."""
     tid = kb.create_task(conn, title=title, assignee="worker")
+    for parent in parents:
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     claimed = kb.claim_task(conn, tid, claimer="worker")
@@ -55,14 +62,6 @@ def _make_running_again(conn, tid):
 # ---------------------------------------------------------------------------
 # Loop breaker
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
 
 
 def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
@@ -90,7 +89,12 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(
+            conn,
+            parent_id=parent,
+            child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         kb.block_task(conn, child, reason="wait", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
         # Finish the parent, then let recompute_ready run.
@@ -100,77 +104,6 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         kb.complete_task(conn, parent, result="done")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
-
-
-def test_dependency_no_parent_does_not_repromote(kanban_home: Path) -> None:
-    """Regression (t_e85f0abe): a dependency-wait with NO parent link must
-    PARK in ``todo`` and never auto-re-promote — the <1s
-    dependency_wait→promoted→claimed→spawned loop that burned a paid worker
-    run per tick.
-    """
-    with kbc.connect_closing() as conn:
-        tid = _running_task(conn)
-        assert kb.block_task(conn, tid, reason="waiting on a sibling", kind="dependency")
-        assert kb.get_task(conn, tid).status == "todo"
-        # Simulate many dispatcher ticks. Without the park guard, the very
-        # first recompute_ready would flip it back to 'ready'.
-        for _ in range(20):
-            kb.recompute_ready(conn)
-            assert kb.get_task(conn, tid).status == "todo", (
-                "dependency-wait with no parent must not auto-re-promote"
-            )
-        # No 'promoted' event fired after the dependency_wait.
-        evs = kb.list_events(conn, tid)
-        dep_idx = max(i for i, e in enumerate(evs) if e.kind == "dependency_wait")
-        assert not any(
-            e.kind == "promoted" for e in evs[dep_idx + 1:]
-        ), "no re-promotion event should follow the dependency_wait"
-
-
-def test_dependency_already_done_parent_does_not_repromote(
-    kanban_home: Path,
-) -> None:
-    """Regression (t_e85f0abe, mirrors live t_309aaeb8): a dependency-wait
-    whose parent was ALREADY done at block time must PARK — the named
-    dependency isn't the parent, so nothing genuinely resolved and
-    re-promoting just re-runs the worker that declared itself blocked.
-    """
-    with kbc.connect_closing() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
-        # Finish the parent FIRST, then the child declares a dependency wait.
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
-        kb.claim_task(conn, parent, claimer="worker")
-        kb.complete_task(conn, parent, result="done")
-        kb.block_task(conn, child, reason="waiting on something else", kind="dependency")
-        assert kb.get_task(conn, child).status == "todo"
-        for _ in range(20):
-            kb.recompute_ready(conn)
-            assert kb.get_task(conn, child).status == "todo", (
-                "dependency-wait with an already-done parent must not "
-                "auto-re-promote"
-            )
-
-
-def test_dependency_unblock_recovers_parked_wait(kanban_home: Path) -> None:
-    """A parked dependency-wait (no parent) recovers on an explicit
-    kanban_unblock — the sanctioned exit from the park state.
-    """
-    with kbc.connect_closing() as conn:
-        tid = _running_task(conn)
-        kb.block_task(conn, tid, reason="need a sibling artifact", kind="dependency")
-        assert kb.get_task(conn, tid).status == "todo"
-        kb.recompute_ready(conn)
-        assert kb.get_task(conn, tid).status == "todo"
-        # Explicit operator unblock. block_task on a 'todo' dependency-wait set
-        # status='todo' (not 'blocked'), so drive it via the normal recovery:
-        # unblock only acts on blocked/scheduled, so a parked todo recovers by
-        # a manual promote_task instead.
-        ok, _ = kb.promote_task(conn, tid, actor="operator", force=True)
-        assert ok
-        assert kb.get_task(conn, tid).status == "ready"
 
 
 def test_dependency_parent_completes_after_park_promotes(
@@ -183,7 +116,10 @@ def test_dependency_parent_completes_after_park_promotes(
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(
+            conn, parent_id=parent, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         kb.block_task(conn, child, reason="wait for parent", kind="dependency")
         # Parent not done yet — child parks and does not promote.
         kb.recompute_ready(conn)
@@ -197,86 +133,6 @@ def test_dependency_parent_completes_after_park_promotes(
         assert kb.get_task(conn, child).status == "ready"
 
 
-def test_dependency_rerun_after_completion_not_parked(kanban_home: Path) -> None:
-    """A stale dependency_wait from a PRIOR run must not park a task that has
-    since completed and been re-activated. The task's own 'completed' event
-    after the dependency_wait supersedes the parked state (there is no
-    'unblocked' after a completion), otherwise the revived task parks forever.
-    """
-    with kbc.connect_closing() as conn:
-        tid = _running_task(conn)
-        # First life: worker declares a dependency wait (no parent) → parks.
-        kb.block_task(conn, tid, reason="wait", kind="dependency")
-        assert kb.get_task(conn, tid).status == "todo"
-        # Task is then driven to completion (e.g. operator promote + finish).
-        ok, _ = kb.promote_task(conn, tid, actor="operator", force=True)
-        assert ok
-        kb.claim_task(conn, tid, claimer="worker")
-        kb.complete_task(conn, tid, result="done")
-        assert kb.get_task(conn, tid).status == "done"
-        # Second life: re-activate the finished task back into todo and run the
-        # gate. The stale dependency_wait must NOT re-park it.
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
-        for _ in range(5):
-            kb.recompute_ready(conn)
-        assert kb.get_task(conn, tid).status == "ready", (
-            "a completed-then-reactivated task must not be re-parked by a "
-            "stale dependency_wait from its previous run"
-        )
-
-
-def test_dependency_rerun_after_status_done_not_parked(kanban_home: Path) -> None:
-    """A task marked done via the dashboard/direct path (a 'status' event, not
-    'completed') after a no-parent dependency_wait, then reopened, must not be
-    re-parked by that stale wait — mirroring the 'completed' supersession.
-    """
-    with kbc.connect_closing() as conn:
-        tid = _running_task(conn)
-        kb.block_task(conn, tid, reason="wait", kind="dependency")
-        assert kb.get_task(conn, tid).status == "todo"
-        # Operator drags the parked card straight to 'done' on the board.
-        assert _set_status_direct(conn, tid, "done")
-        assert kb.get_task(conn, tid).status == "done"
-        # Reopen it back into todo and run the gate — the terminal 'status'
-        # move must supersede the stale dependency_wait.
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
-        for _ in range(5):
-            kb.recompute_ready(conn)
-        assert kb.get_task(conn, tid).status == "ready", (
-            "a task marked done via a terminal status move must not be re-parked "
-            "by its stale dependency_wait after being reopened"
-        )
-
-
-def test_dependency_link_done_parent_recovers(kanban_home: Path) -> None:
-    """Graph repair: a parked wait with no parent recovers when an
-    ALREADY-done parent is linked AFTER the block via `kanban link`. No new
-    'completed' event fires for the finished parent, so the recovery must key
-    off the post-wait 'linked' event + the parent's current terminal status.
-    """
-    with kbc.connect_closing() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = _running_task(conn, title="child")
-        # Finish the parent BEFORE it is ever linked.
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
-        kb.claim_task(conn, parent, claimer="worker")
-        kb.complete_task(conn, parent, result="done")
-        # Child declares a dependency wait with NO parent link → parks.
-        kb.block_task(conn, child, reason="wait on parent", kind="dependency")
-        assert kb.get_task(conn, child).status == "todo"
-        kb.recompute_ready(conn)
-        assert kb.get_task(conn, child).status == "todo"
-        # Operator repairs the graph by linking the already-done parent.
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
-        kb.recompute_ready(conn)
-        assert kb.get_task(conn, child).status == "ready", (
-            "linking an already-done parent after the wait must resolve it"
-        )
-
-
 def test_dependency_unlink_all_parents_recovers(kanban_home: Path) -> None:
     """Graph repair (mirror of link): a child that parked with a mistaken
     parent edge recovers when that edge is removed via `kanban unlink` after
@@ -288,7 +144,10 @@ def test_dependency_unlink_all_parents_recovers(kanban_home: Path) -> None:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
         # A mistaken edge is added, then the child declares a dependency wait.
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(
+            conn, parent_id=parent, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         kb.block_task(conn, child, reason="wait on wrong parent", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
         kb.recompute_ready(conn)
@@ -312,7 +171,10 @@ def test_dependency_delete_parent_releases_last_parent_park(
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(
+            conn, parent_id=parent, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         kb.block_task(conn, child, reason="wait on wrong parent", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
         kb.recompute_ready(conn)
@@ -325,71 +187,6 @@ def test_dependency_delete_parent_releases_last_parent_park(
         )
 
 
-def test_dependency_idempotent_link_does_not_release_existing_done_parent(
-    kanban_home: Path,
-) -> None:
-    """A no-op re-link must not masquerade as a post-wait graph repair.
-
-    If an already-done parent was linked before the dependency wait, the child
-    must park. Re-running the same kanban link is idempotent, so it should not
-    emit a fresh post-wait 'linked' event that releases the park.
-    """
-    with kbc.connect_closing() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
-        kb.claim_task(conn, parent, claimer="worker")
-        kb.complete_task(conn, parent, result="done")
-        kb.block_task(conn, child, reason="waiting on something else", kind="dependency")
-        assert kb.get_task(conn, child).status == "todo"
-        kb.recompute_ready(conn)
-        assert kb.get_task(conn, child).status == "todo"
-
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
-        kb.recompute_ready(conn)
-
-        assert kb.get_task(conn, child).status == "todo", (
-            "idempotent re-link of an existing done parent must not release "
-            "a dependency wait"
-        )
-
-
-def test_dependency_archive_of_already_done_parent_does_not_promote(
-    kanban_home: Path,
-) -> None:
-    """Routine cleanup must not reintroduce the respawn loop.
-
-    A child dependency-waits while its only parent is already ``done``. The
-    parent was terminal at block time, so the child must park. Later archiving
-    that already-satisfied parent emits a post-wait ``archived`` event, but no
-    dependency became *newly* satisfied — the child must STAY parked, not get
-    promoted by ``archive_task``'s ``recompute_ready``.
-    """
-    with kbc.connect_closing() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
-        # Parent finishes BEFORE the wait → terminal at block time.
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
-        kb.claim_task(conn, parent, claimer="worker")
-        kb.complete_task(conn, parent, result="done")
-        kb.block_task(conn, child, reason="waiting on something else", kind="dependency")
-        assert kb.get_task(conn, child).status == "todo"
-        kb.recompute_ready(conn)
-        assert kb.get_task(conn, child).status == "todo"
-
-        # Routine cleanup archives the already-done parent.
-        assert kb.archive_task(conn, parent)
-
-        assert kb.get_task(conn, child).status == "todo", (
-            "archiving an already-terminal parent is not a NEW resolution and "
-            "must not promote a parked dependency wait"
-        )
-
-
 def test_dependency_parent_completing_after_wait_still_promotes(
     kanban_home: Path,
 ) -> None:
@@ -398,7 +195,10 @@ def test_dependency_parent_completing_after_wait_still_promotes(
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(
+            conn, parent_id=parent, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         # Child waits while the parent is still in flight.
         kb.block_task(conn, child, reason="wait on parent", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
@@ -431,7 +231,10 @@ def test_dependency_reopened_parent_recompletion_after_wait_promotes(
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(
+            conn, parent_id=parent, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         # Parent completes once.
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
@@ -453,41 +256,6 @@ def test_dependency_reopened_parent_recompletion_after_wait_promotes(
         )
 
 
-def test_dependency_parent_reopened_after_wait_then_recompletes_promotes(
-    kanban_home: Path,
-) -> None:
-    """A parent that was ``done`` at the wait, then is reopened AND re-completed
-    entirely AFTER the wait, must release the park.
-
-    Distinct from the pre-wait reopen case: here the reopen→recompletion is a
-    genuine non-terminal→terminal transition after the block (a repair workflow
-    where an already-satisfied parent is reopened and re-run), so the child must
-    promote rather than stay stranded in todo.
-    """
-    with kbc.connect_closing() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
-        # Parent is done BEFORE the wait → terminal at block time.
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
-        kb.claim_task(conn, parent, claimer="worker")
-        kb.complete_task(conn, parent, result="done")
-        kb.block_task(conn, child, reason="waiting on done parent", kind="dependency")
-        assert kb.get_task(conn, child).status == "todo"
-        kb.recompute_ready(conn)
-        assert kb.get_task(conn, child).status == "todo"
-        # Repair: reopen the already-done parent AFTER the wait, then re-complete.
-        assert _set_status_direct(conn, parent, "ready")
-        kb.claim_task(conn, parent, claimer="worker")
-        kb.complete_task(conn, parent, result="repaired")
-        kb.recompute_ready(conn)
-        assert kb.get_task(conn, child).status == "ready", (
-            "a parent reopened and re-completed after the wait is a genuine new "
-            "resolution and must release the park"
-        )
-
-
 def test_dependency_purge_archived_parent_releases_last_parent_park(
     kanban_home: Path,
 ) -> None:
@@ -502,7 +270,10 @@ def test_dependency_purge_archived_parent_releases_last_parent_park(
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(
+            conn, parent_id=parent, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         kb.block_task(conn, child, reason="wait on parent", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
         kb.recompute_ready(conn)
@@ -532,8 +303,14 @@ def test_dependency_partial_unlink_of_unresolved_parent_releases_park(
         parent_a = kb.create_task(conn, title="parent-A-done", assignee="worker")
         parent_b = kb.create_task(conn, title="parent-B-inflight", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent_a, child_id=child)
-        kb.link_tasks(conn, parent_id=parent_b, child_id=child)
+        kb.link_tasks(
+            conn, parent_id=parent_a, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
+        kb.link_tasks(
+            conn, parent_id=parent_b, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         # A finishes before the wait; B stays in flight.
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent_a,))
@@ -563,8 +340,14 @@ def test_dependency_partial_unlink_leaving_inflight_parent_still_parks(
         parent_a = kb.create_task(conn, title="parent-A", assignee="worker")
         parent_b = kb.create_task(conn, title="parent-B", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent_a, child_id=child)
-        kb.link_tasks(conn, parent_id=parent_b, child_id=child)
+        kb.link_tasks(
+            conn, parent_id=parent_a, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
+        kb.link_tasks(
+            conn, parent_id=parent_b, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         kb.block_task(conn, child, reason="wait on A and B", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
         kb.recompute_ready(conn)
@@ -590,7 +373,10 @@ def test_dependency_parent_marked_done_via_status_after_wait_promotes(
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(
+            conn, parent_id=parent, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         # Child waits while the parent is still in flight (todo/ready).
         kb.block_task(conn, child, reason="wait on parent", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
@@ -602,6 +388,84 @@ def test_dependency_parent_marked_done_via_status_after_wait_promotes(
             "a parent marked done via set_status_direct after the wait is a "
             "genuine new resolution and must release the park"
         )
+
+
+def test_dependency_block_with_terminal_parents_parks_then_escalates(
+    kanban_home: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A ``dependency`` block whose parents are all terminal can never be
+    satisfied by ``recompute_ready``: it must park in ``blocked`` as
+    ``needs_input`` (no ``dependency_wait``, no re-promotion), say so on the
+    CLI, and count toward the loop breaker so a re-block after an unblock
+    reaches ``triage``."""
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="already-done-parent", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        # The edge exists before the run: link_tasks refuses to gate a running child retroactively.
+        child = _running_task(conn, title="child-of-done", parents=(parent,))
+
+        # `hermes kanban block <child> --kind dependency waiting on upstream`
+        args = argparse.Namespace(task_id=child, ids=None, reason=["waiting", "on", "upstream"], kind="dependency")
+        assert kanban_cli._cmd_block(args) == 0
+        assert "needs_input" in capsys.readouterr().out
+        parked = kb.get_task(conn, child)
+        assert (parked.status, parked.block_kind, parked.block_recurrences) == ("blocked", "needs_input", 1)
+        events = kb.list_events(conn, child)
+        assert not [e for e in events if e.kind == "dependency_wait"]
+        blocked = [e for e in events if e.kind == "blocked"][-1].payload
+        assert (blocked["requested_kind"], blocked["rekind_reason"]) == ("dependency", "no_open_parent")
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "blocked"
+
+        # A cron/human unblocks; the worker re-declares the same impossible wait.
+        assert kb.unblock_task(conn, child)
+        assert kb.claim_task(conn, child, claimer="worker") is not None
+        assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
+        assert kb.get_task(conn, child).status == "triage"
+        loop = [e for e in kb.list_events(conn, child) if e.kind == "block_loop_detected"][-1].payload
+        assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
+
+
+def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
+    kanban_home: Path, all_assignees_spawnable,
+) -> None:
+    """Control: a genuine wait on an incomplete parent parks in ``todo``
+    without counting a recurrence, survives a dispatch tick unspawned, and
+    resumes once the parent finishes."""
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="open-parent", assignee="alice")
+        # Linked while todo (a running child cannot be gated retroactively); the parent then stays
+        # open while the child runs — the reopened-parent shape, forced the same way the loop below does.
+        child = kb.create_task(conn, title="waiter", assignee="worker")
+        kb.link_tasks(
+            conn, parent_id=parent, child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
+        for _ in range(kb.BLOCK_RECURRENCE_LIMIT + 1):
+            assert kb.block_task(conn, child, reason="wait", kind="dependency")
+            parked = kb.get_task(conn, child)
+            assert (parked.status, parked.block_kind, parked.block_recurrences) == ("todo", "dependency", 0)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
+        assert kb.block_task(conn, child, reason="wait", kind="dependency")
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert kb.get_task(conn, child).status == "todo"
+        assert child not in spawns
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        kb.claim_task(conn, parent, claimer="alice")
+        kb.complete_task(conn, parent, result="done")
+        res2 = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert child in [row[0] for row in res2.spawned]
 
 
 # ---------------------------------------------------------------------------

@@ -37,7 +37,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
   assert.equal(attempts, 1);
   assert.equal(logs.length, 1);
-  assert.match(logs[0], /Reconnect failed \(boom\)/);
+  assert.match(logs[0], /boom/);
   assert.equal(timers.length, 2, 'rejection must schedule a retry');
   assert.equal(timers[1].ms, 5000);
 

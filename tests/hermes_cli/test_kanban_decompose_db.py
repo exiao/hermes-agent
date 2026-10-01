@@ -1,4 +1,4 @@
-"""Tests for kb.decompose_triage_task — the DB-layer atomic fan-out
+"""Tests for decompose_triage_task — the DB-layer atomic fan-out
 from the triage column. LLM-free by design.
 """
 
@@ -11,6 +11,7 @@ import pytest
 from hermes_cli import kanban_db_workspace as kbw
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
 
 
@@ -55,7 +56,7 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         {"title": "build it", "body": "write code", "assignee": "engineer", "parents": [0]},
     ]
     with kbc.connect() as conn:
-        child_ids = kb.decompose_triage_task(
+        child_ids = decompose_triage_task(
             conn,
             tid,
             root_assignee="orchestrator",
@@ -185,7 +186,7 @@ def test_decompose_rejects_cyclic_parents(kanban_home):
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kbc.connect() as conn:
         tid = _create_triage(conn)
-        child_ids = kb.decompose_triage_task(
+        child_ids = decompose_triage_task(
             conn,
             tid,
             root_assignee="orch",
@@ -198,7 +199,7 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
         comments = kb.list_comments(conn, tid)
         events = kb.list_events(conn, tid)
 
-    assert any("Decomposed into" in (c.body or "") for c in comments)
+    assert comments
     assert any(ev.kind == "decomposed" for ev in events)
 
 

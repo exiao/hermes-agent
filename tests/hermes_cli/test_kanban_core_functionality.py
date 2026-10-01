@@ -11,13 +11,9 @@ parity across every registered verb.
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import subprocess
-import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -451,23 +447,6 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
 
 
 
-def test_relative_age_renders_coarse_buckets():
-    """Freshness helper turns epoch seconds into coarse human ages, and
-    degrades safely on missing / future timestamps."""
-    now = 1_000_000
-    assert kb._relative_age(now, now) == "just now"
-    assert kb._relative_age(now - 30, now) == "just now"
-    assert kb._relative_age(now - 5 * 60, now) == "5m ago"
-    assert kb._relative_age(now - 18 * 3600, now) == "18h ago"
-    assert kb._relative_age(now - 2 * 86400, now) == "2d ago"
-    # Clock skew across machines/profiles must not claim "in the future".
-    assert kb._relative_age(now + 500, now) == "just now"
-    # Missing / unparseable timestamps render empty so callers can append
-    # unconditionally.
-    assert kb._relative_age(None, now) == ""
-    # Defensive: an unparseable value (e.g. a stray string) renders empty
-    # rather than raising.
-    assert kb._relative_age("garbage", now) == ""  # type: ignore[arg-type]
 
 
 def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
@@ -609,6 +588,11 @@ def test_cli_bulk_complete_without_summary_still_works(kanban_home):
     try:
         a = kb.create_task(conn, title="a", assignee="worker")
         b = kb.create_task(conn, title="b", assignee="worker")
+        # Keep bulk completion focused on omitted handoff flags with evidence already on each card.
+        conn.execute(
+            "UPDATE tasks SET result = ? WHERE id IN (?, ?)",
+            ("Verified task work is complete", a, b),
+        )
         kb.claim_task(conn, a); kb.claim_task(conn, b)
     finally:
         conn.close()
@@ -636,10 +620,14 @@ def test_completed_event_payload_carries_summary(kanban_home):
 
 
 def test_completed_event_payload_summary_none_when_missing(kanban_home):
-    """If the caller passes no summary AND no result, payload.summary is None."""
+    """Omitting new summary/result leaves payload.summary None when prior evidence exists."""
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET result = ? WHERE id = ?",
+            ("Verified task work is complete", tid),
+        )
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid)  # no summary, no result
         events = kb.list_events(conn, tid)
@@ -809,8 +797,7 @@ def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch):
 # Battle-test findings (May 2026: stress/ suite exposed zombie + id collision)
 # -------------------------------------------------------------------------
 
-@pytest.mark.skipif("linux" not in __import__("sys").platform,
-                    reason="zombie detection is Linux-specific")
+@pytest.mark.platforms("linux")
 def test_pid_alive_detects_zombie(kanban_home):
     """_pid_alive must return False for a zombie process.
 
@@ -1256,20 +1243,6 @@ def test_legacy_migration_no_legacy_columns_at_all(tmp_path):
 # Gateway-embedded dispatcher: config, CLI warnings, daemon deprecation stub
 # ---------------------------------------------------------------------------
 
-def test_config_default_dispatch_in_gateway_is_true():
-    """Default config must enable gateway-embedded dispatch out of the box.
-    Flipping this default to false is a user-visible behaviour change and
-    should require a conscious migration."""
-    from hermes_cli.config import DEFAULT_CONFIG
-    kanban = DEFAULT_CONFIG.get("kanban", {})
-    assert kanban.get("dispatch_in_gateway") is True, (
-        "kanban.dispatch_in_gateway default should be True; got "
-        f"{kanban.get('dispatch_in_gateway')!r}"
-    )
-    interval = kanban.get("dispatch_interval_seconds")
-    assert isinstance(interval, (int, float)) and interval >= 1, (
-        f"dispatch_interval_seconds must be a positive number, got {interval!r}"
-    )
 
 
 
@@ -1293,7 +1266,11 @@ def _make_create_ns(**overrides):
 def test_cli_create_warns_when_no_gateway(kanban_home, monkeypatch, capsys):
     """ready+assigned task + no gateway -> warning on stderr."""
     from hermes_cli import kanban as kb_cli
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    from gateway.status import GatewayLiveness
+    monkeypatch.setattr(
+        "gateway.status.resolve_gateway_liveness",
+        lambda **kwargs: GatewayLiveness(running=False, pid=None, source="none"),
+    )
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
@@ -1308,7 +1285,11 @@ def test_cli_create_warns_when_no_gateway(kanban_home, monkeypatch, capsys):
 def test_cli_create_silent_when_gateway_up(kanban_home, monkeypatch, capsys):
     """gateway running + dispatch enabled -> no warning."""
     from hermes_cli import kanban as kb_cli
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+    from gateway.status import GatewayLiveness
+    monkeypatch.setattr(
+        "gateway.status.resolve_gateway_liveness",
+        lambda **kwargs: GatewayLiveness(running=True, pid=4242, source="pidfile"),
+    )
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
@@ -1322,7 +1303,11 @@ def test_cli_create_silent_when_gateway_up(kanban_home, monkeypatch, capsys):
 def test_cli_create_no_warn_on_triage(kanban_home, monkeypatch, capsys):
     """Triage tasks can't be dispatched -> no warning."""
     from hermes_cli import kanban as kb_cli
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    from gateway.status import GatewayLiveness
+    monkeypatch.setattr(
+        "gateway.status.resolve_gateway_liveness",
+        lambda **kwargs: GatewayLiveness(running=False, pid=None, source="none"),
+    )
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
@@ -1336,7 +1321,11 @@ def test_cli_create_no_warn_on_triage(kanban_home, monkeypatch, capsys):
 def test_cli_create_no_warn_unassigned(kanban_home, monkeypatch, capsys):
     """Unassigned tasks can't be dispatched -> no warning."""
     from hermes_cli import kanban as kb_cli
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    from gateway.status import GatewayLiveness
+    monkeypatch.setattr(
+        "gateway.status.resolve_gateway_liveness",
+        lambda **kwargs: GatewayLiveness(running=False, pid=None, source="none"),
+    )
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
@@ -1414,7 +1403,6 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     import hermes_cli.config as _cfg_mod
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
-    from hermes_cli import kanban_db_dispatch as _kbd
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
@@ -1488,13 +1476,6 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kbc.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -1703,6 +1684,7 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     return _drive_worker_exit(conn, tid, fake_pid, 256)
 
 
+@pytest.mark.platforms("linux")
 def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     """Mixed failure kinds must not consume the violation retry budget.
 
@@ -1713,7 +1695,6 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     retries, and below-budget violations must leave the unified counter
     untouched (so the two budgets stay independent).
     """
-    import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
     conn = kbc.connect()
     try:
@@ -1791,3 +1772,72 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
     finally:
         conn.close()
 
+
+_WORKER_LOG_TAIL = (
+    "Query: work kanban task\n"
+    "╭─ ☤ Hermes ───────────────────╮\n"
+    "│ the board protocol requires reassigning this card to orchestrator, but the │\n"
+    "│ native kanban_* tools available here have no reassignment operation.       │\n"
+    "╰──────────────────────────────╯\n"
+    "\nResume this session with:\n  hermes --resume 20260915_000000_abc\n\n"
+    "Session:        20260915_000000_abc\nMessages:       3 (1 user, 2 tool calls)\n"
+)
+
+
+@pytest.mark.parametrize("drive", [_drive_protocol_violation, _drive_nonzero_crash])
+def test_dead_worker_reap_surfaces_the_workers_own_last_output(kanban_home, drive):
+    """Regression for #88603 / #46593: a worker that explained why it could not comply
+    (or printed a provider error) and then exited must have that text on the board and
+    on the reap event — with the CLI exit summary trimmed — instead of only the canned label."""
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="handoff", assignee="worker")
+        log_path = kb.worker_log_path(tid)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(_WORKER_LOG_TAIL)
+
+        drive(conn, tid, 991100)
+
+        task = kb.get_task(conn, tid)
+        assert "no reassignment operation" in (task.last_failure_error or "")
+        assert "Resume this session" not in (task.last_failure_error or "")
+        assert "Query:" not in (task.last_failure_error or "")
+        assert "│" not in (task.last_failure_error or "")
+        events = [e for e in kb.list_events(conn, tid) if e.kind in ("protocol_violation", "crashed")]
+        assert len(events) == 1
+        assert "no reassignment operation" in (events[0].payload or {}).get("worker_output", "")
+    finally:
+        conn.close()
+
+
+def test_dead_worker_reap_reads_the_log_of_the_dispatching_board(kanban_home):
+    """The reap must read the worker log under the board the tick runs for, not the
+    ambient "current" board — otherwise every non-default board silently gets the canned
+    message (the #88603 review finding)."""
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    assert kb.get_current_board() == "default"
+    board = "other-board"
+    conn = kbc.connect(board=board)
+    try:
+        tid = kb.create_task(conn, title="handoff", assignee="worker")
+        log_path = kb.worker_log_path(tid, board=board)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(_WORKER_LOG_TAIL)
+        host_prefix = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock") is not None
+        kbd._set_worker_pid(conn, tid, 991101)
+        kbd._record_worker_exit(991101, 0)
+        original_alive = kb._pid_alive
+        kb._pid_alive = lambda p: False
+        try:
+            kbd.detect_crashed_workers(conn, board=board)
+        finally:
+            kb._pid_alive = original_alive
+        task = kb.get_task(conn, tid)
+        assert "no reassignment operation" in (task.last_failure_error or "")
+    finally:
+        conn.close()

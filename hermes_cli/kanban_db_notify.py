@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 
 # Notifier reaction to a terminal event: "notify" = passive adapter.send only
-# (default); "notify+wake" = send AND wake the destination agent; "wake" = wake only.
+# (TUI default); "notify+wake" = send AND wake the destination agent; "wake" = wake only.
 _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
 
 _SCALAR_TYPES = (str, int, float, bool)
@@ -86,7 +86,8 @@ def add_notify_sub(
     omitting it would key the wake into a different session. ``None`` keeps an
     existing row's value. ``delivery_mode``: ``None`` leaves an existing row
     untouched, an explicit valid value is last-write-wins, unknown falls back
-    to the platform default below. New subs start caught up
+    to the platform default below. ``delivery_metadata`` merges supplied
+    routing anchors into an existing row. New subs start caught up
     (``last_event_id`` = ``MAX(task_events.id)``) so the notifier never
     replays history at boot.
 
@@ -148,9 +149,10 @@ def add_notify_sub(
         )
         # chat_type / delivery_mode are last-write-wins. Delivery metadata
         # merges so enabling a routing opt-in cannot erase platform context.
-        # user_id_alt and notifier_profile only self-heal legacy rows lacking one.
+        # user_id, user_id_alt and notifier_profile only self-heal legacy rows lacking one.
         for column, value, fill_only in (
             ("chat_type", chat_type, False),
+            ("user_id", user_id, True),
             ("user_id_alt", user_id_alt, True),
             ("notifier_profile", notifier_profile, True),
             ("delivery_mode", valid_mode, False),
@@ -170,7 +172,14 @@ def subscribe_from_cli(conn: sqlite3.Connection, args: Any, *, notifier_profile:
     from hermes_cli.profiles import normalize_profile_name, validate_profile_name
 
     platform = args.platform.strip().lower()
-    metadata: dict[str, Any] = {}
+    metadata: dict[str, Any] = {
+        key: value
+        for key, value in (
+            ("parent_chat_id", getattr(args, "parent_chat_id", None)),
+            ("guild_id", getattr(args, "guild_id", None)),
+        )
+        if value
+    }
     if getattr(args, "agent_owned_blockers", False):
         metadata["agent_owned_blockers"] = True
     coordinator = getattr(args, "coordinator_profile", None)
@@ -462,6 +471,19 @@ def advance_notify_cursor(
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? " + _SUB_KEY_WHERE,
             (int(new_cursor), *_sub_key(task_id, platform, chat_id, thread_id)),
+        )
+
+
+def record_notify_ping(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, event_id: int,
+) -> None:
+    """Checkpoint a sent ping independently of the retryable wake cursor."""
+    with _kb.write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_ping_event_id = MAX(last_ping_event_id, ?) "
+            + _SUB_KEY_WHERE,
+            (int(event_id), *_sub_key(task_id, platform, chat_id, thread_id)),
         )
 
 
