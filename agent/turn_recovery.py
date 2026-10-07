@@ -540,6 +540,25 @@ def _recover_format_errors(
     ):
         return True
 
+    # Chat-completions twin: OpenRouter can serve a turn from a different upstream caller than
+    # the one that sealed the replayed ``reasoning_details`` ("encrypted_content was not issued to
+    # this caller"). Drop the blobs from history too, or every later call re-sends them.
+    if (
+        classified.reason == FailoverReason.invalid_encrypted_content
+        and agent.api_mode != "codex_responses"
+        and not _retry.invalid_encrypted_content_retry_attempted
+    ):
+        removed = 0
+        for batch in (messages, api_messages if isinstance(api_messages, list) else []):
+            for _m in batch:
+                if isinstance(_m, dict) and _m.get("role") == "assistant" and _m.pop("reasoning_details", None):
+                    removed += 1
+        if removed:
+            _retry.invalid_encrypted_content_retry_attempted = True
+            _vlines(agent, "⚠️  Provider rejected replayed reasoning, stripped it and retrying...")
+            logger.warning("%sForeign reasoning replay recovery: stripped %d message(s)", agent.log_prefix, removed)
+            return True
+
     # Structured 400 naming ``context_management``: disable native compaction for the
     # session, retry once; local compression takes over.
     if (
