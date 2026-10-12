@@ -37,7 +37,7 @@ _SYNC_BACK_EXCLUDE_DIRS = ("venvs",)
 # ".sync-manifest.json" into $HERMES_HOME on every cleanup — creating an internal
 # artifact on the controller, or overwriting a user file of that name. The
 # mktemp siblings (.sync-manifest.XXXXXX) are excluded for the same reason.
-_SYNC_BACK_EXCLUDE_GLOBS = (".sync-manifest.json", ".sync-manifest.*")
+_SYNC_BACK_EXCLUDE_GLOBS = (".sync-manifest.json", ".sync-manifest.*", "*.sock")
 
 
 def _tar_stderr_is_only_concurrent_change(stderr: str) -> bool:
@@ -93,6 +93,7 @@ class SSHEnvironment(BaseEnvironment):
     # Passthrough values are re-forwarded on every command (see _run_bash), so like docker/local
     # they stay out of the remote snapshot under multiplex.
     _profile_scoped_passthrough = True
+    _sudo_nopasswd_probe_supported = True
 
     def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
         """Keep HERMES_HOME out of the session snapshot.
@@ -110,7 +111,7 @@ class SSHEnvironment(BaseEnvironment):
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
-                 probe_only: bool = False):
+                 probe_only: bool = False, sync_files: bool = True):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
@@ -129,6 +130,7 @@ class SSHEnvironment(BaseEnvironment):
         if probe_only:
             self._sync_manager = None
             return
+        self._remote_home_detected = False
         self._remote_home = self._detect_remote_home()
         # Profile-scoped remote root + persisted manifest: the PR's whole
         # point. Base still syncs every profile into one shared
@@ -144,17 +146,19 @@ class SSHEnvironment(BaseEnvironment):
             f"{self._remote_hermes_home}"
         )
 
-        self._ensure_remote_dirs()
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(self._remote_hermes_home),
-            upload_fn=self._scp_upload,
-            delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload,
-            bulk_download_fn=self._ssh_bulk_download,
-            manifest_load_fn=self._load_sync_manifest,
-            manifest_save_fn=self._save_sync_manifest,
-        )
-        self._sync_manager.sync(force=True)
+        self._sync_manager = None
+        if sync_files:
+            self._ensure_remote_dirs()
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files(self._remote_hermes_home),
+                upload_fn=self._scp_upload,
+                delete_fn=self._ssh_delete,
+                bulk_upload_fn=self._ssh_bulk_upload,
+                bulk_download_fn=self._ssh_bulk_download,
+                manifest_load_fn=self._load_sync_manifest,
+                manifest_save_fn=self._save_sync_manifest,
+            )
+            self._sync_manager.sync(force=True)
         self.init_session()
 
     def _control_socket_for(self, send_env: tuple[str, ...]) -> Path:
@@ -209,15 +213,15 @@ class SSHEnvironment(BaseEnvironment):
         except subprocess.TimeoutExpired:
             raise EnvironmentConnectionError(
                 f"SSH connection to {self.user}@{self.host} timed out",
-                retry_hint=(f"Check network connectivity to {self.host}:{self.port} "
-                            "and that sshd is accepting connections, then retry."))
+                retry_hint=(f"Check that {self.host} is up and reachable on port {self.port} "
+                            "and that sshd is running, then retry."))
         if result.returncode != 0:
             error_msg = result.stderr.strip() or result.stdout.strip()
             raise EnvironmentConnectionError(
                 f"SSH connection failed: {error_msg}",
-                retry_hint=(f"Verify {self.user}@{self.host}:{self.port} is reachable "
-                            "(host up, sshd running, key/agent auth working), then "
-                            "retry — the connection is re-established automatically."))
+                retry_hint=(f"Check that {self.host} is up, sshd is running on port {self.port}, and "
+                            f"{self.user} can log in with the configured key, then retry — "
+                            "the connection is re-established automatically."))
 
     def _detect_remote_home(self) -> str:
         """Detect the remote user's home directory."""
@@ -225,6 +229,7 @@ class SSHEnvironment(BaseEnvironment):
             result = self._run_ssh("echo $HOME", timeout=10)
             if result.returncode == 0 and result.stdout.strip():
                 logger.debug("SSH: remote home = %s", result.stdout.strip())
+                self._remote_home_detected = True
                 return result.stdout.strip()
         return "/root" if self.user == "root" else f"/home/{self.user}"
 
@@ -470,10 +475,17 @@ class SSHEnvironment(BaseEnvironment):
                 ssh_cmd, stdin=subprocess.DEVNULL, stdout=f,
                 stderr=subprocess.PIPE, timeout=_BULK_UPLOAD_MAX_TIMEOUT)
         stderr = (result.stderr or b"").decode(errors="replace").strip()
-        if result.returncode != 0 and (
-                result.returncode != 1 or not _tar_stderr_is_only_concurrent_change(stderr)):
-            raise _sync_error(f"SSH bulk download failed: {stderr}",
-                              f"File sync from {self.host}")
+        if result.returncode != 0:
+            diagnostic_lines = [line for line in stderr.splitlines() if line.strip()]
+            tolerated = (
+                result.returncode == 1 and _tar_stderr_is_only_concurrent_change(stderr)
+            ) or (
+                result.returncode == 2 and bool(diagnostic_lines)
+                and all(line.endswith(": socket ignored") for line in diagnostic_lines)
+            )
+            if not tolerated:
+                raise _sync_error(f"SSH bulk download failed: {stderr}",
+                                  f"File sync from {self.host}")
 
     def _ssh_delete(self, remote_paths: list[str]) -> None:
         self._run_ssh_checked(quoted_rm_command(remote_paths), 10, "remote rm failed",

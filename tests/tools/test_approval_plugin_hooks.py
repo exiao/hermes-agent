@@ -57,7 +57,7 @@ class TestCliPathFiresHooks:
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
         # approvals.mode=manual so we actually reach the prompt site
-        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
         captured = []
 
@@ -97,7 +97,7 @@ class TestCliPathFiresHooks:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
         captured = []
 
@@ -126,7 +126,7 @@ class TestCliPathFiresHooks:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
         def boom(hook_name, **kwargs):
             raise RuntimeError("plugin crashed")
@@ -143,13 +143,6 @@ class TestCliPathFiresHooks:
         assert result["approved"] is True
 
 
-class TestGatewayPathFiresHooks:
-    """Async gateway approval path: HERMES_GATEWAY_SESSION is set and a
-    gateway notify callback is registered. The agent thread blocks on the
-    approval event until resolve_gateway_approval() is called from another
-    thread."""
-
-
 class TestSmartModeFiresHooks:
     def _configure(self, monkeypatch, verdict):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
@@ -157,7 +150,7 @@ class TestSmartModeFiresHooks:
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
-        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
         monkeypatch.setattr(approval_smart, "_smart_approve", lambda *_: verdict)
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
@@ -320,7 +313,7 @@ class TestSmartModeFiresHooks:
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
-        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
         monkeypatch.setattr(approval_smart, "_smart_approve", lambda *_: next(verdicts))
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
@@ -340,5 +333,4 @@ class TestSmartModeFiresHooks:
             "smart_approve",
             "smart_deny",
         ]
-
 

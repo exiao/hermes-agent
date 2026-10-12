@@ -25,7 +25,7 @@ def test_anthropic_catalog_uses_scoped_key(monkeypatch):
 
     monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr(
-        "agent.anthropic_adapter.resolve_anthropic_token",
+        "agent.anthropic_credentials.resolve_anthropic_token",
         lambda: "sk-ant-oat01-default-profile",
     )
     ss.set_multiplex_active(True)
@@ -64,7 +64,7 @@ def test_named_profile_catalog_does_not_borrow_process_credentials(
     monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
     monkeypatch.setattr(
-        "agent.anthropic_adapter.resolve_anthropic_token",
+        "agent.anthropic_credentials.resolve_anthropic_token",
         lambda: "sk-ant-oat01-default-profile",
     )
     ss.set_multiplex_active(True)
@@ -112,7 +112,7 @@ def test_default_profile_catalog_keeps_claude_file_fallback(monkeypatch, tmp_pat
     monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
     monkeypatch.setattr(
-        "agent.anthropic_adapter.resolve_anthropic_token",
+        "agent.anthropic_credentials.resolve_anthropic_token",
         lambda: "sk-ant-oat01-claude-file-login",
     )
     ss.set_multiplex_active(True)
@@ -164,7 +164,7 @@ def test_explicit_api_key_skips_fallback_resolution(monkeypatch, tmp_path):
 
     monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
     monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
-    monkeypatch.setattr("agent.anthropic_adapter.resolve_anthropic_token", _no_resolve)
+    monkeypatch.setattr("agent.anthropic_credentials.resolve_anthropic_token", _no_resolve)
     ss.set_multiplex_active(True)
     token = ss.set_secret_scope({})
     try:

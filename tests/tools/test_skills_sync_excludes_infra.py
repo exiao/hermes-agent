@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.credential_files import _walk_skill_tree
+from tools.credential_files import _walk_linked_skill_tree
 from tools.environments.file_sync import _is_excluded_skill_remote_path
 
 
@@ -18,7 +18,7 @@ def _skill_tree(tmp_path: Path) -> Path:
 
 
 def _remote_paths(root: Path) -> set[str]:
-    return {e["container_path"] for e in _walk_skill_tree(root, "/root/.hermes/skills")}
+    return {e["container_path"] for e in _walk_linked_skill_tree(root, "/root/.hermes/skills")}
 
 
 def test_real_skill_files_are_still_synced(tmp_path):

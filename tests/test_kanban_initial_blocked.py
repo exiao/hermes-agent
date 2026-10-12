@@ -8,14 +8,16 @@ on a ticket nobody had scheduled. Observed live on t_7a8459f5: created at
 1787773142, promoted and claimed at 1787773146.
 """
 import pytest
+from hermes_cli import kanban_db_connect as kbc
 
 from hermes_cli import kanban_db
+from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
 
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    c = kanban_db.connect(tmp_path / "kanban.db")
+    c = kbc.connect(tmp_path / "kanban.db")
     yield c
     c.close()
 
@@ -124,7 +126,7 @@ def test_dashboard_drag_out_of_blocked_releases_the_park(conn):
     )
     assert kanban_db._has_sticky_block(conn, tid) is True
 
-    kanban_db.set_status_direct(conn, tid, "todo")
+    _set_status_direct(conn, tid, "todo")
 
     assert kanban_db._has_sticky_block(conn, tid) is False
 
@@ -132,6 +134,6 @@ def test_dashboard_drag_out_of_blocked_releases_the_park(conn):
 def test_dashboard_drag_into_blocked_is_a_park(conn):
     """The other direction must still stick."""
     tid = kanban_db.create_task(conn, title="normal", assignee="dev")
-    kanban_db.set_status_direct(conn, tid, "blocked")
+    _set_status_direct(conn, tid, "blocked")
 
     assert kanban_db._has_sticky_block(conn, tid) is True

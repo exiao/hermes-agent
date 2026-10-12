@@ -20,20 +20,10 @@ def _reset(monkeypatch):
 
 
 class TestRuntimeProviderUsesScope:
-    """hermes_cli.runtime_provider._getenv resolves through the secret scope."""
-
-    def test_getenv_reads_scope_under_multiplex(self, monkeypatch):
-        from hermes_cli.runtime_provider import _getenv
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-global-leak")
-        ss.set_multiplex_active(True)
-        tok = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-profileA"})
-        try:
-            assert _getenv("ANTHROPIC_API_KEY") == "sk-profileA"
-        finally:
-            ss.reset_secret_scope(tok)
+    """runtime_provider's credential reads (agent.secret_scope.get_secret_str) resolve through the scope."""
 
     def test_getenv_two_profiles_isolated(self, monkeypatch):
-        from hermes_cli.runtime_provider import _getenv
+        from agent.secret_scope import get_secret_str as _getenv
         ss.set_multiplex_active(True)
 
         tok_a = ss.set_secret_scope({"OPENAI_API_KEY": "sk-A"})
@@ -78,13 +68,13 @@ class TestMcpInterpolationUsesScope:
             ss.reset_secret_scope(tok)
 
     def test_interpolation_unset_keeps_placeholder(self, monkeypatch):
-        from tools.mcp_tool import _interpolate_env_vars
+        from tools.mcp_tool_config import _interpolate_env_vars
         monkeypatch.delenv("UNSET_MCP_VAR", raising=False)
         # multiplex off: unset var keeps literal placeholder (legacy behavior)
         assert _interpolate_env_vars("${UNSET_MCP_VAR}") == "${UNSET_MCP_VAR}"
 
     def test_interpolation_off_reads_environ(self, monkeypatch):
-        from tools.mcp_tool import _interpolate_env_vars
+        from tools.mcp_tool_config import _interpolate_env_vars
         monkeypatch.setenv("MY_MCP_TOKEN", "env-token")
         # multiplex off: legacy os.environ resolution
         assert _interpolate_env_vars("${MY_MCP_TOKEN}") == "env-token"
@@ -801,6 +791,7 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
             monkeypatch.delenv(ev, raising=False)
         default_home = tmp_path / ".hermes"
         default_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
         ss.set_multiplex_active(True)
         tok = ss.set_secret_scope({"OPENAI_API_KEY": "sk-default-openai"})
         home_tok = set_hermes_home_override(str(default_home))
@@ -813,6 +804,57 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
             "default profile under multiplexing must still list copilot from its "
             "own pool creds"
         )
+
+    def test_custom_dot_hermes_home_does_not_borrow_default_pool(self, monkeypatch, tmp_path):
+        """A custom secondary home named .hermes is still isolated from the process owner."""
+        from hermes_cli.model_switch_providers import _pool_usable
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        custom_home = tmp_path / "tenant" / ".hermes"
+        custom_home.mkdir(parents=True)
+        ss.set_multiplex_active(True)
+        scope_token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-secondary"})
+        home_token = set_hermes_home_override(str(custom_home))
+        try:
+            monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+            class _Pool:
+                def has_credentials(self):
+                    return True
+
+                def has_available(self):
+                    return True
+
+            monkeypatch.setattr("agent.credential_pool.load_pool", lambda _slug: _Pool())
+            assert not _pool_usable("copilot")
+        finally:
+            reset_hermes_home_override(home_token)
+            ss.reset_secret_scope(scope_token)
+
+    def test_scoped_pool_guard_fails_closed_on_auth_store_error(self, monkeypatch, tmp_path):
+        """A secondary pool check must not fall through to ambient load_pool after auth I/O fails."""
+        from hermes_cli.model_switch_providers import _pool_usable
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        custom_home = tmp_path / "tenant" / "profile"
+        custom_home.mkdir(parents=True)
+        ss.set_multiplex_active(True)
+        scope_token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-secondary"})
+        home_token = set_hermes_home_override(str(custom_home))
+        try:
+            def _auth_store_error():
+                raise OSError("auth store unavailable")
+
+            monkeypatch.setattr("hermes_cli.auth._load_auth_store", _auth_store_error)
+            monkeypatch.setattr(
+                "agent.credential_pool.load_pool",
+                lambda _slug: pytest.fail(
+                    "ambient pool must not be consulted after scoped auth failure"
+                ),
+            )
+            assert not _pool_usable("copilot")
+        finally:
+            reset_hermes_home_override(home_token)
+            ss.reset_secret_scope(scope_token)
 
     def test_single_profile_still_lists_copilot_from_pool(self, monkeypatch):
         """Multiplex off / no scope (CLI/TUI): the pool fallback still runs, so
@@ -833,7 +875,7 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
 
     def _list_copilot_via_canonical(self, monkeypatch, *, pool_has_creds: bool):
         from hermes_cli.model_switch import list_authenticated_providers
-        from hermes_cli.models import ProviderEntry
+        from hermes_cli.models_catalog_static import ProviderEntry
 
         # copilot reaches the canonical cross-check (section 2b) only: no
         # overlay match, no models.dev entry, empty auth store, scoped env
@@ -1102,6 +1144,74 @@ def test_turn_scoped_dotenv_reload_does_not_pollute_process_env(tmp_path, monkey
         assert load_hermes_dotenv(hermes_home=get_hermes_home()) == []
         assert "PROFILE_SCOPED_API_KEY" not in os.environ
         assert os.environ["DISCORD_ALLOWED_CHANNELS"] == "all-channels"
+
+
+def test_launch_home_dotenv_still_loads_under_multiplex(tmp_path, monkeypatch):
+    """#125530: the multiplex guard skips only FOREIGN (routed) home loads.
+
+    The launch profile's own scoped bodies bind an override naming the launch home, so a
+    launch-home load legitimately arrives with an override set; skipping it hid the launch
+    home's ``.env`` (a fallback_providers key) from the process env. A routed profile's
+    ``.env`` is still never copied into ``os.environ``.
+    """
+    import os
+
+    from hermes_cli.env_loader import load_hermes_dotenv
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    launch = tmp_path / "launch"
+    routed = tmp_path / "profiles" / "routed"
+    launch.mkdir()
+    routed.mkdir(parents=True)
+    (launch / ".env").write_text("LAUNCH_ONLY_FALLBACK_KEY=launch-key\n", encoding="utf-8")
+    (routed / ".env").write_text("LAUNCH_ONLY_FALLBACK_KEY=routed-secret\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.delenv("LAUNCH_ONLY_FALLBACK_KEY", raising=False)
+    ss.set_multiplex_active(True)
+
+    def _load(home):
+        token = set_hermes_home_override(str(home))
+        try:
+            return load_hermes_dotenv(hermes_home=home)
+        finally:
+            reset_hermes_home_override(token)
+
+    assert _load(launch) == [launch / ".env"]
+    assert os.environ["LAUNCH_ONLY_FALLBACK_KEY"] == "launch-key"
+    assert _load(routed) == []
+    assert os.environ["LAUNCH_ONLY_FALLBACK_KEY"] == "launch-key"
+    assert _load(launch) == [launch / ".env"]
+    assert os.environ["LAUNCH_ONLY_FALLBACK_KEY"] == "launch-key"
+
+
+def test_launch_home_load_inside_foreign_turn_keeps_routed_cwd_out_of_process_env(tmp_path, monkeypatch):
+    """A launch-targeted load while a FOREIGN profile is routed is still skipped: its terminal
+    bridge reads config through the override, so it would copy the routed profile's ``terminal.cwd``
+    into the shared ``TERMINAL_CWD`` that the launch profile's own turns and cron jobs read."""
+    import os
+
+    from hermes_cli.env_loader import load_hermes_dotenv
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    launch = tmp_path / "launch"
+    routed = tmp_path / "profiles" / "routed"
+    launch_work = tmp_path / "work-launch"
+    routed_work = tmp_path / "work-routed"
+    for d in (launch, routed, launch_work, routed_work):
+        d.mkdir(parents=True)
+    (launch / ".env").write_text("LAUNCH_ONLY_FALLBACK_KEY=launch-key\n", encoding="utf-8")
+    (launch / "config.yaml").write_text(f"terminal:\n  backend: local\n  cwd: {launch_work}\n", encoding="utf-8")
+    (routed / "config.yaml").write_text(f"terminal:\n  backend: local\n  cwd: {routed_work}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv("TERMINAL_CWD", str(launch_work))
+    ss.set_multiplex_active(True)
+
+    token = set_hermes_home_override(str(routed))
+    try:
+        assert load_hermes_dotenv(hermes_home=launch) == []
+    finally:
+        reset_hermes_home_override(token)
+    assert os.environ["TERMINAL_CWD"] == str(launch_work)
 
 
 def test_cold_profile_hydrates_external_source_without_global_env(

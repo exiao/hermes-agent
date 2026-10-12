@@ -39,13 +39,18 @@ def test_liveness_true_when_gateway_process_holds_runtime_lock(tmp_path, monkeyp
         "print('READY', flush=True)\n"
         "sys.stdin.read()\n"
     )
+    child_env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parents[2])
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (repo_root, child_env.get("PYTHONPATH", "")) if value
+    )
     process = subprocess.Popen(
         [sys.executable, str(gateway_script)],
         cwd=Path(__file__).resolve().parents[2],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
-        env=os.environ.copy(),
+        env=child_env,
     )
     ready = []
     reader = threading.Thread(target=lambda: ready.append(process.stdout.readline()))
@@ -66,7 +71,7 @@ def test_liveness_true_when_gateway_process_holds_runtime_lock(tmp_path, monkeyp
         )
 
         assert cron_mod._builtin_gateway_liveness() is True
-        assert status_mod.is_gateway_running(cleanup_stale=False) is True
+        assert status_mod.get_running_pid(cleanup_stale=False) is not None
     finally:
         if process.stdin is not None:
             process.stdin.close()
@@ -80,14 +85,14 @@ def test_liveness_true_when_gateway_process_holds_runtime_lock(tmp_path, monkeyp
 
     # cleanup_stale=False is intentional: the dead process leaves its PID
     # record for diagnostics instead of deleting it during this probe.
-    assert status_mod.is_gateway_running(cleanup_stale=False) is False
+    assert status_mod.get_running_pid(cleanup_stale=False) is None
     assert (tmp_path / "gateway.pid").exists()
 
 
 def test_liveness_falls_back_to_scan_when_pid_file_is_stale(monkeypatch):
     """A missing/stale PID file must still find a live gateway by process scan."""
     monkeypatch.setattr(cron_mod, "_active_cron_provider_name", lambda: "builtin")
-    monkeypatch.setattr(status_mod, "is_gateway_running", lambda **kw: False)
+    monkeypatch.setattr(status_mod, "get_running_pid", lambda **kw: None)
     monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda *a, **k: [4242])
 
     assert cron_mod._builtin_gateway_liveness() is True
@@ -96,7 +101,7 @@ def test_liveness_falls_back_to_scan_when_pid_file_is_stale(monkeypatch):
 def test_liveness_false_when_nothing_is_running(monkeypatch):
     """Both oracles empty is the only state that may warn the user."""
     monkeypatch.setattr(cron_mod, "_active_cron_provider_name", lambda: "builtin")
-    monkeypatch.setattr(status_mod, "is_gateway_running", lambda **kw: False)
+    monkeypatch.setattr(status_mod, "get_running_pid", lambda **kw: None)
     monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda *a, **k: [])
 
     assert cron_mod._builtin_gateway_liveness() is False
@@ -109,6 +114,6 @@ def test_non_builtin_provider_still_exempt(monkeypatch):
     def _boom(*a, **k):  # pragma: no cover - must not be reached
         raise AssertionError("provider exemption must short-circuit the probe")
 
-    monkeypatch.setattr(status_mod, "is_gateway_running", _boom)
+    monkeypatch.setattr(status_mod, "get_running_pid", _boom)
 
     assert cron_mod._builtin_gateway_liveness() is True

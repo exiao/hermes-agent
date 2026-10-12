@@ -1,4 +1,4 @@
-"""Tests for the FD-headroom preflight in ``hermes_cli.kanban_db.connect``.
+"""Tests for the FD-headroom preflight in ``hermes_cli.kbc.connect``.
 
 Layer 2 corruption guard (2026-07-13 FD-leak incident): before opening the
 shared kanban DB, ``connect()`` refuses when the process OR the host is within
@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 import pytest
+from hermes_cli import kanban_db_connect as kbc
 
 from hermes_cli import kanban_db as kb
 
@@ -156,7 +157,7 @@ def test_connect_refuses_and_writes_no_sidecar(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_FD_HEADROOM", "64")
 
     with pytest.raises(kb.KanbanFDPressureError):
-        kb.connect()
+        kbc.connect()
 
     assert not wal.exists()
     assert not shm.exists()
@@ -166,7 +167,7 @@ def test_connect_succeeds_before_and_after_pressure(kanban_home, monkeypatch):
     """Fail-before/pass-after: connect works healthy, refuses under pressure,
     then works again once pressure clears (self-healing)."""
     # Healthy: connect works.
-    conn = kb.connect()
+    conn = kbc.connect()
     conn.close()
 
     # Under pressure: refuse.
@@ -174,11 +175,11 @@ def test_connect_succeeds_before_and_after_pressure(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "_system_fd_headroom", lambda: None)
     monkeypatch.setenv("HERMES_KANBAN_FD_HEADROOM", "64")
     with pytest.raises(kb.KanbanFDPressureError):
-        kb.connect()
+        kbc.connect()
 
     # Pressure clears: connect works again with no lingering damage.
     monkeypatch.setattr(kb, "_proc_fd_headroom", lambda: 5000)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
@@ -195,7 +196,7 @@ def test_dispatcher_style_tick_survives_refusal(kanban_home, monkeypatch):
     tick_ran = False
     skipped = False
     try:
-        conn = kb.connect()  # would corrupt if it opened under pressure
+        conn = kbc.connect()  # would corrupt if it opened under pressure
         tick_ran = True
         conn.close()
     except Exception:

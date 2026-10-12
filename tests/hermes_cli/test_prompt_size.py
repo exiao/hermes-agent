@@ -57,9 +57,9 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
 
 
 def test_blank_slate_prompt_size_counts_only_minimal_tools(isolated_home):
-    """Blank Slate prompt-size should report file + terminal schemas only."""
+    """Blank Slate includes file/terminal, image reading, skills and discovery."""
     from hermes_cli.config import save_config
-    from hermes_cli.setup import (
+    from hermes_cli.setup_quick import (
         _blank_slate_minimal_toolsets,
         _blank_slate_minimize_config,
     )
@@ -71,9 +71,9 @@ def test_blank_slate_prompt_size_counts_only_minimal_tools(isolated_home):
 
     data = compute_prompt_breakdown("cli")
 
-    # file (read_file, write_file, patch, search_files, send_file) + terminal
-    # (terminal, process) = 7 minimal tool schemas.
-    assert data["tools"]["count"] == 7
+    # Five file + two terminal + vision + three skills + tool_search.
+    assert cfg["platform_toolsets"]["cli"] == ["file", "skills", "terminal", "vision"]
+    assert data["tools"]["count"] == 12
 
 
 

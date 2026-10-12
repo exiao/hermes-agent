@@ -1,3 +1,5 @@
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 """Regression: kanban terminal-state notifications must not clip the worker's
 handoff mid-sentence.
 
@@ -55,10 +57,10 @@ async def _run_one_notifier_tick(monkeypatch, runner):
 
 
 def _blocked_subscription(reason):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="block notify", assignee="dev")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
         kb.block_task(conn, tid, reason=reason)
         return tid
@@ -71,10 +73,10 @@ def _gave_up_subscription(error):
     the production path (`_record_task_failure`), not hand-written. With
     ``failure_limit=1`` a single failure crosses the threshold and emits the
     ``gave_up`` event the notifier reads."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="gaveup notify", assignee="dev")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb.claim_task(conn, tid)
         kb._record_task_failure(
             conn, tid, error=error,
@@ -89,10 +91,10 @@ def _gave_up_subscription(error):
 def _completed_subscription(summary):
     """Complete via the real `complete_task` producer so the event payload is
     built (and capped) exactly as production does, not hand-written."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="done notify", assignee="dev")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, summary=summary)
         return tid
@@ -226,7 +228,7 @@ def test_gave_up_run_row_stores_full_error_for_retry(tmp_path, monkeypatch):
     ) * 4  # >500 chars
     assert len(error) > 500
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="runrow", assignee="dev")
         kb.claim_task(conn, tid)

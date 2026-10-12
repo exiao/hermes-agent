@@ -22,7 +22,7 @@ import pytest
 from agent.auxiliary_client import _CodexCompletionsAdapter
 
 
-def _adapter_with_recording_client(stream):
+def _adapter_with_recording_client(stream, *, shutdown_event=None):
     """Build an adapter whose client records (action, thread) events.
 
     The nested ``_client._transport._pool._connections`` shape is what
@@ -33,6 +33,8 @@ def _adapter_with_recording_client(stream):
     class _Sock:
         def shutdown(self, how):
             events.append(("shutdown", threading.get_ident()))
+            if shutdown_event is not None:
+                shutdown_event.set()
 
         def close(self):
             events.append(("sock.close", threading.get_ident()))
@@ -71,13 +73,18 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
         shutdown(); the real close() must land on the owning thread in the
         adapter's ``finally``."""
 
-        def _stalled():
-            deadline = time.monotonic() + 30.0
-            while time.monotonic() < deadline:
-                time.sleep(0.02)
-                yield SimpleNamespace(type="response.in_progress")
+        shutdown_event = threading.Event()
 
-        adapter, events = _adapter_with_recording_client(_stalled())
+        def _stalled():
+            # Keep the owner inside the SDK iterator so the watchdog, rather
+            # than the owner's next per-event check, owns the timeout race.
+            yield SimpleNamespace(type="response.in_progress")
+            assert shutdown_event.wait(timeout=5.0)
+            yield SimpleNamespace(type="response.in_progress")
+
+        adapter, events = _adapter_with_recording_client(
+            _stalled(), shutdown_event=shutdown_event
+        )
         owner_tid = threading.get_ident()
 
         def _consume(stream, *, model, on_event):

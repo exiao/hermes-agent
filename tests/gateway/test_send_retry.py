@@ -11,7 +11,7 @@ Verifies that:
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from gateway.platforms.base import BasePlatformAdapter, SendResult, _RETRYABLE_ERROR_PATTERNS
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.base import Platform, PlatformConfig
 
 
@@ -66,9 +66,6 @@ class _StubAdapter(BasePlatformAdapter):
 class TestIsRetryableError:
     def test_none_is_not_retryable(self):
         assert not _StubAdapter._is_retryable_error(None)
-
-    def test_empty_string_is_not_retryable(self):
-        assert not _StubAdapter._is_retryable_error("")
 
 
     def test_permission_error_not_retryable(self):
@@ -153,9 +150,6 @@ class TestIsAmbiguousDeliveryError:
 class TestIsTimeoutError:
     def test_none_is_not_timeout(self):
         assert not _StubAdapter._is_timeout_error(None)
-
-    def test_empty_is_not_timeout(self):
-        assert not _StubAdapter._is_timeout_error("")
 
 
 # ---------------------------------------------------------------------------

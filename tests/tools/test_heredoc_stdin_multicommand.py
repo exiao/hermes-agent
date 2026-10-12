@@ -22,7 +22,6 @@ from pathlib import Path
 import pytest
 
 from tools.environments.base import BaseEnvironment
-from tools.environments.modal_utils import wrap_modal_stdin_heredoc
 
 
 # The real shape emitted by FileOperations._atomic_write: a multi-command
@@ -51,8 +50,8 @@ def _run(wrapped: str) -> subprocess.CompletedProcess:
 
 @pytest.mark.parametrize(
     "embed",
-    [BaseEnvironment._embed_stdin_heredoc, wrap_modal_stdin_heredoc],
-    ids=["base", "modal_utils"],
+    [BaseEnvironment._embed_stdin_heredoc],
+    ids=["base"],
 )
 class TestHeredocFeedsWholeCommand:
     def test_atomic_write_body_reaches_the_file(self, embed, tmp_path):

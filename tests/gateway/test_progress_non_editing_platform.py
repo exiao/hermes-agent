@@ -73,7 +73,10 @@ class _BlockingSendAdapter(_NoEditAdapter):
 
 
 def _runner_for(adapter, ctx):
-    from gateway.run import TurnRunner
+    # Import the facade first so its fork-specific TurnRunner method overrides
+    # are installed before importing the defining class module directly.
+    import gateway.run
+    from gateway.run_turn_runner import TurnRunner
 
     class _StubGatewayRunner:
         def _adapter_for_source(self, source):

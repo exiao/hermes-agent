@@ -10,6 +10,7 @@ always lands). The cap is configurable via ``kanban.block_reason_max_chars``.
 from __future__ import annotations
 
 import pytest
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -26,7 +27,7 @@ def worker_env(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
@@ -38,7 +39,7 @@ def worker_env(monkeypatch, tmp_path):
 
 def _stored_reason(task_id):
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         run = kb.latest_run(conn, task_id)
     finally:
