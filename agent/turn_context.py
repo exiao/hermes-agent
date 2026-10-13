@@ -611,6 +611,7 @@ def _collect_pre_llm_call_context(
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
+            session_key=getattr(agent, "_gateway_session_key", None) or "",
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,

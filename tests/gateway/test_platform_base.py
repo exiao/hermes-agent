@@ -2,6 +2,7 @@
 
 import os
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -710,6 +711,126 @@ class TestUniversalMediaEgress:
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert media == [("/nonexistent/report.pdf", False)]
         assert "MEDIA:" not in cleaned
+
+
+@pytest.fixture
+def session_media_provider(monkeypatch):
+    from agent import terminal_env_registry as registry
+    from agent.terminal_env_provider import TerminalEnvironmentProvider
+    from tools.terminal_scope import terminal_scope
+
+    class Provider(TerminalEnvironmentProvider):
+        name = "session_media_test"
+        requires_session_media_isolation = True
+
+        def is_available(self):
+            return True
+
+        def create_environment(self, **kwargs):
+            raise NotImplementedError
+
+    provider = Provider()
+    previous = registry.get_provider(provider.name)
+    registry.register_provider(provider)
+    try:
+        with terminal_scope({"TERMINAL_ENV": provider.name}):
+            yield provider
+    finally:
+        registry.restore_registration(provider.name, provider, previous)
+
+
+@pytest.mark.parametrize("failure", ["deny", "exception", "missing_callback", "missing_session", "invalid_result", "missing_provider"])
+def test_isolated_media_denial_never_uses_host_cache_or_remote_fetch(
+    tmp_path, monkeypatch, session_media_provider, failure,
+):
+    import gateway.platforms.base as base
+    from agent import terminal_env_registry as registry
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    foreign = cache / "other-session.png"
+    foreign.write_bytes(b"foreign chart")
+    monkeypatch.setattr(base, "MEDIA_DELIVERY_SAFE_ROOTS", (cache,))
+    monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "3600")
+
+    def deny(path, session_key):
+        if failure == "exception":
+            raise RuntimeError("sandbox unavailable")
+        return False if failure == "invalid_result" else None
+
+    if failure != "missing_callback":
+        monkeypatch.setattr(session_media_provider, "validate_media_delivery_path", deny, raising=False)
+    if failure == "missing_provider":
+        monkeypatch.setattr(registry, "get_provider", lambda name: None)
+    key = "" if failure == "missing_session" else "gateway:session:a"
+    with patch("gateway.media_fetch.fetch_remote_media") as fetch:
+        assert base.validate_media_delivery_path(str(foreign), key) is None
+        assert BasePlatformAdapter.filter_media_delivery_paths([(str(foreign), False)], session_key=key) == []
+    fetch.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("as_document", [False, True])
+async def test_isolated_media_delivers_spool_copy_after_original_symlink_changes(
+    tmp_path, monkeypatch, session_media_provider, as_document,
+):
+    session = tmp_path / "session"
+    session.mkdir()
+    chart = session / "chart.png"
+    chart.write_bytes(b"own chart")
+    foreign = tmp_path / "other-session.png"
+    foreign.write_bytes(b"foreign chart")
+    link = session / "output.png"
+    link.symlink_to(chart)
+    spool = tmp_path / "gateway-private" / "unique-chart.png"
+    spool.parent.mkdir(mode=0o700)
+    calls = []
+    sandbox_bytes = chart.read_bytes()  # Stand-in for bytes read inside the plugin's sandbox.
+
+    def spool_copy(path, session_key):
+        calls.append((path, session_key))
+        spool.write_bytes(sandbox_bytes)  # Never host-open the model-supplied path.
+        link.unlink()
+        link.symlink_to(foreign)
+        return str(spool)
+
+    from unittest.mock import AsyncMock, MagicMock
+    from gateway.config import Platform, PlatformConfig
+    from gateway.session import SessionSource
+    from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+
+    monkeypatch.setattr(session_media_provider, "validate_media_delivery_path", spool_copy, raising=False)
+    adapter = WhatsAppCloudAdapter(PlatformConfig())
+    event = MessageEvent(text="render chart", source=SessionSource(platform=Platform.WHATSAPP_CLOUD, chat_id="test-chat"))
+    uploaded = []
+    sent = []
+
+    async def graph_stub(url, **kwargs):
+        response = MagicMock(status_code=200)
+        if url.endswith("/media"):
+            filename, handle, mime = kwargs["files"]["file"]
+            uploaded.append((handle.name, handle.read()))
+            response.json.return_value = {"id": "stub-media-id"}
+        else:
+            sent.append(kwargs["json"])
+            response.json.return_value = {"messages": [{"id": "stub-message-id"}]}
+        return response
+
+    adapter._http_client = MagicMock(post=AsyncMock(side_effect=graph_stub))
+    response = f"{'[[as_document]] ' if as_document else ''}MEDIA:{link}"
+    with patch("gateway.media_fetch.fetch_remote_media") as fetch:
+        extracted = await adapter._extract_response_content(response, event, "gateway:session:a", is_ephemeral_response=False)
+        assert extracted.media_files == [(str(spool), False)]
+        await adapter._deliver_media_attachments(
+            event, extracted.media_files, extracted.local_files,
+            force_document_attachments=extracted.force_document_attachments, human_delay=0, metadata={},
+        )
+    assert calls == [(str(link), "gateway:session:a")]
+    assert uploaded == [(str(spool), b"own chart")]
+    assert len(sent) == 1
+    assert sent[0]["type"] == ("document" if as_document else "image")
+    assert link.read_bytes() == b"foreign chart"
+    fetch.assert_not_called()
 
 
 class TestMediaDeliveryPathValidation:

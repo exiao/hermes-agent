@@ -1083,12 +1083,42 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
     return None
 
 
+def _isolated_media_provider():
+    """Selected terminal provider, only when media requires session isolation.
+
+    Unknown plugin backends and policy-resolution errors must never become host access.
+    """
+    from tools.terminal_tool import _ensure_terminal_env_bridged
+    from agent.terminal_env_registry import BUILTIN_BACKEND_NAMES, get_provider
+
+    _ensure_terminal_env_bridged()
+    backend = _tenv("TERMINAL_ENV", "local").strip().lower()
+    if backend in BUILTIN_BACKEND_NAMES:
+        return None
+    provider = get_provider(backend)
+    if provider is None:
+        raise RuntimeError("Selected terminal provider is unavailable")
+    return provider if provider.requires_session_media_isolation else None
+
+
 def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
     """Safe absolute file path for native media delivery, else None. Default: any existing
     regular file outside the credential / system denylist (symmetric with inbound). Strict
     (``HERMES_MEDIA_DELIVERY_STRICT=1``, public bots where prompt injection must not exfiltrate
     host secrets): MUST be under a Hermes cache, an operator root (``HERMES_MEDIA_ALLOW_DIRS``),
     or freshly produced within the recency window. Symlinks are resolved before any check."""
+    try:
+        provider = _isolated_media_provider()
+        if provider is not None:
+            if not session_key:
+                return None
+            spool = provider.validate_media_delivery_path(path, session_key)
+            # The trusted provider owns the copy; do not reopen the session path or
+            # send a denial through permissive host-cache/remote-fetch validation.
+            return spool if isinstance(spool, str) and os.path.isabs(spool) else None
+    except Exception:
+        logger.warning("Session media delivery policy failed", exc_info=True)
+        return None
     candidate = _normalize_media_tag_path(path)
     if not candidate:
         return None
@@ -1137,8 +1167,13 @@ def _validated_delivery_path(raw_path, session_key: str, label: str) -> Optional
     raw = str(raw_path)
     safe_path = validate_media_delivery_path(raw, session_key=session_key)
     if not safe_path:
-        from gateway.media_fetch import fetch_remote_media
-        safe_path = fetch_remote_media(raw)
+        try:
+            isolated = _isolated_media_provider() is not None
+        except Exception:
+            isolated = True
+        if not isolated:
+            from gateway.media_fetch import fetch_remote_media
+            safe_path = fetch_remote_media(raw)
     if not safe_path:
         # Say WHY: a path that does not exist on the host is the common case (a model hallucinated or
         # a sandbox path failed to translate) and is not a security rejection.

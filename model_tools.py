@@ -727,7 +727,8 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
             if modified_args is not None:
                 function_args = modified_args
         except Exception as _hook_err:
-            logger.debug("pre_tool_call hook error: %s", _hook_err)
+            logger.warning("pre_tool_call plugin dispatch failed: %s", _hook_err)
+            block_message = "pre_tool_call plugin dispatch failed"
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 

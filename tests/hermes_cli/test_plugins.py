@@ -1228,6 +1228,37 @@ class TestForceReloadSymmetry:
         assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in result
         hold.set()
 
+    @pytest.mark.parametrize("timeout", [0, 1])
+    def test_pre_tool_callback_exception_blocks_real_dispatch(self, monkeypatch, timeout):
+        import hermes_cli.plugins as plugins_mod
+        from model_tools import handle_function_call
+
+        monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: timeout)
+
+        def broken_policy(**kwargs):
+            raise RuntimeError("policy unavailable")
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [lambda **kwargs: {"action": "approve"}, broken_policy]
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+        registry = MagicMock()
+        with patch("model_tools.registry", registry):
+            result = handle_function_call("web_search", {"query": "test"}, task_id="t1")
+        registry.dispatch.assert_not_called()
+        assert "pre_tool_call plugin callback failed" in result
+
+    def test_pre_tool_dispatch_exception_blocks_registry_handler(self):
+        from model_tools import handle_function_call
+
+        registry = MagicMock()
+        with (
+            patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", side_effect=RuntimeError("dispatch unavailable")),
+            patch("model_tools.registry", registry),
+        ):
+            result = handle_function_call("web_search", {"query": "test"}, task_id="t1")
+        registry.dispatch.assert_not_called()
+        assert "pre_tool_call plugin dispatch failed" in result
+
     def test_force_reload_of_one_profile_does_not_orphan_another(self, monkeypatch):
         """Real two-manager regression: force-reloading profile A's plugin
         manager must leave profile B's shell hook registered exactly once —

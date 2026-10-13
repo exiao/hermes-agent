@@ -17,6 +17,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.provider_base import ProviderBase
 
 
+# Core policy-hook fail-closed + authoritative session media spool contract.
+# External plugins/installers must require this before enabling isolation.
+SESSION_BOUNDARY_GUARDS_VERSION = 1
+
+
 class TerminalEnvironmentProvider(ProviderBase):
     """Abstract base class for a pluggable terminal execution backend.
 
@@ -43,6 +48,21 @@ class TerminalEnvironmentProvider(ProviderBase):
     is_remote: bool = True
     is_container: bool = True
     session_isolated_when_nonpersistent: bool = False
+    requires_session_media_isolation: bool = False
+
+    def validate_media_delivery_path(self, path: str, session_key: str) -> Optional[str]:
+        """For isolated providers, return a trusted spool copy or None to deny.
+
+        Core supplies the original model path and trusted gateway session key, before
+        host/cache/recency checks. Resolve the session-to-sandbox mapping, reject paths
+        resolved outside its root, and read bytes inside that sandbox. A resolved string
+        alone is unsafe under concurrent symlink mutation. Copy to a unique gateway-owned
+        spool inaccessible to session writers (never a hardlink), stable through upload.
+        Sandbox reads must also prevent access via hardlinks to foreign/secret inodes.
+        Core accepts the spool string directly; denial/errors never use host/remote fallback.
+        Nonisolated providers retain ordinary media handling and need not override this.
+        """
+        return None
 
     @property
     def description(self) -> str:

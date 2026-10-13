@@ -44,7 +44,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "pre_verify", "on_session_start", "on_session_end",
 }
 
-# Policy hooks: timeout / still-running must fail closed (block the tool).
+# Policy hooks: exceptions / timeout / still-running must fail closed (block the tool).
 _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
@@ -187,7 +187,7 @@ class PluginDispatchMixin:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
                     if ret is _HOOK_SKIPPED:
                         if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                            results.insert(0, {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
                         continue
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
@@ -196,6 +196,8 @@ class PluginDispatchMixin:
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
+                if fail_closed:
+                    results.insert(0, {"action": "block", "message": "pre_tool_call plugin callback failed"})
         return results
 
     def _run_hook_callback_bounded(

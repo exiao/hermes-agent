@@ -375,6 +375,21 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_plugin_dispatch_exception_blocks_agent_execution(concurrent):
+    agent = _make_agent("web_search")
+    msg = SimpleNamespace(content="", tool_calls=[_mock_tool_call("web_search")])
+    messages = []
+    with (
+        patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", side_effect=RuntimeError("dispatch unavailable")),
+        patch("model_tools.handle_function_call", return_value="SHOULD_NOT_RUN") as handler,
+    ):
+        execute = agent._execute_tool_calls_concurrent if concurrent else agent._execute_tool_calls_sequential
+        execute(msg, messages, "task-1")
+    handler.assert_not_called()
+    assert "pre_tool_call plugin dispatch failed" in messages[0]["content"]
+
+
 def test_default_run_conversation_warns_without_guardrail_halt():
     agent = _make_agent("web_search", max_iterations=10)
     same_args = {"query": "same"}

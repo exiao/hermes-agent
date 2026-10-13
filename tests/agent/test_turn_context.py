@@ -201,6 +201,22 @@ def _build(agent, **overrides):
     return build_turn_context(**kwargs)
 
 
+@pytest.mark.parametrize("session_key", ["gateway:session:a", ""])
+def test_pre_llm_plugin_receives_trusted_session_key_and_task(monkeypatch, session_key):
+    from hermes_cli.plugins import PluginManager
+    import hermes_cli.plugins as plugins
+
+    agent = _FakeAgent()
+    if session_key:
+        agent._gateway_session_key = session_key
+    captured = []
+    manager = PluginManager()
+    manager._hooks["pre_llm_call"] = [lambda **kwargs: captured.append(kwargs)]
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    _build(agent, task_id="sandbox-task")
+    assert [(item["session_key"], item["task_id"]) for item in captured] == [(session_key, "sandbox-task")]
+
+
 def test_returns_turn_context_with_user_message_appended():
     agent = _FakeAgent()
     ctx = _build(agent)
