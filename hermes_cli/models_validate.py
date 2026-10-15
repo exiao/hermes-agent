@@ -368,6 +368,12 @@ def _validate_custom(req: _Request) -> dict[str, Any]:
         verdict = match.verdict(req)
         if verdict is not None:
             return verdict
+        # A Codex ``-900k`` picker alias never appears in a listing: it is stripped before the
+        # request, so the endpoint only has to serve the base slug.
+        from agent.model_metadata import is_codex_context_variant, strip_codex_context_variant_suffix
+
+        if is_codex_context_variant(req.lookup) and strip_codex_context_variant_suffix(req.lookup) in set(api_models):
+            return _accept()
         message = (
             f"Note: `{req.requested}` was not found in this custom endpoint's model listing "
             f"({probe.get('probed_url')}). It may still work if the server supports hidden or aliased models."
