@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 def _load_plugin_module():
@@ -59,7 +60,7 @@ def _make_board_db(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     db_path = tmp_path / "kanban.db"
-    return kb.connect(db_path=db_path)
+    return kbc.connect(db_path=db_path)
 
 
 def _set_status(conn, task_id, status):

@@ -33,7 +33,7 @@ function readMappingFile(sessionDir, identifier, suffix = '') {
   }
 }
 
-export function expandWhatsAppIdentifiers(identifier, sessionDir) {
+export function expandWhatsAppIdentifiers(identifier, sessionDir, getMapping) {
   const normalized = normalizeWhatsAppIdentifier(identifier);
   if (!normalized) {
     return new Set();
@@ -53,7 +53,7 @@ export function expandWhatsAppIdentifiers(identifier, sessionDir) {
     resolved.add(current);
 
     for (const suffix of ['', '_reverse']) {
-      const mapped = readMappingFile(sessionDir, current, suffix);
+      const mapped = getMapping ? normalizeWhatsAppIdentifier(getMapping(current, suffix)) : readMappingFile(sessionDir, current, suffix);
       if (mapped && !resolved.has(mapped)) {
         queue.push(mapped);
       }
@@ -63,7 +63,32 @@ export function expandWhatsAppIdentifiers(identifier, sessionDir) {
   return resolved;
 }
 
-export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
+export function matchesAllowedSender(senderId, senderAltId, allowedUsers, sessionDir, getMapping) {
+  // WhatsApp Multi-Device can expose a first-contact sender as an opaque LID
+  // before it persists LID mapping files. Baileys supplies the same sender's
+  // phone JID separately (key.remoteJidAlt for DMs, key.participantAlt in
+  // groups), so consult it as an additional alias without changing the
+  // allowlist itself (#63415, #72529).
+  return matchesAllowedUser(senderId, allowedUsers, sessionDir, getMapping)
+    || matchesAllowedUser(senderAltId, allowedUsers, sessionDir, getMapping);
+}
+
+export function matchesInboundWhatsAppGroup({
+  chatId,
+  groupPolicy,
+  groupAllowedUsers,
+  sessionDir,
+}) {
+  if (groupPolicy === 'disabled' || groupPolicy === 'pairing') {
+    return false;
+  }
+  if (groupPolicy === 'allowlist') {
+    return matchesAllowedUser(chatId, groupAllowedUsers, sessionDir);
+  }
+  return groupPolicy === 'open';
+}
+
+export function matchesAllowedUser(senderId, allowedUsers, sessionDir, getMapping) {
   // Empty allowlist = NO ONE allowed (secure default, #8389).  Operators
   // who want an open bot must set ``WHATSAPP_ALLOWED_USERS=*`` explicitly.
   // Previous behaviour (empty → return true) let any stranger DM the
@@ -77,7 +102,7 @@ export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
     return true;
   }
 
-  const aliases = expandWhatsAppIdentifiers(senderId, sessionDir);
+  const aliases = expandWhatsAppIdentifiers(senderId, sessionDir, getMapping);
   for (const alias of aliases) {
     if (allowedUsers.has(alias)) {
       return true;
