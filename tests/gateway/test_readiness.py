@@ -4,7 +4,9 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
+import gateway.readiness as readiness_module
 from gateway.readiness import collect_runtime_readiness
 
 
@@ -18,6 +20,11 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
     with sqlite3.connect(home / "state.db") as conn:
         conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        readiness_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=100, used=50, free=50),
+    )
 
     result = collect_runtime_readiness(
         configured_model="test/model",

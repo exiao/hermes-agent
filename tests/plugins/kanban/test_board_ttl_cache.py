@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 def _load_plugin_module():
@@ -66,7 +67,7 @@ def _make_board_db(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     db_path = tmp_path / "kanban.db"
-    return kb.connect(db_path=db_path)
+    return kbc.connect(db_path=db_path)
 
 
 def _reset_cache():
@@ -216,7 +217,7 @@ def _setup_hermes_home(tmp_path, monkeypatch):
     """Point HERMES_HOME (and Path.home) at a temp root WITHOUT pinning a
     fixed db_path, so board reads/writes flow through the real resolution
     chain (env → ``current`` file → ``default``). Unlike ``_make_board_db``
-    this lets ``get_board(board=None)`` and ``kb.connect(board=...)`` agree on
+    this lets ``get_board(board=None)`` and ``kbc.connect(board=...)`` agree on
     where each board's DB lives — required for a board-switch test that
     asserts on payload *content*, not just cache identity."""
     home = tmp_path / ".hermes"
@@ -234,13 +235,13 @@ def test_switching_active_board_bypasses_cache_for_none_board(tmp_path, monkeypa
     _setup_hermes_home(tmp_path, monkeypatch)
 
     # Seed the default board through the resolution chain.
-    conn_default = kb.connect(board="default")
+    conn_default = kbc.connect(board="default")
     kb.create_task(conn_default, title="default task", assignee="x")
     conn_default.close()
 
     # Seed a second board.
     kb.create_board("other")
-    conn_other = kb.connect(board="other")
+    conn_other = kbc.connect(board="other")
     kb.create_task(conn_other, title="other task", assignee="y")
     conn_other.close()
 
@@ -297,7 +298,7 @@ def test_create_within_ttl_invalidates_stale_board(tmp_path, monkeypatch):
     _reset_cache()
     _setup_hermes_home(tmp_path, monkeypatch)
     kb.set_current_board("default")
-    conn = kb.connect(board="default")
+    conn = kbc.connect(board="default")
     kb.create_task(conn, title="first task", assignee="x")
     conn.close()
 
@@ -331,7 +332,7 @@ def test_delete_within_ttl_invalidates_stale_board(tmp_path, monkeypatch):
     _reset_cache()
     _setup_hermes_home(tmp_path, monkeypatch)
     kb.set_current_board("default")
-    conn = kb.connect(board="default")
+    conn = kbc.connect(board="default")
     tid = kb.create_task(conn, title="doomed", assignee="x")
     kb.create_task(conn, title="survivor", assignee="x")
     conn.close()
@@ -359,7 +360,7 @@ def test_patch_within_ttl_invalidates_stale_board(tmp_path, monkeypatch):
     _reset_cache()
     _setup_hermes_home(tmp_path, monkeypatch)
     kb.set_current_board("default")
-    conn = kb.connect(board="default")
+    conn = kbc.connect(board="default")
     tid = kb.create_task(conn, title="old title", assignee="x")
     conn.close()
 
@@ -388,7 +389,7 @@ def test_invalidate_helper_clears_all_entries(tmp_path, monkeypatch):
     _reset_cache()
     _setup_hermes_home(tmp_path, monkeypatch)
     kb.set_current_board("default")
-    conn = kb.connect(board="default")
+    conn = kbc.connect(board="default")
     kb.create_task(conn, title="a", assignee="alice")
     kb.create_task(conn, title="b", assignee="bob")
     conn.close()
@@ -410,7 +411,7 @@ def test_dispatch_non_dryrun_invalidates_board_cache(tmp_path, monkeypatch):
     _reset_cache()
     _setup_hermes_home(tmp_path, monkeypatch)
     kb.set_current_board("default")
-    conn = kb.connect(board="default")
+    conn = kbc.connect(board="default")
     kb.create_task(conn, title="pending task", assignee="x")
     conn.close()
 
@@ -451,7 +452,7 @@ def test_inflight_fill_does_not_repopulate_after_concurrent_invalidation(tmp_pat
     _reset_cache()
     _setup_hermes_home(tmp_path, monkeypatch)
     kb.set_current_board("default")
-    conn = kb.connect(board="default")
+    conn = kbc.connect(board="default")
     kb.create_task(conn, title="original", assignee="x")
     conn.close()
 
@@ -489,7 +490,7 @@ def test_update_task_invalidates_after_partial_mutation_then_error(tmp_path, mon
     _reset_cache()
     _setup_hermes_home(tmp_path, monkeypatch)
     kb.set_current_board("default")
-    conn = kb.connect(board="default")
+    conn = kbc.connect(board="default")
     tid = kb.create_task(conn, title="task one", assignee="old")
     conn.close()
 
@@ -527,7 +528,7 @@ def test_update_task_404_does_not_invalidate(tmp_path, monkeypatch):
     _reset_cache()
     _setup_hermes_home(tmp_path, monkeypatch)
     kb.set_current_board("default")
-    conn = kb.connect(board="default")
+    conn = kbc.connect(board="default")
     kb.create_task(conn, title="only task", assignee="x")
     conn.close()
 
@@ -544,5 +545,3 @@ def test_update_task_404_does_not_invalidate(tmp_path, monkeypatch):
     assert exc.value.status_code == 404
     # Unchanged DB -> warm cache preserved (no needless recompute).
     assert len(plugin_api._BOARD_CACHE) == 1
-
-

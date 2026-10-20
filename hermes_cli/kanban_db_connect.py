@@ -439,9 +439,13 @@ def _repairable_index_names(messages: list[str]) -> Optional[list[str]]:
     (caller fails closed; also ``None`` for no messages). First-appearance
     order is preserved so the REINDEX pass is deterministic."""
     names: list[str] = []
-    for raw in messages:
-        message = (raw or "").strip()
-        if not message:
+    # SQLite groups an index-page fragmentation note under a database banner.
+    # REINDEX remains limited to named indexes and must pass a full re-check.
+    lines = (line.strip() for raw in messages for line in (raw or "").splitlines())
+    for message in lines:
+        if not message or message.startswith("*** in database "):
+            continue
+        if re.fullmatch(r"Fragmentation of \d+ bytes reported as \d+ on page \d+", message):
             continue
         for pattern in _REPAIRABLE_INDEX_ERROR_PATTERNS:
             match = pattern.match(message)
@@ -458,22 +462,28 @@ def _repairable_index_names(messages: list[str]) -> Optional[list[str]]:
 def _attempt_index_reindex_repair(path: Path, index_names: list[str]) -> tuple[bool, list[str]]:
     """REINDEX the named indexes (per-index first; bare ``REINDEX`` fallback if
     a parsed name is an internal/auto index), then re-run integrity_check.
-    Returns ``(clean, post_repair_messages)``; never raises. Callers must hold
+    Returns ``(clean, post_repair_messages)``; transient lock errors propagate. Callers must hold
     the board's cross-process init flock so nothing connects mid-repair."""
     try:
         conn = _sqlite_connect(path)
     except sqlite3.Error as exc:
+        if _is_busy_error(exc):
+            raise
         return False, [f"could not reopen for REINDEX: {exc}"]
     try:
         try:
             for name in index_names:
                 escaped = name.replace('"', '""')
                 conn.execute(f'REINDEX "{escaped}"')
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if _is_busy_error(exc):
+                raise
             # Per-index rebuild failed — bare REINDEX rebuilds every index.
             conn.execute("REINDEX")
         messages = _run_integrity_check(conn)
     except sqlite3.Error as exc:
+        if _is_busy_error(exc):
+            raise
         return False, [f"REINDEX failed: {exc}"]
     finally:
         conn.close()
@@ -639,6 +649,7 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     conn = _sqlite_connect(path)
     try:
         conn.row_factory = sqlite3.Row
+        conn.text_factory = _kb._lossy_text
         with _INIT_LOCK:
             # WAL doesn't work on network filesystems; the helper falls back to
             # DELETE with one ERROR log (see hermes_state_wal._WAL_INCOMPAT_MARKERS).
@@ -672,6 +683,17 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    from agent.delegation_context import kanban_path_is_fenced
+    if kanban_path_is_fenced(path):
+        # Reads must not enter schema/backfill write transactions. Never create a
+        # missing board or migrate on a descendant's behalf; the owner initializes it.
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.text_factory = _kb._lossy_text
+        if not _schema_is_present(conn):
+            conn.close()
+            raise PermissionError("Kanban descendants require an initialized board; ask its owner to initialize it")
+        return conn
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, skip the
@@ -755,6 +777,26 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     return path
 
 
+# Nullable/defaulted columns of the v1 ``tasks`` CREATE TABLE that external
+# harnesses seeding a board with a reduced schema have omitted. Hermes's own
+# DBs always carry them, so this is a no-op there; without it a board that
+# also has ``task_runs`` fails every ``connect()`` inside
+# ``_backfill_legacy_inflight_runs`` ("no such column: claim_lock") — before
+# ``_INITIALIZED_PATHS`` caches, so the dispatcher re-raises each tick (#112953).
+# DDL must match SCHEMA_SQL exactly.
+_BASE_TASK_COLUMNS = (
+    ("body", "body TEXT"),
+    ("assignee", "assignee TEXT"),
+    ("priority", "priority INTEGER DEFAULT 0"),
+    ("created_by", "created_by TEXT"),
+    ("started_at", "started_at INTEGER"),
+    ("completed_at", "completed_at INTEGER"),
+    ("workspace_kind", "workspace_kind TEXT NOT NULL DEFAULT 'scratch'"),
+    ("workspace_path", "workspace_path TEXT"),
+    ("claim_lock", "claim_lock TEXT"),
+    ("claim_expires", "claim_expires INTEGER"),
+)
+
 # Additive ``tasks`` columns in the order legacy DBs receive them (= physical
 # column order for ``SELECT *`` on migrated boards).
 _EARLY_TASK_COLUMNS = (
@@ -798,13 +840,17 @@ _LATER_TASK_COLUMNS = (
     # Ralph-style goal loop toggle; 0 = classic single-shot worker.
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),
+    ("completion_contract", "completion_contract TEXT"),
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
+    ("worker_started_at", "worker_started_at INTEGER"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
+    ("last_ping_event_id", "last_ping_event_id INTEGER NOT NULL DEFAULT 0"),
     ("notifier_profile", "notifier_profile TEXT"),
     ("delivery_mode", "delivery_mode TEXT NOT NULL DEFAULT 'notify'"),
     ("chat_type", "chat_type TEXT"),
@@ -813,6 +859,12 @@ _NOTIFY_SUB_COLUMNS = (
     # (which prefers ``user_id_alt``). NULL is inert.
     ("user_id_alt", "user_id_alt TEXT"),
     ("delivery_metadata", "delivery_metadata TEXT"),
+)
+
+_TASK_RUN_COLUMNS = (
+    # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
+    # terminal-worker reaper; NULL = legacy row, never signalled).
+    ("worker_started_at", "worker_started_at INTEGER"),
 )
 
 
@@ -829,7 +881,7 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns introduced after v1 to legacy DBs (called via ``init_db``)."""
     cols = _column_names(conn, "tasks")
-    for name, ddl in _EARLY_TASK_COLUMNS:
+    for name, ddl in _BASE_TASK_COLUMNS + _EARLY_TASK_COLUMNS:
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, ddl)
 
@@ -849,16 +901,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn.execute(copy_sql)
     for name, ddl in _LATER_TASK_COLUMNS:
         if name not in cols:
-            if name == "model_override":
-                conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
-            else:
-                _add_column_if_missing(conn, "tasks", name, ddl)
+            _add_column_if_missing(conn, "tasks", name, ddl)
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
     # so a ``CREATE INDEX`` over a missing column in SCHEMA_SQL would abort
     # init on legacy boards before the ALTER TABLE pass runs. ``IF NOT EXISTS``
     # keeps re-running here cheap and correct on fresh DBs.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
@@ -889,6 +939,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 )
 
     if _table_exists(conn, "task_runs"):
+        run_cols = _column_names(conn, "task_runs")
+        for name, ddl in _TASK_RUN_COLUMNS:
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, ddl)
         _backfill_legacy_inflight_runs(conn)
 
     # One-shot event-kind rename: old names still worked but were awkward on
@@ -988,7 +1042,7 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -1005,6 +1059,7 @@ _REBUILD_SPECS = {
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
         " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " last_ping_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -1131,6 +1186,17 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+def _main_db_file(conn: sqlite3.Connection) -> Optional[str]:
+    """Filesystem path of *conn*'s main database (None for in-memory / unreadable)."""
+    try:
+        for _seq, name, file in conn.execute("PRAGMA database_list") or ():
+            if name == "main":
+                return file or None
+    except (sqlite3.Error, TypeError, ValueError):
+        pass
+    return None
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one
@@ -1142,7 +1208,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     (``complete_task`` & co.) must never run under an open outer transaction,
     since those side effects would fire while the outer txn can still roll back.
     """
-    _kb._assert_not_delegated_child_mutation()
+    _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(

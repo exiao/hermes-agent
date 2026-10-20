@@ -15,12 +15,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
+from hermes_state import SessionDB
+
 from agent.turn_context import (
     PreflightCompressionTimedOut,
     TurnContext,
     build_turn_context,
 )
-from hermes_state import SessionDB
 
 
 class _FakeTodoStore:
@@ -90,7 +91,6 @@ class _FakeAgent:
         self._stream_think_scrubber = None
         # Attributes the prologue assigns; recorded for assertions.
         self._invalid_tool_retries = -1
-        self._vision_supported = None
         self._persist_calls = 0
         self._session_messages = []
         self._pending_cli_user_message = None
@@ -140,6 +140,19 @@ class _FakeAgent:
         self._persist_calls += 1
 
 
+@pytest.fixture(autouse=True)
+def _stub_runtime_main():
+    """``build_turn_context`` calls ``auxiliary_client.set_runtime_main`` as a
+    production side effect (telling aux tools the live main provider/model).
+    That writes a module-level global these unit tests don't care about and
+    which would otherwise leak into sibling tests (e.g. provider-parity
+    resolution) when the per-test process isolation plugin is disabled. Stub
+    it out so the prologue tests stay hermetic.
+    """
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+        yield
+
+
 def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
     agent = _FakeAgent()
     agent.compression_enabled = True
@@ -165,19 +178,6 @@ def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
     agent.context_compressor = compressor
     agent._session_db = db
     return agent
-
-
-@pytest.fixture(autouse=True)
-def _stub_runtime_main():
-    """``build_turn_context`` calls ``auxiliary_client.set_runtime_main`` as a
-    production side effect (telling aux tools the live main provider/model).
-    That writes a module-level global these unit tests don't care about and
-    which would otherwise leak into sibling tests (e.g. provider-parity
-    resolution) when the per-test process isolation plugin is disabled. Stub
-    it out so the prologue tests stay hermetic.
-    """
-    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
-        yield
 
 
 def _build(agent, **overrides):
@@ -215,7 +215,8 @@ def test_returns_turn_context_with_user_message_appended():
 
 
 def test_preflight_timeout_stops_turn_before_provider_boundary():
-    """An unchanged oversized payload must not escape turn construction."""
+    """An unchanged payload above the model window must not escape turn construction (a request that
+    still fits its window is sent uncompressed instead — see test_preflight_compression_timeout_fail_closed)."""
     agent = _FakeAgent()
     agent.compression_enabled = True
     agent.max_compression_attempts = 3
@@ -223,7 +224,7 @@ def test_preflight_timeout_stops_turn_before_provider_boundary():
         protect_first_n=2,
         protect_last_n=2,
         threshold_tokens=1_000,
-        context_length=4_000,
+        context_length=1_500,
         summary_target_ratio=0.3,
         last_prompt_tokens=0,
         should_compress=lambda tokens=None: True,
@@ -288,8 +289,61 @@ def test_prefetch_runs_for_substantive_user_message():
     agent, mm = _agent_with_memory_manager()
     query = "what did we decide about the deploy pipeline?"
     ctx = _build(agent, user_message=query)
-    mm.prefetch_all.assert_called_once_with(query)
+    mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id)
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+
+
+# ── Per-turn author ──────────────────────────────────────────────────────────
+
+
+def test_turn_author_is_normalized_then_reaches_on_turn_start_and_the_agent_stash():
+    agent, mm = _agent_with_memory_manager()
+
+    _build(agent, user_message="what did we decide about the deploy pipeline?",
+           turn_author={"id": " bot:al\x00pha ", "name": "Alpha", "is_bot": 1, "x": 1})
+
+    kwargs = mm.on_turn_start.call_args.kwargs
+    assert (kwargs["author_id"], kwargs["author_name"], kwargs["author_is_bot"]) == ("bot:alpha", "Alpha", True)
+    # The end-of-turn sync reads this back off the agent.
+    assert agent._turn_author == {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
+
+
+def test_turn_without_author_clears_previous_bot_author():
+    agent, mm = _agent_with_memory_manager()
+    _build(agent, user_message="first turn", turn_author={"id": "bot:alpha", "name": "Alpha", "is_bot": True})
+    assert agent._turn_author["id"] == "bot:alpha"
+
+    _build(agent, user_message="second turn")
+
+    assert agent._turn_author is None
+    kwargs = mm.on_turn_start.call_args.kwargs
+    assert kwargs["author_id"] is None
+    assert kwargs["author_is_bot"] is False
+
+
+def test_turn_author_reaches_the_agent_through_the_real_facade(monkeypatch):
+    """``AIAgent.run_conversation(turn_author=...)`` crosses the facade and the loop entry point, not only
+    ``build_turn_context``; a kwarg dropped at either hop raised TypeError on every real turn."""
+    from types import SimpleNamespace
+    from run_agent import AIAgent
+
+    class _Completions:
+        def create(self, **_kw):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="ok", tool_calls=None, reasoning=None, reasoning_content=None),
+                finish_reason="stop")], usage=None, model="test-model")
+
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI",
+                        lambda **_kw: SimpleNamespace(chat=SimpleNamespace(completions=_Completions())))
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda *a, **k: [])
+    agent = AIAgent(model="test-model", api_key="k", base_url="http://localhost:1/v1", platform="cli",
+                    max_iterations=2, quiet_mode=True, skip_memory=True)
+    agent._disable_streaming = True
+
+    agent.run_conversation("hi", turn_author={"id": "bot:alpha", "name": "Alpha", "is_bot": True})
+    assert agent._turn_author == {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
+    agent.run_conversation("hi again")
+    assert agent._turn_author is None
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
@@ -329,24 +383,15 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)
-    # Retry counters reset, guardrails reset, vision re-armed, turn counted.
+    # Retry counters reset, guardrails reset, turn counted.
     assert agent._invalid_tool_retries == 0
     assert agent._tool_guardrails.reset_called is True
-    assert agent._vision_supported is True
     assert agent._user_turn_count == 1
     # Crash-resilience persistence fired once.
     assert agent._persist_calls == 1
     # task/turn ids assigned on the agent.
     assert agent._current_task_id
     assert agent._current_turn_id
-
-
-
-
-
-
-
-
 
 
 def test_pending_cli_message_uses_clean_override_for_api_local_note():
@@ -366,12 +411,6 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     assert ctx.messages[-1]["_db_persisted"] is True
     assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert agent._pending_cli_user_message is None
-
-
-
-
-
-
 
 
 def test_recall_indicator_emitted_when_memory_injected():
@@ -503,8 +542,11 @@ def test_expired_cooldown_allows_preflight(tmp_path):
         cooldown_until=1.0,
     )
 
+    # Upstream defers unanchored rough estimates to the next response; pin the estimate as
+    # anchored real usage so this test exercises only the expired-cooldown gate.
+    agent.context_compressor.should_defer_preflight_to_real_usage = lambda _tokens: False
     with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+         patch("agent.turn_context._preflight_request_tokens", return_value=230_000):
         ctx = _build(agent)
 
     assert isinstance(ctx, TurnContext)
@@ -586,3 +628,40 @@ def test_runtime_sync_keeps_failed_local_cooldown_through_refresh(tmp_path):
         _build(agent)
 
     assert compressor.get_active_compression_failure_cooldown(refresh=True) is not None
+
+
+def test_prologue_names_a_subagent_run_after_its_goal_without_a_model_call():
+    """A delegate run gets ``Subagent: <goal>`` at derived authority so it reads as machinery
+    wherever ``sessions.show_subagents`` lists it, instead of staying untitled (#97202)."""
+    from agent import turn_context
+
+    agent = _TitlingAgent("subagent")
+    agent._session_db.set_auto_title.return_value = True
+    with patch("agent.title_generator.maybe_auto_title") as titler:
+        turn_context._maybe_title_session_at_turn_start(
+            agent, [{"role": "user", "content": "Audit the billing module\n\nContext: ..."}])
+    assert not titler.called
+    agent._session_db.set_auto_title.assert_called_once_with(
+        "sess-1", "Subagent: Audit the billing module", source="derived")
+
+
+def test_prologue_leaves_cron_runs_untitled():
+    agent = _TitlingAgent("cron")
+    from agent import turn_context
+
+    turn_context._maybe_title_session_at_turn_start(agent, [{"role": "user", "content": "Run the job"}])
+    assert not agent._session_db.set_auto_title.called
+
+
+def test_prologue_forwards_the_submit_title_preview_to_the_titler():
+    """A paste-shrunk ``display_metadata.title_preview`` from prompt.submit is the text the
+    titler should read, not the full pasted body."""
+    from agent import turn_context
+
+    with patch("agent.title_generator.maybe_auto_title") as titler:
+        turn_context._maybe_title_session_at_turn_start(
+            _TitlingAgent("desktop"),
+            [{"role": "user", "content": "x" * 5000,
+              "display_metadata": {"title_preview": "Pasted 5000 chars"}}],
+        )
+    assert titler.call_args.kwargs["title_preview"] == "Pasted 5000 chars"

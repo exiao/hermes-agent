@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 import pytest
+from hermes_cli import kanban_db_connect as kbc
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
@@ -84,7 +85,7 @@ def test_validate_assignee_accepts_unassigned_sentinels(kanban_home, sentinel):
 # ---------------------------------------------------------------------------
 
 def _board_task_count() -> int:
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         row = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()
         return int(row["n"])

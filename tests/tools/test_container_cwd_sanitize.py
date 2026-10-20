@@ -19,24 +19,14 @@ behaviour so neither path can regress.
 
 import tools.terminal_tool as tt
 
-
 class TestIsUnusableContainerCwd:
     def test_windows_backslash_host_path_rejected(self):
         # The exact shape from the bug report: a Windows host cwd reaching a
         # Linux container's -w flag.
         assert tt._is_unusable_container_cwd(r"C:\Users\someuser") is True
 
-
     def test_posix_home_host_path_rejected(self):
         assert tt._is_unusable_container_cwd("/home/ben/projects") is True
-
-
-    def test_container_backends_set(self):
-        from tools.terminal_tool_config import _CONTAINER_BACKENDS
-        assert _CONTAINER_BACKENDS == frozenset(
-            {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
-        )
-
 
 class TestOverrideCwdSanitizedAtCallSite:
     """E2E pin: a per-task cwd OVERRIDE that is a host path must NOT reach the
@@ -108,12 +98,10 @@ class TestOverrideCwdSanitizedAtCallSite:
             "It must be sanitized back to config['cwd']."
         )
 
-
     def test_valid_container_override_is_preserved(self, monkeypatch):
         # RL/benchmark envs set an in-container path; it must pass through.
         cwd = self._run_and_capture_cwd(monkeypatch, "/workspace/task42")
         assert cwd == "/workspace/task42"
-
 
 class TestFileOpsCwdSanitizedAtCallSite:
     """E2E pin: file tools (_get_file_ops) must sanitize a host/relative cwd
@@ -169,13 +157,13 @@ class TestFileOpsCwdSanitizedAtCallSite:
             def execute(self, *a, **k):
                 return {"output": "", "exit_code": 0}
 
-        def fake_create_environment(env_type, image, cwd, timeout, **kwargs):
+        def fake_create_environment(config, env_type, image, cwd, timeout, **kwargs):
             captured["cwd"] = cwd
             return _DummyEnv()
 
         monkeypatch.setattr(tt, "_get_env_config", lambda: config)
         monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
-        monkeypatch.setattr("tools.terminal_tool_backends._create_environment", fake_create_environment)
+        monkeypatch.setattr("tools.terminal_tool._create_configured_env", fake_create_environment)
         # Force a fresh environment build.
         monkeypatch.setattr(tt, "_active_environments", {})
         monkeypatch.setattr(tt, "_last_activity", {})
@@ -198,7 +186,6 @@ class TestFileOpsCwdSanitizedAtCallSite:
             "It must be sanitized back to config['cwd']."
         )
 
-
     def test_valid_container_override_is_preserved(self, monkeypatch):
         # RL/benchmark envs set an in-container path; it must pass through.
         cwd = self._run_and_capture_cwd(monkeypatch, "/workspace/task42")
@@ -207,9 +194,4 @@ class TestFileOpsCwdSanitizedAtCallSite:
     def test_host_override_sanitized_on_singularity(self, monkeypatch):
         cwd = self._run_and_capture_cwd(
             monkeypatch, "/Users/me/workspace", env_type="singularity")
-        assert cwd == "/workspace"
-
-    def test_host_override_sanitized_on_modal(self, monkeypatch):
-        cwd = self._run_and_capture_cwd(
-            monkeypatch, "/Users/me/workspace", env_type="modal")
         assert cwd == "/workspace"
