@@ -988,3 +988,9 @@ class TestCustomEndpointCodex900kAlias:
         result = _validate("gpt-6-sol-900k", "custom:openai-codex", api_models=self.LISTING,
                            base_url="http://127.0.0.1:10100/v1")
         assert "was not found in this custom endpoint's model listing" in result["message"]
+
+    @pytest.mark.parametrize("api_mode", ["chat_completions", "anthropic_messages"])
+    def test_alias_warns_on_transports_that_send_it_verbatim(self, api_mode):
+        result = _validate("gpt-6-astra-900k", "custom:openai-codex", api_models=self.LISTING,
+                           base_url="http://127.0.0.1:10100/v1", api_mode=api_mode)
+        assert "was not found in this custom endpoint's model listing" in result["message"]

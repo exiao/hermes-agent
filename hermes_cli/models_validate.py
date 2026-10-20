@@ -368,11 +368,14 @@ def _validate_custom(req: _Request) -> dict[str, Any]:
         verdict = match.verdict(req)
         if verdict is not None:
             return verdict
-        # A Codex ``-900k`` picker alias never appears in a listing: it is stripped before the
-        # request, so the endpoint only has to serve the base slug.
+        # A Codex ``-900k`` picker alias never appears in a listing: the Responses transport strips
+        # it before the request, so the endpoint only has to serve the base slug. Chat/Messages
+        # transports send the id verbatim, so there the "not listed" warning is accurate.
         from agent.model_metadata import is_codex_context_variant, strip_codex_context_variant_suffix
 
-        if is_codex_context_variant(req.lookup) and strip_codex_context_variant_suffix(req.lookup) in set(api_models):
+        if (req.api_mode not in ("chat_completions", "anthropic_messages")
+                and is_codex_context_variant(req.lookup)
+                and strip_codex_context_variant_suffix(req.lookup) in set(api_models)):
             return _accept()
         message = (
             f"Note: `{req.requested}` was not found in this custom endpoint's model listing "
