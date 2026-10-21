@@ -114,9 +114,12 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     ``delegate_task`` child follows (``scoped_fallback_chain``): a chain entry is a different
     provider and usually a different model, which is exactly what the pin ruled out. Same-provider
     credential-pool rotation is not the chain and still applies. Unpinned jobs inherit the chain.
+    A job's own ``fallback_providers`` list (same shape as the global key) overrides either
+    default, so a pinned job can name its backups; ``[]`` disables fallback.
     """
     return scoped_fallback_chain(
-        get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
+        get_fallback_chain(cfg), job.get("fallback_providers"),
+        pinned=_job_route_pinned(job), owner="cron job")
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
@@ -124,7 +127,7 @@ def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
     failed too" vs "none configured" (most installs). Fails open to "the backups failed too" if
     config can't be read — never crash delivery.
     """
-    if job is not None and _job_route_pinned(job):
+    if job is not None and _job_route_pinned(job) and not job.get("fallback_providers"):
         return (
             "This job is pinned to its own provider/model, so it does not fall back to "
             f"`fallback_providers`; `hermes cron edit {job.get('id')} --unpin` lets it follow the "

@@ -176,3 +176,42 @@ def test_pinned_job_failure_notice_does_not_promise_a_backup(monkeypatch):
     assert "pinned" in phrase and "--unpin" in phrase
     assert "succeeded" not in phrase
     assert scheduler._fallback_chain_phrase(_job()) == "No backup provider succeeded either."
+
+
+_OWN = [{"provider": "anthropic", "model": "claude-sonnet-5"}]
+
+
+def test_pinned_job_walks_its_own_chain_at_resolve_time(tmp_path):
+    """A job's own fallback_providers lets a pin name its backups without unpinning."""
+    job = _job(provider="xai-oauth", model="grok-4.5", fallback_providers=list(_OWN))
+
+    def resolve(**kwargs):
+        if kwargs.get("requested") == "anthropic":
+            return _runtime("anthropic")
+        raise AuthError("Subscription quota exhausted")
+
+    jc = _CronJobConfig(cfg={"fallback_providers": list(_CHAIN)}, model="grok-4.5",
+                        model_cfg={}, cron_default_provider="")
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=resolve):
+        runtime, model = _resolve_job_runtime(job, "pin-job", jc)
+    assert (runtime["provider"], model) == ("anthropic", "claude-sonnet-5")
+
+
+def test_pinned_job_agent_gets_its_own_chain_mid_run(tmp_path):
+    job = _job(provider="anthropic", model="claude-opus-5", fallback_providers=list(_OWN))
+    success, error, _requested, agent_kwargs = _run(tmp_path, job)
+    assert (success, error) == (True, None)
+    assert agent_kwargs["fallback_model"] == _OWN
+
+
+def test_job_empty_chain_disables_fallback_for_an_unpinned_job(tmp_path):
+    success, error, _requested, agent_kwargs = _run(tmp_path, _job(fallback_providers=[]))
+    assert (success, error) == (True, None)
+    assert agent_kwargs["fallback_model"] is None
+
+
+def test_pinned_job_with_own_chain_failure_notice_does_not_say_unpin(monkeypatch):
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
+    job = _job(provider="anthropic", model="claude-opus-5", fallback_providers=list(_OWN))
+    phrase = scheduler._fallback_chain_phrase(job)
+    assert "--unpin" not in phrase
