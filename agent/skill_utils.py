@@ -326,7 +326,7 @@ def get_skills_preload_all() -> bool:
     return bool(skills_cfg.get("preload_all", False))
 
 
-def parse_config_string_list(value) -> List[str]:
+def parse_config_string_list(value) -> list[str]:
     """Normalize a config value that may hold a JSON-array string into a list.
     ``hermes config set`` stores lists as quoted JSON/Python-literal strings;
     treating one as a single name would silently filter nothing. A scalar
@@ -881,7 +881,7 @@ def _normalize_skill_description(frontmatter: dict[str, Any]) -> str:
     return str(raw_desc).strip().strip("'\"") if raw_desc else ""
 
 
-def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
+def extract_skill_description(frontmatter: dict[str, Any]) -> str:
     """Extract the full description; authoring validation owns the length cap."""
     return _normalize_skill_description(frontmatter)
 

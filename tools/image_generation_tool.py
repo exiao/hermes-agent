@@ -352,7 +352,7 @@ def _agent_visible_cache_path(host_path: str, env: Any) -> str | None:
         from tools.credential_files import map_cache_path_to_container
 
         return map_cache_path_to_container(host_path, container_base=cache_base)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("Could not translate image cache path for backend: %s", exc)
     return None
 
@@ -363,7 +363,7 @@ def _force_artifact_sync(env: Any) -> None:
         return
     try:
         sync_manager.sync(force=True)
-    except Exception as exc:  # noqa: BLE001 - keep generation success; log for operators
+    except Exception as exc:
         logger.warning("Could not force-sync generated image artifact: %s", exc)
 
 

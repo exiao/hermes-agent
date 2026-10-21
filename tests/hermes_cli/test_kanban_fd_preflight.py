@@ -54,7 +54,7 @@ def test_headroom_env_invalid_falls_through(kanban_home, monkeypatch):
 
 
 def test_headroom_config_value(kanban_home, monkeypatch):
-    import hermes_cli.config as config
+    from hermes_cli import config
 
     monkeypatch.setattr(
         config, "load_config_readonly", lambda *a, **k: {"kanban": {"fd_headroom": 128}}

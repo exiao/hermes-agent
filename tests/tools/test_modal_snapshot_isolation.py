@@ -177,7 +177,6 @@ def _install_modal_test_modules(
 
             async def _terminate_aio():
                 self.terminated = True
-                return None
 
             async def _exec_aio(*cmd):
                 exec_calls.append(cmd)

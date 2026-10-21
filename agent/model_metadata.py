@@ -1676,7 +1676,7 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: dict[str, int] = {
 # catalog's ``max_context_window`` still caps the bump (#105443) if it publishes a lower ceiling.
 # ``gpt-6-astra`` is EXACT (not a ``gpt-6`` prefix): untested Astra Pro / tier (-fast/-flex) slugs must
 # never gain a variant they cannot use.
-_CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES: Dict[str, int] = {
+_CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES: dict[str, int] = {
     "gpt-5.6": 900_000, "gpt-6-sol": 900_000, "gpt-6-luna": 900_000,
 }
 _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: dict[str, int] = {

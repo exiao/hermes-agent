@@ -4742,8 +4742,8 @@ def _resolve_auto_route(
 
 
 def _resolve_auto(
-    main_runtime: Optional[Dict[str, Any]] = None, task: Optional[str] = None
-) -> Tuple[Optional[OpenAI], Optional[str]]:
+    main_runtime: Optional[dict[str, Any]] = None, task: Optional[str] = None
+) -> tuple[Optional[OpenAI], Optional[str]]:
     """Compatibility facade for callers that only need the client and model."""
     client, model, _provider = _resolve_auto_route(main_runtime=main_runtime, task=task)
     return client, model
@@ -6025,7 +6025,7 @@ def _close_httpx_pool_sockets_sync(inner_httpx: Any) -> None:
     worker-thread loop) or when we are retiring the client at eviction time.
     """
     try:
-        transports: List[Any] = []
+        transports: list[Any] = []
         base = getattr(inner_httpx, "_transport", None)
         if base is not None:
             transports.append(base)

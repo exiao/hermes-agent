@@ -469,6 +469,8 @@ select = [
 "apps/desktop/electron/fixtures/**" = ["TID251"]
 "pm/**" = ["TID251"]
 "tests/pm/**" = ["TID251"]
+# Imports the gateway.run MODULE by alias; `from gateway import run` binds a different object here.
+"tests/gateway/test_active_agents_heartbeat.py" = ["PLR0402"]
 
 [lint.mccabe]
 max-complexity = 20

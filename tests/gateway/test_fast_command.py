@@ -146,7 +146,7 @@ async def test_handle_fast_command_gates_on_session_model_override(monkeypatch, 
         }
     }
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", dict)
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "unsupported-model")
     import hermes_cli.models as models_mod
 
@@ -165,9 +165,9 @@ async def test_handle_fast_command_gates_on_channel_model_override(monkeypatch, 
     event = _make_event("/fast fast")
     runner.config = SimpleNamespace(streaming=None)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", dict)
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "unsupported-model")
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", dict)
     monkeypatch.setattr(
         gateway_run,
         "_get_channel_override",

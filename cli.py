@@ -887,7 +887,7 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
     # _pending_input, so it is enqueued only after the fresh queue exists.
     _seeded_first_message: Optional[_SeededQueryMessage] = None
     # Inspection surfaces (banner, /tools, status line) read this on partially built instances too.
-    disabled_toolsets: Optional[List[str]] = None
+    disabled_toolsets: Optional[list[str]] = None
     _last_failure_reason: Optional[str] = None
 
     def __init__(

@@ -383,7 +383,6 @@ class TestDeliveryPlatform:
 
         def fake_deliver(job, content, adapters=None, loop=None, *, for_failure=False):
             delivered.append((content, adapters, loop, for_failure))
-            return None
 
         with cron_jobs.use_cron_store(tmp_path):
             cron_jobs.save_jobs([job])

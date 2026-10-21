@@ -164,7 +164,7 @@ def _positive_config_int(value: Any, default: int) -> int:
 
 
 def _resolve_lane_goal_defaults(
-    task: "Task", kanban_cfg: Optional[dict] = None,
+    task: Task, kanban_cfg: Optional[dict] = None,
 ) -> tuple[bool, Optional[int]]:
     """Resolve task-explicit or lane-default goal mode for one worker spawn."""
     cfg = _load_kanban_cfg() if kanban_cfg is None else (kanban_cfg or {})
@@ -1279,6 +1279,7 @@ def _slug_from_git_remote(workspace_path: Optional[str]) -> Optional[str]:
         remote = subprocess.run(
             ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=10,
+            check=False,
         )
     except (subprocess.SubprocessError, OSError):
         return None
@@ -4758,7 +4759,7 @@ from hermes_cli.kanban_db_connect import (
     init_db,
     write_txn,
 )
-from hermes_cli import kanban_db_connect as _kanban_db_connect  # noqa: E402
+from hermes_cli import kanban_db_connect as _kanban_db_connect
 
 _migrate_upstream = _kanban_db_connect._migrate_add_optional_columns
 
@@ -4819,7 +4820,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
 # this keeps every direct/helper caller on the same corruption guard.
 _kanban_db_connect.connect = connect
 connect_closing = _kanban_db_connect.connect_closing
-from hermes_cli.kanban_db_workspace import (  # noqa: E402
+from hermes_cli.kanban_db_workspace import (
     _cleanup_workspace,
     _ensure_git_worktree,
     _is_managed_scratch_path,

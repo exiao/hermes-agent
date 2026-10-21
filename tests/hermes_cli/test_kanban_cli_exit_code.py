@@ -26,6 +26,7 @@ def _run_kanban(home: str, *argv: str) -> subprocess.CompletedProcess:
         env=env,
         capture_output=True,
         text=True,
+        check=False,
     )
 
 
@@ -88,7 +89,8 @@ def test_bool_return_does_not_propagate_as_exit_code(isolated_home, retval):
     env = dict(os.environ)
     env["HERMES_HOME"] = isolated_home
     proc = subprocess.run(
-        [sys.executable, "-c", script], env=env, capture_output=True, text=True
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True,
+        check=False,
     )
     assert proc.returncode == 0, (
         f"bool return {retval} must not propagate as a failing exit code, "

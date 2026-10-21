@@ -4419,7 +4419,7 @@ class TestRunConversation:
                 [{"role": "user", "content": "hello"}],
                 "compressed system prompt",
             )
-            result = agent.run_conversation("hello", conversation_history=prefill)
+            agent.run_conversation("hello", conversation_history=prefill)
 
     def test_length_finish_reason_requests_continuation(self, agent):
         """Normal truncation (partial real content) triggers continuation."""

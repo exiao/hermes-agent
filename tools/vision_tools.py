@@ -1109,8 +1109,7 @@ def _looks_like_video_bytes(head: bytes) -> bool:
 
 def _is_streaming_host(video_url: str) -> bool:
     host = (urlparse(video_url).hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
+    host = host.removeprefix("www.")
     return any(host == h or host.endswith("." + h) for h in _STREAMING_HOSTS)
 
 
@@ -1160,7 +1159,7 @@ async def _extract_stream_to_file(video_url: str, destination: Path) -> Path:
     )
     try:
         resolved_out, resolve_err = await asyncio.wait_for(resolve.communicate(), timeout=60.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         resolve.kill()
         await resolve.wait()
         raise RuntimeError(f"yt-dlp timed out resolving media URL for {video_url[:80]}")
@@ -1199,7 +1198,7 @@ async def _extract_stream_to_file(video_url: str, destination: Path) -> Path:
     )
     try:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=180.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         raise RuntimeError(f"yt-dlp timed out extracting video from {video_url[:80]}")

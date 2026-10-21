@@ -4608,7 +4608,7 @@ class TestResolveAutoProviderModelSourceMismatch:
              patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
              patch("agent.auxiliary_client._get_aux_model_for_provider", return_value="gpt-5.5"), \
              patch("agent.auxiliary_client.resolve_provider_client", side_effect=_fake_resolve):
-            client, model = _resolve_auto(main_runtime={"provider": "openai-codex", "model": ""})
+            client, _model = _resolve_auto(main_runtime={"provider": "openai-codex", "model": ""})
 
         # The poisoned config-default model must NOT reach the Codex endpoint.
         assert captured["model"] != "claude-opus-4-8"
@@ -4632,7 +4632,7 @@ class TestResolveAutoProviderModelSourceMismatch:
              patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8"), \
              patch("agent.auxiliary_client._get_aux_model_for_provider", return_value="gpt-5.5") as aux_default, \
              patch("agent.auxiliary_client.resolve_provider_client", side_effect=_fake_resolve):
-            client, model = _resolve_auto(
+            client, _model = _resolve_auto(
                 main_runtime={"provider": "openai-codex", "model": "gpt-5.5-codex"}
             )
 
@@ -4659,7 +4659,7 @@ class TestResolveAutoProviderModelSourceMismatch:
              patch("agent.auxiliary_client._try_nous", return_value=(step2_client, "nous-model")), \
              patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
-            client, model = _resolve_auto(
+            client, _model = _resolve_auto(
                 main_runtime={"provider": "openai-codex", "model": ""}
             )
 

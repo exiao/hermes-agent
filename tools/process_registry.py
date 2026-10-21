@@ -2582,7 +2582,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
+    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None):
         """Write running process metadata to the checkpoint file atomically."""
         try:
             with self._lock:

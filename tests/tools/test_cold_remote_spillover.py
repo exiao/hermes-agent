@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 from agent.tool_executor import _ToolCallRef, _commit_tool_result, _finalize_tool_batch
 from tools.budget_config import BudgetConfig
-import tools.file_tools as file_tools
-import tools.terminal_tool as terminal_tool
+from tools import file_tools
+from tools import terminal_tool
 import tools.terminal_tool_lifecycle as lifecycle
 
 

@@ -3234,7 +3234,7 @@ class BasePlatformAdapter(ABC):
             if newline == -1:
                 return False
             body = text[newline + 1:].rstrip()
-            inner = body[:-3] if body.endswith("```") else body
+            inner = body.removesuffix("```")
         else:
             inner = text.strip("`")
         lines = []
@@ -3259,7 +3259,7 @@ class BasePlatformAdapter(ABC):
         return True
 
     @staticmethod
-    def _classify_protected_spans(content: str) -> Tuple[list, list]:
+    def _classify_protected_spans(content: str) -> tuple[list, list]:
         """Return ``(masked, delivered)`` protected wrapper spans.
 
         A wrapper containing only real, allowlisted MEDIA tags stays scannable;
@@ -3622,7 +3622,7 @@ class BasePlatformAdapter(ABC):
             error.lower(),
         ))
 
-    def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
+    def _unwrap_ephemeral(self, response: Any) -> tuple[Optional[str], int]:
         """Unwrap a str/None/:class:`EphemeralReply` response into ``(text, ttl)``. ``ttl > 0``
         means schedule ``_schedule_ephemeral_delete`` after a successful send; forced to 0 when the
         adapter doesn't override ``delete_message`` so non-supporting platforms degrade to normal

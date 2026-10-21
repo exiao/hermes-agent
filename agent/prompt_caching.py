@@ -31,7 +31,7 @@ from agent.prompt_cache_boundary import find_stable_prefix
 CACHE_TTL: str = "1h"
 
 
-def make_cache_marker(cache_ttl: str = CACHE_TTL) -> Dict[str, Any]:
+def make_cache_marker(cache_ttl: str = CACHE_TTL) -> dict[str, Any]:
     """Return an Anthropic ``cache_control`` marker honoring the TTL.
 
     Use this at every inline cache_control injection site so a single
@@ -40,7 +40,7 @@ def make_cache_marker(cache_ttl: str = CACHE_TTL) -> Dict[str, Any]:
         {"type": "ephemeral"}                          # implicit 5m
         {"type": "ephemeral", "ttl": "1h"}             # explicit 1h
     """
-    marker: Dict[str, Any] = {"type": "ephemeral"}
+    marker: dict[str, Any] = {"type": "ephemeral"}
     if cache_ttl == "1h":
         marker["ttl"] = "1h"
     return marker
@@ -377,7 +377,7 @@ def build_prompt_cache_plan(
 
 
 def apply_anthropic_cache_control(
-    api_messages: List[Dict[str, Any]], cache_ttl: str = CACHE_TTL, native_anthropic: bool = False,
+    api_messages: list[dict[str, Any]], cache_ttl: str = CACHE_TTL, native_anthropic: bool = False,
     static_system_prefix: str | None = None, tool_part_markers: bool = True,
 ) -> list[dict[str, Any]]:
     """Apply Anthropic cache-control markers to API messages.

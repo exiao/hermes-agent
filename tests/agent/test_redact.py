@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import agent.redact as redact
+from agent import redact
 from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
 
 

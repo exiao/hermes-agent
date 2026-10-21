@@ -1515,11 +1515,11 @@ from gateway.media_repair import tool_name_by_call_id as _tool_name_by_call_id
 
 
 def _collect_auto_append_media_tags(
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
     history_tool_call_ids: Optional[set] = None,
-) -> tuple[List[str], bool]:
+) -> tuple[list[str], bool]:
     """Collect real media tags from current-turn producer-tool results only.
 
     Two layered guards keep stale/example MEDIA: strings out of the reply:
@@ -1601,9 +1601,9 @@ def _collect_auto_append_media_tags(
     return media_tags, has_voice_directive
 
 
-def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
+def _collect_history_media_paths(agent_history: list[dict[str, Any]]) -> set:
     media_paths: set = set()
-    tool_name_by_call_id: Dict[str, str] = {}
+    tool_name_by_call_id: dict[str, str] = {}
     for msg in agent_history:
         if msg.get("role") != "assistant":
             continue
@@ -1671,7 +1671,7 @@ def _iter_deliverable_reply_media_paths(content: str):
 
 def _append_missing_auto_media_tags(
     final_response: str,
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
     history_tool_call_ids: Optional[set] = None,
@@ -1707,7 +1707,7 @@ def _append_missing_auto_media_tags(
 
 
 def _append_missing_auto_media_tags_to_result(
-    result: Optional[Dict[str, Any]],
+    result: Optional[dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
     history_tool_call_ids: Optional[set] = None,
@@ -3857,7 +3857,7 @@ class GatewayRunner(
                 self, event, source, session_entry, session_key, quick_key, run_generation
             )
 
-    def _command_handler_table(self, names) -> Dict[str, Any]:
+    def _command_handler_table(self, names) -> dict[str, Any]:
         """Scope decomposed slash handlers to the routed profile without copying their bodies."""
         table = GatewayBusySessionMixin._command_handler_table(self, names)
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):

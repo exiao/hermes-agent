@@ -40,7 +40,7 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 
-from tools.memory_tool_store import (  # noqa: E402,F401  (re-exports)
+from tools.memory_tool_store import (
     ENTRY_DELIMITER, FAILURE_CLASS, MEMORY_BLOCK_HEADERS, PATCH_DROP_HINT, MemoryStore as _BaseMemoryStore,
     _scan_memory_content)
 
@@ -92,7 +92,7 @@ def _spill_to_pending(target: str, content: str) -> str:
 class MemoryStore(_BaseMemoryStore):
     """Upstream store with lossless overflow into the pending GC queue."""
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def add(self, target: str, content: str) -> dict[str, Any]:
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}

@@ -732,7 +732,7 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
         # Only copilot in the catalog; its scoped env vars are absent, the auth
         # store is empty, and the credential POOL reports credentials (as it
         # would after auto-seeding from the default profile's gh identity).
-        monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+        monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
         monkeypatch.setattr(
             "hermes_cli.providers.HERMES_OVERLAYS",
             {"github-copilot": HermesOverlay(
@@ -741,7 +741,7 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
             )},
         )
         monkeypatch.setattr("hermes_cli.models.CANONICAL_PROVIDERS", [])
-        monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+        monkeypatch.setattr("hermes_cli.auth._load_auth_store", dict)
         monkeypatch.setattr(
             "hermes_cli.models.cached_provider_model_ids",
             lambda *a, **kw: ["gpt-4o-copilot"],
@@ -816,7 +816,7 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
         scope_token = ss.set_secret_scope({"OPENAI_API_KEY": "sk-secondary"})
         home_token = set_hermes_home_override(str(custom_home))
         try:
-            monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+            monkeypatch.setattr("hermes_cli.auth._load_auth_store", dict)
             class _Pool:
                 def has_credentials(self):
                     return True
@@ -881,13 +881,13 @@ class TestScopedListingSkipsProcessGlobalCredentialFallbacks:
         # overlay match, no models.dev entry, empty auth store, scoped env
         # vars absent, and the credential POOL reports credentials (as it
         # would after auto-seeding from the default profile's gh identity).
-        monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+        monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
         monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
         monkeypatch.setattr(
             "hermes_cli.models.CANONICAL_PROVIDERS",
             [ProviderEntry("copilot", "GitHub Copilot", "GitHub Copilot")],
         )
-        monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+        monkeypatch.setattr("hermes_cli.auth._load_auth_store", dict)
         monkeypatch.setattr(
             "hermes_cli.models.cached_provider_model_ids",
             lambda *a, **kw: ["gpt-4o-copilot"],

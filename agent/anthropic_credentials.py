@@ -945,10 +945,10 @@ def resolve_anthropic_token(*, model: Optional[str] = None) -> Optional[str]:
     except Exception:
         claude_code_suppressed = False
 
-    creds: Optional[Dict[str, Any]] = None
+    creds: Optional[dict[str, Any]] = None
     creds_loaded = False
 
-    def _read_creds() -> Optional[Dict[str, Any]]:
+    def _read_creds() -> Optional[dict[str, Any]]:
         # Lazy read (upstream): the Claude file / macOS Keychain is only
         # touched when a resolver actually needs it. A suppressed source, or a
         # non-default scoped profile (whose global ~/.claude record belongs to

@@ -248,15 +248,15 @@ def _safe_skills_path(skills_dir: Path) -> str:
     return str(safe_dir)
 
 
-def iter_skills_files(container_base: str = "/root/.hermes") -> List[Dict[str, str]]:
+def iter_skills_files(container_base: str = "/root/.hermes") -> list[dict[str, str]]:
     """Per-file entries for all skill trees, following only contained symlinks."""
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
     for host_dir, container_root in _skill_dir_roots(container_base):
         result.extend(_walk_linked_skill_tree(host_dir, container_root))
     return result
 
 
-def _walk_linked_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
+def _walk_linked_skill_tree(root: Path, container_root: str) -> list[dict[str, str]]:
     """Enumerate regular files while following symlinks confined to approved skill trees.
 
     Profile skills are commonly symlinked into the shared root. Resolved files outside the
@@ -264,8 +264,8 @@ def _walk_linked_skill_tree(root: Path, container_root: str) -> List[Dict[str, s
     """
     from hermes_constants import get_default_hermes_root
 
-    entries: List[Dict[str, str]] = []
-    boundaries: List[Path] = []
+    entries: list[dict[str, str]] = []
+    boundaries: list[Path] = []
     for candidate in (root, get_default_hermes_root(_resolve_hermes_home()) / "skills"):
         try:
             boundaries.append(candidate.resolve())
@@ -541,7 +541,7 @@ def _is_synced_diagram(item: Path, rel: Path) -> bool:
         return False
 
 
-def iter_plans_files(container_base: str = "/root/.hermes") -> List[Dict[str, str]]:
+def iter_plans_files(container_base: str = "/root/.hermes") -> list[dict[str, str]]:
     """Read-only plan context for remote workers, root home first then profile home."""
     from hermes_constants import get_default_hermes_root
 
@@ -553,7 +553,7 @@ def iter_plans_files(container_base: str = "/root/.hermes") -> List[Dict[str, st
     container_root = f"{container_base.rstrip('/')}/plans"
     allowed_suffixes = {".md", ".txt", ".json", ".yaml", ".yml", ".svg"}
     skip_roots = {"archive", "wt-reaper-rescued", "shelved", "babysit-split-backup"}
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
     seen: set[str] = set()
     for plans_dir in plans_dirs:
         if plans_dir.is_symlink() or not plans_dir.is_dir():
@@ -574,7 +574,7 @@ def iter_plans_files(container_base: str = "/root/.hermes") -> List[Dict[str, st
     return result
 
 
-def iter_cache_files(container_base: str = "/root/.hermes") -> List[Dict[str, str]]:
+def iter_cache_files(container_base: str = "/root/.hermes") -> list[dict[str, str]]:
     """Per-file cache entries (Modal upload/resync); skips symlinks. ``cache/generated`` is
     never swept, so only its files from the last ``MEDIA_CACHE_MAX_AGE_HOURS`` are synced —
     otherwise every remote sync would re-walk and upload the whole generation history."""

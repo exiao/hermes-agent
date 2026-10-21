@@ -1149,7 +1149,7 @@ def _resolve_hook_callback_timeout() -> float:
 class _AnonymousHookCallId(str):
     """Internal gate identity; callbacks receive the original payload."""
 
-    def __new__(cls, payload: Dict[str, Any]):
+    def __new__(cls, payload: dict[str, Any]):
         from uuid import uuid4
 
         identity = super().__new__(cls, f"anonymous-hook-{uuid4().hex}")
@@ -1246,7 +1246,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._predeclared_tools: dict[str, list[str]] = {}
 
     def _run_hook_callback_bounded(
-        self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], timeout: float
+        self, hook_name: str, cb: Callable, kwargs: dict[str, Any], timeout: float
     ) -> Any:
         from hermes_cli.plugins_dispatch import _hook_call_identity
 
@@ -1256,7 +1256,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         return super()._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
 
     @classmethod
-    def _invoke_hook_callback(cls, callback: Callable, payload: Dict[str, Any]) -> Any:
+    def _invoke_hook_callback(cls, callback: Callable, payload: dict[str, Any]) -> Any:
         identity = payload.get("tool_call_id")
         if isinstance(identity, _AnonymousHookCallId):
             payload = identity.payload

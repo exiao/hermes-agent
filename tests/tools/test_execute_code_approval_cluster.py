@@ -503,7 +503,7 @@ def test_get_allow_execute_code_reads_config(monkeypatch):
     assert A._get_allow_execute_code() is True
     monkeypatch.setattr(A, "_get_approval_config", lambda: {"allow_execute_code": "no"})
     assert A._get_allow_execute_code() is False
-    monkeypatch.setattr(A, "_get_approval_config", lambda: {})
+    monkeypatch.setattr(A, "_get_approval_config", dict)
     assert A._get_allow_execute_code() is False
 
 

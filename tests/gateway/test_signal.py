@@ -2320,7 +2320,7 @@ class TestSignalSSEReconnectEscalation:
             s2.release.set()
             try:
                 await asyncio.wait_for(task, timeout=2)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 task.cancel()
 
     @pytest.mark.asyncio
@@ -2433,7 +2433,7 @@ class TestSignalSSEReconnectEscalation:
                 stream.release.set()
                 try:
                     await asyncio.wait_for(task, timeout=2)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                except (TimeoutError, asyncio.CancelledError):
                     task.cancel()
 
         assert any(
@@ -2540,7 +2540,7 @@ class TestSignalSSEReconnectEscalation:
                 await asyncio.sleep(0.01)
             await asyncio.wait_for(silent_client.streams[0].started.wait(), timeout=2)
             await asyncio.wait_for(monitor, timeout=10)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             monitor.cancel()
         finally:
             adapter._running = False
@@ -2551,7 +2551,7 @@ class TestSignalSSEReconnectEscalation:
                     task.cancel()
                 try:
                     await task
-                except (asyncio.CancelledError, asyncio.TimeoutError):
+                except (TimeoutError, asyncio.CancelledError):
                     pass
 
         assert restarts, (
@@ -2629,7 +2629,7 @@ class TestSignalSSEReconnectEscalation:
             stream.release.set()
             try:
                 await asyncio.wait_for(task, timeout=2)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 task.cancel()
 
         assert adapter._reconnects_without_events == 0, (

@@ -1378,7 +1378,7 @@ class TestGitDestructiveOps:
 
     def test_git_push_dash_f_detected(self):
         cmd = "git push -f origin main"
-        dangerous, _, desc = detect_dangerous_command(cmd)
+        dangerous, _, _desc = detect_dangerous_command(cmd)
         assert dangerous is True
 
     def test_git_clean_force_detected(self):
@@ -1389,7 +1389,7 @@ class TestGitDestructiveOps:
 
     def test_git_branch_force_delete_detected(self):
         cmd = "git branch -D feature-branch"
-        dangerous, _, desc = detect_dangerous_command(cmd)
+        dangerous, _, _desc = detect_dangerous_command(cmd)
         assert dangerous is True
 
     def test_safe_git_status_not_flagged(self):

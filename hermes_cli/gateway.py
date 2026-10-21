@@ -4011,7 +4011,7 @@ def _probe_launchd_domain_for_label(label: str) -> str:
     # Not loaded anywhere: Aqua → gui/<uid>; anything else (Background, loginwindow) → user/<uid>,
     # the pre-probing default and the recommended domain on macOS 26+.
     try:
-        result = subprocess.run(["launchctl", "managername"], timeout=5, **_CAPTURE_TEXT)
+        result = subprocess.run(["launchctl", "managername"], timeout=5, **_CAPTURE_TEXT, check=False)
         if "Aqua" in (result.stdout or ""):
             return gui_domain
     except launchctl_errors:

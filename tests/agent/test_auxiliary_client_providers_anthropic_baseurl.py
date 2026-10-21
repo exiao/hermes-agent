@@ -35,7 +35,7 @@ def _run_try_anthropic(tmp_path, monkeypatch, config: dict):
         patch("agent.anthropic_adapter.build_anthropic_client") as mock_build,
     ):
         mock_build.return_value = MagicMock()
-        client, model = _try_anthropic()
+        client, _model = _try_anthropic()
 
     assert client is not None, "auxiliary client must still be created"
     return _base_url_passed_to_build(mock_build)

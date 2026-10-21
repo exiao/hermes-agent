@@ -81,7 +81,7 @@ class MessageEvent:
     reply_to_is_own_message: bool = False  # True when the user replied to this bot/assistant's message
     # Fork: description and local paths of media in the quoted message (Signal quote replies).
     reply_to_media_summary: Optional[str] = None
-    reply_to_media_paths: List[str] = field(default_factory=list)
+    reply_to_media_paths: list[str] = field(default_factory=list)
     # Structured interactive-prompt reply (relay only): {prompt_id, option_id, label?,
     # prompt_message_id?}; routed to the approval/slash-confirm/clarify resolvers BEFORE dispatch.
     prompt_response: Optional[dict[str, Any]] = None
