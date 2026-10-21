@@ -31,8 +31,8 @@ sleep() { return 1; }
 '''
 
 
-# Workflows use Blacksmith's drop-in checkout (same inputs, cached on its runners;
-# it also works on the remaining GitHub-hosted jobs); a few still use actions/checkout.
+# Upstream uses Blacksmith's drop-in checkout; this fork runs on GitHub-hosted runners with
+# actions/checkout. Both are accepted so upstream workflows still parse on the next sync.
 CHECKOUT_ACTIONS = ("actions/checkout@", "useblacksmith/checkout@")
 
 
