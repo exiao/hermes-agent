@@ -152,6 +152,13 @@ class GatewaySessionCommandsMixin:
         live_messages = getattr(_old_agent, "_session_messages", None)
         if isinstance(live_messages, list):
             messages_snapshot = list(live_messages)
+        # Claim the memory teardown HERE, on the loop, before the caller evicts the agent: the cache
+        # eviction's soft release would otherwise claim it first, shut the providers down, and the
+        # background job's session-end extraction would then lose the claim and never run.
+        _mm = getattr(_old_agent, "_memory_manager", None)
+        if _mm is not None:
+            with contextlib.suppress(Exception):
+                _mm.claim_teardown(session_end=True)
         self._retain_background_task(asyncio.create_task(
             self._cleanup_agent_resources_off_loop(
                 _old_agent,
