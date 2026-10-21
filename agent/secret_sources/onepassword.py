@@ -11,10 +11,11 @@ material is fingerprinted, never stored).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
-import subprocess  # noqa: F401 — tests monkeypatch ``op.subprocess.run``
+import subprocess  # tests monkeypatch ``op.subprocess.run``; production goes through run_cli
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -48,7 +49,7 @@ _OP_ENV_ALLOWLIST = (
 # L1 key folds in str(home_path) so a HERMES_HOME switch inside one long-lived
 # process (the gateway) can't return another profile's secrets. The disk key
 # omits home because the file already lives under <home>/cache/.
-_CacheKey = Tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
+_CacheKey = tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
 _DISK_CACHE_BASENAME = "op_cache.json"
 
 
@@ -80,10 +81,10 @@ def _classify_op_error(message: str) -> ErrorKind:
     return classify_cli_error(message, _OP_ERROR_RULES)
 
 
-def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
+def _validate_references(references: Optional[dict[str, str]]) -> tuple[dict[str, str], list[str]]:
     """``(valid_refs, warnings)``: keep valid env names bound to stripped ``op://`` strings."""
-    valid: Dict[str, str] = {}
-    warnings: List[str] = []
+    valid: dict[str, str] = {}
+    warnings: list[str] = []
     for name, ref in (references or {}).items():
         if not is_valid_env_name(name):
             warnings.append(f"Skipping {name!r}: not a valid env-var name")
@@ -148,7 +149,7 @@ def _auth_fingerprint(
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
-def _refs_fingerprint(references: Dict[str, str]) -> str:
+def _refs_fingerprint(references: dict[str, str]) -> str:
     return _fingerprint("\n".join(f"{name}={references[name]}" for name in sorted(references)))
 
 
@@ -296,7 +297,7 @@ def fetch_onepassword_secrets(
     auth_env: Optional[Dict[str, str]] = None,
     binary: Optional[Path] = None, binary_path: str = "", use_cache: bool = True,
     cache_ttl_seconds: float = 300, home_path: Optional[Path] = None,
-) -> Tuple[Dict[str, str], List[str]]:
+) -> tuple[dict[str, str], list[str]]:
     """Resolve ``references`` (name → ``op://…``) to ``(secrets, warnings)``.
 
     Raises ``RuntimeError`` only when no ``op`` binary is available; per-ref
@@ -330,7 +331,7 @@ def fetch_onepassword_secrets(
                            "(https://developer.1password.com/docs/cli/get-started/) or set "
                            "secrets.onepassword.binary_path to its absolute location.")
 
-    secrets: Dict[str, str] = {}
+    secrets: dict[str, str] = {}
     read_errors = 0
     for name in sorted(valid):
         try:
@@ -362,7 +363,7 @@ def _missing_binary_error(binary_path: str) -> str:
 
 
 def apply_onepassword_secrets(
-    *, enabled: bool, env: Optional[Dict[str, str]] = None, account: str = "",
+    *, enabled: bool, env: Optional[dict[str, str]] = None, account: str = "",
     service_account_token_env: str = _DEFAULT_TOKEN_ENV, binary_path: str = "",
     override_existing: bool = True, cache_ttl_seconds: float = 300, home_path: Optional[Path] = None,
 ) -> FetchResult:
