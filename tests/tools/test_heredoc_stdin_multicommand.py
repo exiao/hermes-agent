@@ -45,6 +45,7 @@ def _run(wrapped: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", "-c", wrapped], stdin=subprocess.DEVNULL,
         capture_output=True, text=True, timeout=30,
+        check=False,
     )
 
 

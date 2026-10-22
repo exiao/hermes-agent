@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.platforms.signal_rate_limit import _signal_send_timeout
+from plugins.platforms.signal.signal_rate_limit import _signal_send_timeout
 
 
 def test_text_only_send_keeps_a_bounded_deadline():
@@ -38,7 +38,7 @@ def test_attachment_timeout_is_size_independent():
 @pytest.mark.asyncio
 async def test_send_document_passes_size_aware_timeout(tmp_path):
     """Documents must not fall back to the client default timeout."""
-    from gateway.platforms.signal import SignalAdapter
+    from plugins.platforms.signal.adapter import SignalAdapter
 
     attachment = tmp_path / "slow-upload.txt"
     attachment.write_text("payload")
@@ -55,7 +55,7 @@ async def test_send_document_passes_size_aware_timeout(tmp_path):
 @pytest.mark.asyncio
 async def test_send_image_passes_size_aware_timeout(tmp_path):
     """file:// images must use the attachment-scaled RPC timeout too."""
-    from gateway.platforms.signal import SignalAdapter
+    from plugins.platforms.signal.adapter import SignalAdapter
 
     image = tmp_path / "slow-upload.png"
     image.write_bytes(b"image")
@@ -72,7 +72,7 @@ async def test_send_image_passes_size_aware_timeout(tmp_path):
 @pytest.mark.asyncio
 async def test_send_document_does_not_deadline_large_upload(tmp_path):
     """The accepted 100 MiB document must not carry a read deadline."""
-    from gateway.platforms.signal import SIGNAL_MAX_ATTACHMENT_SIZE, SignalAdapter
+    from plugins.platforms.signal.adapter import SIGNAL_MAX_ATTACHMENT_SIZE, SignalAdapter
 
     attachment = tmp_path / "slow-upload.bin"
     with attachment.open("wb") as file:
@@ -90,7 +90,7 @@ async def test_send_document_does_not_deadline_large_upload(tmp_path):
 @pytest.mark.asyncio
 async def test_send_multiple_images_passes_batch_byte_total(tmp_path):
     """Large image batches must not fall back to the attachment-count floor."""
-    from gateway.platforms.signal import SIGNAL_MAX_ATTACHMENT_SIZE, SignalAdapter
+    from plugins.platforms.signal.adapter import SIGNAL_MAX_ATTACHMENT_SIZE, SignalAdapter
 
     images = []
     for index in range(2):
@@ -118,7 +118,7 @@ async def test_send_message_tool_signal_path_does_not_deadline_upload(tmp_path, 
     This is the path an agent MEDIA: reply actually travels, and it was still
     calling the helper with attachment count only.
     """
-    from tools.send_message_tool import _send_signal
+    from plugins.platforms.signal.standalone import _send_signal
 
     attachment = tmp_path / "big.bin"
     with attachment.open("wb") as file:

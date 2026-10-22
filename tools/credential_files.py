@@ -25,7 +25,7 @@ from agent.skill_utils import EXCLUDED_SKILL_DIRS, is_excluded_skill_dir_name
 
 try:  # pragma: no cover - exercised via the fail-closed test below
     from agent.file_safety import get_read_block_error
-except ImportError:  # noqa: F401 - sentinel consumed in register_credential_file
+except ImportError:
     get_read_block_error = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
@@ -36,22 +36,22 @@ def _resolve_hermes_home() -> Path:
     return get_hermes_home()
 
 # Session-scoped registry; ContextVar prevents cross-session bleed in the gateway.
-_registered_files_var: ContextVar[Dict[str, str]] = ContextVar("_registered_files")
+_registered_files_var: ContextVar[dict[str, str]] = ContextVar("_registered_files")
 
 # Cache for config-based file list, one entry per profile home (tests reset it).
-_config_files: Dict[str, List[Dict[str, str]]] = {}
+_config_files: dict[str, list[dict[str, str]]] = {}
 # Reused across calls so sanitized skill copies don't accumulate.
 _safe_skills_tempdir: Path | None = None
 
 
-def _get_registered() -> Dict[str, str]:
+def _get_registered() -> dict[str, str]:
     val = _registered_files_var.get(None)
     if val is None:
         _registered_files_var.set(val := {})
     return val
 
 
-def _mount(host_path: Path | str, container_path: str) -> Dict[str, str]:
+def _mount(host_path: Path | str, container_path: str) -> dict[str, str]:
     return {"host_path": str(host_path), "container_path": container_path}
 
 
@@ -120,7 +120,7 @@ def register_credential_file(relative_path: str, container_base: str = "/root/.h
     return True
 
 
-def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> List[str]:
+def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> list[str]:
     """Register skill-frontmatter entries (str or dict with ``path``); return missing paths."""
     missing = []
     for entry in entries:
@@ -134,7 +134,7 @@ def register_credential_files(entries: list, container_base: str = "/root/.herme
     return missing
 
 
-def _load_config_files() -> List[Dict[str, str]]:
+def _load_config_files() -> list[dict[str, str]]:
     """Load ``terminal.credential_files`` from config.yaml (cached per profile home: the
     multiplexed gateway must never mount the launch profile's credential files into a
     secondary profile's sandbox)."""
@@ -144,7 +144,7 @@ def _load_config_files() -> List[Dict[str, str]]:
     if cached is not None:
         return cached
 
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
     try:
         from hermes_cli.config import read_raw_config
         hermes_home = get_hermes_home()
@@ -166,7 +166,7 @@ def _load_config_files() -> List[Dict[str, str]]:
     return result
 
 
-def get_credential_file_mounts() -> List[Dict[str, str]]:
+def get_credential_file_mounts() -> list[dict[str, str]]:
     """Skill-registered + config credential files as ``host_path``/``container_path`` dicts (re-checked for existence)."""
     mounts = {cp: hp for cp, hp in _get_registered().items() if Path(hp).is_file()}
     for entry in _load_config_files():
@@ -178,7 +178,7 @@ def get_credential_file_mounts() -> List[Dict[str, str]]:
 
 # --- Skills directory mounts ---
 
-def _skill_dir_roots(container_base: str) -> Iterator[Tuple[Path, str]]:
+def _skill_dir_roots(container_base: str) -> Iterator[tuple[Path, str]]:
     """Yield ``(host_dir, container_root)`` for every existing skills directory.
 
     Local skills mount at ``<base>/skills``, external at ``<base>/external_skills/<i>``, trusted
@@ -196,7 +196,7 @@ def _skill_dir_roots(container_base: str) -> Iterator[Tuple[Path, str]]:
         yield from ((d, f"{base}/{label}/{idx}") for idx, d in enumerate(dirs) if d.is_dir())
 
 
-def _walk_skill_tree(root: Path) -> Iterator[Tuple[Path, List[Path]]]:
+def _walk_skill_tree(root: Path) -> Iterator[tuple[Path, list[Path]]]:
     """Yield ``(dir, regular_non_symlink_files)`` for every directory a sandbox should receive.
 
     Prunes ``EXCLUDED_SKILL_DIRS`` *before* descending so bookkeeping/dependency trees (``.hub``,
@@ -211,7 +211,7 @@ def _walk_skill_tree(root: Path) -> Iterator[Tuple[Path, List[Path]]]:
         yield base, [f for f in (base / n for n in filenames) if not f.is_symlink() and f.is_file()]
 
 
-def get_skills_directory_mount(container_base: str = "/root/.hermes") -> list[Dict[str, str]]:
+def get_skills_directory_mount(container_base: str = "/root/.hermes") -> list[dict[str, str]]:
     """Directory mount entries for all skill dirs (local + external + project).
 
     Bind mounts follow symlinks, so a dir containing any symlink is replaced by a sanitized
@@ -248,15 +248,15 @@ def _safe_skills_path(skills_dir: Path) -> str:
     return str(safe_dir)
 
 
-def iter_skills_files(container_base: str = "/root/.hermes") -> List[Dict[str, str]]:
+def iter_skills_files(container_base: str = "/root/.hermes") -> list[dict[str, str]]:
     """Per-file entries for all skill trees, following only contained symlinks."""
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
     for host_dir, container_root in _skill_dir_roots(container_base):
         result.extend(_walk_linked_skill_tree(host_dir, container_root))
     return result
 
 
-def _walk_linked_skill_tree(root: Path, container_root: str) -> List[Dict[str, str]]:
+def _walk_linked_skill_tree(root: Path, container_root: str) -> list[dict[str, str]]:
     """Enumerate regular files while following symlinks confined to approved skill trees.
 
     Profile skills are commonly symlinked into the shared root. Resolved files outside the
@@ -264,8 +264,8 @@ def _walk_linked_skill_tree(root: Path, container_root: str) -> List[Dict[str, s
     """
     from hermes_constants import get_default_hermes_root
 
-    entries: List[Dict[str, str]] = []
-    boundaries: List[Path] = []
+    entries: list[dict[str, str]] = []
+    boundaries: list[Path] = []
     for candidate in (root, get_default_hermes_root(_resolve_hermes_home()) / "skills"):
         try:
             boundaries.append(candidate.resolve())
@@ -366,7 +366,7 @@ _CACHE_DIRS: list[tuple[str, str]] = [
 ]
 
 
-def _cache_dir_roots(container_base: str, *, create_missing: bool) -> Iterator[Tuple[Path, str]]:
+def _cache_dir_roots(container_base: str, *, create_missing: bool) -> Iterator[tuple[Path, str]]:
     """Yield ``(host_dir, container_root)`` per cache dir; always maps to the *new* container layout."""
     base = container_base.rstrip("/")
     for new_subpath, old_name in _CACHE_DIRS:
@@ -390,7 +390,7 @@ def _cache_dir_roots(container_base: str, *, create_missing: bool) -> Iterator[T
         yield host_dir, f"{base}/{new_subpath}"
 
 
-def get_cache_directory_mounts(container_base: str = "/root/.hermes") -> List[Dict[str, str]]:
+def get_cache_directory_mounts(container_base: str = "/root/.hermes") -> list[dict[str, str]]:
     """Bind-mount entries for each cache directory (host layout via ``get_hermes_dir``)."""
     return [_mount(h, c) for h, c in _cache_dir_roots(container_base, create_missing=True)]
 
@@ -541,7 +541,7 @@ def _is_synced_diagram(item: Path, rel: Path) -> bool:
         return False
 
 
-def iter_plans_files(container_base: str = "/root/.hermes") -> List[Dict[str, str]]:
+def iter_plans_files(container_base: str = "/root/.hermes") -> list[dict[str, str]]:
     """Read-only plan context for remote workers, root home first then profile home."""
     from hermes_constants import get_default_hermes_root
 
@@ -553,7 +553,7 @@ def iter_plans_files(container_base: str = "/root/.hermes") -> List[Dict[str, st
     container_root = f"{container_base.rstrip('/')}/plans"
     allowed_suffixes = {".md", ".txt", ".json", ".yaml", ".yml", ".svg"}
     skip_roots = {"archive", "wt-reaper-rescued", "shelved", "babysit-split-backup"}
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
     seen: set[str] = set()
     for plans_dir in plans_dirs:
         if plans_dir.is_symlink() or not plans_dir.is_dir():
@@ -574,13 +574,13 @@ def iter_plans_files(container_base: str = "/root/.hermes") -> List[Dict[str, st
     return result
 
 
-def iter_cache_files(container_base: str = "/root/.hermes") -> List[Dict[str, str]]:
+def iter_cache_files(container_base: str = "/root/.hermes") -> list[dict[str, str]]:
     """Per-file cache entries (Modal upload/resync); skips symlinks. ``cache/generated`` is
     never swept, so only its files from the last ``MEDIA_CACHE_MAX_AGE_HOURS`` are synced —
     otherwise every remote sync would re-walk and upload the whole generation history."""
     generated_cutoff = time.time() - MEDIA_CACHE_MAX_AGE_HOURS * 3600
     gen_root = f"{container_base.rstrip('/')}/{_GENERATED_CACHE}"
-    entries: List[Dict[str, str]] = []
+    entries: list[dict[str, str]] = []
     for host_dir, root in _cache_dir_roots(container_base, create_missing=False):
         for item in host_dir.rglob("*"):
             try:

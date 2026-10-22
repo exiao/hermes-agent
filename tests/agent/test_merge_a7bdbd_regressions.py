@@ -84,7 +84,6 @@ class TestParallelToolCallsAreNotBlocked:
                 # real and test nothing.
                 entered.set()
                 release.wait(timeout=10.0)
-            return None
 
         mgr = PluginManager()
         mgr._hooks["pre_tool_call"] = [slow_first_then_fast]
@@ -123,7 +122,6 @@ class TestParallelToolCallsAreNotBlocked:
 
         def hung(**_kwargs):
             hold.wait(timeout=10.0)
-            return None
 
         mgr = PluginManager()
         mgr._hooks["pre_tool_call"] = [hung]

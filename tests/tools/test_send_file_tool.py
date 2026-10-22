@@ -21,7 +21,7 @@ from agent.anthropic_adapter import convert_tools_to_anthropic
 from gateway.platforms.base import BasePlatformAdapter
 
 # Trigger registration (idempotent)
-import tools.send_file_tool  # noqa: F401
+import tools.send_file_tool
 
 
 # ===========================================================================
@@ -138,14 +138,14 @@ class TestExtractMediaExpandedExtensions:
         f.write_text("content", encoding="utf-8")
 
         content = f"Here is the file\nMEDIA:{f}"
-        media, cleaned = BasePlatformAdapter.extract_media(content)
+        media, _cleaned = BasePlatformAdapter.extract_media(content)
         assert len(media) >= 1, f"extract_media() did not match .{ext}"
         path = media[0][0]
         assert path.endswith(f".{ext}"), f"Extracted path {path!r} doesn't end with .{ext}"
 
     def test_extract_media_cleans_tag_from_text(self):
         content = "Here is your config\nMEDIA:/tmp/config.yaml"
-        media, cleaned = BasePlatformAdapter.extract_media(content)
+        _media, cleaned = BasePlatformAdapter.extract_media(content)
         assert "MEDIA:" not in cleaned
         assert "Here is your config" in cleaned
 
@@ -156,25 +156,25 @@ class TestExtractMediaExpandedExtensions:
             "MEDIA:/tmp/data.json\n"
             "MEDIA:/tmp/image.png"
         )
-        media, cleaned = BasePlatformAdapter.extract_media(content)
+        media, _cleaned = BasePlatformAdapter.extract_media(content)
         assert len(media) == 3
         exts = {Path(m[0]).suffix for m in media}
         assert exts == {".pdf", ".json", ".png"}
 
     def test_extract_media_quoted_path(self):
         content = 'MEDIA:"/tmp/my file.pdf"'
-        media, cleaned = BasePlatformAdapter.extract_media(content)
+        media, _cleaned = BasePlatformAdapter.extract_media(content)
         assert len(media) >= 1
 
     def test_extract_media_tilde_path(self):
         content = "MEDIA:~/documents/report.md"
-        media, cleaned = BasePlatformAdapter.extract_media(content)
+        media, _cleaned = BasePlatformAdapter.extract_media(content)
         assert len(media) >= 1
         assert media[0][0].endswith("report.md")
 
     def test_voice_directive_preserved(self):
         content = "[[audio_as_voice]]\nMEDIA:/tmp/speech.ogg"
-        media, cleaned = BasePlatformAdapter.extract_media(content)
+        media, _cleaned = BasePlatformAdapter.extract_media(content)
         assert len(media) == 1
         assert media[0][1] is True  # is_voice flag
 
@@ -210,29 +210,29 @@ class TestExtractLocalFilesExpanded:
     ])
     def test_bare_path_detected(self, ext):
         content = f"Check the file /tmp/data.{ext} for details"
-        files, cleaned = self._extract_with_mock(content)
+        files, _cleaned = self._extract_with_mock(content)
         assert any(f.endswith(f".{ext}") for f in files), (
             f"extract_local_files() missed .{ext}"
         )
 
     def test_original_image_extensions_still_work(self):
         content = "See /tmp/photo.png and /tmp/video.mp4"
-        files, cleaned = self._extract_with_mock(content)
+        files, _cleaned = self._extract_with_mock(content)
         assert len(files) == 2
 
     def test_code_block_paths_ignored(self):
         content = "```\n/tmp/data.json\n```"
-        files, cleaned = self._extract_with_mock(content)
+        files, _cleaned = self._extract_with_mock(content)
         assert len(files) == 0
 
     def test_inline_code_paths_ignored(self):
         content = "Run `cat /tmp/data.yaml` to see it"
-        files, cleaned = self._extract_with_mock(content)
+        files, _cleaned = self._extract_with_mock(content)
         assert len(files) == 0
 
     def test_url_paths_ignored(self):
         content = "Download from https://example.com/data.json"
-        files, cleaned = self._extract_with_mock(content)
+        files, _cleaned = self._extract_with_mock(content)
         assert len(files) == 0
 
 

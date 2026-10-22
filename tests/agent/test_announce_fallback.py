@@ -28,7 +28,7 @@ def _load_helper():
     m = re.search(
         r"(    def _announce_or_buffer_fallback\(self.*?)(?=\n    (?:async )?def )",
         src,
-        re.S,
+        re.DOTALL,
     )
     assert m, "could not locate _announce_or_buffer_fallback in run_agent.py"
     ns: dict = {}

@@ -8,7 +8,7 @@ false-positive regressions that caused spurious italics in production.
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.signal_format import markdown_to_signal
+from plugins.platforms.signal.signal_format import markdown_to_signal
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -89,14 +89,14 @@ class TestItalicFalsePositives:
             "* tools/file_tools.py — file operations\n"
             "* tools/web_tools.py — web operations"
         )
-        text, styles = _m2s(md)
+        _text, styles = _m2s(md)
         assert _find_style(styles, "ITALIC") == []
 
     # --- Cross-line spans (DOTALL removal) ---
 
     def test_underscore_italic_no_cross_line(self):
         """_foo\\nbar_ must NOT match as italic (no DOTALL)."""
-        text, styles = _m2s("_foo\nbar_")
+        _text, styles = _m2s("_foo\nbar_")
         assert _find_style(styles, "ITALIC") == []
 
     def test_star_italic_multiline_response(self):
@@ -108,7 +108,7 @@ class TestItalicFalsePositives:
             "* tools/web_tools.py — web search/extract\n\n"
             "Everything looks good."
         )
-        text, styles = _m2s(md)
+        _text, styles = _m2s(md)
         assert _find_style(styles, "ITALIC") == []
 
     # --- Legitimate italic still works ---
@@ -155,13 +155,13 @@ class TestEdgeCases:
     def test_bold_inside_bullet(self):
         """Bold inside a bullet list item."""
         md = "* **important** item\n* normal item"
-        text, styles = _m2s(md)
+        _text, styles = _m2s(md)
         assert len(_find_style(styles, "BOLD")) == 1
         assert _find_style(styles, "ITALIC") == []
 
     def test_lone_asterisk(self):
         """A single * with no pair should not cause issues."""
-        text, styles = _m2s("5 * 3 = 15")
+        text, _styles = _m2s("5 * 3 = 15")
         # Should not crash; any italic match would be a false positive
         assert "5" in text and "15" in text
 
@@ -180,7 +180,7 @@ class TestMarkdownStripPatch:
     def test_fenced_code_block_multiline(self):
         """Multi-line code blocks preserve all lines."""
         md = "```\nline1\nline2\nline3\n```"
-        text, styles = _m2s(md)
+        text, _styles = _m2s(md)
         assert "line1" in text
         assert "line2" in text
         assert "line3" in text
@@ -189,7 +189,7 @@ class TestMarkdownStripPatch:
     def test_links_preserved(self):
         """[text](url) links are kept as-is — Signal auto-linkifies."""
         md = "Check [this link](https://example.com) for details"
-        text, styles = _m2s(md)
+        text, _styles = _m2s(md)
         # Links should pass through — either as markdown or just preserved
         assert "https://example.com" in text
 
@@ -227,14 +227,14 @@ class TestSignalStreamingPatch:
     def test_signal_does_not_support_editing(self, monkeypatch):
         """SignalAdapter.SUPPORTS_MESSAGE_EDITING must be False."""
         monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "")
-        from gateway.platforms.signal import SignalAdapter
+        from plugins.platforms.signal.adapter import SignalAdapter
         assert SignalAdapter.SUPPORTS_MESSAGE_EDITING is False
 
     @pytest.mark.asyncio
     async def test_send_returns_no_message_id(self, monkeypatch):
         """send() returns message_id=None so stream consumer uses no-edit path."""
         monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "")
-        from gateway.platforms.signal import SignalAdapter
+        from plugins.platforms.signal.adapter import SignalAdapter
 
         config = PlatformConfig(enabled=True)
         config.extra = {

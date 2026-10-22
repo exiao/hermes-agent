@@ -26,7 +26,7 @@ import pytest
 
 from dotenv import load_dotenv as dotenv_load_dotenv
 
-import hermes_cli.env_loader as env_loader
+from hermes_cli import env_loader
 
 
 class _RacingEnviron:

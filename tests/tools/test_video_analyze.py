@@ -258,7 +258,7 @@ class TestVideoToolsetRegistration:
 # ---------------------------------------------------------------------------
 
 
-from tools.vision_tools import (  # noqa: E402
+from tools.vision_tools import (
     _looks_like_video_bytes,
     _is_streaming_host,
     _download_video,
@@ -478,7 +478,7 @@ class TestExtractStreamPicksVideoFile:
         assert "--no-config" in captured["args"]
 
 
-from tools.vision_tools import _is_direct_media_url  # noqa: E402
+from tools.vision_tools import _is_direct_media_url
 
 
 class TestIsDirectMediaUrl:

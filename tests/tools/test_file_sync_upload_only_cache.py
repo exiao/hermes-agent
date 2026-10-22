@@ -253,20 +253,19 @@ def test_retargeted_same_remote_path_is_protected(monkeypatch, tmp_path):
 def test_retarget_with_identical_stat_key_is_protected(monkeypatch, tmp_path):
     """A retarget producing no upload must still refresh the protections.
 
-    ``_synced_files`` keys on the remote path's ``(mtime, size)``. A symlink
-    retargeted to another profile's file with the SAME mtime and size yields
-    no upload at all, so forcing the refresh on ``to_upload`` alone left the
-    warm memo in place and the other profile's file unprotected.
+    A symlink retargeted to another profile's file with the SAME bytes yields
+    no upload at all (the pushed hash already matches), so forcing the refresh
+    on ``to_upload`` alone left the warm memo in place and the other profile's
+    file unprotected.
     """
     local = tmp_path / "local-skill.md"
     other_profile = tmp_path / "other-profile-skill.md"
     local.write_text("host version")
-    # Byte-identical size, and the same mtime: the stat key cannot tell these
-    # two files apart.
+    # Byte-identical content and the same mtime + size; only inode/ctime differ.
     other_profile.write_text("host version")
     stat = local.stat()
-    os.utime(other_profile, (stat.st_atime, stat.st_mtime))
-    assert _file_mtime_key(str(local)) == _file_mtime_key(str(other_profile))
+    os.utime(other_profile, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert _file_mtime_key(str(local))[:2] == _file_mtime_key(str(other_profile))[:2]
 
     remote = "/root/.hermes/skills/shared.md"
     files = [(str(local), remote)]

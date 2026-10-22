@@ -29,7 +29,7 @@ httpx = pytest.importorskip("httpx")
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Length", "2")
         self.end_headers()
