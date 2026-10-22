@@ -48,7 +48,7 @@ async def _run_one_notifier_tick(monkeypatch, runner):
 
     async def fake_sleep(delay):
         if delay == 5:
-            return None
+            return
         runner._running = False
         await real_sleep(0)
 
@@ -117,7 +117,7 @@ def test_blocked_reason_is_not_clipped_at_160(tmp_path, monkeypatch):
     )
     assert len(reason) > 160
 
-    tid = _blocked_subscription(reason)
+    _blocked_subscription(reason)
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
@@ -150,7 +150,7 @@ def test_gave_up_error_survives_producer_and_notifier(tmp_path, monkeypatch):
     ) * 3  # >500 chars: exceeds the old producer cap, not just the notifier cap
     assert len(error) > 500
 
-    tid = _gave_up_subscription(error)
+    _gave_up_subscription(error)
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
@@ -182,7 +182,7 @@ def test_completed_long_summary_survives_producer_400_cap(tmp_path, monkeypatch)
     ).replace("\n", " ")
     assert len(summary) > 400 and len(summary) < 3500
 
-    tid = _completed_subscription(summary)
+    _completed_subscription(summary)
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
@@ -199,7 +199,7 @@ def test_pathological_reason_is_bounded_with_visible_suffix(tmp_path, monkeypatc
     kb.init_db()
 
     reason = "x" * (_NOTIFY_DETAIL_MAX + 500)
-    tid = _blocked_subscription(reason)
+    _blocked_subscription(reason)
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
@@ -260,7 +260,7 @@ def test_completed_whitespace_only_summary_has_no_trailing_newline(tmp_path, mon
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
-    tid = _completed_subscription("   \n  \t ")
+    _completed_subscription("   \n  \t ")
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
@@ -283,7 +283,7 @@ def test_capped_handoff_plus_envelope_fits_under_4000_char_adapter(tmp_path, mon
 
     # A summary well past the inline cap forces the visible-suffix path.
     summary = "x" * (_NOTIFY_DETAIL_MAX + 1000)
-    tid = _completed_subscription(summary)
+    _completed_subscription(summary)
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 

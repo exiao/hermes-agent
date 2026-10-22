@@ -122,7 +122,7 @@ def test_editable_grouping_drops_lines_on_non_editing_platform(grouping):
 
 def test_separate_grouping_sends_lines_on_non_editing_platform():
     adapter = _NoEditAdapter()
-    ctx, q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
+    ctx, _q = _ctx_with("separate", ["🔧 terminal", "🔍 web_search"])
     runner = _runner_for(adapter, ctx)
 
     asyncio.run(asyncio.wait_for(runner.send_progress_messages(), 10))

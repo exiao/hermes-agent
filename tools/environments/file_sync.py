@@ -28,6 +28,7 @@ import psutil
 
 from hermes_constants import get_hermes_home
 from tools.environments.base import _file_mtime_key
+from utils import mtime_is_racy
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ _monotonic = time.monotonic
 _SYNC_INTERVAL_SECONDS = 5.0
 _FORCE_SYNC_ENV = "HERMES_FORCE_FILE_SYNC"
 _UPLOAD_ONLY_TTL_SECONDS = 60.0
+# Synced-state key no stat result equals (see sync): forces a content check next sync.
+_RACY_SYNC_KEY = (-1, -1, -1, -1)
 
 # Transport callbacks provided by each backend
 UploadFn = Callable[[str, str], None]  # (host_path, remote_path) -> raises on failure
@@ -48,9 +51,9 @@ BulkUploadFn = Callable[[list[tuple[str, str]]], None]  # [(host_path, remote_pa
 BulkDownloadFn = Callable[[Path], None]  # (dest_tar_path) -> writes tar archive, raises on failure
 DeleteFn = Callable[[list[str]], None]  # (remote_paths) -> raises on failure
 GetFilesFn = Callable[[], list[tuple[str, str]]]  # () -> [(host_path, remote_path), ...]
-ManifestState = tuple[dict[str, tuple[float, int]], dict[str, str]]
+ManifestState = tuple[dict[str, tuple[int, int, int, int]], dict[str, str]]
 ManifestLoadFn = Callable[[], ManifestState | None]
-ManifestSaveFn = Callable[[dict[str, tuple[float, int]], dict[str, str]], None]
+ManifestSaveFn = Callable[[dict[str, tuple[int, int, int, int]], dict[str, str]], None]
 
 _SYNC_WARNING_BYTES = 100 * 1024 * 1024
 
@@ -267,7 +270,7 @@ class FileSyncManager:
         self._bulk_download_fn = bulk_download_fn
         self._delete_fn = delete_fn
         self._transaction_lock = threading.Lock()
-        self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
+        self._synced_files: dict[str, tuple[int, int, int, int]] = {}  # remote_path -> file_signature
         self._synced_hosts: dict[str, str] = {}
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
         self._manifest_hashes_need_rebuild = False
@@ -320,7 +323,7 @@ class FileSyncManager:
             # sync-back baseline instead of risking a host overwrite.
             raw_files = manifest
 
-        valid: dict[str, tuple[float, int]] = {}
+        valid: dict[str, tuple[int, int, int, int]] = {}
         if not isinstance(raw_files, dict):
             self._manifest_needs_save = True
             return
@@ -328,25 +331,27 @@ class FileSyncManager:
             if not isinstance(remote_path, str) or not isinstance(file_key, (list, tuple)):
                 self._manifest_needs_save = True
                 continue
-            if len(file_key) != 2:
+            # Pre-file_signature manifests stored (mtime, size): drop them so the next sync
+            # re-keys the entry (the pushed hash still skips the re-upload when bytes match).
+            if len(file_key) != 4:
                 self._manifest_needs_save = True
                 continue
             try:
-                mtime, size = float(file_key[0]), int(file_key[1])
+                key = tuple(int(part) for part in file_key)
             except (TypeError, ValueError, OverflowError):
                 self._manifest_needs_save = True
                 continue
-            if size < 0:
+            if key[1] < 0 and key != _RACY_SYNC_KEY:
                 self._manifest_needs_save = True
                 continue
-            valid[remote_path] = (mtime, size)
+            valid[remote_path] = key
         self._synced_files = valid
         self._pushed_hashes = persisted_hashes
         self._manifest_hashes_need_rebuild = any(
             remote_path not in persisted_hashes for remote_path in valid
         )
 
-    def _persist_state(self, files: dict[str, tuple[float, int]]) -> None:
+    def _persist_state(self, files: dict[str, tuple[int, int, int, int]]) -> None:
         if self._manifest_save_fn is None:
             return
         try:
@@ -389,6 +394,7 @@ class FileSyncManager:
         to_upload: list[tuple[str, str]] = []
         new_files = dict(self._synced_files)
         new_hosts = dict(self._synced_hosts)
+        content_confirmed = False
         mapping_changed = False
         credential_mount_host_paths: set[str] | None = None
         for host_path, remote_path in current_files:
@@ -426,8 +432,18 @@ class FileSyncManager:
                 and not self._manifest_hashes_need_rebuild
             ):
                 continue
+            # A key whose mtime is still inside the racy window is recorded as never-matching: a
+            # same-size rewrite in the same coarse tick would keep every stat field (ctime ticks
+            # just as coarsely). The next sync then confirms the bytes against the pushed hash.
+            new_files[remote_path] = _RACY_SYNC_KEY if mtime_is_racy(file_key[0]) else file_key
+            pushed_hash = self._pushed_hashes.get(remote_path)
+            try:
+                if pushed_hash is not None and _sha256_file(host_path) == pushed_hash:
+                    content_confirmed = True  # the remote already holds these bytes
+                    continue
+            except OSError:
+                pass  # vanished/unreadable after its stat: the staging copy fails the cycle
             to_upload.append((host_path, remote_path))
-            new_files[remote_path] = file_key
 
         if sync_bytes > _SYNC_WARNING_BYTES and directory_bytes:
             if not self._large_sync_warning_active:
@@ -461,8 +477,10 @@ class FileSyncManager:
         to_delete = [p for p in self._synced_files if p not in current_remote_paths]
 
         if not to_upload and not to_delete:
+            if content_confirmed:
+                self._synced_files = new_files  # content-confirmed keys, nothing to push
             self._last_sync_time = _monotonic()
-            if self._manifest_needs_save:
+            if self._manifest_needs_save or content_confirmed:
                 self._persist_state(self._synced_files)
             return
 
@@ -603,7 +621,7 @@ class FileSyncManager:
         finally:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except (OSError, IOError):
+            except OSError:
                 pass
             lock_fd.close()
 

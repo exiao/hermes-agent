@@ -13,13 +13,55 @@ the chain at both points. Drives the real ``run_job`` with AIAgent and
 ``resolve_runtime_provider`` mocked.
 """
 
+import asyncio
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from cron import scheduler
-from cron.scheduler import _CronJobConfig, _resolve_job_runtime, run_job
+from cron.scheduler import _CronJobConfig, _resolve_job_runtime
 from hermes_cli.auth import AuthError
+
+
+def _run_owned_job(job, tmp_path):
+    """Run the job through the production owner bridge (cron turns execute inside the gateway
+    owner, which lends its canonical store); returns run_job's ``(success, output, final,
+    error)`` tuple."""
+    from gateway.session_contract import SessionRef
+    from gateway.session_cron import current_execution, execute
+    from hermes_state_registry import acquire, release
+
+    ref = SessionRef("test-profile", "cron-owner-session")
+    admission_id = "cron-owner-admission"
+    db = acquire(tmp_path / "state.db")
+    db.create_session(ref.session_id, source="cron")
+    authority = SimpleNamespace(
+        db=db, pending_results={},
+        sessions={ref.session_id: SimpleNamespace(source=SimpleNamespace(user_id="cron-owner"))},
+    )
+    row = {"admission_id": admission_id, "request_id": "cron-owner-request",
+           "principal_id": "cron-owner", "payload": {"text": ""}}
+    policy = SimpleNamespace(request_json=json.dumps(
+        {"cron_job": job, "extra_prompt": None, "request_id": "cron-owner-request"}))
+
+    async def run():
+        previous = current_execution()
+        try:
+            await execute(authority, ref, row, policy)
+        except RuntimeError as exc:
+            saved = authority.pending_results.get(admission_id)
+            if saved is None:
+                raise
+            assert str(exc) == saved["result"]["cron_result"][3]
+        assert current_execution() is previous
+        return tuple(authority.pending_results[admission_id]["result"]["cron_result"])
+
+    try:
+        return asyncio.run(run())
+    finally:
+        release(db)
 
 _CONFIG = (
     "model:\n"
@@ -56,12 +98,11 @@ def _run(tmp_path, job, *, primary_error=None):
          patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
          patch("hermes_cli.env_loader.load_hermes_dotenv"), \
          patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-         patch("hermes_state_registry.acquire", return_value=MagicMock()), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=resolve), \
          patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
          patch("run_agent.AIAgent") as agent_cls:
         agent_cls.return_value.run_conversation.return_value = {"final_response": "ok"}
-        success, _output, _final, error = run_job(dict(job))
+        success, _output, _final, error = _run_owned_job(dict(job), tmp_path)
     kwargs = agent_cls.call_args.kwargs if agent_cls.called else {}
     return success, error, requested, kwargs
 
@@ -176,3 +217,42 @@ def test_pinned_job_failure_notice_does_not_promise_a_backup(monkeypatch):
     assert "pinned" in phrase and "--unpin" in phrase
     assert "succeeded" not in phrase
     assert scheduler._fallback_chain_phrase(_job()) == "No backup provider succeeded either."
+
+
+_OWN = [{"provider": "anthropic", "model": "claude-sonnet-5"}]
+
+
+def test_pinned_job_walks_its_own_chain_at_resolve_time(tmp_path):
+    """A job's own fallback_providers lets a pin name its backups without unpinning."""
+    job = _job(provider="xai-oauth", model="grok-4.5", fallback_providers=list(_OWN))
+
+    def resolve(**kwargs):
+        if kwargs.get("requested") == "anthropic":
+            return _runtime("anthropic")
+        raise AuthError("Subscription quota exhausted")
+
+    jc = _CronJobConfig(cfg={"fallback_providers": list(_CHAIN)}, model="grok-4.5",
+                        model_cfg={}, cron_default_provider="")
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=resolve):
+        runtime, model = _resolve_job_runtime(job, "pin-job", jc)
+    assert (runtime["provider"], model) == ("anthropic", "claude-sonnet-5")
+
+
+def test_pinned_job_agent_gets_its_own_chain_mid_run(tmp_path):
+    job = _job(provider="anthropic", model="claude-opus-5", fallback_providers=list(_OWN))
+    success, error, _requested, agent_kwargs = _run(tmp_path, job)
+    assert (success, error) == (True, None)
+    assert agent_kwargs["fallback_model"] == _OWN
+
+
+def test_job_empty_chain_disables_fallback_for_an_unpinned_job(tmp_path):
+    success, error, _requested, agent_kwargs = _run(tmp_path, _job(fallback_providers=[]))
+    assert (success, error) == (True, None)
+    assert agent_kwargs["fallback_model"] is None
+
+
+def test_pinned_job_with_own_chain_failure_notice_does_not_say_unpin(monkeypatch):
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
+    job = _job(provider="anthropic", model="claude-opus-5", fallback_providers=list(_OWN))
+    phrase = scheduler._fallback_chain_phrase(job)
+    assert "--unpin" not in phrase

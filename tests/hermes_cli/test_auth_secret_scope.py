@@ -28,7 +28,7 @@ def test_credential_pool_seed_prefers_active_scope_over_raw_dotenv(monkeypatch):
     value into ``get_secret``. If the pool seed prefers the file value first, it
     can persist ``op://...`` or stale plaintext instead of the scoped secret.
     """
-    import agent.credential_pool as credential_pool
+    from agent import credential_pool
 
     monkeypatch.setattr(
         credential_pool,

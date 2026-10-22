@@ -571,6 +571,7 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
         [sys.executable, "-m", "hermes_cli.main", "kanban",
          "complete", a, b, "--summary", "oops"],
         capture_output=True, text=True, env=env,
+        check=False,
     )
     assert "per-task" in r.stderr, r.stderr
     # The tasks must still be running (no partial apply).
@@ -631,7 +632,7 @@ def test_completed_event_payload_summary_none_when_missing(kanban_home):
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid)  # no summary, no result
         events = kb.list_events(conn, tid)
-        comp = [e for e in events if e.kind == "completed"][0]
+        comp = next(e for e in events if e.kind == "completed")
         assert comp.payload.get("summary") is None
     finally:
         conn.close()
@@ -707,6 +708,7 @@ def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch):
         [_sys.executable, "-m", "hermes_cli.main", "kanban",
          "create", "smoke", "--assignee", "worker", "--json"],
         capture_output=True, text=True, env=env,
+        check=False,
     )
     assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr}"
     import json as _json
@@ -1026,12 +1028,8 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert "--skills" not in cmd, (
         f"spawn argv should not auto-load any skill: {cmd}"
     )
-    assert "--accept-hooks" in cmd, f"spawn argv missing --accept-hooks: {cmd}"
-    assert cmd.index("--accept-hooks") < cmd.index("chat"), (
-        f"--accept-hooks must come before 'chat' in argv: {cmd}"
-    )
-    # Assignee + task env are still present
-    assert "some-profile" in cmd
+    assert cmd[-2:] == ["-m", "hermes_cli.kanban_worker_client"]
+    # Assignee + task identity reaches the owner client; policy is read from the board.
     env = captured["env"]
     assert env.get("HERMES_KANBAN_TASK") == tid
     assert env.get("HERMES_PROFILE") == "some-profile"
@@ -1821,6 +1819,7 @@ def test_dead_worker_reap_reads_the_log_of_the_dispatching_board(kanban_home):
     from hermes_cli import kanban_db_dispatch as kbd
     assert kb.get_current_board() == "default"
     board = "other-board"
+    kb.create_board(board)  # explicit creation; connect() must not create boards (#43243)
     conn = kbc.connect(board=board)
     try:
         tid = kb.create_task(conn, title="handoff", assignee="worker")

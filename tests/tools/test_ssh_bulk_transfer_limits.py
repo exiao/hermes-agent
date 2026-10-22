@@ -88,6 +88,7 @@ class TestTarExitOneClassification:
             ["tar", "cf", os.devnull, "-C", str(tmp_path), "d", "nosuchfile"],
             capture_output=True,
             text=True,
+            check=False,
         )
         assert result.returncode != 0, "expected tar to fail on a missing member"
         assert not _tar_stderr_is_only_concurrent_change(result.stderr)
@@ -99,5 +100,6 @@ class TestTarExitOneClassification:
             ["tar", "cf", os.devnull, "-C", str(tmp_path), "d"],
             capture_output=True,
             text=True,
+            check=False,
         )
         assert result.returncode == 0

@@ -106,7 +106,6 @@ def _capture_home_in_worker(monkeypatch, entrypoint, prof_home: Path):
     def _fake_fetch(*args, **kwargs):
         # Executes inside the ThreadPoolExecutor worker thread.
         seen["home"] = str(get_hermes_home())
-        return None  # fail-open path below; we only care about the captured home
 
     monkeypatch.setattr(na, "get_nous_portal_account_info", _fake_fetch)
     # Pass the local auth gate so we reach the executor.

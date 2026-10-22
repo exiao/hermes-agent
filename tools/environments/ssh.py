@@ -86,7 +86,8 @@ class SSHEnvironment(BaseEnvironment):
     """Run commands on a remote machine over SSH.
 
     Spawn-per-call: every execute() spawns a fresh ``ssh ... bash -c`` process.
-    Session snapshot preserves env vars across calls; CWD persists via in-band
+    Session snapshot preserves exported env vars across calls (unless
+    ``persistent=False``); CWD persists via in-band
     stdout markers. Uses SSH ControlMaster for connection reuse.
     """
 
@@ -111,8 +112,8 @@ class SSHEnvironment(BaseEnvironment):
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
-                 probe_only: bool = False, sync_files: bool = True):
-        super().__init__(cwd=cwd, timeout=timeout)
+                 probe_only: bool = False, sync_files: bool = True, persistent: bool = True):
+        super().__init__(cwd=cwd, timeout=timeout, persist_env=persistent)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
@@ -233,7 +234,7 @@ class SSHEnvironment(BaseEnvironment):
                 return result.stdout.strip()
         return "/root" if self.user == "root" else f"/home/{self.user}"
 
-    def _load_sync_manifest(self) -> tuple[dict[str, tuple[float, int]], dict[str, str]] | None:
+    def _load_sync_manifest(self) -> tuple[dict[str, tuple[int, int, int, int]], dict[str, str]] | None:
         path = shlex.quote(self._sync_manifest_path)
         cmd = self._build_ssh_command()
         cmd.append(f"if test -f {path}; then cat {path}; else exit 3; fi")
@@ -243,6 +244,7 @@ class SSHEnvironment(BaseEnvironment):
             text=True, encoding="utf-8", errors="replace",
             timeout=10,
             stdin=subprocess.DEVNULL,
+            check=False,
         )
         if result.returncode == 3:
             return None
@@ -256,25 +258,23 @@ class SSHEnvironment(BaseEnvironment):
             return None
         if not isinstance(payload, dict):
             return None
-        if payload.get("version") != 1 or payload.get("key") != self._sync_manifest_key:
+        if payload.get("version") != 2 or payload.get("key") != self._sync_manifest_key:
             return None
         files = payload.get("files")
         if not isinstance(files, dict):
             return None
 
-        parsed: dict[str, tuple[float, int]] = {}
+        parsed: dict[str, tuple[int, int, int, int]] = {}
         for remote_path, file_key in files.items():
             if not isinstance(remote_path, str) or not isinstance(file_key, list):
                 return None
-            if len(file_key) != 2:
+            if len(file_key) != 4:
                 return None
             try:
-                mtime, size = float(file_key[0]), int(file_key[1])
+                key = tuple(int(part) for part in file_key)
             except (TypeError, ValueError, OverflowError):
                 return None
-            if size < 0:
-                return None
-            parsed[remote_path] = (mtime, size)
+            parsed[remote_path] = key
         raw_hashes = payload.get("hashes", {})
         if not isinstance(raw_hashes, dict):
             raw_hashes = {}
@@ -289,17 +289,14 @@ class SSHEnvironment(BaseEnvironment):
 
     def _save_sync_manifest(
         self,
-        files: dict[str, tuple[float, int]],
+        files: dict[str, tuple[int, int, int, int]],
         hashes: dict[str, str],
     ) -> None:
         payload = json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "key": self._sync_manifest_key,
-                "files": {
-                    remote_path: [mtime, size]
-                    for remote_path, (mtime, size) in files.items()
-                },
+                "files": {remote_path: list(key) for remote_path, key in files.items()},
                 "hashes": hashes,
             },
             sort_keys=True,
@@ -317,6 +314,7 @@ class SSHEnvironment(BaseEnvironment):
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=10,
+            check=False,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -473,7 +471,7 @@ class SSHEnvironment(BaseEnvironment):
         with open(dest, "wb") as f:
             result = subprocess.run(
                 ssh_cmd, stdin=subprocess.DEVNULL, stdout=f,
-                stderr=subprocess.PIPE, timeout=_BULK_UPLOAD_MAX_TIMEOUT)
+                stderr=subprocess.PIPE, timeout=_BULK_UPLOAD_MAX_TIMEOUT, check=False)
         stderr = (result.stderr or b"").decode(errors="replace").strip()
         if result.returncode != 0:
             diagnostic_lines = [line for line in stderr.splitlines() if line.strip()]
@@ -522,6 +520,6 @@ class SSHEnvironment(BaseEnvironment):
                 continue
             with contextlib.suppress(OSError, subprocess.SubprocessError):
                 cmd = ["ssh", "-o", f"ControlPath={socket}", "-O", "exit", f"{self.user}@{self.host}"]
-                subprocess.run(cmd, capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
+                subprocess.run(cmd, capture_output=True, timeout=5, stdin=subprocess.DEVNULL, check=False)
             with contextlib.suppress(OSError):
                 socket.unlink()

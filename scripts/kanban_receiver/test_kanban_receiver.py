@@ -67,9 +67,9 @@ def test_create_card_happy_path(monkeypatch):
 
 def test_create_card_requires_assignee_and_title(monkeypatch):
     monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc())
-    status, body = kr.create_card({"title": "no assignee"})
+    status, _body = kr.create_card({"title": "no assignee"})
     assert status == 400
-    status, body = kr.create_card({"assignee": "dev"})
+    status, _body = kr.create_card({"assignee": "dev"})
     assert status == 400
 
 
@@ -167,14 +167,14 @@ def test_create_card_nonpositive_goal_max_turns(monkeypatch):
 
     monkeypatch.setattr(kr, "_run_hermes_kanban", fake_run)
     # Non-positive -> flag dropped, CLI default applies (200, no --goal-max-turns).
-    status, body = kr.create_card(
+    status, _body = kr.create_card(
         {"assignee": "dev", "title": "x", "goal": True, "goal_max_turns": 0}
     )
     assert status == 200
     assert "--goal" in captured["args"]
     assert "--goal-max-turns" not in captured["args"]
     # Non-integer -> clean 400.
-    status, body = kr.create_card(
+    status, _body = kr.create_card(
         {"assignee": "dev", "title": "x", "goal": True, "goal_max_turns": "nope"}
     )
     assert status == 400
@@ -195,7 +195,7 @@ def test_comment_rejects_non_string_fields(monkeypatch):
 
 def test_create_card_bad_priority(monkeypatch):
     monkeypatch.setattr(kr, "_run_hermes_kanban", lambda args: _FakeProc())
-    status, body = kr.create_card({"assignee": "dev", "title": "x", "priority": "high"})
+    status, _body = kr.create_card({"assignee": "dev", "title": "x", "priority": "high"})
     assert status == 400
 
 
@@ -235,7 +235,7 @@ def test_create_card_cli_failure(monkeypatch):
     monkeypatch.setattr(
         kr, "_run_hermes_kanban", lambda args: _FakeProc(returncode=1, stderr="boom")
     )
-    status, body = kr.create_card({"assignee": "dev", "title": "x"})
+    status, _body = kr.create_card({"assignee": "dev", "title": "x"})
     assert status == 502
 
 
@@ -244,7 +244,7 @@ def test_create_card_timeout(monkeypatch):
         raise subprocess.TimeoutExpired(cmd="hermes", timeout=30)
 
     monkeypatch.setattr(kr, "_run_hermes_kanban", raise_timeout)
-    status, body = kr.create_card({"assignee": "dev", "title": "x"})
+    status, _body = kr.create_card({"assignee": "dev", "title": "x"})
     assert status == 504
 
 
@@ -283,7 +283,7 @@ def test_comment_unknown_card_is_404(monkeypatch):
         kr, "_run_hermes_kanban",
         lambda args: _FakeProc(returncode=1, stderr="kanban: unknown task t_x"),
     )
-    status, body = kr.comment_card({"card_id": "t_x", "text": "hi"})
+    status, _body = kr.comment_card({"card_id": "t_x", "text": "hi"})
     assert status == 404
 
 
@@ -366,14 +366,14 @@ def test_http_health_no_auth(server):
 
 def test_http_fail_closed_when_secret_unset(server):
     # No secret in env -> every write is 403.
-    status, body = _post(f"{server}/kanban/card-drop",
+    status, _body = _post(f"{server}/kanban/card-drop",
                          {"assignee": "dev", "title": "x"})
     assert status == 403
 
 
 def test_http_403_wrong_secret(server, monkeypatch):
     monkeypatch.setenv("KANBAN_RECEIVER_SECRET", "right")
-    status, body = _post(f"{server}/kanban/card-drop",
+    status, _body = _post(f"{server}/kanban/card-drop",
                          {"assignee": "dev", "title": "x"},
                          headers={"X-Cron-Secret": "wrong"})
     assert status == 403
@@ -403,5 +403,5 @@ def test_http_comment_with_secret(server, monkeypatch):
 
 def test_http_unknown_route_404(server, monkeypatch):
     monkeypatch.setenv("CRON_SECRET", "s")
-    status, body = _post(f"{server}/nope", {}, headers={"X-Cron-Secret": "s"})
+    status, _body = _post(f"{server}/nope", {}, headers={"X-Cron-Secret": "s"})
     assert status == 404

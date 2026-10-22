@@ -430,7 +430,7 @@ def test_dispatch_non_dryrun_invalidates_board_cache(tmp_path, monkeypatch):
         spawned: int = 0
 
     monkeypatch.setattr(
-        plugin_api.kanban_db, "dispatch_once",
+        plugin_api.kbd, "dispatch_once",
         lambda conn, dry_run, max_spawn, board: _FakeResult(),
     )
 

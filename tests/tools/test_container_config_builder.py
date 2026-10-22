@@ -125,6 +125,12 @@ class TestBuilder:
             _CONTAINER_CONFIG_DEFAULTS
         )
 
+    def test_keys_match_upstream_backend_table(self):
+        """The fork's builder must carry every key upstream's backends read (docker_image_pinned
+        was once missing, so a changed docker image silently kept the old container)."""
+        from tools.terminal_tool_backends import _CONTAINER_KEYS
+        assert set(_CONTAINER_CONFIG_DEFAULTS) == {key for key, _default in _CONTAINER_KEYS}
+
     @pytest.mark.parametrize("env_type", ["local", "ssh", ""])
     def test_non_container_backends_get_none(self, env_type):
         assert build_container_config(env_type, {}) is None

@@ -32,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from cron.scheduler import _inactivity_watchdog_loop  # noqa: E402
+from cron.scheduler import _inactivity_watchdog_loop
 
 
 def _run(readings, limit_s=600.0):
@@ -71,8 +71,7 @@ def test_watchdog_reports_the_idle_value_it_tripped_on():
         "activity clock and can report an idle value that never tripped it"
     )
     assert tripped_idle >= 600.0, (
-        "reported idle (%r) must be the value that breached the limit"
-        % (tripped_idle,)
+        f"reported idle ({tripped_idle!r}) must be the value that breached the limit"
     )
 
 

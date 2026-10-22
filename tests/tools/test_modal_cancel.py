@@ -27,11 +27,12 @@ def test_cancellable_command_preserves_the_original_command(tmp_path):
     marker = tmp_path / "ran"
     inner = f"echo hi && echo second > {marker}"
 
-    bare = subprocess.run(["bash", "-c", inner], capture_output=True, text=True)
+    bare = subprocess.run(["bash", "-c", inner], capture_output=True, text=True, check=False)
     marker.unlink(missing_ok=True)
     wrapped = subprocess.run(
         ["bash", "-c", modal_env._cancellable_command(inner, str(pidfile))],
         capture_output=True, text=True,
+        check=False,
     )
 
     assert wrapped.stdout == bare.stdout, "wrapper changed the command's output"
@@ -57,7 +58,7 @@ def test_cancellable_command_records_the_shell_pid_not_an_env_var(tmp_path):
     )
     (tmp_path / "gate").write_text("go\n")
     proc = subprocess.run(["bash", "-c", tagged + f'; echo "$$" > {tmp_path / "self"}'],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, check=False)
 
     assert proc.returncode == 0, proc
     # The file records "<pid> <pgid>"; the first field is the contract the
@@ -66,7 +67,7 @@ def test_cancellable_command_records_the_shell_pid_not_an_env_var(tmp_path):
     recorded = pidfile.read_text().split()[0]
     actual = (tmp_path / "self").read_text().strip()
     assert recorded == actual, (
-        "recorded pid %r is not the command shell's own pid %r" % (recorded, actual)
+        f"recorded pid {recorded!r} is not the command shell's own pid {actual!r}"
     )
 
 
@@ -81,6 +82,7 @@ def test_cancellable_command_quotes_the_pidfile(tmp_path):
     proc = subprocess.run(
         ["bash", "-c", modal_env._cancellable_command("echo ok", nasty)],
         capture_output=True, text=True,
+        check=False,
     )
 
     assert "ok" in proc.stdout, proc
@@ -90,7 +92,7 @@ def test_cancellable_command_quotes_the_pidfile(tmp_path):
     # the `rm` after a `;`. Either it wrote the file or it failed on the literal
     # path; both prove the injection never became shell syntax.
     assert os.path.exists(nasty) or nasty in proc.stderr, (
-        "hostile pidfile path was not treated as one literal argument: %r" % (proc,)
+        f"hostile pidfile path was not treated as one literal argument: {proc!r}"
     )
 
 
@@ -111,21 +113,24 @@ def test_pidfile_write_cannot_break_the_command(tmp_path):
         plain = subprocess.run(
             ["bash", "-c", modal_env._cancellable_command("echo hi", pidfile)],
             capture_output=True, text=True,
+            check=False,
         )
         errexit = subprocess.run(
             ["bash", "-ec", modal_env._cancellable_command("echo hi", pidfile)],
             capture_output=True, text=True,
+            check=False,
         )
         chained = subprocess.run(
             ["bash", "-c", modal_env._cancellable_command("echo hi && echo two", pidfile)],
             capture_output=True, text=True,
+            check=False,
         )
     finally:
         readonly.chmod(0o700)
 
     for label, proc in (("plain", plain), ("set -e", errexit), ("&&", chained)):
         assert proc.returncode == 0, (
-            "unwritable pid path broke the command under %s: %r" % (label, proc)
+            f"unwritable pid path broke the command under {label}: {proc!r}"
         )
         assert "hi" in proc.stdout, (label, proc)
 
@@ -134,7 +139,7 @@ def test_cancellable_command_preserves_exit_status(tmp_path):
     pidfile = tmp_path / "command.pid"
     tagged = modal_env._cancellable_command("exit 37", str(pidfile))
 
-    result = subprocess.run(["bash", "-c", tagged], capture_output=True, text=True)
+    result = subprocess.run(["bash", "-c", tagged], capture_output=True, text=True, check=False)
 
     assert result.returncode == 37
 
@@ -151,10 +156,10 @@ def test_cancellable_command_preserves_dollar_dollar_semantics(tmp_path):
         "trap 'exit 42' TERM; kill -TERM $$; sleep 3", str(pidfile)
     )
 
-    result = subprocess.run(["bash", "-c", tagged], capture_output=True, text=True)
+    result = subprocess.run(["bash", "-c", tagged], capture_output=True, text=True, check=False)
 
     assert result.returncode == 42, (
-        "the command's own $$ trap must still fire; got %s" % result.returncode
+        f"the command's own $$ trap must still fire; got {result.returncode}"
     )
 
 
@@ -322,7 +327,7 @@ def test_cancel_during_a_slow_exec_rpc_is_still_applied():
     assert launched.is_set(), "the target command never launched"
     kill_calls = [c for c in sandbox.exec_calls if modal_env._CANCEL_SCRIPT in c]
     assert kill_calls, (
-        "a cancel that arrived before launch was dropped: %r" % (sandbox.exec_calls,)
+        f"a cancel that arrived before launch was dropped: {sandbox.exec_calls!r}"
     )
     assert sandbox.terminated is False
 
@@ -500,11 +505,11 @@ def _live_cancel_cycle(inner_command: str, name: str):
 def test_live_cancel_keeps_the_sandbox_and_its_state_usable():
     result, still_usable, state, elapsed = _live_cancel_cycle("sleep 300", "sleep")
 
-    assert result["returncode"] == 130, "interrupt path did not fire: %r" % (result,)
-    assert elapsed < 60, "command not stopped promptly: %.1fs" % elapsed
-    assert still_usable["returncode"] == 0, "SANDBOX BRICKED: %r" % (still_usable,)
+    assert result["returncode"] == 130, f"interrupt path did not fire: {result!r}"
+    assert elapsed < 60, f"command not stopped promptly: {elapsed:.1f}s"
+    assert still_usable["returncode"] == 0, f"SANDBOX BRICKED: {still_usable!r}"
     assert "alive" in still_usable["output"], still_usable
-    assert "persisted" in state["output"], "session state lost: %r" % (state,)
+    assert "persisted" in state["output"], f"session state lost: {state!r}"
 
 
 @_live_only
@@ -514,9 +519,9 @@ def test_live_cancel_reaches_a_shell_builtin_only_command():
         "while :; do :; done", "builtin"
     )
 
-    assert result["returncode"] == 130, "interrupt path did not fire: %r" % (result,)
-    assert elapsed < 60, "builtin loop not cancelled promptly: %.1fs" % elapsed
-    assert still_usable["returncode"] == 0, "SANDBOX BRICKED: %r" % (still_usable,)
+    assert result["returncode"] == 130, f"interrupt path did not fire: {result!r}"
+    assert elapsed < 60, f"builtin loop not cancelled promptly: {elapsed:.1f}s"
+    assert still_usable["returncode"] == 0, f"SANDBOX BRICKED: {still_usable!r}"
     assert "persisted" in state["output"], state
 
 
@@ -529,9 +534,9 @@ def test_live_cancel_survives_the_env_snapshot_being_sourced():
     )
     result, still_usable, state, elapsed = _live_cancel_cycle(inner, "snapshot")
 
-    assert result["returncode"] == 130, "interrupt path did not fire: %r" % (result,)
-    assert elapsed < 60, "not cancelled promptly: %.1fs" % elapsed
-    assert still_usable["returncode"] == 0, "SANDBOX BRICKED: %r" % (still_usable,)
+    assert result["returncode"] == 130, f"interrupt path did not fire: {result!r}"
+    assert elapsed < 60, f"not cancelled promptly: {elapsed:.1f}s"
+    assert still_usable["returncode"] == 0, f"SANDBOX BRICKED: {still_usable!r}"
     assert "persisted" in state["output"], state
 
 
@@ -541,9 +546,9 @@ def test_live_cancel_kills_the_whole_child_tree():
         "sleep 300 & sleep 300 & wait", "tree"
     )
 
-    assert result["returncode"] == 130, "interrupt path did not fire: %r" % (result,)
-    assert elapsed < 60, "child tree not cancelled promptly: %.1fs" % elapsed
-    assert still_usable["returncode"] == 0, "SANDBOX BRICKED: %r" % (still_usable,)
+    assert result["returncode"] == 130, f"interrupt path did not fire: {result!r}"
+    assert elapsed < 60, f"child tree not cancelled promptly: {elapsed:.1f}s"
+    assert still_usable["returncode"] == 0, f"SANDBOX BRICKED: {still_usable!r}"
     assert "persisted" in state["output"], state
 
 
@@ -848,11 +853,11 @@ def test_cancel_script_reads_the_pgid_correctly_for_any_comm(tmp_path):
         out = subprocess.run(
             ["bash", "-c", f'STATFILE={statfile}; {parser}; echo "$pgid"'],
             capture_output=True, text=True,
+            check=False,
         )
         got = out.stdout.strip()
         assert got == pgid, (
-            "comm %r: parsed pgid %r, expected %r (ppid was %r)"
-            % (comm, got, pgid, ppid)
+            f"comm {comm!r}: parsed pgid {got!r}, expected {pgid!r} (ppid was {ppid!r})"
         )
 
 
@@ -875,6 +880,7 @@ def test_pidfile_cleanup_does_not_touch_the_command_or_its_exit(tmp_path):
     exited = subprocess.run(
         ["bash", "-c", modal_env._cancellable_command("exit 37", str(pidfile))],
         capture_output=True, text=True,
+        check=False,
     )
     assert exited.returncode == 37, exited
 
@@ -884,6 +890,7 @@ def test_pidfile_cleanup_does_not_touch_the_command_or_its_exit(tmp_path):
         ["bash", "-c", modal_env._cancellable_command(
             "trap 'exit 42' TERM; kill -TERM $$; sleep 3", str(pidfile))],
         capture_output=True, text=True,
+        check=False,
     )
     assert selfsignal.returncode == 42, selfsignal
 
@@ -892,6 +899,7 @@ def test_pidfile_cleanup_does_not_touch_the_command_or_its_exit(tmp_path):
         ["bash", "-c", modal_env._cancellable_command(
             "trap 'echo MY_TRAP_RAN' EXIT; echo body", str(pidfile))],
         capture_output=True, text=True,
+        check=False,
     )
     assert "body" in trapped.stdout, trapped
     assert "MY_TRAP_RAN" in trapped.stdout, "the command's own EXIT trap was lost"
@@ -902,9 +910,10 @@ def test_pidfile_cleanup_does_not_touch_the_command_or_its_exit(tmp_path):
         ["bash", "-c", modal_env._cancellable_command(
             "jobs -r | wc -l", str(pidfile))],
         capture_output=True, text=True,
+        check=False,
     )
     assert jobs.stdout.strip().splitlines()[-1].strip() == "0", (
-        "cleanup left a background job running alongside the command: %r" % (jobs,)
+        f"cleanup left a background job running alongside the command: {jobs!r}"
     )
 
     # 5. Cleanup behaves IDENTICALLY however the command terminates. This is
@@ -920,16 +929,17 @@ def test_pidfile_cleanup_does_not_touch_the_command_or_its_exit(tmp_path):
         "exit 0",                          # exits directly
         "kill -TERM $$",                   # dies on a signal
     ]):
-        pf = tmp_path / ("mode%d.pid" % i)
+        pf = tmp_path / f"mode{i}.pid"
         subprocess.run(
             ["bash", "-c", modal_env._cancellable_command(body, str(pf))],
             capture_output=True, text=True,
+            check=False,
         )
         outcomes.add(pf.exists())
 
     assert len(outcomes) == 1, (
         "pid-file cleanup depends on how the command exits, so some exit "
-        "paths leak and others do not: %r" % (outcomes,)
+        f"paths leak and others do not: {outcomes!r}"
     )
 
 
@@ -970,9 +980,9 @@ def test_stale_pidfile_sweep_cannot_fail_the_command(tmp_path):
     sweep = modal_env._stale_pidfile_sweep().replace(
         shlex.quote(modal_env._CANCEL_DIR), shlex.quote(str(tmp_path / "nope"))
     )
-    proc = subprocess.run(["bash", "-c", sweep], capture_output=True, text=True)
+    proc = subprocess.run(["bash", "-c", sweep], capture_output=True, text=True, check=False)
 
-    assert proc.returncode == 0, "a failing sweep would break every command: %r" % (proc,)
+    assert proc.returncode == 0, f"a failing sweep would break every command: {proc!r}"
 
 
 def test_stale_pidfile_sweep_leaves_a_live_commands_file_alone(tmp_path):
@@ -1053,6 +1063,6 @@ def test_live_cancel_reaches_a_child_that_outlives_the_wrapper():
 
     assert "n=0" not in before_out, "the background child never started"
     assert "cancelled=1" in kill_out, (
-        "cancel gave up because the wrapper had exited: %r" % (kill_out,)
+        f"cancel gave up because the wrapper had exited: {kill_out!r}"
     )
     assert "n=0" in after_out, f"background child survived cancel: {after_out!r}"

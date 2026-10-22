@@ -90,6 +90,20 @@ def test_picker_synthesizes_astra_but_never_astra_pro_or_tiers():
     assert "gpt-6-astra-pro-900k" not in out
     assert "gpt-6-astra-fast-900k" not in out
     assert "gpt-6-astra-flex-900k" not in out
+def test_catalog_identity_stays_stable_for_rotation_but_changes_with_route(monkeypatch):
+    from hermes_cli import auth, codex_models
+    import agent.credential_pool as pool
+
+    credentials = {"api_key": "first-token", "base_url": "https://first.example/codex/"}
+    monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", lambda **_: dict(credentials))
+    monkeypatch.setattr(auth, "_codex_access_token_is_expiring", lambda *_: False)
+    monkeypatch.setattr(pool, "_codex_principal_identity", lambda _: ("account", "subject"))
+    first = codex_models.codex_catalog_credential_identity()
+    credentials["api_key"] = "rotated-token"
+    credentials["base_url"] = "https://first.example/codex"
+    assert codex_models.codex_catalog_credential_identity() == first
+    credentials["base_url"] = "https://second.example/codex"
+    assert codex_models.codex_catalog_credential_identity() != first
 
 
 

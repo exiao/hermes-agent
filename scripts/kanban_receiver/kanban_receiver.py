@@ -163,6 +163,7 @@ def _run_hermes_kanban(args: list[str]) -> subprocess.CompletedProcess:
         capture_output=True,
         timeout=CLI_TIMEOUT_SECONDS,
         env=os.environ.copy(),
+        check=False,
     )
 
 
@@ -352,17 +353,17 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return obj if isinstance(obj, dict) else None
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002,A003
+    def log_message(self, format: str, *args: Any) -> None:
         LOG.info("%s - %s", self.address_string(), format % args)
 
     # --- routes ------------------------------------------------------------
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if self.path.rstrip("/") in ("/health", "/kanban/health"):
             self._send_json(200, {"ok": True, "ts": int(time.time())})
             return
         self._send_json(404, {"error": "not found"})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         route = self.path.rstrip("/")
         if route not in ("/kanban/card-drop", "/kanban/comment"):
             self._send_json(404, {"error": "not found"})

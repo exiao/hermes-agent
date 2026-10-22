@@ -1349,6 +1349,8 @@ app.get('/health', (req, res) => {
     scriptHash: SCRIPT_HASH,
     antiban: antiban.enabled,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    // path.resolve, not realpath: the adapter compares against os.path.abspath, which keeps symlinks.
+    session: path.resolve(SESSION_DIR),
     capabilities: { outboundMentions: true },
   });
 });

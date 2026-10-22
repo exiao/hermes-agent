@@ -7,7 +7,9 @@
 class TestToolProgressProvenance:
     def test_winning_source_controls_mode_and_intent(self):
         from gateway.display_config import resolve_tool_progress
+        from hermes_cli.plugins import discover_plugins
 
+        discover_plugins()  # slack's "off" default ships on its PlatformEntry (display_overrides)
         cases = [
             ({}, None, ("off", False)),
             ({}, "all", ("all", True)),
@@ -79,6 +81,8 @@ class TestHideCodeInProgressDefaults:
         customer channel, so with stock config it must default to hiding raw
         commands/code rather than falling through to the global False."""
         from gateway.display_config import resolve_display_setting
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()  # WhatsApp is a plugin platform; its PlatformEntry carries the default
         assert resolve_display_setting({}, "whatsapp", "hide_code_in_progress") is True
 
     def test_whatsapp_opt_out_still_possible(self):
@@ -166,10 +170,15 @@ def assert_keeps_platform_display_defaults(cfg):
 
     Shared by every config seeder's regression test: a seeded global ``display.<key>`` beats each
     platform tier, because the gateway loader merges no DEFAULT_CONFIG (#121230)."""
-    from gateway.display_config import _PLATFORM_DEFAULTS, resolve_display_setting, resolve_tool_progress
+    from gateway.display_config import _PLATFORM_DEFAULTS, _platform_defaults, resolve_display_setting, resolve_tool_progress
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.plugins import discover_plugins
 
-    tier_keys = {key for tier in _PLATFORM_DEFAULTS.values() for key in tier}
-    for platform in _PLATFORM_DEFAULTS:
+    # Core-only rows plus every plugin platform that declares display defaults on its PlatformEntry.
+    discover_plugins()
+    platforms = set(_PLATFORM_DEFAULTS) | {e.name for e in platform_registry.all_entries() if e.display_tier}
+    tier_keys = {key for platform in platforms for key in _platform_defaults(platform)}
+    for platform in sorted(platforms):
         assert resolve_tool_progress(cfg, platform) == resolve_tool_progress({}, platform), platform
         for key in tier_keys:
             assert resolve_display_setting(cfg, platform, key) == resolve_display_setting({}, platform, key), (
@@ -250,7 +259,7 @@ class TestConfigMigration:
         import hermes_cli.config as cfg_mod
         importlib.reload(cfg_mod)
 
-        result = cfg_mod.migrate_config(interactive=False, quiet=True)
+        cfg_mod.migrate_config(interactive=False, quiet=True)
         # Re-read config
         updated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         platforms = updated.get("display", {}).get("platforms", {})

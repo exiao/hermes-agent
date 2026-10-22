@@ -55,7 +55,7 @@ class TestCompressContextRebuildsPrompt(unittest.TestCase):
         agent.session_log_file = Path("/tmp/fake.json")
         agent.logs_dir = Path("/tmp")
 
-        compressed, new_prompt = AIAgent._compress_context(
+        _compressed, new_prompt = AIAgent._compress_context(
             agent,
             messages=[{"role": "user", "content": "m"}],
             system_message="parent_msg",

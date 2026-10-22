@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import tools.terminal_tool_sudo as terminal_tool_sudo
+from tools import terminal_tool_sudo
 from tools.environments.base import BaseEnvironment, _load_json_store
 from tools.environments.base_output import _BoundedOutputCollector, _ThreadedProcessHandle
 
@@ -258,6 +258,7 @@ class TestEmbedStdinHeredoc:
         proc = subprocess.run(
             ["bash", "-c", result], stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=30,
+            check=False,
         )
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.startswith("hello world")
@@ -276,6 +277,7 @@ class TestEmbedStdinHeredoc:
             proc = subprocess.run(
                 ["bash", "-c", wrapped], stdin=subprocess.DEVNULL,
                 capture_output=True, text=True, timeout=30,
+                check=False,
             )
             assert proc.returncode == 0, proc.stderr
             assert target.read_text().startswith("payload\n")

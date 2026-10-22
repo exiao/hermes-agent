@@ -120,7 +120,7 @@ class TestConfigSurface:
         import gateway.run as gw
 
         block = re.search(r"_terminal_env_map\s*=\s*\{(.*?)\n\s*\}",
-                          Path(gw.__file__).read_text(), re.S)
+                          Path(gw.__file__).read_text(), re.DOTALL)
         assert block, "could not locate _terminal_env_map in gateway/run.py"
         gateway_keys = set(re.findall(r'"(\w+)":\s*"TERMINAL_', block.group(1)))
 
