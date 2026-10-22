@@ -49,7 +49,8 @@ def test_routed_turn_rehomes_adapter_cached_attachments_a_b_a(two_homes):
     a, b = two_homes
     doc, img = _adapter_cached(a, "documents", "doc_0123456789ab_report.pdf"), _adapter_cached(a, "images", "img_1.jpg")
     event = MessageEvent(text=f"[document 'report.pdf' saved at: {doc}]", message_type=MessageType.DOCUMENT,
-                         source=None, media_urls=[doc, img], media_types=["application/pdf", "image/jpeg"])
+                         source=None, media_urls=[doc, img], media_types=["application/pdf", "image/jpeg"],
+                         reply_to_media_paths=[img])  # a quoted image is also the reply pointer's local copy
 
     with _profile_runtime_scope(b):  # routed turn: B's mounts, B's cache roots
         rehome_inbound_media(event)
@@ -64,6 +65,7 @@ def test_routed_turn_rehomes_adapter_cached_attachments_a_b_a(two_homes):
                                 str(b / "cache" / "images" / "img_1.jpg")]
     assert not Path(doc).exists() and not Path(img).exists()  # moved, not copied: A holds nothing of B's
     assert (b / "cache" / "images" / "img_1.jpg").is_file()
+    assert event.reply_to_media_paths == [str(b / "cache" / "images" / "img_1.jpg")]  # pointer follows the move
 
     # A→B→A: a launch-profile turn keeps its own files where they are (no-op, no bleed into B).
     doc_a = _adapter_cached(a, "documents", "doc_aaaaaaaaaaaa_own.pdf")
