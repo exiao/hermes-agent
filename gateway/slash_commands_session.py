@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import dataclasses
 import logging
 import os
@@ -155,18 +156,25 @@ class GatewaySessionCommandsMixin:
         # Claim the memory teardown HERE, on the loop, before the caller evicts the agent: the cache
         # eviction's soft release would otherwise claim it first, shut the providers down, and the
         # background job's session-end extraction would then lose the claim and never run.
+        # Holding that claim makes this job the ONLY owner of extraction + provider shutdown, so it
+        # must never be dropped while queued: no wait_for bound here (that cancels a work item still
+        # waiting for a busy housekeeping worker). The job is detached, so /new never waits on it.
         _mm = getattr(_old_agent, "_memory_manager", None)
         if _mm is not None:
             with contextlib.suppress(Exception):
                 _mm.claim_teardown(session_end=True)
-        self._retain_background_task(asyncio.create_task(
-            self._cleanup_agent_resources_off_loop(
-                _old_agent,
-                context=f"/new reset {session_key}",
-                session_key=session_key,
-                session_messages=messages_snapshot,
-            )
-        ))
+
+        async def _teardown() -> None:
+            try:
+                await self._run_housekeeping_in_executor(
+                    self._run_release_in_profile_scope,
+                    functools.partial(self._cleanup_agent_resources, session_messages=messages_snapshot),
+                    (_old_agent,), session_key,
+                )
+            except Exception as cleanup_exc:
+                logger.warning("Agent resource cleanup (/new reset %s) failed: %s", session_key, cleanup_exc)
+
+        self._retain_background_task(asyncio.create_task(_teardown()))
 
     async def _fire_session_reset_hooks(self, source: SessionSource, session_key: str, old_sid,
                                         new_sid) -> None:

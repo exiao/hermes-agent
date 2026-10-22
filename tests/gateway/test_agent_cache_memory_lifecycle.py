@@ -189,9 +189,13 @@ class TestAgentCacheMemoryLifecycle:
 
         async def run_after_eviction(*args, **kwargs):
             await evicted.wait()
+            await asyncio.sleep(0.2)  # queued past the cleanup timeout below
             return await real_run(*args, **kwargs)
 
         runner._run_housekeeping_in_executor = run_after_eviction
+        # A queued job holding the session-end claim must not be dropped by a timeout: nothing else
+        # would then extract or shut the providers down.
+        runner._CLEANUP_TIMEOUT_S = 0.05
         try:
             await runner._cleanup_old_agent_for_reset(key)
             runner._evict_cached_agent(key)
@@ -200,6 +204,8 @@ class TestAgentCacheMemoryLifecycle:
             evicted.set()
             await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
         finally:
-            runner._housekeeping_executor.shutdown(wait=True)
+            pool = getattr(runner, "_housekeeping_executor", None)
+            if pool is not None:
+                pool.shutdown(wait=True)
         assert events == ["on_session_end", "shutdown"]
         assert not provider.writer.is_alive()
