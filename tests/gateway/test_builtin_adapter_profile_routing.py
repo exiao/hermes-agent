@@ -58,6 +58,8 @@ def signal_adapter(runner, monkeypatch):
         enabled=True,
         extra={"http_url": "http://127.0.0.1:8080", "account": "+15550000000"},
     )
+    from hermes_cli.plugins import discover_plugins
+    discover_plugins()  # Signal is a plugin platform now; the gateway discovers plugins at startup
     adapter = runner._create_adapter(Platform.SIGNAL, config)
     assert adapter is not None, "Signal adapter should build from a valid config"
     return adapter

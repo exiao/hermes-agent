@@ -644,7 +644,7 @@ class TestMemoryBatch:
         # Nothing applied — neither the add nor anything else.
         assert "should not persist" not in store.memory_entries
         assert "keep me" in store.memory_entries
-        assert "current_entries" in result
+        assert "current_entries" not in result  # batch aborts never echo the store (#97316)
 
     def test_batch_final_budget_overflow_rejected(self, store):
         result = json.loads(memory_tool(

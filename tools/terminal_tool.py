@@ -40,8 +40,9 @@ def _redact_terminal_error_text(value: Any) -> str:
 
 
 from tools.registry import tool_error
+# _create_configured_env is defined below (fork: build_container_config keeps every container key).
 from tools.terminal_tool_lifecycle import (
-    _check_disk_usage_warning, _cleanup_inactive_envs, _create_configured_env,
+    _check_disk_usage_warning, _cleanup_inactive_envs,
     _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
 )
 from tools.terminal_tool_config import (
@@ -52,13 +53,13 @@ from tools.terminal_tool_config import (
 from tools.terminal_tool_backends import (
     _REQUIREMENT_CHECKERS, _VERCEL_SANDBOX_DEFAULT_CWD, _check_plugin_requirements,
     _get_modal_backend_state, _ManagedModalEnvironment, _ModalEnvironment,
-    _record_unavailable_reason, terminal_backend_unavailable_reason,  # noqa: F401 — re-exported
+    _record_unavailable_reason, terminal_backend_unavailable_reason,
 )
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled
 
 CONTAINER_ENV_TYPES = {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
-_CONTAINER_CONFIG_DEFAULTS: Dict[str, Any] = {
+_CONTAINER_CONFIG_DEFAULTS: dict[str, Any] = {
     "container_cpu": 1, "container_memory": 5120, "container_disk": 51200,
     "container_persistent": True, "container_idle_timeout": 0, "lifetime_seconds": 300,
     "modal_mode": "auto", "vercel_runtime": "", "vercel_image": "", "docker_volumes": [],
@@ -66,10 +67,11 @@ _CONTAINER_CONFIG_DEFAULTS: Dict[str, Any] = {
     "docker_run_as_host_user": False, "docker_extra_args": [], "docker_shm_size": "1g",
     "docker_network": True, "docker_persist_across_processes": True,
     "docker_shared_container_key": "", "docker_orphan_reaper": True, "docker_snap_compat": False,
+    "docker_image_pinned": False,
 }
 
 
-def build_container_config(env_type: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def build_container_config(env_type: str, config: dict[str, Any]) -> Optional[dict[str, Any]]:
     if env_type not in CONTAINER_ENV_TYPES:
         return None
     return {key: config.get(key, copy.deepcopy(default))
@@ -125,7 +127,7 @@ def _create_environment(*, env_type: str, image: str, cwd: str, timeout: int,
                persistent_filesystem=cc["container_persistent"], task_id=task_id)
 
 
-def _create_configured_env(config: Dict[str, Any], env_type: str, *, image: str, cwd: str,
+def _create_configured_env(config: dict[str, Any], env_type: str, *, image: str, cwd: str,
                            timeout: int, task_id: str, host_cwd: Optional[str], local_config=None):
     from tools.terminal_tool_backends import _ssh_config_from_config
     return _create_environment(

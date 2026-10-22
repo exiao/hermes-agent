@@ -244,6 +244,7 @@ class SSHEnvironment(BaseEnvironment):
             text=True, encoding="utf-8", errors="replace",
             timeout=10,
             stdin=subprocess.DEVNULL,
+            check=False,
         )
         if result.returncode == 3:
             return None
@@ -313,6 +314,7 @@ class SSHEnvironment(BaseEnvironment):
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=10,
+            check=False,
         )
         if result.returncode != 0:
             raise RuntimeError(

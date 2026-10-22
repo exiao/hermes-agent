@@ -397,14 +397,14 @@ _SELF_PROC_TOKEN = (
     r'(?:(?<![\w-])hermes(?:-[\w.-]*)?(?![\w])|'
     r'(?<![\w-])hermes_cli(?:[\w.]*)?|(?<![\w-])gateway(?![\w-])|cli\.py)')
 _STRICT_SELF_TERM_PATTERNS = (
-    (re.compile(r'\b(?:pkill|killall)\b[^;&|]*' + _SELF_PROC_TOKEN, re.I | re.S),
+    (re.compile(r'\b(?:pkill|killall)\b[^;&|]*' + _SELF_PROC_TOKEN, re.IGNORECASE | re.DOTALL),
      "kill hermes/gateway process (self-termination)"),
-    (re.compile(r'\bkill\b[^;&|]*\$\(\s*(?:pgrep|pidof)\b[^)]*' + _SELF_PROC_TOKEN, re.I | re.S),
+    (re.compile(r'\bkill\b[^;&|]*\$\(\s*(?:pgrep|pidof)\b[^)]*' + _SELF_PROC_TOKEN, re.IGNORECASE | re.DOTALL),
      "kill process via pgrep/pidof expansion (self-termination)"),
-    (re.compile(r'\bkill\b[^;&|]*`\s*(?:pgrep|pidof)\b[^`]*' + _SELF_PROC_TOKEN, re.I | re.S),
+    (re.compile(r'\bkill\b[^;&|]*`\s*(?:pgrep|pidof)\b[^`]*' + _SELF_PROC_TOKEN, re.IGNORECASE | re.DOTALL),
      "kill process via backtick pgrep/pidof expansion (self-termination)"),
 )
-_FORK_EXTRA_PATTERNS = tuple((re.compile(pattern, re.I | re.S), description) for pattern, description in (
+_FORK_EXTRA_PATTERNS = tuple((re.compile(pattern, re.IGNORECASE | re.DOTALL), description) for pattern, description in (
     (r'\bgit\s+push\b\s+\S+\s+\S*[/:+\s](?:main|master)(?:\s|$|[\'"`])',
      "git push to main/master (bypasses PR review)"),
     (r'\bgit\s+push\b\s+\S+\s+(?:main|master)(?:\s|$|[\'"`])',

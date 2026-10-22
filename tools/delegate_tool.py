@@ -54,7 +54,7 @@ from tools.delegate_tool_registry import (
 from tools.delegate_tool_tasks import (
     _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
 )
-from tools.delegate_tool_toolsets import (  # noqa: F401
+from tools.delegate_tool_toolsets import (
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
 )
 from tools.delegate_tool_results import (
@@ -72,7 +72,7 @@ _TOOLSET_ALIASES = {
 }
 
 
-def _get_toolset_canonical_map() -> Dict[str, str]:
+def _get_toolset_canonical_map() -> dict[str, str]:
     result = {str(name).lower(): str(name) for name in get_toolset_names()}
     result.update({"all": "all", "*": "all"})
     static = {str(name).lower() for name in TOOLSETS}
@@ -167,7 +167,7 @@ def _resolve_child_toolsets(parent_agent, toolsets, effective_role):
     return child_toolsets, child_disabled
 
 
-def _configured_child_fallbacks(config: dict) -> Optional[List[Dict[str, str]]]:
+def _configured_child_fallbacks(config: dict) -> Optional[list[dict[str, str]]]:
     """Explicit fallbacks for a provider-pinned child; malformed entries are ignored."""
     raw = config.get("fallback_providers")
     if not isinstance(raw, list):
@@ -360,8 +360,8 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
-    override_request_overrides: Optional[Dict[str, Any]] = None,
-    override_fallback_providers: Optional[List[Dict[str, Any]]] = None,
+    override_request_overrides: Optional[dict[str, Any]] = None,
+    override_fallback_providers: Optional[list[dict[str, Any]]] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[list[str]] = None,

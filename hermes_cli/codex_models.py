@@ -42,7 +42,7 @@ DEFAULT_CODEX_MODELS: list[str] = [
 # paths below intentionally do not filter on it. PR #12994 removed this entry on the assumption it was
 # unsupported — that was wrong; restored here. Keep it in the curated fallback so Pro users still see Spark
 # in `/model` when live discovery is unavailable (offline first run, transient API failure).
-_FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
+_FORWARD_COMPAT_TEMPLATE_MODELS: list[tuple[str, tuple[str, ...]]] = [
     ("gpt-6-astra", ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")),
     ("gpt-6-sol", ("gpt-5.6-sol", "gpt-5.5")),
     ("gpt-6-luna", ("gpt-5.6-luna", "gpt-5.5")),

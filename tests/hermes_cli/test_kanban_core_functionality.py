@@ -571,6 +571,7 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
         [sys.executable, "-m", "hermes_cli.main", "kanban",
          "complete", a, b, "--summary", "oops"],
         capture_output=True, text=True, env=env,
+        check=False,
     )
     assert "per-task" in r.stderr, r.stderr
     # The tasks must still be running (no partial apply).
@@ -631,7 +632,7 @@ def test_completed_event_payload_summary_none_when_missing(kanban_home):
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid)  # no summary, no result
         events = kb.list_events(conn, tid)
-        comp = [e for e in events if e.kind == "completed"][0]
+        comp = next(e for e in events if e.kind == "completed")
         assert comp.payload.get("summary") is None
     finally:
         conn.close()
@@ -707,6 +708,7 @@ def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch):
         [_sys.executable, "-m", "hermes_cli.main", "kanban",
          "create", "smoke", "--assignee", "worker", "--json"],
         capture_output=True, text=True, env=env,
+        check=False,
     )
     assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr}"
     import json as _json

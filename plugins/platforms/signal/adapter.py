@@ -235,7 +235,7 @@ class SignalAdapter(BasePlatformAdapter):
         # replies to this bot are recognised after the echo was consumed.
         self._sent_message_timestamps: OrderedDict[str, None] = OrderedDict()
         self._max_sent_message_timestamps = 500
-        self._sent_attachment_paths: "OrderedDict[Tuple[str, str], List[str]]" = OrderedDict()
+        self._sent_attachment_paths: OrderedDict[tuple[str, str], list[str]] = OrderedDict()
         self._max_sent_attachment_entries = 200
         # Best-effort number↔ACI/PNI UUID mapping so sends can upgrade a number to the UUID signal-cli prefers.
         self._recipient_uuid_by_number: dict[str, str] = {}
@@ -439,14 +439,14 @@ class SignalAdapter(BasePlatformAdapter):
         if old_client is not None:
             try:
                 await asyncio.wait_for(old_client.aclose(), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Signal: timed out closing stale SSE client")
             except Exception:
                 logger.debug("Signal: error closing SSE client", exc_info=True)
         if old_task is not None and not old_task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(old_task), timeout=10.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
             except Exception:
                 logger.debug("Signal: cancelled SSE listener raised", exc_info=True)
@@ -635,7 +635,7 @@ class SignalAdapter(BasePlatformAdapter):
         return bool(acct) and (author == acct or author == self._recipient_uuid_by_number.get(acct)
                                or self._recipient_number_by_uuid.get(author) == acct)
 
-    def _remember_sent_attachments(self, timestamp: Any, chat_id: str, paths: List[str]) -> None:
+    def _remember_sent_attachments(self, timestamp: Any, chat_id: str, paths: list[str]) -> None:
         """Map an outbound timestamp and destination to local attachment paths."""
         if timestamp is None or not chat_id or not paths:
             return
@@ -651,7 +651,7 @@ class SignalAdapter(BasePlatformAdapter):
         attachments = quote_data.get("attachments") if isinstance(quote_data, dict) else None
         if not isinstance(attachments, list) or not attachments:
             return None
-        descriptions: List[str] = []
+        descriptions: list[str] = []
         for attachment in attachments:
             if not isinstance(attachment, dict):
                 continue
@@ -671,7 +671,7 @@ class SignalAdapter(BasePlatformAdapter):
             f"{len(descriptions)} attachments: " + "; ".join(descriptions)
         )
 
-    def _conversation_key_aliases(self, chat_id: str) -> List[str]:
+    def _conversation_key_aliases(self, chat_id: str) -> list[str]:
         aliases = [str(chat_id)]
         if str(chat_id).startswith("group:"):
             return aliases
@@ -683,7 +683,7 @@ class SignalAdapter(BasePlatformAdapter):
                 aliases.append(alias)
         return aliases
 
-    def _resolve_quoted_media_paths(self, quote_id: Optional[str], chat_id: str) -> List[str]:
+    def _resolve_quoted_media_paths(self, quote_id: Optional[str], chat_id: str) -> list[str]:
         if not quote_id or not chat_id:
             return []
         for alias in self._conversation_key_aliases(chat_id):
@@ -1029,7 +1029,7 @@ class SignalAdapter(BasePlatformAdapter):
             success=delivered,
             error=None if delivered else "all Signal attachment batches failed")
 
-    async def _send_attachment_batch(self, scheduler, params: Dict[str, Any], n: int, label: str,
+    async def _send_attachment_batch(self, scheduler, params: dict[str, Any], n: int, label: str,
                                      *, chat_id: Optional[str] = None) -> bool:
         """Send one attachment batch with rate-limit pacing and a single transient retry. Tokens are
         deducted only on validated success (None = server never accepted it); 429s feed the scheduler.

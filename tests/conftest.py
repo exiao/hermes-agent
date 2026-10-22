@@ -588,7 +588,7 @@ def _neutralize_macos_keychain_creds(request, monkeypatch, tmp_path):
     try:
         from agent import anthropic_credentials as _credentials_mod
     except Exception:
-        return None
+        return
 
     class _HermeticCredentialPath(type(Path())):
         """A real Path whose ``home()`` is the test's tmp dir (CLAUDE_CONFIG_DIR still builds paths)."""

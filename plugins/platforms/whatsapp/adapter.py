@@ -774,7 +774,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """Leave paced group requests enough time to reach the bridge's serialized sender."""
         return 120 if chat_id.endswith("@g.us") else 30
 
-    async def _post_bridge_message(self, path: str, payload: Dict[str, Any], *, timeout: float) -> SendResult:
+    async def _post_bridge_message(self, path: str, payload: dict[str, Any], *, timeout: float) -> SendResult:
         """POST to the bridge; 200 → SendResult(messageId, raw_response), else the error text."""
         try:
             async with self._bridge_req("post", path, timeout, json=payload) as resp:
@@ -842,7 +842,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     @_needs_bridge
     async def send_poll(self, chat_id: str, question: str, options: list[str], *, selectable_count: int = 1) -> SendResult:
         """Native WhatsApp poll (low-level transport primitive; approval UX stays gateway-owned)."""
-        payload: Dict[str, Any] = {"chatId": to_whatsapp_jid(chat_id), "question": question, "options": list(options or []), "selectableCount": selectable_count}
+        payload: dict[str, Any] = {"chatId": to_whatsapp_jid(chat_id), "question": question, "options": list(options or []), "selectableCount": selectable_count}
         return await self._post_bridge_message(
             "send-poll", payload, timeout=self._bridge_send_timeout(payload["chatId"])
         )

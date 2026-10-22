@@ -1120,7 +1120,7 @@ def test_load_pool_does_not_read_claude_code_when_suppressed(tmp_path, monkeypat
     # fix, eagerly called read_claude_code_credentials() there — _boom would
     # fire even though claude_code is suppressed. After the fix, suppression is
     # checked first and the reader is never called.
-    changed, active = _seed_from_singletons("anthropic", entries)
+    _changed, active = _seed_from_singletons("anthropic", entries)
     assert "claude_code" not in active
     assert "claude_code" not in {entry.source for entry in entries}
 

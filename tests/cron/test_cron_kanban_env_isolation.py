@@ -367,7 +367,7 @@ def test_every_dispatcher_kanban_var_is_identity_gated(tmp_path, monkeypatch):
     Descendants retain routing and tuning, but cannot inherit the worker's
     task/run/claim identity or mutate the board the dispatcher assigned.
     """
-    import hermes_cli.kanban_db_dispatch as kanban_db_dispatch
+    from hermes_cli import kanban_db_dispatch
     from agent.delegation_context import (
         DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS,
         is_dispatcher_owned_worker_context, scrub_kanban_env,

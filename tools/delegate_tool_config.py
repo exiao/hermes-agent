@@ -334,7 +334,7 @@ def _credential_bundle(model, provider, base_url, api_key, api_mode, request_ove
         "request_overrides": request_overrides, **extra,
     }
 
-def _delegation_fallback_providers(cfg: dict) -> Optional[List[Dict[str, Any]]]:
+def _delegation_fallback_providers(cfg: dict) -> Optional[list[dict[str, Any]]]:
     """Return the normalized fallback chain declared for this delegation call."""
     if not isinstance(cfg, dict) or not isinstance(cfg.get("fallback_providers"), list):
         return None

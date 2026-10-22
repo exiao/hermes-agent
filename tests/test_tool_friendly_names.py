@@ -108,7 +108,7 @@ class TestToolDisplay:
 
     def test_no_config_uses_raw_name(self):
         """Without tool_display config, raw tool name is shown."""
-        cb, q = _build_progress_callback(display_config={})
+        cb, _q = _build_progress_callback(display_config={})
         msg = cb("WebSearch", preview="AAPL earnings")
         assert "WebSearch" in msg
         assert "AAPL earnings" in msg
@@ -116,7 +116,7 @@ class TestToolDisplay:
     def test_display_name_replaces_raw(self):
         """With mapping, display name replaces raw tool name."""
         config = {"tool_display": {"WebSearch": "Searching the web: {preview}"}}
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("WebSearch", preview="AAPL earnings")
         assert "Searching the web: AAPL earnings" in msg
         assert "WebSearch" not in msg
@@ -124,7 +124,7 @@ class TestToolDisplay:
     def test_no_preview_placeholder_suppresses_args(self):
         """Display name without {preview} suppresses the raw preview."""
         config = {"tool_display": {"terminal": "Looking up data"}}
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", preview="scripts/serper.sh 'AAPL'")
         assert "Looking up data..." in msg
         assert "serper" not in msg
@@ -132,7 +132,7 @@ class TestToolDisplay:
     def test_unmapped_tool_falls_through(self):
         """Unmapped NON-code tools keep their raw name + preview."""
         config = {"tool_display": {"WebSearch": "Searching the web: {preview}"}}
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("read_file", preview="notes.md")
         assert "read_file" in msg
         assert "notes.md" in msg
@@ -140,7 +140,7 @@ class TestToolDisplay:
     def test_unmapped_terminal_never_echoes_command(self):
         """With hide_code_in_progress, an unmapped `terminal` shows a generic label."""
         config = {"tool_display": {"WebSearch": "Searching the web: {preview}"}}
-        cb, q = _build_progress_callback(display_config=config, hide_code_in_progress=True,
+        cb, _q = _build_progress_callback(display_config=config, hide_code_in_progress=True,
                                          supports_code_blocks=True)
         msg = cb("terminal", preview="ls -la /root/.hermes", args={"command": "ls -la /root/.hermes"})
         assert "terminal" in msg
@@ -156,7 +156,7 @@ class TestToolDisplay:
             "open('/root/.hermes/.env')\n"
             "PY"
         )
-        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=True,
+        cb, _q = _build_progress_callback(display_config={}, hide_code_in_progress=True,
                                          supports_code_blocks=True)
         msg = cb("terminal", args={"command": secret_cmd})
         for leak in ("BLOOMBOT_WHATSAPP_SECRET", "/root/.hermes/.env", "python3", "import os"):
@@ -164,7 +164,7 @@ class TestToolDisplay:
 
     def test_unmapped_execute_code_never_echoes_code(self):
         """With hide_code_in_progress, `execute_code` never echoes its code preview."""
-        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=True)
+        cb, _q = _build_progress_callback(display_config={}, hide_code_in_progress=True)
         msg = cb("execute_code", preview="print(open('/etc/passwd').read())")
         assert "passwd" not in msg
         assert "print(" not in msg
@@ -173,20 +173,20 @@ class TestToolDisplay:
         """`process` submit/write stdin is part of the terminal surface: with
         hide_code_in_progress, a command piped into a background shell must not
         appear in the progress bubble."""
-        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=True)
+        cb, _q = _build_progress_callback(display_config={}, hide_code_in_progress=True)
         msg = cb("process", preview='submit "cat ~/.hermes/.env"')
         assert ".env" not in msg
         assert "cat " not in msg
 
     def test_process_stdin_shown_when_hide_off(self):
         """Default (hide off): process previews still flow through as before."""
-        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=False)
+        cb, _q = _build_progress_callback(display_config={}, hide_code_in_progress=False)
         msg = cb("process", preview='submit "echo hi"')
         assert "echo hi" in msg
 
     def test_default_keeps_bash_block_for_code_block_platforms(self):
         """Default (hide off): a markdown adapter still renders the full ```bash block."""
-        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=False,
+        cb, _q = _build_progress_callback(display_config={}, hide_code_in_progress=False,
                                          supports_code_blocks=True)
         msg = cb("terminal", args={"command": "ls -la /root/.hermes"})
         assert "```bash" in msg
@@ -194,7 +194,7 @@ class TestToolDisplay:
 
     def test_default_plain_platform_unaffected(self):
         """Default (hide off) on a non-code-block platform keeps the old preview line."""
-        cb, q = _build_progress_callback(display_config={}, hide_code_in_progress=False,
+        cb, _q = _build_progress_callback(display_config={}, hide_code_in_progress=False,
                                          supports_code_blocks=False)
         msg = cb("terminal", preview="ls -la")
         assert "ls -la" in msg
@@ -202,7 +202,7 @@ class TestToolDisplay:
     def test_empty_display_dict(self):
         """Empty dict = same as no config."""
         config = {"tool_display": {}}
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("read_file", preview="notes.md")
         assert "read_file" in msg
         assert "notes.md" in msg
@@ -210,14 +210,14 @@ class TestToolDisplay:
     def test_preview_placeholder_with_no_preview(self):
         """{preview} with no actual preview = empty string."""
         config = {"tool_display": {"WebSearch": "Searching the web: {preview}"}}
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("WebSearch")
         assert "Searching the web: " in msg
 
     def test_non_dict_display_config_handled(self):
         """If tool_display is not a dict, no crash."""
         config = {"tool_display": "oops"}
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("WebSearch", preview="test")
         assert "WebSearch" in msg
 
@@ -239,7 +239,7 @@ class TestToolDisplayRewrite:
         config = {
             "tool_display_rewrite": {"bloom earnings (.+)": "Looking up earnings data: $1"}
         }
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", preview="bloom earnings AAPL")
         assert "Looking up earnings data: AAPL" in msg
         assert "terminal" not in msg.replace("⚙️", "").strip().split(" ", 1)[-1][:8]
@@ -252,7 +252,7 @@ class TestToolDisplayRewrite:
                 "bloom (.+)": "Bloom generic: $1",
             }
         }
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", preview="bloom earnings TSLA")
         assert "Looking up earnings data: TSLA" in msg
         assert "Bloom generic" not in msg
@@ -263,7 +263,7 @@ class TestToolDisplayRewrite:
             "tool_display": {"terminal": "Looking up data"},
             "tool_display_rewrite": {"bloom earnings (.+)": "Looking up earnings data: $1"},
         }
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", preview="curl https://api.example.com")
         assert "Looking up data..." in msg
         assert "curl" not in msg
@@ -273,7 +273,7 @@ class TestToolDisplayRewrite:
         config = {
             "tool_display_rewrite": {"bloom fundamentals (.+)": "Looking up fundamentals: $1"}
         }
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", args={"command": "bloom fundamentals NVDA"})
         assert "Looking up fundamentals: NVDA" in msg
 
@@ -285,14 +285,14 @@ class TestToolDisplayRewrite:
                 "bloom price (.+)": "Checking price: $1",
             }
         }
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", preview="bloom price GOOG")
         assert "Checking price: GOOG" in msg
 
     def test_non_dict_rewrite_config_handled(self):
         """If tool_display_rewrite is not a dict, no crash."""
         config = {"tool_display_rewrite": ["bad", "config"]}
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", preview="bloom earnings AAPL")
         # Falls through to raw name
         assert "terminal" in msg
@@ -303,7 +303,7 @@ class TestToolDisplayRewrite:
             "tool_display": {"terminal": "Looking up data"},
             "tool_display_rewrite": {"bloom news (.+)": "Looking up news: $1"},
         }
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", preview="bloom news MSFT")
         assert "Looking up news: MSFT" in msg
         assert "Looking up data" not in msg
@@ -313,7 +313,7 @@ class TestToolDisplayRewrite:
         config = {
             "tool_display_rewrite": {"bloom (\\w+) (\\w+)": "$1 for $2"}
         }
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", preview="bloom earnings AAPL")
         assert "earnings for AAPL" in msg
 
@@ -324,7 +324,7 @@ class TestLegacyCompat:
     def test_legacy_friendly_names_used_when_no_tool_display(self):
         """Old tool_friendly_names key works as fallback."""
         config = {"tool_friendly_names": {"terminal": "Looking up data"}}
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal", preview="some command")
         assert "Looking up data..." in msg
         assert "some command" not in msg
@@ -335,7 +335,7 @@ class TestLegacyCompat:
             "tool_display": {"terminal": "New name"},
             "tool_friendly_names": {"terminal": "Old name"},
         }
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("terminal")
         assert "New name..." in msg
         assert "Old name" not in msg
@@ -346,7 +346,7 @@ class TestLegacyCompat:
             "tool_friendly_names": {"WebSearch": "Searching the web"},
             "tool_show_preview": ["WebSearch"],
         }
-        cb, q = _build_progress_callback(display_config=config)
+        cb, _q = _build_progress_callback(display_config=config)
         msg = cb("WebSearch", preview="AAPL earnings")
         assert "Searching the web" in msg
         assert "AAPL earnings" in msg

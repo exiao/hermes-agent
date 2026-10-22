@@ -258,6 +258,7 @@ class TestEmbedStdinHeredoc:
         proc = subprocess.run(
             ["bash", "-c", result], stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=30,
+            check=False,
         )
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.startswith("hello world")
@@ -276,6 +277,7 @@ class TestEmbedStdinHeredoc:
             proc = subprocess.run(
                 ["bash", "-c", wrapped], stdin=subprocess.DEVNULL,
                 capture_output=True, text=True, timeout=30,
+                check=False,
             )
             assert proc.returncode == 0, proc.stderr
             assert target.read_text().startswith("payload\n")

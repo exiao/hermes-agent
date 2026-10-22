@@ -64,7 +64,7 @@ class DeliveryTransport:
 
 
 def resolve_delivery_transport(platform: Platform, config: GatewayConfig,
-                               adapters: Optional[Dict[Platform, Any]], *,
+                               adapters: Optional[dict[Platform, Any]], *,
                                allow_disabled_native: bool = False) -> Optional[DeliveryTransport]:
     """Resolve a logical platform to its live delivery transport. A concrete native adapter always wins;
     Relay is eligible only when its authenticated transport explicitly advertises that it fronts the

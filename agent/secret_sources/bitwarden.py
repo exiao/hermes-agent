@@ -181,8 +181,8 @@ def fetch_bitwarden_secrets(
     cache_ttl_seconds: float = 300, use_cache: bool = True, server_url: str = "",
     home_path: Optional[Path] = None, encrypted_cache_enabled: bool = False,
     encrypted_cache_max_stale_seconds: float = 0,
-    scoped_env: Optional[Dict[str, str]] = None,
-) -> Tuple[Dict[str, str], List[str]]:
+    scoped_env: Optional[dict[str, str]] = None,
+) -> tuple[dict[str, str], list[str]]:
     """Pull the secrets for ``project_id`` from BSM → ``(secrets, warnings)``.
 
     ``server_url``: region / self-hosted instance (empty = US Cloud). With
@@ -292,8 +292,8 @@ def _run_bws_list(
     access_token: str,
     project_id: str,
     server_url: str = "",
-    scoped_env: Optional[Dict[str, str]] = None,
-) -> Tuple[Dict[str, str], List[str]]:
+    scoped_env: Optional[dict[str, str]] = None,
+) -> tuple[dict[str, str], list[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
     # The bws child intentionally receives the access token; a profile-local
     # fetch must not inherit sibling credentials (source_child_env).
@@ -384,7 +384,7 @@ class BitwardenSource(SecretSource):
         self,
         cfg: dict,
         home_path: Path,
-        environ: Optional[Dict[str, str]] = None,
+        environ: Optional[dict[str, str]] = None,
     ) -> FetchResult:
         cfg = cfg if isinstance(cfg, dict) else {}
         result = FetchResult()

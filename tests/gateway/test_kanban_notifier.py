@@ -980,7 +980,7 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
 
 def test_unserved_coordinator_profile_stays_on_human_path(monkeypatch):
     from gateway.kanban_watchers_notifier import _is_coordinator_blocker
-    import hermes_cli.profiles as profiles
+    from hermes_cli import profiles
 
     monkeypatch.setattr(profiles, "profiles_to_serve", lambda **_kwargs: [("default", None)])
     ev = SimpleNamespace(kind="blocked", id=1, payload={"owner": "coordinator"})

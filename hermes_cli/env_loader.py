@@ -366,7 +366,7 @@ class _StableEnviron(MutableMapping[str, str]):
             # aliased ``stable[b'PATH']`` onto ``'PATH'``, so os.get_exec_path
             # saw both spellings and killed every subprocess spawned here.
             raise
-        except Exception:  # noqa: BLE001 - match os._Environ's fail-open reads
+        except Exception:
             return key
 
     def _snapshot_key(self, key: Any) -> Any:

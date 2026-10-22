@@ -583,7 +583,7 @@ class TestExtractMedia:
         self._patch_safe_root(monkeypatch, root)
 
         content = "See `MEDIA:/etc/passwd`"
-        media, _ = BasePlatformAdapter.extract_media(content)
+        _media, _ = BasePlatformAdapter.extract_media(content)
     # --- Markdown emphasis wrapping tolerance ---
     # Models routinely present a file as **MEDIA:/path** / *MEDIA:/path* /
     # _MEDIA:/path_. The old pattern only tolerated a single quote/backtick, so

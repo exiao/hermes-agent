@@ -1166,7 +1166,7 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
         c = kb.create_task(conn, title="c", assignee="bob", parents=[p])
         # Finish parent outside dispatch; promotion happens inside.
         kb.complete_task(conn, p, result="Verified task work is complete")
-        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        kbd.dispatch_once(conn, spawn_fn=fake_spawn)
     # Spawned c (a was already done when dispatch was called).
     assert len(spawns) == 1
     assert spawns[0][0] == c

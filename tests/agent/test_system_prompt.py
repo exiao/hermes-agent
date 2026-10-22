@@ -728,7 +728,7 @@ class TestBareSystemPrompt:
             assert absent not in full
 
     def test_bare_prompt_falls_back_to_default_identity(self):
-        import agent.system_prompt as system_prompt
+        from agent import system_prompt
 
         parts = self._build(self._bare_agent(), soul="")
 

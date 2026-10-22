@@ -1,6 +1,8 @@
 """Memory-provider lifecycle of cached gateway agents: soft eviction (``release_clients``) versus
 end-of-session teardown (``shutdown_memory_provider`` / ``close``)."""
 
+import asyncio
+import contextlib
 import threading
 
 import pytest
@@ -133,11 +135,10 @@ class TestAgentCacheMemoryLifecycle:
             agent.close()
 
     @pytest.mark.asyncio
-    async def test_eviction_after_timed_out_reset_cleanup_leaves_shutdown_to_it(self, monkeypatch):
-        """/new gives up waiting on its cleanup worker after the timeout and then evicts the same agent.
-        The worker is still inside on_session_end(), so the eviction must not shut the providers
-        down under that extraction, and the providers must be shut down exactly once, after it."""
-        import gateway.slash_commands_session as session_cmds
+    async def test_eviction_after_nonblocking_reset_cleanup_leaves_shutdown_to_it(self):
+        """Fork: /new schedules its cleanup job and evicts the same agent right away. The job is
+        still inside on_session_end(), so the eviction must not shut the providers down under that
+        extraction, and the providers must be shut down exactly once, after it."""
         from tests.waiting import wait_until
 
         events = []
@@ -155,52 +156,60 @@ class TestAgentCacheMemoryLifecycle:
         key = "agent:main:telegram:dm:1"
         runner = _make_runner()
         runner._agent_cache[key] = (agent, "sig")
-        # Only a deadline for giving up on the worker: on_session_end blocks until let_finish, so
-        # /new always times out, however slow the runner.
-        monkeypatch.setattr(session_cmds, "_RESET_CLEANUP_TIMEOUT_S", 0.05)
         try:
             await runner._cleanup_old_agent_for_reset(key)
-            assert in_session_end.wait(10)
             runner._evict_cached_agent(key)
-            wait_until(lambda: agent._session_messages == [], what="the soft eviction to finish")
+            assert await asyncio.to_thread(in_session_end.wait, 10)
+            await asyncio.to_thread(wait_until, lambda: agent._session_messages == [],
+                                    what="the soft eviction to finish")
             assert events == ["on_session_end:start"], "eviction shut providers down mid-extraction"
             assert provider.writer.is_alive()
         finally:
             let_finish.set()
+            await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
             runner._housekeeping_executor.shutdown(wait=True)
         assert events == ["on_session_end:start", "on_session_end:done", "shutdown"]
         assert not provider.writer.is_alive()
 
     @pytest.mark.asyncio
-    async def test_eviction_while_reset_cleanup_is_still_flushing_leaves_shutdown_to_it(self, monkeypatch):
-        """/new's cleanup job can still be in its pre-extraction flush (up to 10 s) when /new stops
-        waiting and evicts the agent; that eviction must not shut the providers down first."""
-        import gateway.slash_commands_session as session_cmds
+    async def test_eviction_before_reset_cleanup_starts_still_extracts_first(self):
+        """Fork: the cache eviction can run its soft release before the scheduled /new cleanup job
+        has even started; the job must still run end-of-session extraction, then shut down once."""
         from tests.waiting import wait_until
 
         events = []
         agent, provider = self._agent_with_writer_provider("mem-reset-flush-test", events)
         agent._session_messages = [{"role": "user", "content": "remember this"}]
-        in_flush, let_finish = threading.Event(), threading.Event()
-
-        def slow_flush(timeout=None):
-            in_flush.set()
-            assert let_finish.wait(10)
-            return True
-
-        agent._memory_manager.flush_pending = slow_flush
         key = "agent:main:telegram:dm:1"
         runner = _make_runner()
         runner._agent_cache[key] = (agent, "sig")
-        monkeypatch.setattr(session_cmds, "_RESET_CLEANUP_TIMEOUT_S", 0.05)
+        # A busy housekeeping pool: the scheduled cleanup reaches its worker only after the eviction's
+        # soft release has already run to completion.
+        real_run = runner._run_housekeeping_in_executor
+        evicted = asyncio.Event()
+
+        async def run_after_eviction(*args, **kwargs):
+            await evicted.wait()  # queued until the test releases it, past the cleanup timeout below
+            return await real_run(*args, **kwargs)
+
+        runner._run_housekeeping_in_executor = run_after_eviction
+        # A queued job holding the session-end claim must not be dropped by a timeout: nothing else
+        # would then extract or shut the providers down.
+        runner._CLEANUP_TIMEOUT_S = 0.05
         try:
             await runner._cleanup_old_agent_for_reset(key)
-            assert in_flush.wait(10)
             runner._evict_cached_agent(key)
-            wait_until(lambda: agent._session_messages == [], what="the soft eviction to finish")
-            assert events == [], "eviction shut providers down before the /new cleanup extracted"
+            await asyncio.to_thread(wait_until, lambda: agent._session_messages == [],
+                                    what="the soft eviction to finish")
+            # Let a bounded wait on the queued job expire before releasing it (a deadline, not a delay
+            # under test): the previous wait_for-wrapped cleanup was cancelled here.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.Event().wait(), timeout=runner._CLEANUP_TIMEOUT_S * 4)
+            evicted.set()
+            await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
         finally:
-            let_finish.set()
-            runner._housekeeping_executor.shutdown(wait=True)
+            pool = getattr(runner, "_housekeeping_executor", None)
+            if pool is not None:
+                pool.shutdown(wait=True)
         assert events == ["on_session_end", "shutdown"]
         assert not provider.writer.is_alive()

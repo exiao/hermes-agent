@@ -47,7 +47,7 @@ class TestNativeAdapterWithoutProfileConfig:
             future = Future()
             try:
                 future.set_result(asyncio.run(coro))
-            except BaseException as e:  # noqa: BLE001
+            except BaseException as e:
                 future.set_exception(e)
             return future
 

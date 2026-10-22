@@ -231,14 +231,12 @@ async def test_reset_schedules_background_cleanup():
     task (so shutdown can cancel it) rather than awaiting it inline."""
     runner = _make_runner_with_cached_agent(lambda: None)
 
-    with patch.object(
-        runner, "_cleanup_agent_resources_off_loop", AsyncMock()
-    ) as _off_loop:
+    with patch.object(runner, "_cleanup_agent_resources") as _cleanup:
         result = await runner._handle_reset_command(_make_event("/new"))
         await _drain_background_tasks(runner)
 
     assert result is not None
-    _off_loop.assert_awaited_once()
+    _cleanup.assert_called_once()
     runner.session_store.reset_session.assert_called_once()
 
 
@@ -261,14 +259,12 @@ async def test_reset_snapshots_transcript_before_eviction():
     agent = runner._agent_cache[build_session_key(_make_source())]
     agent._session_messages = list(transcript)
 
-    with patch.object(
-        runner, "_cleanup_agent_resources_off_loop", AsyncMock()
-    ) as _off_loop:
+    with patch.object(runner, "_cleanup_agent_resources") as _cleanup:
         result = await runner._handle_reset_command(_make_event("/new"))
         await _drain_background_tasks(runner)
 
     assert result is not None
-    _off_loop.assert_awaited_once()
+    _cleanup.assert_called_once()
     # The snapshot handed to cleanup must be the pre-eviction transcript.
-    _, kwargs = _off_loop.call_args
+    _, kwargs = _cleanup.call_args
     assert kwargs.get("session_messages") == transcript

@@ -484,7 +484,7 @@ def test_resolve_runtime_provider_uses_qwen_pool_entry(monkeypatch):
 
 
 def test_resolve_provider_alias_qwen(monkeypatch):
-    monkeypatch.setattr(rp.auth_mod, "_load_auth_store", lambda: {})
+    monkeypatch.setattr(rp.auth_mod, "_load_auth_store", dict)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert rp.resolve_provider("qwen-portal") == "qwen-oauth"

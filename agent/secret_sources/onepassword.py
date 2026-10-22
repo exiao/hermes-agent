@@ -102,7 +102,7 @@ def _auth_fingerprint(
     *,
     token_value: Optional[str] = None,
     include_process_auth: bool = True,
-    auth_env: Optional[Dict[str, str]] = None,
+    auth_env: Optional[dict[str, str]] = None,
 ) -> str:
     """SHA-256 prefix over the auth material `op` would use.
 
@@ -118,7 +118,7 @@ def _auth_fingerprint(
     resolved_token = (
         source_env.get(token_env, "") if token_value is None else token_value
     )
-    parts: List[str] = [
+    parts: list[str] = [
         f"token={resolved_token}",
         f"auth_mode={'process' if include_process_auth else 'isolated'}",
     ]
@@ -173,12 +173,12 @@ def _op_child_env(
     token_value: str,
     *,
     include_process_auth: bool = True,
-    auth_env: Optional[Dict[str, str]] = None,
+    auth_env: Optional[dict[str, str]] = None,
     isolated_home: Optional[Path] = None,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
     source_env = get_source_environment()
-    env: Dict[str, str] = {}
+    env: dict[str, str] = {}
     auth_path_vars = {
         "HOME",
         "USERPROFILE",
@@ -230,7 +230,7 @@ def _run_op_read(
     account: str = "",
     token_value: str = "",
     include_process_auth: bool = True,
-    auth_env: Optional[Dict[str, str]] = None,
+    auth_env: Optional[dict[str, str]] = None,
     isolated_home: Optional[Path] = None,
 ) -> str:
     """Resolve a single ``op://`` reference to its value.
@@ -239,7 +239,7 @@ def _run_op_read(
     with empty output, which would otherwise silently clobber a good
     ``.env``/shell credential with ``""``.
     """
-    cmd: List[str] = [str(op), "read"]
+    cmd: list[str] = [str(op), "read"]
     if account:
         cmd += ["--account", account]
     # `--` terminates option parsing so a reference can never be mis-parsed as
@@ -247,7 +247,7 @@ def _run_op_read(
     cmd += ["--", reference]
 
     try:
-        proc = subprocess.run(  # noqa: S603 — op path is user-trusted, argv list
+        proc = subprocess.run(
             cmd,
             env=_op_child_env(
                 token_value,
@@ -260,6 +260,7 @@ def _run_op_read(
             encoding="utf-8",
             errors="replace",
             timeout=_OP_RUN_TIMEOUT,
+            check=False,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
@@ -292,9 +293,9 @@ def _run_op_read(
 
 
 def fetch_onepassword_secrets(
-    *, references: Dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
+    *, references: dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
     token_value: Optional[str] = None, include_process_auth: bool = True,
-    auth_env: Optional[Dict[str, str]] = None,
+    auth_env: Optional[dict[str, str]] = None,
     binary: Optional[Path] = None, binary_path: str = "", use_cache: bool = True,
     cache_ttl_seconds: float = 300, home_path: Optional[Path] = None,
 ) -> tuple[dict[str, str], list[str]]:
@@ -448,7 +449,7 @@ class OnePasswordSource(SecretSource):
         self,
         cfg: dict,
         home_path: Path,
-        environ: Optional[Dict[str, str]] = None,
+        environ: Optional[dict[str, str]] = None,
     ) -> FetchResult:
         cfg = cfg if isinstance(cfg, dict) else {}
         result = FetchResult()

@@ -444,8 +444,8 @@ def _build_anthropic_client_with_bearer_hook(
 
 
 def _apply_proxy_api_key_header(
-    headers: Dict[str, str], base_url: str | None
-) -> Dict[str, str]:
+    headers: dict[str, str], base_url: str | None
+) -> dict[str, str]:
     """Attach the fork billing-proxy admission key only to its own host."""
     proxy_api_key = os.environ.get("PROXY_API_KEY")
     proxy_base_url = os.environ.get("ANTHROPIC_BASE_URL") or ""

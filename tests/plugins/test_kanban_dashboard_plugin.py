@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+import itertools
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -312,7 +313,7 @@ def test_board_done_window_stable_at_tie_boundary(client):
         with conn:
             conn.execute(
                 "UPDATE tasks SET completed_at=?, created_at=? "
-                "WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                "WHERE id IN ({})".format(",".join("?" * len(ids))),
                 (5000000, 5000000, *ids),
             )
     finally:
@@ -565,7 +566,7 @@ def test_board_chunks_returned_task_id_queries(client, monkeypatch):
 
     conn = kbc.connect()
     ids = _seed_done_tasks(client, 8)
-    for left, right in zip(ids, ids[1:]):
+    for left, right in itertools.pairwise(ids):
         kb.link_tasks(conn, left, right)
     for tid in ids:
         kb.add_comment(conn, tid, "tester", "comment")

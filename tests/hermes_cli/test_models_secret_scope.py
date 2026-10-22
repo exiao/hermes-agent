@@ -3,7 +3,7 @@
 import json
 
 from agent import secret_scope as ss
-import hermes_cli.models as models
+from hermes_cli import models
 
 
 def test_anthropic_catalog_uses_scoped_key(monkeypatch):
@@ -62,7 +62,7 @@ def test_named_profile_catalog_does_not_borrow_process_credentials(
     monkeypatch.setenv("HERMES_HOME", str(named_home))
 
     monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
-    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+    monkeypatch.setattr("hermes_cli.auth._load_auth_store", dict)
     monkeypatch.setattr(
         "agent.anthropic_credentials.resolve_anthropic_token",
         lambda: "sk-ant-oat01-default-profile",
@@ -110,7 +110,7 @@ def test_default_profile_catalog_keeps_claude_file_fallback(monkeypatch, tmp_pat
     monkeypatch.setenv("HERMES_HOME", str(default_home))
 
     monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
-    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+    monkeypatch.setattr("hermes_cli.auth._load_auth_store", dict)
     monkeypatch.setattr(
         "agent.anthropic_credentials.resolve_anthropic_token",
         lambda: "sk-ant-oat01-claude-file-login",
@@ -163,7 +163,7 @@ def test_explicit_api_key_skips_fallback_resolution(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(default_home))
 
     monkeypatch.setattr(models, "_urlopen_model_catalog_request", _urlopen)
-    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+    monkeypatch.setattr("hermes_cli.auth._load_auth_store", dict)
     monkeypatch.setattr("agent.anthropic_credentials.resolve_anthropic_token", _no_resolve)
     ss.set_multiplex_active(True)
     token = ss.set_secret_scope({})

@@ -396,7 +396,7 @@ def load_env_file(env_path: Path) -> dict[str, str]:
     return secrets
 
 
-def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
+def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
     """Build an isolated, resolved secret mapping for one profile home.
 
     Named profiles inherit the shared root ``.env`` as a base layer but never
@@ -415,7 +415,7 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
             is_named_profile = home.resolve() != get_process_hermes_home().resolve()
         except OSError:
             is_named_profile = True
-    secrets: Dict[str, str] = {}
+    secrets: dict[str, str] = {}
 
     if not is_named_profile:
         secrets.update(
@@ -476,7 +476,7 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
         else {**configured_refs, **raw_refs}
     )
     if op_refs:
-        resolved: Dict[str, str] = {}
+        resolved: dict[str, str] = {}
         try:
             from agent.secret_sources.base import (
                 reset_source_environment,
