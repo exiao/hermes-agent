@@ -991,3 +991,27 @@ def test_picker_payload_omits_ids_the_validator_rejects_for_whitespace():
     assert "claude-opus-4.6" in by_slug["anthropic"]
     assert "Go reasoning" in by_slug["omniroute"]
     assert "Meta Llama 3.1 8B" in by_slug["lmstudio"]
+
+
+# -- custom endpoint: Codex -900k picker alias --------------------------------
+
+class TestCustomEndpointCodex900kAlias:
+    LISTING = ["gpt-6-astra", "gpt-6-astra--fast", "gpt-6-luna"]
+
+    @pytest.mark.parametrize("api_mode", ["codex_responses", "codex_app_server"])
+    def test_valid_alias_accepted_when_base_listed(self, api_mode):
+        result = _validate("gpt-6-astra-900k", "custom:openai-codex", api_models=self.LISTING,
+                           base_url="http://127.0.0.1:10100/v1", api_mode=api_mode)
+        assert result["accepted"] and result["persist"]
+        assert not result.get("message")
+
+    def test_alias_still_warns_when_base_missing(self):
+        result = _validate("gpt-6-sol-900k", "custom:openai-codex", api_models=self.LISTING,
+                           base_url="http://127.0.0.1:10100/v1", api_mode="codex_responses")
+        assert "was not found in this custom endpoint's model listing" in result["message"]
+
+    @pytest.mark.parametrize("api_mode", ["chat_completions", "anthropic_messages", "bedrock_converse", "my_plugin_mode"])
+    def test_alias_warns_on_transports_that_send_it_verbatim(self, api_mode):
+        result = _validate("gpt-6-astra-900k", "custom:openai-codex", api_models=self.LISTING,
+                           base_url="http://127.0.0.1:10100/v1", api_mode=api_mode)
+        assert "was not found in this custom endpoint's model listing" in result["message"]
