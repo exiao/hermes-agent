@@ -71,3 +71,19 @@ class TestQuotedImageIsVisible:
             "id": 1792600000000, "attachments": [{"contentType": "image/jpeg", "thumbnail": {"id": "t"}}]}))
         assert event.media_urls == []
         assert event.reply_to_media_summary == "an image (image/jpeg)"
+
+    @pytest.mark.asyncio
+    async def test_an_oversized_thumbnail_is_not_fetched(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        fetched = []
+
+        async def fetch(att_id, filename=""):
+            fetched.append(att_id)
+            return None, ""
+
+        adapter._fetch_attachment = fetch
+        event = await self._capture(adapter, self._envelope({
+            "id": 1792600000000,
+            "attachments": [{"contentType": "image/jpeg", "thumbnail": {"id": "t", "size": 200 * 1024 * 1024}}]}))
+        assert fetched == []
+        assert event.media_urls == []

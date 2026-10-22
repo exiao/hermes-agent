@@ -706,6 +706,9 @@ class SignalAdapter(BasePlatformAdapter):
             thumb_id = thumb.get("id") if isinstance(thumb, dict) else None
             if not thumb_id or not str(attachment.get("contentType") or "").startswith("image/"):
                 continue
+            if (thumb.get("size") or 0) > SIGNAL_MAX_ATTACHMENT_SIZE:  # same cap as direct attachments
+                logger.warning("Signal: quoted thumbnail too large (%d bytes), skipping", thumb.get("size"))
+                continue
             try:
                 cached_path, ext = await self._fetch_attachment(thumb_id, thumb.get("filename") or "")
             except Exception:  # health: allow BLE001 -- a missing preview must not drop the message
