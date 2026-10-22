@@ -48,4 +48,7 @@ def rehome_inbound_media(event: MessageEvent) -> None:
         rewritten[i] = str(dest)
         if event.text and raw in event.text:  # note an adapter already baked in (observed/replied media)
             event.text = event.text.replace(raw, to_agent_visible_cache_path(str(dest)))
+    moved = dict(zip(event.media_urls, rewritten))
     event.media_urls = rewritten
+    # A quoted image rides in both lists (Signal); keep the reply pointer on the moved file.
+    event.reply_to_media_paths = [moved.get(p, p) for p in event.reply_to_media_paths]

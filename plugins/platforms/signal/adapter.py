@@ -563,11 +563,24 @@ class SignalAdapter(BasePlatformAdapter):
         media_urls, media_types = [], []
         if attachments_data and not getattr(self, "ignore_attachments", False):
             media_urls, media_types = await self._collect_attachments(attachments_data)
+        own_media_types = list(media_types)  # the message's type ignores the quote (a text reply is not a photo burst)
+        if quote_data and not getattr(self, "ignore_attachments", False):
+            # The agent should SEE the quoted image, not only read its name: attach it like a new
+            # one. Our own sends resolve to the original file; anything else (the user's photo, or
+            # one of ours from before a restart) uses the thumbnail the sender's app put on the quote.
+            quoted_images = [p for p in reply_to_media_paths if _is_image_ext(Path(p).suffix)]
+            if not quoted_images:
+                quoted_images = await self._fetch_quoted_thumbnails(quote_data)
+                reply_to_media_paths = reply_to_media_paths or quoted_images
+            for path in quoted_images:
+                if path not in media_urls:
+                    media_urls.append(path)
+                    media_types.append(_ext_to_mime(Path(path).suffix))
         # Skip contentless envelopes (profile key updates, empty messages) that still carry a
         # dataMessage wrapper — otherwise msg='' triggers a full agent turn.
-        if (not text or not text.strip()) and not media_urls:
+        if (not text or not text.strip()) and not own_media_types:
             logger.debug("Signal: skipping contentless envelope from %s (%d attachments)", redact_phone(sender),
-                         len(media_urls) if media_urls else 0)
+                         len(own_media_types))
             return
         source = self.build_source(
             chat_id=chat_id, chat_name=group_info.get("groupName") if group_info else sender_name,
@@ -576,8 +589,8 @@ class SignalAdapter(BasePlatformAdapter):
             chat_id_alt=group_id if is_group else None)
         # First matching MIME prefix wins; everything else (application/*, text/*, unknown) is a DOCUMENT
         # so run.py's document-context injection surfaces the cached path.
-        msg_type = MessageType.TEXT if not media_types else next(
-            (mt for prefix, mt in _MEDIA_TYPE_BY_MIME_PREFIX if any(m.startswith(prefix) for m in media_types)),
+        msg_type = MessageType.TEXT if not own_media_types else next(
+            (mt for prefix, mt in _MEDIA_TYPE_BY_MIME_PREFIX if any(m.startswith(prefix) for m in own_media_types)),
             MessageType.DOCUMENT)
         ts_ms = envelope_data.get("timestamp", 0)  # milliseconds since epoch
         timestamp = datetime.now(tz=UTC)
@@ -682,6 +695,28 @@ class SignalAdapter(BasePlatformAdapter):
             if alias and alias not in aliases:
                 aliases.append(alias)
         return aliases
+
+    async def _fetch_quoted_thumbnails(self, quote_data: dict) -> list[str]:
+        """Cache the thumbnails signal-cli reports on ``quote.attachments[]`` (image quotes only)."""
+        paths: list[str] = []
+        for attachment in quote_data.get("attachments") or []:
+            if not isinstance(attachment, dict):
+                continue
+            thumb = attachment.get("thumbnail")
+            thumb_id = thumb.get("id") if isinstance(thumb, dict) else None
+            if not thumb_id or not str(attachment.get("contentType") or "").startswith("image/"):
+                continue
+            if (thumb.get("size") or 0) > SIGNAL_MAX_ATTACHMENT_SIZE:  # same cap as direct attachments
+                logger.warning("Signal: quoted thumbnail too large (%d bytes), skipping", thumb.get("size"))
+                continue
+            try:
+                cached_path, ext = await self._fetch_attachment(thumb_id, thumb.get("filename") or "")
+            except Exception:  # health: allow BLE001 -- a missing preview must not drop the message
+                logger.warning("Signal: failed to fetch quoted thumbnail %s", thumb_id, exc_info=True)
+                continue
+            if cached_path and _is_image_ext(ext):
+                paths.append(cached_path)
+        return paths
 
     def _resolve_quoted_media_paths(self, quote_id: Optional[str], chat_id: str) -> list[str]:
         if not quote_id or not chat_id:
