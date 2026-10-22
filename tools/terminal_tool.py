@@ -40,8 +40,9 @@ def _redact_terminal_error_text(value: Any) -> str:
 
 
 from tools.registry import tool_error
+# _create_configured_env is defined below (fork: build_container_config keeps every container key).
 from tools.terminal_tool_lifecycle import (
-    _check_disk_usage_warning, _cleanup_inactive_envs, _create_configured_env,
+    _check_disk_usage_warning, _cleanup_inactive_envs,
     _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
 )
 from tools.terminal_tool_config import (

@@ -1278,8 +1278,7 @@ def _slug_from_git_remote(workspace_path: Optional[str]) -> Optional[str]:
     try:
         remote = subprocess.run(
             ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=10,
-            check=False,
+            capture_output=True, text=True, timeout=10, check=False,
         )
     except (subprocess.SubprocessError, OSError):
         return None

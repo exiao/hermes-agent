@@ -2,6 +2,7 @@
 end-of-session teardown (``shutdown_memory_provider`` / ``close``)."""
 
 import asyncio
+import contextlib
 import threading
 
 import pytest
@@ -188,8 +189,7 @@ class TestAgentCacheMemoryLifecycle:
         evicted = asyncio.Event()
 
         async def run_after_eviction(*args, **kwargs):
-            await evicted.wait()
-            await asyncio.sleep(0.2)  # queued past the cleanup timeout below
+            await evicted.wait()  # queued until the test releases it, past the cleanup timeout below
             return await real_run(*args, **kwargs)
 
         runner._run_housekeeping_in_executor = run_after_eviction
@@ -201,6 +201,10 @@ class TestAgentCacheMemoryLifecycle:
             runner._evict_cached_agent(key)
             await asyncio.to_thread(wait_until, lambda: agent._session_messages == [],
                                     what="the soft eviction to finish")
+            # Let a bounded wait on the queued job expire before releasing it (a deadline, not a delay
+            # under test): the previous wait_for-wrapped cleanup was cancelled here.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.Event().wait(), timeout=runner._CLEANUP_TIMEOUT_S * 4)
             evicted.set()
             await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
         finally:

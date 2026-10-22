@@ -171,8 +171,8 @@ class GatewaySessionCommandsMixin:
                     functools.partial(self._cleanup_agent_resources, session_messages=messages_snapshot),
                     (_old_agent,), session_key,
                 )
-            except Exception as cleanup_exc:
-                logger.warning("Agent resource cleanup (/new reset %s) failed: %s", session_key, cleanup_exc)
+            except Exception:  # health: allow BLE001 -- detached best-effort teardown; logged with traceback
+                logger.warning("Agent resource cleanup (/new reset %s) failed", session_key, exc_info=True)
 
         self._retain_background_task(asyncio.create_task(_teardown()))
 
