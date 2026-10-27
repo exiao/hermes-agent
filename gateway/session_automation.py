@@ -326,8 +326,17 @@ def admission_display(payload):
     return card
 
 
+# The fields that name WHERE a wake lands. Sender and display labels (user_id, user_name,
+# chat_name, *_alt) describe the last human message, not the chat: a routing origin recorded
+# before them (or by a restore that keeps only the chat) leaves them blank, and comparing them
+# refused every wake for that chat as admission_conflict.
+_ROUTE_IDENTITY_KEYS = ('platform', 'chat_id', 'chat_type', 'thread_id', 'scope_id', 'parent_chat_id',
+                        'profile')
+
+
 def _route_identity(source):
-    return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
+    data = source.to_dict()
+    return {key: data.get(key) for key in _ROUTE_IDENTITY_KEYS}
 
 
 def committed_route_envelope(authority, entry):
