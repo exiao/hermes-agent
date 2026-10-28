@@ -94,7 +94,7 @@ class SSHEnvironment(BaseEnvironment):
     # Passthrough values are re-forwarded on every command (see _run_bash), so like docker/local
     # they stay out of the remote snapshot under multiplex.
     _profile_scoped_passthrough = True
-    _sudo_nopasswd_probe_supported = True
+    _passwordless_sudo_probe_supported = True
 
     def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
         """Keep HERMES_HOME out of the session snapshot.

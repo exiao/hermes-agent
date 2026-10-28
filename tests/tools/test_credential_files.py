@@ -521,7 +521,7 @@ class TestMapCachePathToContainer:
 class TestToAgentVisiblePathPerBackend:
     """#76577 follow-up: translation covers every backend that relocates the
     Hermes cache — not just docker — and skips the ones where the host path
-    stays correct (local; singularity auto-binds the host home)."""
+    stays correct (local, unknown)."""
 
     def _staged(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
@@ -587,7 +587,7 @@ class TestToAgentVisiblePathPerBackend:
             "/home/alice/.hermes/profiles/profile-a/plans/task.md"
         )
 
-    @pytest.mark.parametrize("backend", ["local", "singularity", ""])
+    @pytest.mark.parametrize("backend", ["local", ""])
     def test_untranslated_backends_keep_host_path(self, tmp_path, monkeypatch, backend):
         staged = self._staged(tmp_path, monkeypatch)
         monkeypatch.setenv("TERMINAL_ENV", backend)

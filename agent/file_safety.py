@@ -242,11 +242,13 @@ def build_write_approval_paths(home: str) -> set[str]:
 # HERMES_HOME / root subpaths that the agent's generic file tools must not
 # rewrite. Session transcripts (state.db, sessions/) are application-owned
 # state whose rewrite can falsify history and break resume/compression;
-# mcp-tokens/, pairing/, vault/ (key + ciphertext side by side) and
-# browser-profile/ (copied cookies / Login Data) hold credential material.
+# mcp-tokens/, pairing/, vault/ (key + ciphertext side by side),
+# browser-profile/ (copied cookies / Login Data) and webapp/ (the Webapp's
+# browser credential and its grants to native apps) hold credential material.
 # Control files (auth.json, config.yaml, webhook_subscriptions.json) are
 # deliberately NOT here (#45947): read-denied, but the user may ask to edit them.
-_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing", "vault", "browser-profile")
+_HERMES_PROTECTED_SUBPATHS = (
+    "state.db", "sessions", "mcp-tokens", "pairing", "vault", "browser-profile", "webapp")
 
 
 def _classify_write_denial(path: str, *, entry: bool = False) -> Optional[str]:
@@ -362,6 +364,11 @@ _READ_DENIED_DIRS = (
     ("vault",
      "is the Hermes credential vault directory and cannot be read directly (secrets are filled server-side by browser_vault).",
      "is inside the Hermes credential vault (encrypted secrets + local key) and cannot be read directly (browser_vault resolves them server-side)."),
+    # session-token is the Webapp's browser credential (a bare token no redaction pattern masks); the
+    # rest are its grants to native apps and its Web Access registration.
+    ("webapp",
+     "is the Hermes Webapp sign-in directory and cannot be read directly.",
+     "is a Hermes Webapp sign-in file (the browser credential or its sign-in records) and cannot be read directly."),
 )
 
 
@@ -503,47 +510,14 @@ def _denied_path_set() -> tuple[frozenset[Path], tuple[Path, ...]]:
 def get_read_block_error(path: str) -> Optional[str]:
     """Return an error message when a read targets a denied Hermes path.
 
-    Three categories are blocked:
+    Blocked: internal skill-hub caches (prompt-injection carriers), credential
+    stores under HERMES_HOME and the global root (exact files, plus anything
+    under ``mcp-tokens/``, ``browser-profile/``, ``vault/`` and ``webapp/``), and project-local ``.env``
+    files anywhere on disk (``.env.example`` is the documented-shape substitute).
 
-      * Internal Hermes cache files under ``HERMES_HOME/skills/.hub`` —
-        readable metadata that an attacker could use as a prompt-injection
-        carrier.
-      * Credential / secret stores under HERMES_HOME and the global Hermes
-        root: ``auth.json``, ``auth.lock``, ``.anthropic_oauth.json``,
-        ``.env``, ``webhook_subscriptions.json``, ``auth/google_oauth.json``,
-        and anything under ``mcp-tokens/``. These hold plaintext provider keys,
-        OAuth tokens, and HMAC secrets that the agent never needs to read
-        directly — provider tools / gateway adapters consume them through
-        internal channels.
-      * Project-local environment files anywhere on disk: ``.env``,
-        ``.env.local``, ``.env.development``, ``.env.production``,
-        ``.env.test``, ``.env.staging``, ``.envrc``. These routinely hold
-        API keys, database passwords, and other credentials for the user's
-        own projects. The agent helping debug a project shouldn't normally
-        need to read these — ``.env.example`` is the documented-shape
-        substitute.
-
-    **This is NOT a security boundary.** The terminal tool runs as the
-    same OS user with shell access; the agent can still ``cat auth.json``
-    or ``cat ~/.hermes/.env`` and exfiltrate the file. The read-deny exists
-    as defense-in-depth that:
-
-      * Returns a clear error to models that respect tool denials, which
-        empirically prompts most modern models to stop rather than reach
-        for the shell.
-      * Surfaces a visible audit trail when something tries to read
-        credentials — easier to spot in logs than a generic ``cat``.
-
-    Treat any user-visible framing around this as "may help" rather than
-    "stops attackers." A determined model or malicious instruction can
-    always shell out.
-
-    Callers that resolve relative paths against a non-process cwd
-    (e.g. ``TERMINAL_CWD`` in ``tools/file_tools.py``) MUST pre-resolve
-    and pass the absolute path string.  This function's own ``resolve()``
-    is anchored at the Python process cwd, so a relative input like
-    ``"auth.json"`` would otherwise miss the denylist when the task's
-    terminal cwd differs from the process cwd.
+    Callers that resolve relative paths against a non-process cwd (e.g.
+    ``TERMINAL_CWD``) MUST pass an absolute path: ``resolve()`` here anchors at
+    the process cwd, so a relative ``"auth.json"`` would miss the denylist.
     """
     # NT/device-namespace check runs on the RAW string, before resolve():
     # on Windows, resolving \??\UNC\host\share (or \\?\UNC\, GLOBALROOT)
