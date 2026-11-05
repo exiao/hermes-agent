@@ -471,4 +471,4 @@ class GatewayVoiceMixin:
         thread_meta["notify"] = True
         for path in audio_paths:
             await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
-                             metadata=thread_meta)
+                             metadata=thread_meta, is_voice=True)

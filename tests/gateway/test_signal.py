@@ -530,8 +530,9 @@ class TestSignalRecipientResolution:
 
 class TestSignalSendVoice:
     @pytest.mark.asyncio
-    async def test_send_voice_sends_via_rpc(self, monkeypatch, tmp_path):
-        """send_voice should send audio as attachment via signal-cli RPC."""
+    @pytest.mark.parametrize("voice_kwargs, expect_note", [({}, False), ({"is_voice": True}, True)])
+    async def test_send_voice_sends_via_rpc(self, monkeypatch, tmp_path, voice_kwargs, expect_note):
+        """send_voice sends audio via signal-cli RPC; is_voice ([[audio_as_voice]]) marks it a voice note."""
         adapter = _make_signal_adapter(monkeypatch)
         mock_rpc, captured = _stub_rpc({"timestamp": 1234567890})
         adapter._rpc = mock_rpc
@@ -540,15 +541,14 @@ class TestSignalSendVoice:
         audio_path = tmp_path / "reply.ogg"
         audio_path.write_bytes(b"OggS" + b"\x00" * 100)
 
-        result = await adapter.send_voice(chat_id="+155****4567", audio_path=str(audio_path))
+        result = await adapter.send_voice(chat_id="+155****4567", audio_path=str(audio_path), **voice_kwargs)
 
         assert result.success is True
         assert captured[0]["method"] == "send"
         assert captured[0]["params"]["attachments"] == [str(audio_path)]
-        assert captured[0]["params"]["message"] == ""  # caption=None → ""
+        assert captured[0]["params"]["message"] == "" and ("voiceNote" in captured[0]["params"]) is expect_note
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         assert 1234567890 in adapter._recent_sent_timestamps
-
 
     @pytest.mark.asyncio
     async def test_send_voice_too_large(self, monkeypatch, tmp_path):

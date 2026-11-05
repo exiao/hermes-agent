@@ -488,7 +488,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             try:
                 if _should_send_media_as_audio(source.platform, _ext, _is_voice):
                     await adapter.send_voice(
-                        chat_id=source.chat_id, audio_path=media_path, metadata=metadata,
+                        chat_id=source.chat_id, audio_path=media_path, metadata=metadata, is_voice=_is_voice,
                     )
                 elif _ext in _VIDEO_EXTS:
                     await adapter.send_video(
