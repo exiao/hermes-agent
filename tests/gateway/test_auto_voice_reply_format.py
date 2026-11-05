@@ -51,6 +51,7 @@ class TestAutoVoiceReplyFormat:
         assert requested_paths and requested_paths[0].endswith(".ogg")
         adapter.send_voice.assert_awaited_once()
         assert adapter.send_voice.await_args.kwargs["audio_path"].endswith(".ogg")
+        assert adapter.send_voice.await_args.kwargs["is_voice"] is True  # Signal renders a voice note
 
     def test_should_send_voice_reply_streamed_global_auto_tts_fires(self):
         """Streamed reply + global voice.auto_tts (no /voice opt-in) sends voice.
