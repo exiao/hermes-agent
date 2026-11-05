@@ -546,8 +546,7 @@ class TestSignalSendVoice:
         assert result.success is True
         assert captured[0]["method"] == "send"
         assert captured[0]["params"]["attachments"] == [str(audio_path)]
-        assert captured[0]["params"]["message"] == ""  # caption=None → ""
-        assert ("voiceNote" in captured[0]["params"]) is expect_note
+        assert captured[0]["params"]["message"] == "" and ("voiceNote" in captured[0]["params"]) is expect_note
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         assert 1234567890 in adapter._recent_sent_timestamps
 
