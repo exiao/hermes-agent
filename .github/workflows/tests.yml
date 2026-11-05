@@ -37,15 +37,18 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests (${{ matrix.slice }}/4)
-    # Preserve full discovery while keeping the fork's standard runners within
-    # the job deadline. Each file belongs to exactly one deterministic slice.
+    # Three 32-core slices instead of one box: on one runner the suite is ~10 min of
+    # nearly fully packed work, and a single bigger runner (96-core) scaled ~1.8x for
+    # 3x the price because files contend for the shared machine. Separate machines
+    # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
+    # every slice agrees on the split without a planning job.
+    name: Run tests (${{ matrix.slice }}/3)
+    runs-on: ${{ vars.BIG_RUNNER || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        slice: [1, 2, 3, 4]
-    runs-on: ${{ vars.HUGE_RUNNER || 'ubuntu-latest-96-core' }}
-    timeout-minutes: 30
+        slice: [1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -106,8 +109,11 @@ jobs:
         #
         # Each matrix job runs one deterministic duration-balanced slice.
         run: |
-          scripts/run_tests.sh --jobs "$(nproc)" --slice "${{ matrix.slice }}/4"
+          scripts/run_tests.sh
         env:
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/3
+          HERMES_TEST_FORKSERVER: "1"
+          HERMES_TEST_WORKERS: 32
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -122,7 +128,7 @@ jobs:
         with:
           path: test_durations.json
           # Per-slice key: each slice's file keeps the restored entries for the other
-          # slice's files and refreshes its own, so the cache stays complete.
+          # slices' files and refreshes its own, so the cache stays complete.
           key: test-durations-${{ github.run_id }}-${{ matrix.slice }}
 
       - name: Check the checkout is clean

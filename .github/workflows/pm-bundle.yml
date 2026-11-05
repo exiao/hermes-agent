@@ -74,8 +74,6 @@ jobs:
           #   runner: blacksmith-32vcpu-ubuntu-2404-arm
           - label: darwin-arm64
             runner: macos-15
-          - label: darwin-x64
-            runner: macos-15-intel
           - label: win32-x64
             runner: ${{ vars.WIN_BIG_RUNNER || 'windows-latest-32-core' }}
           - label: win32-arm64
