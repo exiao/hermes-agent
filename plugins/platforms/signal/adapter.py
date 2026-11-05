@@ -1131,10 +1131,13 @@ class SignalAdapter(BasePlatformAdapter):
                 "oversize": f"Image too large ({detail} bytes)"}[reason])
         return await self._send_file(chat_id, file_path, caption, "RPC send with attachment failed")
 
-    async def _send_file(self, chat_id: str, file_path: str, caption: Optional[str], fail_error: str) -> SendResult:
+    async def _send_file(self, chat_id: str, file_path: str, caption: Optional[str], fail_error: str,
+                         *, voice_note: bool = False) -> SendResult:
         """Send one local file as a Signal attachment via the ``send`` RPC."""
         params = await self._with_target(
             {"account": self.account, "message": caption or "", "attachments": [file_path]}, chat_id)
+        if voice_note:
+            params["voiceNote"] = True  # signal-cli --voice-note: renders as a playable voice note
         try:
             file_size = Path(file_path).stat().st_size
         except FileNotFoundError:
@@ -1153,7 +1156,7 @@ class SignalAdapter(BasePlatformAdapter):
         return SendResult(success=True)
 
     async def _send_attachment(self, chat_id: str, file_path: str, media_label: str,
-                               caption: Optional[str] = None) -> SendResult:
+                               caption: Optional[str] = None, *, voice_note: bool = False) -> SendResult:
         """Send any local file as a Signal attachment (shared by send_document/image_file/voice/video)."""
         await self._stop_typing_indicator(chat_id)
         try:
@@ -1162,7 +1165,8 @@ class SignalAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"{media_label} file not found: {file_path}")
         if file_size > SIGNAL_MAX_ATTACHMENT_SIZE:
             return SendResult(success=False, error=f"{media_label} too large ({file_size} bytes)")
-        return await self._send_file(chat_id, file_path, caption, f"RPC send {media_label.lower()} failed")
+        return await self._send_file(chat_id, file_path, caption, f"RPC send {media_label.lower()} failed",
+                                     voice_note=voice_note)
 
     async def send_document(self, chat_id, file_path, caption=None, filename=None, **kwargs) -> SendResult:
         return await self._send_attachment(chat_id, file_path, "File", caption)
@@ -1172,8 +1176,9 @@ class SignalAdapter(BasePlatformAdapter):
         return await self._send_attachment(chat_id, image_path, "Image", caption)
 
     async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, **kwargs) -> SendResult:
-        """Audio attachment — Signal has no distinct voice-message API."""
-        return await self._send_attachment(chat_id, audio_path, "Audio", caption)
+        """Audio attachment; ``is_voice`` ([[audio_as_voice]]) marks it as a voice note."""
+        return await self._send_attachment(chat_id, audio_path, "Audio", caption,
+                                           voice_note=bool(kwargs.get("is_voice")))
 
     async def send_video(self, chat_id, video_path, caption=None, reply_to=None, **kwargs) -> SendResult:
         return await self._send_attachment(chat_id, video_path, "Video", caption)
