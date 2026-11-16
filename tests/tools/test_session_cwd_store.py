@@ -197,12 +197,8 @@ class TestCommandCwdReadsTheRecord:
         )
         assert resolved == "/my/worktree"
 
-
     def test_deleted_local_record_falls_back_to_default(self, tmp_path):
-        gone = tmp_path / "removed-worktree"
-        gone.mkdir()
-        tt.record_session_cwd("sess-a", str(gone))
-        gone.rmdir()
+        tt.record_session_cwd("sess-a", str(tmp_path / "removed-worktree"))
         resolved = tt._resolve_command_cwd(
             workdir=None,
             default_cwd=str(tmp_path),

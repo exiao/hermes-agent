@@ -1121,7 +1121,8 @@ def _resolve_command_cwd(
     if workdir:
         return coerce_ssh_remote_cwd(_container_visible_cwd(workdir, env_type, env), env_type)
     recorded = get_session_cwd(session_key)
-    if recorded and env_type == "local" and not os.path.isdir(recorded):
+    from tools.environments.local import _msys_to_windows_path
+    if recorded and env_type == "local" and not os.path.isdir(_msys_to_windows_path(recorded)):
         # The recorded dir was deleted (e.g. a removed worktree). ``cd`` into
         # it would fail every later command in this session, so drop it.
         logger.info("Recorded session cwd %r no longer exists; using %r.", recorded, default_cwd)
