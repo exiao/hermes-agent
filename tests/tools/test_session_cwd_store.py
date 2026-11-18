@@ -217,9 +217,12 @@ class TestCommandCwdReadsTheRecord:
         )
         assert resolved == "/config/default"
 
-    def test_cd_then_next_command_runs_in_the_new_dir(self, monkeypatch):
+    def test_cd_then_next_command_runs_in_the_new_dir(self, monkeypatch, tmp_path):
         """E2E through terminal_tool: the record round-trips cd state."""
         import json
+
+        # Local env drops a recorded cwd that does not exist, so use a real dir.
+        project = str(tmp_path)
 
         class FakeEnv:
             env = {}
@@ -245,7 +248,7 @@ class TestCommandCwdReadsTheRecord:
             lambda command, env_type, **kwargs: {"approved": True},
         )
 
-        json.loads(tt.terminal_tool(command="cd /project", task_id="sess-a"))
-        assert tt.get_session_cwd("sess-a") == "/project"
+        json.loads(tt.terminal_tool(command=f"cd {project}", task_id="sess-a"))
+        assert tt.get_session_cwd("sess-a") == project
         json.loads(tt.terminal_tool(command="pwd", task_id="sess-a"))
-        assert fake.last_cwd_arg == "/project"
+        assert fake.last_cwd_arg == project
