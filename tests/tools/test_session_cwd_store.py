@@ -252,3 +252,4 @@ class TestCommandCwdReadsTheRecord:
         assert tt.get_session_cwd("sess-a") == project
         json.loads(tt.terminal_tool(command="pwd", task_id="sess-a"))
         assert fake.last_cwd_arg == project
+        assert tt.get_session_cwd("sess-a") == project
