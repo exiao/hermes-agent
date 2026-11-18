@@ -197,6 +197,16 @@ class TestCommandCwdReadsTheRecord:
         )
         assert resolved == "/my/worktree"
 
+    def test_deleted_local_record_falls_back_to_default(self, tmp_path):
+        tt.record_session_cwd("sess-a", str(tmp_path / "removed-worktree"))
+        resolved = tt._resolve_command_cwd(
+            workdir=None,
+            default_cwd=str(tmp_path),
+            session_key="sess-a",
+            env_type="local",
+        )
+        assert resolved == str(tmp_path)
+        assert tt.get_session_cwd("sess-a") is None
 
     def test_other_sessions_record_is_not_consulted(self):
         tt.record_session_cwd("sess-b", "/other/worktree")
@@ -207,9 +217,12 @@ class TestCommandCwdReadsTheRecord:
         )
         assert resolved == "/config/default"
 
-    def test_cd_then_next_command_runs_in_the_new_dir(self, monkeypatch):
+    def test_cd_then_next_command_runs_in_the_new_dir(self, monkeypatch, tmp_path):
         """E2E through terminal_tool: the record round-trips cd state."""
         import json
+
+        # Local env drops a recorded cwd that does not exist, so use a real dir.
+        project = str(tmp_path)
 
         class FakeEnv:
             env = {}
@@ -235,7 +248,8 @@ class TestCommandCwdReadsTheRecord:
             lambda command, env_type, **kwargs: {"approved": True},
         )
 
-        json.loads(tt.terminal_tool(command="cd /project", task_id="sess-a"))
-        assert tt.get_session_cwd("sess-a") == "/project"
+        json.loads(tt.terminal_tool(command=f"cd {project}", task_id="sess-a"))
+        assert tt.get_session_cwd("sess-a") == project
         json.loads(tt.terminal_tool(command="pwd", task_id="sess-a"))
-        assert fake.last_cwd_arg == "/project"
+        assert fake.last_cwd_arg == project
+        assert tt.get_session_cwd("sess-a") == project
